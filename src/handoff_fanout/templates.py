@@ -78,6 +78,27 @@ pytest {tests} 2>&1 | tail -10
 {baseline_block}
 **Status**: `{status}`
 
+## §0 上任审计 — 核对前任 retro evidence (v5.4 / 不可跳过)
+
+> **触发**: 本会话被 launchd 由前任 dump 触发开张。第一步**不是**写代码，是审计前任是否真的复盘了。
+> Source of truth: `project-files/handoff/v5.4-retro-mandate-draft.md` §2.3 / §7.13。
+
+```bash
+TASK="{task}"; PROJ="{project}"
+EVID="$HOME/.claude-handoff/$PROJ/precheck/$TASK.retro.evidence.json"
+OLDREADY="$HOME/.claude-handoff/$PROJ/ack/$TASK.old_ready"
+if [ -f "$EVID" ]; then
+    jq '{{head, mode, phase0, phase1, next_brief, evidence_hash}}' "$EVID" 2>/dev/null || cat "$EVID"
+    [ -f "$OLDREADY" ] && jq '{{session_id_kind, retro_evidence_hash, commit_hash}}' "$OLDREADY"
+    echo "✅ 前任 retro evidence 在位 — 可推进 task"
+else
+    echo "⚠️  前任无 retro.evidence.json — Phase 4a opt-in 阶段，legacy 路径容忍。"
+    echo "   待 HANDOFF_RETRO_MANDATE=1 全局启用后，此情况须写 queue/$TASK.BLOCKED.md 通知主人裁决。"
+fi
+```
+
+**新会话不代签** (v5.4 spec §2.3 Q9): 缺 evidence 时**不要**自己跑 `handoff precheck` 假装补做 — Phase 0/1 是老会话对自身工作的闭环声明，新会话无法证明。若主人明确授权 forensic retro，用 `handoff precheck --mode forensic_retro` 显式标记。
+
 ## 第一步: Baseline 验证 (新会话开局必跑)
 
 ```bash
@@ -129,19 +150,52 @@ touch {handoff_home}/{project}/queue/{task}.done      # 仅停本 task
 3. 文档提取 / 邮箱 / OCR / 银行
 4. 绕守护 / 解锁
 
-## 启动指令
+## §-1 老会话自检 + 启动指令 (dump 前必跑 / v5.4)
 
-按主人 5/27 立法自主推进 task `{task}` (project `{project}`). 闭环后调:
+按主人 5/27 立法自主推进 task `{task}` (project `{project}`). 本 task 闭环后, **dump 下一个 task 之前**必须先跑 retro precheck — Phase 闭环 SOP 工具层 invariant (Phase 4a 已上线 `handoff precheck`, Phase 4b 写入每份 handoff prompt)。
 
 ```bash
 cd {workspace}
+# 1) 生成 retro evidence (Phase 0 五项 + Phase 1 五类显式声明 / status enum 见 §7.13)
+handoff precheck \\
+    --task <next-task-id> \\
+    --phase0-status memory=✅ --phase0-status tests=✅ \\
+    --phase0-status audit=✅ --phase0-status commit=✅ \\
+    --phase0-status code_review=✅ \\
+    --phase1-status codex=✅ --phase1-status claude_md=✅ \\
+    --phase1-status l2_memory=✅ --phase1-status tests=✅ \\
+    --phase1-status prs=✅
+# → 写 ~/.claude-handoff/{project}/precheck/<next-task-id>.retro.evidence.json
+
+# 2) dump 时传 --retro-evidence; HANDOFF_RETRO_MANDATE=1 强制激活 gate
 handoff dump \\
     --task <next-task-id> \\
     --next "<next-task-brief>" \\
     --status active \\
-    --tests "<test-files>"
+    --tests "<test-files>" \\
+    --retro-evidence ~/.claude-handoff/{project}/precheck/<next-task-id>.retro.evidence.json
 # project + workspace 自动从 cwd 推断
 ```
+
+**status enum** (Phase 4a 实施 / `handoff_fanout.handoff_precheck`):
+- `✅` — 本 task 实际改动 / `⚠️` — warning 不阻塞 / `❌` — 漏做 (gate 拒) / `skip` — 显式跳过 (须 reason)
+- **phase0 keys**: `memory / tests / audit / commit / code_review`
+- **phase1 keys**: `codex / claude_md / l2_memory / tests / prs`
+- ⚠️ spec §7.13 旧 enum (`updated/...`) **与 runtime 不符**, 待 4c/4d 协调
+
+**紧急 P0 bypass** (§7.1 / §7.9): `HANDOFF_RETRO_BYPASS=1` 启用 — 须有 `ack/<task>.retro.override.json` 含 `follow_up_retro_task_id` + ISO-8601 `follow_up_deadline`，否则 exit 6 `ERR-BYPASS`。
+
+**exit code 速查** (§7.1 — AI 按 subcode 决定 retry / stop / BLOCKED):
+
+| exit / 前缀 | 含义 | AI 应对 |
+|---|---|---|
+| 0 / `OK:` | gate 通过 | 等 launchd spawn 下个 tab |
+| 2 / `ERR-BLOCKED:` | attempt_n=2 硬拒 / head-stale-fatal | 停止 retry + 走 BLOCKED 流程 |
+| 3 / `ERR-LOCKED:` | precheck/dump/attempt 锁竞争 | 让位退出 (并行 tab 在 dump) |
+| 4 / `ERR-RETRY:` | evidence 缺 / hash mismatch / schema 不通过 | 修后 re-dump 一次 (attempt_n < 2) |
+| 6 / `ERR-BYPASS:` | bypass 字段缺 / follow-up overdue | 补 trail 字段后 re-dump |
+
+**当前阶段** (Phase 4b / 2026-05-29): 主人尚未拨 `HANDOFF_RETRO_MANDATE=1` 全局开关。不带 `--retro-evidence` 调 dump 不报错 (legacy path 兼容); 拨开关后无 evidence → exit 4 RETRY 拒绝。
 
 成功 → launchd / cron WatchPaths 1 秒内 spawn 新 Claude tab.
 
