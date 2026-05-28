@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-05-29
+
+v5.4 Phase 4d — D-3 `old_ready` writer + D-4 autoclose & follow-up
+overdue scanner. Closes the loop between v5.4 retro-evidence gate and v4
+path-D autoclose, so a successful retro-gated dump now leaves enough
+durable state on disk for the launchd watcher to (a) close the old tab
+via a helper-extension URI without depending on PIDs or window titles,
+and (b) hard-fail subsequent dumps in the same project when a
+`HANDOFF_RETRO_BYPASS=1` promise to follow up retro misses its
+ISO-8601 deadline. Phase 4c text in the handoff prompt is also flipped
+to reflect that `HANDOFF_RETRO_MANDATE=1` is live system-wide.
+
+### Added
+
+- **`dump._write_old_ready`** — when the retro gate ran with a valid
+  evidence file, the active dump now writes
+  `ack/<task>.old_ready` per spec §7.6 with the full v5.4.1 schema:
+  `schema_version`, `task_id`, `nonce`, `session_id`,
+  `session_id_kind` (claude-uuid | fallback-fingerprint),
+  `commit_hash`, `push_completed_at`, `tests_passed`,
+  `memory_updated`, `dump_success`, `retro_evidence_hash` (sha256 of
+  file bytes per §7.5), `retro_evidence_path` (relative to
+  `~/.claude-handoff/<project>/`, portable across machines), and
+  `retro_evidence_path_absolute` (local fast-path lookup).
+  Atomic-written via the same `write_with_fsync` path the rest of the
+  ack/queue artifacts trust.
+- **`install/auto-continue.sh` v5.4 D-4 sections** — every external
+  dependency (`open`, `osascript`, `shasum`, `code`) is now overridable
+  via env vars so the launchd watcher can be fully exercised in tests:
+  - **autoclose segment** — iterates `ack/*.submitted`, validates the
+    matching `old_ready` (schema_version whitelist, retro_evidence_hash
+    file integrity per §7.5, BLOCKED.md / failed-marker / done-marker
+    short-circuits per v4 improvement #4-#5), acquires a per-task
+    `locks/<task>.autoclose.lock` (mkdir-based, 5-min stale TTL,
+    TOCTOU re-check after lock per v4 #4), and fires the helper URI
+    `vscode://dharmaxis.handoff-helper/autoclose?task_id=…&nonce=…&project=…`.
+    Default OFF — opt in via `HANDOFF_AUTOCLOSE_ENABLED=1` or a sentinel
+    file at the global or project level (v4 改进 #6).
+  - **follow-up overdue scanner** — every invocation scans
+    `ack/*.retro.override.json` per spec §7.9: when the
+    `follow_up_deadline` is past and the matching
+    `precheck/<follow_task>.retro.evidence.json` is absent, stamps
+    `ack/<task>.retro_overdue.txt` (idempotent — exists check before
+    notify) and fires one `osascript display notification`. When the
+    follow-up evidence appears later, unlinks both the marker and the
+    original override and appends a closing line to the audit jsonl.
+- **`tests/test_handoff_autoclose.py`** — 19 cases:
+  - **A-01 .. A-12** (autoclose state machine): happy path, nonce
+    propagation, no-submitted skip, helper-failed marker short-circuit
+    (no_candidate / multiple_candidates / is_active_tab), per-task
+    lock serialization under concurrent runs, stale-lock recycling,
+    retro_evidence_hash tamper rejection, missing-evidence rejection,
+    BLOCKED.md skip, unknown schema_version rejection, default-OFF
+    guard.
+  - **V-01 .. V-04** (follow-up overdue scanner): past-deadline marker,
+    follow-up evidence clears marker + override, future-deadline
+    no-marker, marker idempotency across runs.
+  - **D-3 round-trip**: dump.main end-to-end produces a v5.4.1
+    `old_ready` whose `retro_evidence_hash` matches `sha256(file_bytes)`
+    and whose schema fields all map to §7.6 correctly; legacy path (no
+    `--retro-evidence`) writes no `old_ready`.
+
+### Changed
+
+- **`templates.build_handoff_md`** — §-1 closing prompt now reports
+  Phase 4c flipped ✅ and points at the three env paths that carry
+  `HANDOFF_RETRO_MANDATE=1` system-wide (`~/.zshenv`,
+  `launchctl setenv`, `auto-continue.plist EnvironmentVariables`).
+  §7.13 enum reconcile note updated to point at the runtime as the
+  authoritative source.
+- **`install/auto-continue.sh` env contract** — `HANDOFF_ROOT`,
+  `HANDOFF_OPEN_CMD`, `HANDOFF_OSASCRIPT_CMD`, `HANDOFF_SHA256_CMD`,
+  `HANDOFF_CODE_BIN`, `HANDOFF_SKIP_SPAWN`, `HANDOFF_VSCODE_CHECK` and
+  `HANDOFF_AUTOCLOSE_ENABLED` are honoured; previously hard-coded
+  paths kept their original defaults so production launchd behaviour
+  is unchanged.
+
+### Notes
+
+- Source-of-truth for `auto-continue.sh` now lives in
+  `install/auto-continue.sh`; the previous ad-hoc copies under
+  `~/.local/bin/` and ERP `scripts/` are re-synced from this file.
+- Schema bump is `v5.4.1` (matches retro evidence schema_version), so
+  watchers built against 1.1.0/1.2.x stay compatible — the gate's
+  whitelist already accepts it.
+
 ## [1.2.1] — 2026-05-29
 
 Bug fix: `handoff dump --status active` no longer pollutes the user's

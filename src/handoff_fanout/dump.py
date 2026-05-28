@@ -35,7 +35,14 @@ from pathlib import Path
 from handoff_fanout import atomic, retro_gate, templates
 from handoff_fanout import config as _config
 from handoff_fanout.git_guard import git_guard_dir
-from handoff_fanout.handoff_precheck import resolve_session_id
+from handoff_fanout.handoff_precheck import (
+    EVIDENCE_SCHEMA_VERSION,
+    compute_retro_evidence_hash,
+    resolve_session_id,
+)
+
+# v5.4 old_ready schema (§7.6). Bumped together with retro_evidence schema.
+OLD_READY_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
 
 # v5 protocol constants
 SCHEMA_VERSION = 2
@@ -364,6 +371,7 @@ def write_active_dump(
     baseline: dict,
     queue_dir: Path,
     osascript_subtitle: str | None = None,
+    retro_evidence_path: Path | None = None,
 ) -> int:
     roadmap_excerpt = get_roadmap_excerpt(cfg)
 
@@ -414,9 +422,87 @@ def write_active_dump(
 
     _maybe_pbcopy(handoff_content)
 
+    # §7.6 — write ack/<task>.old_ready when retro evidence drove the dump.
+    if retro_evidence_path is not None:
+        _write_old_ready(
+            project=project,
+            task=task,
+            workspace=workspace,
+            evidence_path=retro_evidence_path,
+            ack_dir=cfg.ack_dir(project),
+            home=cfg.home,
+        )
+
     _notify(next_brief, f"自动接续 / {project}", task)
     print(f"[dump] ✅ active dump complete for {project}/{task}")
     return 0
+
+
+def _write_old_ready(
+    *,
+    project: str,
+    task: str,
+    workspace: Path,
+    evidence_path: Path,
+    ack_dir: Path,
+    home: Path,
+) -> Path | None:
+    """Write ``ack/<task>.old_ready`` per spec §7.6.
+
+    Only invoked when the retro gate ran with an evidence file and passed. The
+    artifact tells the v4 autoclose watcher that this session is closed and
+    references the on-disk evidence so the watcher can verify integrity before
+    closing the old tab. Returns the written path (or ``None`` if the evidence
+    file vanished between the gate check and this call).
+    """
+    if not evidence_path.exists():
+        return None
+    try:
+        payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    sid, sid_kind = resolve_session_id()
+    commit_hash = run(["git", "rev-parse", "HEAD"], workspace) or "(unknown)"
+
+    project_root = (home / project).resolve()
+    try:
+        rel_path = str(evidence_path.resolve().relative_to(project_root))
+    except ValueError:
+        # Evidence file lives outside the project's handoff home (unusual but
+        # legal for tests or hand-curated paths). Fall back to the absolute
+        # path so the watcher can still resolve it.
+        rel_path = str(evidence_path.resolve())
+
+    phase0 = payload.get("phase0", {}) if isinstance(payload.get("phase0"), dict) else {}
+    tests_entry = phase0.get("tests", {}) if isinstance(phase0.get("tests"), dict) else {}
+    memory_entry = phase0.get("memory", {}) if isinstance(phase0.get("memory"), dict) else {}
+
+    old_ready = {
+        "schema_version": OLD_READY_SCHEMA_VERSION,
+        "task_id": task,
+        "nonce": payload.get("nonce", "") if isinstance(payload.get("nonce", ""), str) else "",
+        "session_id": sid,
+        "session_id_kind": sid_kind,
+        "commit_hash": commit_hash,
+        "push_completed_at": now_iso(),
+        "tests_passed": tests_entry.get("status") == "✅",
+        "memory_updated": memory_entry.get("status") == "✅",
+        "dump_success": True,
+        "retro_evidence_hash": compute_retro_evidence_hash(evidence_path),
+        "retro_evidence_path": rel_path,
+        "retro_evidence_path_absolute": str(evidence_path.resolve()),
+    }
+    ack_dir.mkdir(parents=True, exist_ok=True)
+    out = ack_dir / f"{task}.old_ready"
+    atomic.write_with_fsync(
+        out,
+        json.dumps(old_ready, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+    )
+    print(f"[dump] wrote {out}")
+    return out
 
 
 def _maybe_pbcopy(content: str) -> None:
@@ -965,6 +1051,19 @@ def main(argv: list[str] | None = None) -> int:
         print("...")
         return 0
 
+    # Pass the evidence path down so write_active_dump can persist
+    # ack/<task>.old_ready alongside the .uri sidecar (§7.6). The gate
+    # already validated the file's existence + hash, so plumbing it
+    # through is safe.
+    retro_evidence_path: Path | None = None
+    if (
+        args.retro_evidence
+        and gate_result is not None
+        and gate_result.is_ok
+        and args.status == "active"
+    ):
+        retro_evidence_path = Path(args.retro_evidence).resolve()
+
     return write_active_dump(
         cfg=cfg,
         project=project,
@@ -976,6 +1075,7 @@ def main(argv: list[str] | None = None) -> int:
         baseline=baseline,
         queue_dir=queue_dir,
         osascript_subtitle=args.blocked_reason or None,
+        retro_evidence_path=retro_evidence_path,
     )
 
 

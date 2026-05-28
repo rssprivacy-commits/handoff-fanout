@@ -167,7 +167,7 @@ touch {handoff_home}/{project}/queue/{task}.done      # 仅停本 task
 
 ## §-1 老会话自检 + 启动指令 (dump 前必跑 / v5.4)
 
-按主人 5/27 立法自主推进 task `{task}` (project `{project}`). 本 task 闭环后, **dump 下一个 task 之前**必须先跑 retro precheck — Phase 闭环 SOP 工具层 invariant (Phase 4a 已上线 `handoff precheck`, Phase 4b 写入每份 handoff prompt)。
+按主人 5/27 立法自主推进 task `{task}` (project `{project}`). 本 task 闭环后, **dump 下一个 task 之前**必须先跑 retro precheck — Phase 闭环 SOP 工具层 invariant (Phase 4a `handoff precheck` 工具 ✅, Phase 4b prompt 注入 ✅, Phase 4c mandate flipped 2026-05-29 ✅)。
 
 ```bash
 cd {workspace}
@@ -196,7 +196,7 @@ handoff dump \\
 - `✅` — 本 task 实际改动 / `⚠️` — warning 不阻塞 / `❌` — 漏做 (gate 拒) / `skip` — 显式跳过 (须 reason)
 - **phase0 keys**: `memory / tests / audit / commit / code_review`
 - **phase1 keys**: `codex / claude_md / l2_memory / tests / prs`
-- ⚠️ spec §7.13 旧 enum (`updated/...`) **与 runtime 不符**, 待 4c/4d 协调
+- spec §7.13 旧 enum (`updated/...`) Phase 4c 取 runtime 协调闭环 — runtime 为权威
 
 **紧急 P0 bypass** (§7.1 / §7.9): `HANDOFF_RETRO_BYPASS=1` 启用 — 须有 `ack/<task>.retro.override.json` 含 `follow_up_retro_task_id` + ISO-8601 `follow_up_deadline`，否则 exit 6 `ERR-BYPASS`。
 
@@ -210,7 +210,7 @@ handoff dump \\
 | 4 / `ERR-RETRY:` | evidence 缺 / hash mismatch / schema 不通过 | 修后 re-dump 一次 (attempt_n < 2) |
 | 6 / `ERR-BYPASS:` | bypass 字段缺 / follow-up overdue | 补 trail 字段后 re-dump |
 
-**当前阶段** (Phase 4b / 2026-05-29): 主人尚未拨 `HANDOFF_RETRO_MANDATE=1` 全局开关。不带 `--retro-evidence` 调 dump 不报错 (legacy path 兼容); 拨开关后无 evidence → exit 4 RETRY 拒绝。
+**当前阶段** (Phase 4c flipped 2026-05-29 / 已拨): `HANDOFF_RETRO_MANDATE=1` 在 `~/.zshenv` + `launchctl setenv` + `auto-continue.plist EnvironmentVariables` 三路径全量生效。不带 `--retro-evidence` 调 dump → exit 4 `ERR-RETRY` 拒绝; 紧急 P0 走 `HANDOFF_RETRO_BYPASS=1` + `ack/<task>.retro.override.json` (含 `follow_up_retro_task_id` + ISO-8601 `follow_up_deadline`)。
 
 成功 → launchd / cron WatchPaths 1 秒内 spawn 新 Claude tab.
 
