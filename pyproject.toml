@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "handoff-fanout"
+version = "0.1.0"
+description = "Project-agnostic auto-handoff & parallel fan-out for AI coding sessions (Claude Code / Cursor / Aider). 5-layer defense against orphan tasks, git index hijack, and stale handoffs."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Chen Mingzhong", email = "sopranoquan@gmail.com" },
+]
+keywords = [
+    "claude-code",
+    "ai-agent",
+    "handoff",
+    "parallel",
+    "fan-out",
+    "git-hijack-defense",
+    "devops",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Software Development :: Version Control :: Git",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+lint = [
+    "ruff>=0.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/rssprivacy-commits/handoff-fanout"
+Repository = "https://github.com/rssprivacy-commits/handoff-fanout"
+Issues = "https://github.com/rssprivacy-commits/handoff-fanout/issues"
+Changelog = "https://github.com/rssprivacy-commits/handoff-fanout/blob/main/CHANGELOG.md"
+
+[project.scripts]
+handoff = "handoff_fanout.cli:main"
+handoff-dump = "handoff_fanout.dump:main"
+handoff-watchdog = "handoff_fanout.watchdog:main"
+handoff-heartbeat = "handoff_fanout.heartbeat:main"
+handoff-safe-commit = "handoff_fanout.safe_commit:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/handoff_fanout"]
+
+[tool.hatch.build.targets.wheel.shared-data]
+"src/handoff_fanout/git_guard/git" = "share/handoff-fanout/git-guard/git"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
