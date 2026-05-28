@@ -10,8 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Extraction roadmap (v0.1.0 → v1.0.0)
 
 - [x] Repo scaffolding (pyproject.toml, LICENSE, .gitignore, README placeholder)
-- [ ] Extract `git_guard/git` shell wrapper (PATH-injected git blocker for sub-task tabs)
-- [ ] Extract `safe_commit` (mkdir-based cross-process lock + expected-files invariant)
+- [x] Extract `git_guard/git` shell wrapper (PATH-injected git blocker for sub-task tabs) — 15 tests
+- [x] Extract `atomic` primitives (atomic_create, write_with_fsync, acquire_dir_lock) — 10 tests
+- [x] Extract `safe_commit` (4-layer hijack defense documented honestly) — 9 tests
 - [ ] Extract `dump` core (queue file generation, baseline detection, IDE spawn URI)
 - [ ] Extract `watchdog` (orphan/stale/timeout/heartbeat fan-in trigger)
 - [ ] Extract `heartbeat` (fan-in tab heartbeat daemon + metrics + Amdahl calibration)
