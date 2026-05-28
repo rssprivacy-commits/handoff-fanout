@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  handoff-fanout Layer 5 — periodic watchdog scan.
+
+  This plist is a template. `install/install.sh` substitutes:
+    @@HANDOFF_BIN@@   → resolved path of the `handoff` console script
+    @@HANDOFF_HOME@@  → resolved HANDOFF_HOME (default ~/.handoff)
+
+  Loaded with:  launchctl load -w ~/Library/LaunchAgents/com.handoff-fanout.watchdog.plist
+  Unloaded:     launchctl unload  ~/Library/LaunchAgents/com.handoff-fanout.watchdog.plist
+  Logs:         ~/.handoff/watchdog.log
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.handoff-fanout.watchdog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@@HANDOFF_BIN@@</string>
+        <string>watchdog</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>WatchPaths</key>
+    <array>
+        <string>@@HANDOFF_HOME@@</string>
+    </array>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>@@HANDOFF_HOME@@/watchdog.log</string>
+    <key>StandardErrorPath</key>
+    <string>@@HANDOFF_HOME@@/watchdog.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HANDOFF_HOME</key>
+        <string>@@HANDOFF_HOME@@</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

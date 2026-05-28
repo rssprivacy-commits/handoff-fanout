@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# handoff-fanout — Layer 2 pre-commit hook
+#
+# Verifies that the staged file set is a subset of $HANDOFF_EXPECTED_FILES
+# (a colon-separated list set by `handoff safe-commit`). Manual commits with
+# no env var set are passed through unchanged.
+#
+# This hook is the server-side guarantee that an absolute-path `/usr/bin/git
+# commit` (which bypasses Layer 1's PATH-injected wrapper) still cannot sweep
+# in another tab's `git add`.
+#
+# Intentionally POSIX-portable (awk + grep, no associative arrays) so it
+# works under macOS's stock bash 3.2 as well as bash 4+/zsh/dash.
+
+set -eu
+
+if [ -z "${HANDOFF_EXPECTED_FILES:-}" ]; then
+    exit 0
+fi
+
+STAGED=$(git diff --cached --name-only)
+
+EXTRA=$(printf '%s\n' "$STAGED" | awk -v expected="$HANDOFF_EXPECTED_FILES" '
+    BEGIN {
+        n = split(expected, parts, ":")
+        for (i = 1; i <= n; i++) if (parts[i] != "") set[parts[i]] = 1
+    }
+    NF { if (!($0 in set)) print }
+')
+
+if [ -n "$EXTRA" ]; then
+    cat >&2 <<EOF
+
+❌ handoff-fanout pre-commit (Layer 2): staged files outside expected set.
+
+HANDOFF_EXPECTED_FILES: ${HANDOFF_EXPECTED_FILES}
+
+Staged but not expected:
+$(printf '%s\n' "$EXTRA" | sed 's/^/  - /')
+
+This usually means another tab's git add was swept into this commit
+(.git/index is repo-shared state).
+
+To override consciously, set HANDOFF_SAFE_COMMIT_BYPASS=1 and document
+why in the commit message. See docs/ARCHITECTURE.md (Layer 2/3).
+EOF
+    exit 1
+fi
+
+exit 0
