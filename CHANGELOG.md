@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-05-29
+
+v4.1 single-task 529-detection symmetry. Plugs the gap where
+`build_handoff_md` emitted a spawn prompt without any heartbeat instruction,
+so when the new tab wedged on 529 / API Error there was nothing for the
+watchdog to notice. Mirrors what `build_sub_task_handoff_md` Step 2 +
+watchdog mode 4 already do for fan-out sub-tasks.
+
+Root cause: 主人 5/29 'API Error 会话裸跑' incident. Sessions launched via the
+single-task path could die silently because they never wrote a heartbeat
+file.
+
+### Added
+
+- **`build_handoff_md` Step 1** — heartbeat daemon that touches
+  `queue/<task>.heartbeat` every 60s, with a pidfile + kill hint. The
+  existing Baseline step is renumbered to Step 2.
+- **`watchdog.scan_single_task_heartbeats` (mode 6)** — cross-project sweep
+  for `queue/<task>.heartbeat` files older than
+  `SUB_TASK_HEARTBEAT_STALE_SECONDS` (5 min). When the task is still
+  active (`.md` present, no `.done` / `.BLOCKED.md` / existing
+  `.529-suspected`), atomic-creates `queue/<task>.529-suspected` and fires
+  the same osascript notification mode 4 uses.
+- **`tests/test_v41_heartbeat.py`** — 11 cases covering template injection
+  (3) and watchdog mode 6 (8: stale-detect, fresh-skip, md-missing-skip,
+  done-skip, BLOCKED-skip, idempotency, cross-project, special-dir-skip).
+
+### Changed
+
+- `watchdog.main` now reports `scanned N batches / M orphans / K stale v4.1
+  heartbeats` in its summary line.
+
 ## [1.1.0] — 2026-05-29
 
 v5.4 retro-evidence gate — Phase 4a tool layer. Adds the precheck CLI that

@@ -99,7 +99,22 @@ fi
 
 **新会话不代签** (v5.4 spec §2.3 Q9): 缺 evidence 时**不要**自己跑 `handoff precheck` 假装补做 — Phase 0/1 是老会话对自身工作的闭环声明，新会话无法证明。若主人明确授权 forensic retro，用 `handoff precheck --mode forensic_retro` 显式标记。
 
-## 第一步: Baseline 验证 (新会话开局必跑)
+## 第一步: 启动 heartbeat (v5.1+ / 529 风暴防御 / v4.1 单 task 模式)
+
+> **触发**: 主人 5/29 'API Error 会话裸跑' 根因 — v4.1 单 task spawn 后若卡死 / 529 overloaded 没人接手。
+> 本步骤让新会话每 60s touch heartbeat 文件，watchdog mode 6 在 >5min 失活时写 `.529-suspected` + 通知主人。
+> 与 sub-task 模式 (build_sub_task_handoff_md 第二步) 对称。
+
+```bash
+( while true; do
+    touch {handoff_home}/{project}/queue/{task}.heartbeat
+    sleep 60
+  done ) &
+echo $! > /tmp/heartbeat-{task}.pid
+# 闭环前 kill: kill $(cat /tmp/heartbeat-{task}.pid) 2>/dev/null
+```
+
+## 第二步: Baseline 验证 (新会话开局必跑)
 
 ```bash
 cd {workspace}

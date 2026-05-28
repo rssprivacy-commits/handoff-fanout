@@ -21,6 +21,13 @@ watchdog covers the failure modes:
   5. **Mode 5 — orphan spawn scan.** Cross-project sweep for
      ``ack/*.spawned`` files whose corresponding queue ``.md`` is gone.
      Writes a ``BLOCKED.md`` so the user can locate and close the tab.
+  6. **Mode 6 — single-task heartbeat stale (v4.1 / 529 detection).**
+     Cross-project sweep for ``queue/<task>.heartbeat`` files older than
+     ``SUB_TASK_HEARTBEAT_STALE_SECONDS``. Mirror of Mode 4 for the v4.1
+     single-task path: writes a ``queue/<task>.529-suspected`` marker so
+     the user can recover. Symmetry with ``build_sub_task_handoff_md``
+     Step 2: now ``build_handoff_md`` Step 1 also touches a heartbeat,
+     and this mode notices when it stops.
 
 Intended to run via ``launchd`` / cron, every ~10 min.
 """
@@ -279,6 +286,90 @@ def _dump_degraded_fan_in(
     )
 
 
+# ─── mode 6: single-task heartbeat stale (v4.1) ─────────────────────────────
+
+
+def scan_single_task_heartbeats() -> int:
+    """Find ``queue/<task>.heartbeat`` files whose mtime is stale past the threshold.
+
+    The v4.1 single-task spawn-prompt (``build_handoff_md`` Step 1) instructs
+    the new session to touch its own heartbeat every 60s. If the session
+    is wedged in a 529 retry loop or hit ``API Error``, the heartbeat goes
+    silent. We mirror Mode 4's behaviour: write ``<task>.529-suspected``
+    and notify, only when the task is still active (``.md`` present, no
+    ``.done`` / ``.BLOCKED.md`` / existing ``.529-suspected`` marker).
+    """
+    suspected = 0
+    root = handoff_root()
+    if not root.exists():
+        return 0
+    for proj_dir in root.iterdir():
+        if not proj_dir.is_dir():
+            continue
+        if proj_dir.name in {"locks", "_recovery"}:
+            continue
+        queue_dir = proj_dir / "queue"
+        if not queue_dir.is_dir():
+            continue
+        for heartbeat in queue_dir.glob("*.heartbeat"):
+            task_id = heartbeat.stem
+            if not (queue_dir / f"{task_id}.md").exists():
+                continue
+            if (queue_dir / f"{task_id}.done").exists():
+                continue
+            if (queue_dir / f"{task_id}.BLOCKED.md").exists():
+                continue
+            marker = queue_dir / f"{task_id}.529-suspected"
+            if marker.exists():
+                continue
+            stale = time.time() - heartbeat.stat().st_mtime
+            if stale <= SUB_TASK_HEARTBEAT_STALE_SECONDS:
+                continue
+            _mark_single_task_529(
+                queue_dir,
+                task_id,
+                proj_dir.name,
+                reason=f"heartbeat stale {stale:.0f}s",
+            )
+            suspected += 1
+    return suspected
+
+
+def _mark_single_task_529(
+    queue_dir: Path,
+    task_id: str,
+    project: str,
+    reason: str,
+) -> None:
+    marker = queue_dir / f"{task_id}.529-suspected"
+    if not atomic.atomic_create(marker):
+        return
+    atomic.write_with_fsync(
+        marker,
+        (
+            f"task_id: {task_id}\n"
+            f"detected_at: {dump.now_iso()}\n"
+            f"reason: {reason}\n"
+            f"queue_dir: {queue_dir}\n\n"
+            f"## Possible cause\n"
+            f"v4.1 single-task tab is wedged — Provider 529 (overloaded), an\n"
+            f"unhandled exception path, or API Error 会话裸跑.\n\n"
+            f"## Manual recovery\n"
+            f"1. Open the Claude tab for `{task_id}` and read the error.\n"
+            f"2. To re-spawn: `rm {queue_dir}/{task_id}.529-suspected` and\n"
+            f"   `touch {queue_dir}/{task_id}.uri` (launchd will re-fire).\n"
+            f"3. To give up: `touch {queue_dir}/{task_id}.BLOCKED.md`.\n"
+        ),
+    )
+    print(f"  [watchdog mode 6] 529-suspected: {project}/{task_id} ({reason})")
+    _notify(
+        f"{task_id}: {reason}",
+        "v5 watchdog / 529-suspected (v4.1)",
+        project,
+        sound="Basso",
+    )
+
+
 # ─── mode 5: cross-project orphan scan ──────────────────────────────────────
 
 
@@ -379,7 +470,15 @@ def main() -> int:
         except Exception as e:
             print(f"[watchdog] orphan scan error: {e}", file=sys.stderr)
             orphans = 0
-        print(f"[watchdog] scanned {scanned} batches / {orphans} orphans")
+        try:
+            stale_v41 = scan_single_task_heartbeats()
+        except Exception as e:
+            print(f"[watchdog] v4.1 heartbeat scan error: {e}", file=sys.stderr)
+            stale_v41 = 0
+        print(
+            f"[watchdog] scanned {scanned} batches / {orphans} orphans / "
+            f"{stale_v41} stale v4.1 heartbeats"
+        )
     finally:
         release_lock(fd)
     return 0
