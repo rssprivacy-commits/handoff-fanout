@@ -10,15 +10,22 @@ This module nails the symmetry shut:
   * ``build_handoff_md`` Step 1 now writes ``queue/<task>.heartbeat`` every 60s
   * ``watchdog.scan_single_task_heartbeats`` (mode 6) marks stale heartbeats
     ``queue/<task>.529-suspected``
+  * ``watchdog._mark_single_task_529`` (mode 6 enforcement, added 2026-05-29)
+    auto-kills the stuck task's processes via SIGTERM → SIGKILL and notifies
+    so the operator doesn't have to manually hunt PIDs.
 
-Both halves are exercised here — drift on either side reopens the gap.
+All three halves are exercised here — drift on any side reopens the gap.
 """
 
 from __future__ import annotations
 
 import os
+import re as _re
+import signal
+import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -173,3 +180,450 @@ def test_mode6_skips_special_dirs(isolated_handoff_home):
         _stale(hb, seconds_ago=watchdog.SUB_TASK_HEARTBEAT_STALE_SECONDS + 60)
 
     assert watchdog.scan_single_task_heartbeats() == 0
+
+
+# ─── C: watchdog mode 6 enforcement (kill + notify) ─────────────────────────
+#
+# Match criterion now: ``pgrep -fa <re.escape(<queue>/<task>.heartbeat)>``.
+# Result type: ``EnforceResult`` (status + killed/still_alive/permission_denied
+# /raced_gone tuples). Verifying after SIGKILL.
+
+
+_REAL_SUBPROCESS_RUN = subprocess.run  # captured before any test monkeypatch
+
+
+class _FakePgrep:
+    """Stand-in for ``subprocess.run(["pgrep", "-fa", <pattern>])``.
+
+    Recognizes ``pgrep`` by basename so ``/usr/bin/pgrep`` works too.
+    Non-pgrep calls fall through to the real ``subprocess.run`` captured
+    at module import time — this avoids the "monkeypatched run calls
+    itself" recursion.
+    """
+
+    def __init__(self, stdout: str, returncode: int = 0):
+        self.stdout = stdout
+        self.returncode = returncode
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, *args, **kwargs):
+        if isinstance(argv, list | tuple) and argv:
+            head = str(argv[0])
+            if head == "pgrep" or head.endswith("/pgrep"):
+                self.calls.append(list(argv))
+                return SimpleNamespace(
+                    stdout=self.stdout, stderr="", returncode=self.returncode
+                )
+        return _REAL_SUBPROCESS_RUN(argv, *args, **kwargs)
+
+
+class _FakeKill:
+    """Stand-in for ``os.kill`` that records signals and simulates outcomes.
+
+    Per-PID outcome knobs:
+
+      * ``alive_after_term`` — PIDs that STAY alive after SIGTERM (probe
+        returns) so the grace loop expires and SIGKILL is sent.
+      * ``exit_after_kill`` — PIDs that flip to "exited" only after
+        SIGKILL is delivered (exercises the SIGKILL-succeeds path).
+      * ``exit_after_polls`` — PIDs that flip to "exited" after N
+        zero-signal probes (exercises the SIGTERM-kills-mid-grace path).
+      * ``missing_pids`` — PIDs that raise ``ProcessLookupError`` on
+        every signal (dead-PID race).
+      * ``permission_pids`` — PIDs that raise ``PermissionError`` on
+        every signal (sandbox / setuid).
+    """
+
+    def __init__(
+        self,
+        *,
+        alive_after_term: set[int] | None = None,
+        exit_after_kill: set[int] | None = None,
+        exit_after_polls: dict[int, int] | None = None,
+        missing_pids: set[int] | None = None,
+        permission_pids: set[int] | None = None,
+    ):
+        self.alive_after_term = set(alive_after_term or ())
+        self.exit_after_kill = set(exit_after_kill or ())
+        self.exit_after_polls = dict(exit_after_polls or {})
+        self.missing_pids = set(missing_pids or ())
+        self.permission_pids = set(permission_pids or ())
+        self.signals: list[tuple[int, int]] = []
+        self._poll_counts: dict[int, int] = {}
+        self._sigkilled: set[int] = set()
+
+    def __call__(self, pid: int, sig: int) -> None:
+        self.signals.append((pid, sig))
+        if pid in self.permission_pids:
+            raise PermissionError(pid)
+        if pid in self.missing_pids:
+            raise ProcessLookupError(pid)
+        if sig == signal.SIGKILL:
+            self._sigkilled.add(pid)
+            return
+        if sig == signal.SIGTERM:
+            return
+        # sig == 0: liveness probe
+        self._poll_counts[pid] = self._poll_counts.get(pid, 0) + 1
+        scheduled = self.exit_after_polls.get(pid)
+        if scheduled is not None and self._poll_counts[pid] >= scheduled:
+            raise ProcessLookupError(pid)
+        if pid in self._sigkilled and pid in self.exit_after_kill:
+            raise ProcessLookupError(pid)
+        if pid in self.alive_after_term:
+            return  # still alive — keep polling
+        raise ProcessLookupError(pid)  # default: clean SIGTERM exit
+
+
+def _setup_stale_task(root: Path, task_id: str, project: str = "demo") -> Path:
+    queue = root / project / "queue"
+    queue.mkdir(parents=True, exist_ok=True)
+    (queue / f"{task_id}.md").write_text("# task")
+    hb = queue / f"{task_id}.heartbeat"
+    hb.write_text("")
+    _stale(hb, seconds_ago=watchdog.SUB_TASK_HEARTBEAT_STALE_SECONDS + 60)
+    return queue
+
+
+def _heartbeat_cmdline(queue: Path, task_id: str, pid: int, extra: str = "") -> str:
+    """Realistic pgrep -fa line whose cmdline contains the heartbeat path."""
+    hb = queue / f"{task_id}.heartbeat"
+    tail = f"  # {extra}" if extra else ""
+    return f"{pid} bash -c while true; do touch {hb}; sleep 60; done{tail}\n"
+
+
+def _patch_time_and_kill(monkeypatch, fake_kill: _FakeKill) -> dict:
+    """Deterministic time + kill mocks.
+
+    ``time.sleep(s)`` advances ``time.monotonic`` by exactly ``s`` so the
+    grace-period loop terminates after a predictable number of probes
+    (~50 with 5s wait / 0.1s poll). Without this the test would hang
+    until the real wall-clock elapses, since the production code uses
+    real ``time.monotonic`` to bound the loop.
+    """
+    state: dict = {"t": 0.0}
+
+    def fake_monotonic() -> float:
+        return state["t"]
+
+    def fake_sleep(s: float) -> None:
+        state["t"] += s
+
+    monkeypatch.setattr(watchdog.os, "kill", fake_kill)
+    monkeypatch.setattr(watchdog.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(watchdog.time, "sleep", fake_sleep)
+    return state
+
+
+def _expected_pgrep_pattern(queue: Path, task_id: str) -> str:
+    return _re.escape(str(queue / f"{task_id}.heartbeat"))
+
+
+def test_mode6_enforce_kills_matching_pids(isolated_handoff_home, monkeypatch):
+    """pgrep matches → SIGTERM sent → marker records killed PIDs."""
+    queue = _setup_stale_task(isolated_handoff_home, "task-kill")
+    fake_pgrep = _FakePgrep(
+        _heartbeat_cmdline(queue, "task-kill", 12345)
+        + _heartbeat_cmdline(queue, "task-kill", 12346, extra="second subshell"),
+    )
+    monkeypatch.setattr(watchdog.subprocess, "run", fake_pgrep)
+    fake_kill = _FakeKill()  # all PIDs exit after first SIGTERM
+    _patch_time_and_kill(monkeypatch, fake_kill)
+
+    assert watchdog.scan_single_task_heartbeats() == 1
+    assert fake_pgrep.calls == [
+        ["pgrep", "-fa", _expected_pgrep_pattern(queue, "task-kill")]
+    ]
+    term_pids = [p for p, s in fake_kill.signals if s == signal.SIGTERM]
+    assert sorted(term_pids) == [12345, 12346]
+    body = (queue / "task-kill.529-suspected").read_text()
+    assert "已 kill 2 进程" in body
+    assert "12345" in body and "12346" in body
+    assert "SIGKILL escalation" in body
+
+
+def test_mode6_enforce_escalates_to_sigkill_when_term_ignored(
+    isolated_handoff_home, monkeypatch
+):
+    """Stubborn PID: SIGTERM → grace expires → SIGKILL → verify → killed."""
+    queue = _setup_stale_task(isolated_handoff_home, "task-stubborn")
+    fake_pgrep = _FakePgrep(_heartbeat_cmdline(queue, "task-stubborn", 9999))
+    monkeypatch.setattr(watchdog.subprocess, "run", fake_pgrep)
+    # alive throughout grace; SIGKILL actually finishes it (verify-probe ok)
+    fake_kill = _FakeKill(alive_after_term={9999}, exit_after_kill={9999})
+    _patch_time_and_kill(monkeypatch, fake_kill)
+
+    watchdog.scan_single_task_heartbeats()
+    sig_seq = [s for s in fake_kill.signals if s[0] == 9999 and s[1] != 0]
+    assert sig_seq == [(9999, signal.SIGTERM), (9999, signal.SIGKILL)]
+    body = (queue / "task-stubborn.529-suspected").read_text()
+    assert "已 kill 1 进程" in body
+    assert "9999" in body
+
+
+def test_mode6_enforce_records_still_alive_when_sigkill_does_not_take(
+    isolated_handoff_home, monkeypatch
+):
+    """Zombie / D-state: SIGKILL sent, verify probe still finds the PID."""
+    queue = _setup_stale_task(isolated_handoff_home, "task-zombie")
+    fake_pgrep = _FakePgrep(_heartbeat_cmdline(queue, "task-zombie", 6666))
+    monkeypatch.setattr(watchdog.subprocess, "run", fake_pgrep)
+    fake_kill = _FakeKill(alive_after_term={6666})  # no exit_after_kill
+    _patch_time_and_kill(monkeypatch, fake_kill)
+
+    watchdog.scan_single_task_heartbeats()
+    body = (queue / "task-zombie.529-suspected").read_text()
+    assert "已 kill" not in body  # didn't actually die
+    assert "SIGKILL 后仍存活" in body
+    assert "6666" in body
+    sent = [sig for pid, sig in fake_kill.signals if pid == 6666 and sig != 0]
+    assert signal.SIGTERM in sent
+    assert signal.SIGKILL in sent
+
+
+def test_mode6_enforce_term_alone_when_process_exits_mid_grace(
+    isolated_handoff_home, monkeypatch
+):
+    """SIGTERM lands, process exits on the 3rd alive-probe → no SIGKILL."""
+    queue = _setup_stale_task(isolated_handoff_home, "task-graceful")
+    fake_pgrep = _FakePgrep(_heartbeat_cmdline(queue, "task-graceful", 7777))
+    monkeypatch.setattr(watchdog.subprocess, "run", fake_pgrep)
+    fake_kill = _FakeKill(alive_after_term={7777}, exit_after_polls={7777: 3})
+    _patch_time_and_kill(monkeypatch, fake_kill)
+
+    watchdog.scan_single_task_heartbeats()
+    real_signals = [s for s in fake_kill.signals if s[1] != 0]
+    assert real_signals == [(7777, signal.SIGTERM)]
+
+
+def test_mode6_enforce_skipped_when_stop_auto(isolated_handoff_home, monkeypatch):
+    """STOP_AUTO marker → mark, notify, but no kill (operator pause)."""
+    queue = _setup_stale_task(isolated_handoff_home, "task-paused", project="paused-proj")
+    (isolated_handoff_home / "paused-proj" / "STOP_AUTO").write_text("")
+    fake_pgrep = _FakePgrep(_heartbeat_cmdline(queue, "task-paused", 5555))
+    monkeypatch.setattr(watchdog.subprocess, "run", fake_pgrep)
+    fake_kill = _FakeKill()
+    _patch_time_and_kill(monkeypatch, fake_kill)
+
+    watchdog.scan_single_task_heartbeats()
+    real_signals = [s for s in fake_kill.signals if s[1] != 0]
+    assert real_signals == []
+    assert fake_pgrep.calls == []  # didn't even run pgrep
+    body = (queue / "task-paused.529-suspected").read_text()
+    assert "STOP_AUTO" in body
+    assert "手动" in body and "rm" in body  # marker explicitly tells op to manual rm
+
+
+def test_mode6_enforce_no_match_when_no_processes(isolated_handoff_home, monkeypatch):
+    """pgrep returns no matches → marker records 'no matching processes'."""
+    queue = _setup_stale_task(isolated_handoff_home, "task-ghost")
+    fake_pgrep = _FakePgrep("", returncode=1)  # pgrep exit 1 = no matches
+    monkeypatch.setattr(watchdog.subprocess, "run", fake_pgrep)
+    fake_kill = _FakeKill()
+    _patch_time_and_kill(monkeypatch, fake_kill)
+
+    watchdog.scan_single_task_heartbeats()
+    body = (queue / "task-ghost.529-suspected").read_text()
+    assert "未找到匹配 heartbeat 路径" in body
+    real_signals = [s for s in fake_kill.signals if s[1] != 0]
+    assert real_signals == []
+
+
+def test_mode6_enforce_skips_self_and_pytest(isolated_handoff_home, monkeypatch):
+    """Don't kill the watchdog process itself or any test-runner."""
+    queue = _setup_stale_task(isolated_handoff_home, "task-self")
+    my_pid = os.getpid()
+    hb_cmd = _heartbeat_cmdline(queue, "task-self", 12345)
+    fake_pgrep = _FakePgrep(
+        f"{my_pid} python -m handoff_fanout.watchdog\n"
+        f"88888 pytest -k task-self\n"
+        f"99999 /usr/local/bin/pytest -k task-self\n"
+        + hb_cmd
+        + f"54321 pgrep -fa task-self\n",
+    )
+    monkeypatch.setattr(watchdog.subprocess, "run", fake_pgrep)
+    fake_kill = _FakeKill()
+    _patch_time_and_kill(monkeypatch, fake_kill)
+
+    watchdog.scan_single_task_heartbeats()
+    killed = [p for p, sig in fake_kill.signals if sig == signal.SIGTERM]
+    assert killed == [12345]
+
+
+def test_mode6_enforce_skips_python_dash_m_pytest(isolated_handoff_home, monkeypatch):
+    """``python -m pytest`` / ``python3 -m pytest`` are runners too."""
+    queue = _setup_stale_task(isolated_handoff_home, "task-modpy")
+    hb_cmd = _heartbeat_cmdline(queue, "task-modpy", 30001)
+    fake_pgrep = _FakePgrep(
+        "20001 python -m pytest tests/test_v41_heartbeat.py -k task-modpy\n"
+        "20002 /opt/homebrew/bin/python3 -m pytest -k task-modpy\n"
+        "20003 python3.13 -m pytest\n"
+        + hb_cmd,
+    )
+    monkeypatch.setattr(watchdog.subprocess, "run", fake_pgrep)
+    fake_kill = _FakeKill()
+    _patch_time_and_kill(monkeypatch, fake_kill)
+
+    watchdog.scan_single_task_heartbeats()
+    killed = [p for p, sig in fake_kill.signals if sig == signal.SIGTERM]
+    assert killed == [30001]
+
+
+def test_mode6_enforce_skips_uv_run_pytest(isolated_handoff_home, monkeypatch):
+    """``uv run pytest`` / ``uvx pytest`` — uv-wrapped runners."""
+    queue = _setup_stale_task(isolated_handoff_home, "task-uv")
+    hb_cmd = _heartbeat_cmdline(queue, "task-uv", 40001)
+    fake_pgrep = _FakePgrep(
+        "21001 uv run pytest -k task-uv\n"
+        "21002 uv run --frozen pytest -k task-uv\n"
+        "21003 uvx pytest -k task-uv\n"
+        + hb_cmd,
+    )
+    monkeypatch.setattr(watchdog.subprocess, "run", fake_pgrep)
+    fake_kill = _FakeKill()
+    _patch_time_and_kill(monkeypatch, fake_kill)
+
+    watchdog.scan_single_task_heartbeats()
+    killed = [p for p, sig in fake_kill.signals if sig == signal.SIGTERM]
+    assert killed == [40001]
+
+
+def test_mode6_enforce_survives_pgrep_missing(isolated_handoff_home, monkeypatch):
+    """Systems without pgrep get a graceful skip — mark/notify still happen."""
+    queue = _setup_stale_task(isolated_handoff_home, "task-no-pgrep")
+
+    def boom(argv, *args, **kwargs):
+        if isinstance(argv, list | tuple) and argv and str(argv[0]).endswith("pgrep"):
+            raise FileNotFoundError("pgrep not on this system")
+        return _REAL_SUBPROCESS_RUN(argv, *args, **kwargs)
+
+    monkeypatch.setattr(watchdog.subprocess, "run", boom)
+    fake_kill = _FakeKill()
+    _patch_time_and_kill(monkeypatch, fake_kill)
+
+    watchdog.scan_single_task_heartbeats()
+    body = (queue / "task-no-pgrep.529-suspected").read_text()
+    assert "pgrep 不可用" in body
+    real_signals = [s for s in fake_kill.signals if s[1] != 0]
+    assert real_signals == []
+
+
+def test_mode6_enforce_treats_pgrep_rc_gt_1_as_unavailable(
+    isolated_handoff_home, monkeypatch
+):
+    """pgrep rc=2 (syntax) / rc=3 (fatal) → unavailable, don't guess."""
+    queue = _setup_stale_task(isolated_handoff_home, "task-rc2")
+    fake_pgrep = _FakePgrep("some garbage\n", returncode=2)
+    monkeypatch.setattr(watchdog.subprocess, "run", fake_pgrep)
+    fake_kill = _FakeKill()
+    _patch_time_and_kill(monkeypatch, fake_kill)
+
+    watchdog.scan_single_task_heartbeats()
+    body = (queue / "task-rc2.529-suspected").read_text()
+    assert "pgrep 不可用" in body
+    real_signals = [s for s in fake_kill.signals if s[1] != 0]
+    assert real_signals == []
+
+
+def test_mode6_enforce_handles_dead_pid_race(isolated_handoff_home, monkeypatch):
+    """Process exits between pgrep and SIGTERM — no crash, no false 'killed'."""
+    queue = _setup_stale_task(isolated_handoff_home, "task-race")
+    fake_pgrep = _FakePgrep(_heartbeat_cmdline(queue, "task-race", 4242))
+    monkeypatch.setattr(watchdog.subprocess, "run", fake_pgrep)
+    fake_kill = _FakeKill(missing_pids={4242})  # SIGTERM raises ProcessLookupError
+    _patch_time_and_kill(monkeypatch, fake_kill)
+
+    watchdog.scan_single_task_heartbeats()
+    real_signals = [s for s in fake_kill.signals if s[1] == signal.SIGTERM]
+    assert real_signals == [(4242, signal.SIGTERM)]
+    kill_signals = [s for s in fake_kill.signals if s[1] == signal.SIGKILL]
+    assert kill_signals == []  # no escalation for a process that's already gone
+    body = (queue / "task-race.529-suspected").read_text()
+    assert "已自然退出" in body
+    assert "4242" in body
+
+
+def test_mode6_enforce_records_permission_denied(isolated_handoff_home, monkeypatch):
+    """PermissionError on initial SIGTERM → recorded as ``permission_denied``."""
+    queue = _setup_stale_task(isolated_handoff_home, "task-perm")
+    fake_pgrep = _FakePgrep(_heartbeat_cmdline(queue, "task-perm", 8888))
+    monkeypatch.setattr(watchdog.subprocess, "run", fake_pgrep)
+    fake_kill = _FakeKill(permission_pids={8888})
+    _patch_time_and_kill(monkeypatch, fake_kill)
+
+    watchdog.scan_single_task_heartbeats()
+    body = (queue / "task-perm.529-suspected").read_text()
+    assert "权限拒绝" in body
+    assert "8888" in body
+
+
+def test_mode6_enforce_neutralizes_regex_metacharacters_in_task_id(
+    isolated_handoff_home, monkeypatch
+):
+    """A task id with regex metachars (``.``, ``+``, ``[``) must NOT widen pgrep."""
+    task = "weird.task+[case]"
+    queue = _setup_stale_task(isolated_handoff_home, task)
+    fake_pgrep = _FakePgrep("", returncode=1)
+    monkeypatch.setattr(watchdog.subprocess, "run", fake_pgrep)
+    fake_kill = _FakeKill()
+    _patch_time_and_kill(monkeypatch, fake_kill)
+
+    watchdog.scan_single_task_heartbeats()
+    assert len(fake_pgrep.calls) == 1
+    pattern = fake_pgrep.calls[0][2]
+    expected = _re.escape(str(queue / f"{task}.heartbeat"))
+    assert pattern == expected
+    # Every metachar in the path appears as an escaped literal
+    assert r"\." in pattern
+    assert r"\+" in pattern
+    assert r"\[" in pattern
+    assert r"\]" in pattern
+
+
+def test_mode6_enforce_isolates_same_named_tasks_across_projects(
+    isolated_handoff_home, monkeypatch
+):
+    """A duplicate task id in another project must not be killed.
+
+    pgrep is now scoped to ``<queue_dir>/<task>.heartbeat`` (project-
+    unique literal path). The mock returns each project's PID only when
+    the pattern matches that project's heartbeat path, proving scoping.
+    """
+    queue_a = _setup_stale_task(isolated_handoff_home, "shared", project="proj-a")
+    queue_b = _setup_stale_task(isolated_handoff_home, "shared", project="proj-b")
+    a_pattern = _re.escape(str(queue_a / "shared.heartbeat"))
+    b_pattern = _re.escape(str(queue_b / "shared.heartbeat"))
+
+    class _ScopedPgrep:
+        def __init__(self):
+            self.calls: list[list[str]] = []
+
+        def __call__(self, argv, *args, **kwargs):
+            if isinstance(argv, list | tuple) and argv and str(argv[0]).endswith("pgrep"):
+                self.calls.append(list(argv))
+                pat = argv[2]
+                if pat == a_pattern:
+                    return SimpleNamespace(
+                        stdout=_heartbeat_cmdline(queue_a, "shared", 10001),
+                        stderr="",
+                        returncode=0,
+                    )
+                if pat == b_pattern:
+                    return SimpleNamespace(
+                        stdout=_heartbeat_cmdline(queue_b, "shared", 20002),
+                        stderr="",
+                        returncode=0,
+                    )
+                return SimpleNamespace(stdout="", stderr="", returncode=1)
+            return _REAL_SUBPROCESS_RUN(argv, *args, **kwargs)
+
+    fake_pgrep = _ScopedPgrep()
+    monkeypatch.setattr(watchdog.subprocess, "run", fake_pgrep)
+    fake_kill = _FakeKill()
+    _patch_time_and_kill(monkeypatch, fake_kill)
+
+    watchdog.scan_single_task_heartbeats()
+    killed = [p for p, sig in fake_kill.signals if sig == signal.SIGTERM]
+    assert sorted(killed) == [10001, 20002]
+    assert (queue_a / "shared.529-suspected").exists()
+    assert (queue_b / "shared.529-suspected").exists()

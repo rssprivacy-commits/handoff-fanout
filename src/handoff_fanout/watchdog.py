@@ -27,7 +27,13 @@ watchdog covers the failure modes:
      single-task path: writes a ``queue/<task>.529-suspected`` marker so
      the user can recover. Symmetry with ``build_sub_task_handoff_md``
      Step 2: now ``build_handoff_md`` Step 1 also touches a heartbeat,
-     and this mode notices when it stops.
+     and this mode notices when it stops. **Enforcement** (added
+     2026-05-29 after 04:05 incident): after marking, the watchdog also
+     looks up the stuck task's heartbeat-shell process (scoped via the
+     literal heartbeat path so a same-named task in another project
+     can't be matched) and sends SIGTERM → 5s grace → SIGKILL so the
+     operator doesn't have to manually hunt the wedged PID. STOP_AUTO
+     suppresses enforcement.
 
 Intended to run via ``launchd`` / cron, every ~10 min.
 """
@@ -35,7 +41,11 @@ Intended to run via ``launchd`` / cron, every ~10 min.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import os
+import re
+import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -49,6 +59,20 @@ LOCK_STALE_SECONDS = 1800  # 30 min — a prior watchdog still running past this
 HEARTBEAT_STALE_SECONDS = 180  # 3 min — fan-in heartbeat decay
 SUB_TASK_HEARTBEAT_STALE_SECONDS = 300  # 5 min — sub-task heartbeat decay (529 detection)
 ORPHAN_GRACE_SECONDS = 300  # 5 min — orphan candidate must be older than this
+
+# Mode 6 enforcement (kill stuck task processes after marking 529-suspected)
+ENFORCE_TERM_WAIT_SECONDS = 5.0  # SIGTERM grace before SIGKILL escalation
+ENFORCE_POLL_INTERVAL = 0.1  # poll cadence while waiting for SIGTERM to land
+ENFORCE_PGREP_TIMEOUT = 10  # `pgrep -fa` subprocess timeout
+
+# Mode 6 enforce status strings — also referenced by tests to keep wording stable.
+ENFORCE_STATUS_STOP_AUTO = "stop_auto"  # STOP_AUTO marker active; deliberately skipped
+ENFORCE_STATUS_PGREP_UNAVAILABLE = "pgrep_unavailable"  # missing binary / timeout / rc>1
+ENFORCE_STATUS_NO_MATCH = "no_match"  # pgrep ran but found nothing
+ENFORCE_STATUS_KILLED = "killed"  # all matched PIDs confirmed gone
+ENFORCE_STATUS_PARTIAL = "partial"  # some killed, others permission/still-alive
+ENFORCE_STATUS_FAILED = "failed"  # nothing successfully killed despite matches
+ENFORCE_STATUS_RACED_GONE = "raced_gone"  # all matches exited before our SIGTERM
 
 
 def handoff_root() -> Path:
@@ -344,6 +368,8 @@ def _mark_single_task_529(
     marker = queue_dir / f"{task_id}.529-suspected"
     if not atomic.atomic_create(marker):
         return
+    result = _enforce_kill_stuck_task(task_id, project, queue_dir)
+    enforcement_block = _format_enforcement_block(result, project, task_id, queue_dir)
     atomic.write_with_fsync(
         marker,
         (
@@ -354,20 +380,331 @@ def _mark_single_task_529(
             f"## Possible cause\n"
             f"v4.1 single-task tab is wedged — Provider 529 (overloaded), an\n"
             f"unhandled exception path, or API Error 会话裸跑.\n\n"
+            f"{enforcement_block}\n"
             f"## Manual recovery\n"
             f"1. Open the Claude tab for `{task_id}` and read the error.\n"
-            f"2. To re-spawn: `rm {queue_dir}/{task_id}.529-suspected` and\n"
-            f"   `touch {queue_dir}/{task_id}.uri` (launchd will re-fire).\n"
-            f"3. To give up: `touch {queue_dir}/{task_id}.BLOCKED.md`.\n"
+            f"2. To re-spawn: `rm {shlex.quote(str(marker))}` and\n"
+            f"   `touch {shlex.quote(str(queue_dir / f'{task_id}.uri'))}` (launchd will re-fire).\n"
+            f"3. To give up: `touch {shlex.quote(str(queue_dir / f'{task_id}.BLOCKED.md'))}`.\n"
         ),
     )
-    print(f"  [watchdog mode 6] 529-suspected: {project}/{task_id} ({reason})")
+    summary = _summarize_enforce_result(result)
+    print(f"  [watchdog mode 6] 529-suspected: {project}/{task_id} ({reason}) — {summary}")
     _notify(
-        f"{task_id}: {reason}",
-        "v5 watchdog / 529-suspected (v4.1)",
+        f"{task_id}: {reason} — {summary}",
+        "v5.4 watchdog / 529-suspected (v4.1)",
         project,
         sound="Basso",
     )
+
+
+# ─── mode 6 enforcement: find + kill stuck task processes ───────────────────
+
+
+@dataclasses.dataclass(frozen=True)
+class EnforceResult:
+    """Structured outcome of one ``_enforce_kill_stuck_task`` call.
+
+    Distinct outcomes are kept separate (instead of collapsing to "killed
+    vs not") because the marker block and the operator notification need
+    to tell the difference between "we can't kill it" (permission) and
+    "we tried but the process won't die" (still_alive after SIGKILL).
+    """
+
+    status: str
+    killed: tuple[int, ...] = ()
+    still_alive: tuple[int, ...] = ()
+    permission_denied: tuple[int, ...] = ()
+    raced_gone: tuple[int, ...] = ()
+
+
+def _enforce_kill_stuck_task(
+    task_id: str,
+    project: str,
+    queue_dir: Path,
+) -> EnforceResult:
+    """Find processes owning ``<queue_dir>/<task_id>.heartbeat`` and kill them.
+
+    The match criterion is the LITERAL heartbeat path (regex-escaped) so
+    a task id with regex metacharacters (``.``, ``+``, ``[``…) can't
+    accidentally widen the kill target, and a same-named task in a
+    different project's queue can't be matched either.
+
+    STOP_AUTO suppresses the kill (mark + notify still happen). Test
+    runners (pytest, ``python -m pytest``, ``uv run pytest``, tox, nox)
+    are filtered out so a ``pytest -k <task>`` invocation can't kill its
+    own watcher when running the regression suite.
+
+    Returns a structured ``EnforceResult`` instead of a bool — the
+    marker text and notification rendering depend on the precise mix of
+    killed / still_alive / permission_denied / raced_gone PIDs.
+    """
+    if dump.any_stop_auto(project):
+        return EnforceResult(status=ENFORCE_STATUS_STOP_AUTO)
+
+    found = _find_stuck_pids(task_id, queue_dir)
+    if found is None:
+        return EnforceResult(status=ENFORCE_STATUS_PGREP_UNAVAILABLE)
+    if not found:
+        return EnforceResult(status=ENFORCE_STATUS_NO_MATCH)
+
+    killed: list[int] = []
+    still_alive: list[int] = []
+    permission_denied: list[int] = []
+    raced_gone: list[int] = []
+    for pid in found:
+        outcome = _kill_pid(pid)
+        if outcome == "killed":
+            killed.append(pid)
+        elif outcome == "still_alive":
+            still_alive.append(pid)
+        elif outcome == "permission_denied":
+            permission_denied.append(pid)
+        elif outcome == "raced_gone":
+            raced_gone.append(pid)
+
+    if killed and not still_alive and not permission_denied:
+        status = ENFORCE_STATUS_KILLED
+    elif killed:
+        status = ENFORCE_STATUS_PARTIAL
+    elif still_alive or permission_denied:
+        status = ENFORCE_STATUS_FAILED
+    else:
+        status = ENFORCE_STATUS_RACED_GONE
+    return EnforceResult(
+        status=status,
+        killed=tuple(killed),
+        still_alive=tuple(still_alive),
+        permission_denied=tuple(permission_denied),
+        raced_gone=tuple(raced_gone),
+    )
+
+
+def _find_stuck_pids(task_id: str, queue_dir: Path) -> list[int] | None:
+    """Return PIDs whose cmdline contains the literal heartbeat path.
+
+    Uses ``pgrep -fa`` (full cmdline + leading PID). The pattern is the
+    regex-escaped full path of ``<queue_dir>/<task_id>.heartbeat`` —
+    that path is unique to this task in this project and is part of
+    every heartbeat subshell's cmdline (the ``touch <path>`` step).
+
+    Returns:
+      * ``None`` — pgrep missing / timed out / returned an error rc (>1)
+      * ``[]`` — pgrep ran cleanly but found nothing
+      * ``[pid, …]`` — matching PIDs, with self/test-runner/pgrep filtered
+    """
+    heartbeat_path = str(queue_dir / f"{task_id}.heartbeat")
+    pattern = re.escape(heartbeat_path)
+    try:
+        result = subprocess.run(
+            ["pgrep", "-fa", pattern],
+            capture_output=True,
+            text=True,
+            timeout=ENFORCE_PGREP_TIMEOUT,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode not in (0, 1):
+        return None
+
+    my_pid = os.getpid()
+    my_ppid = os.getppid()
+    pids: list[int] = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(maxsplit=1)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        cmd = parts[1]
+        if pid in (my_pid, my_ppid):
+            continue
+        if _is_pgrep_invocation(cmd):
+            continue
+        if _is_test_runner(cmd):
+            continue
+        pids.append(pid)
+    return pids
+
+
+def _is_pgrep_invocation(cmd: str) -> bool:
+    """Match the very ``pgrep -fa <pattern>`` call we just issued."""
+    tokens = cmd.split()
+    if not tokens:
+        return False
+    return Path(tokens[0]).name == "pgrep"
+
+
+def _is_test_runner(cmd: str) -> bool:
+    """Match Python test-runner invocations broadly so they're never killed.
+
+    Covers: ``pytest``, ``/.venv/bin/pytest``, ``python -m pytest``,
+    ``python3 -m pytest``, ``uv run pytest``, ``uvx pytest``, ``tox``,
+    ``nox``. We err on the side of false positives — accidentally
+    skipping a doomed shell is far cheaper than killing the user's
+    regression suite during the watchdog's own tests.
+    """
+    tokens = cmd.split()
+    if not tokens:
+        return False
+    runner_basenames = {"pytest", "tox", "nox"}
+    head_basename = Path(tokens[0]).name
+    if head_basename in runner_basenames:
+        return True
+    if (head_basename == "python" or head_basename.startswith("python")) and "-m" in tokens:
+        m_idx = tokens.index("-m")
+        if m_idx + 1 < len(tokens) and tokens[m_idx + 1] in runner_basenames:
+            return True
+    if head_basename in {"uv", "uvx"}:
+        for tok in tokens[1:]:
+            if Path(tok).name in runner_basenames:
+                return True
+    for tok in tokens[1:]:
+        if Path(tok).name in runner_basenames:
+            return True
+    return False
+
+
+def _kill_pid(pid: int) -> str:
+    """Send SIGTERM → grace → SIGKILL, verify after each step.
+
+    Returns one of:
+      * ``"killed"`` — process is confirmed gone
+      * ``"still_alive"`` — SIGKILL sent but a probe still finds the PID
+        (zombie or D-state; operator must investigate)
+      * ``"raced_gone"`` — process was already gone at first SIGTERM
+      * ``"permission_denied"`` — kernel refused our signal at some point
+
+    Verifying after SIGKILL closes the R1 finding: previously the helper
+    returned True unconditionally and the marker recorded false "killed"
+    claims for processes that didn't actually die.
+    """
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "raced_gone"
+    except PermissionError:
+        return "permission_denied"
+
+    deadline = time.monotonic() + ENFORCE_TERM_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        time.sleep(ENFORCE_POLL_INTERVAL)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return "killed"
+        except PermissionError:
+            continue
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return "killed"
+    except PermissionError:
+        return "permission_denied"
+
+    time.sleep(ENFORCE_POLL_INTERVAL)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "killed"
+    except PermissionError:
+        return "permission_denied"
+    return "still_alive"
+
+
+def _summarize_enforce_result(result: EnforceResult) -> str:
+    """One-line summary used in stdout log + osascript notification."""
+    if result.status == ENFORCE_STATUS_STOP_AUTO:
+        return "STOP_AUTO active — 未 kill"
+    if result.status == ENFORCE_STATUS_PGREP_UNAVAILABLE:
+        return "pgrep 不可用 — 手动 kill"
+    if result.status == ENFORCE_STATUS_NO_MATCH:
+        return "无匹配进程"
+    if result.status == ENFORCE_STATUS_KILLED:
+        return f"已 kill {len(result.killed)} 进程"
+    if result.status == ENFORCE_STATUS_PARTIAL:
+        remaining = len(result.still_alive) + len(result.permission_denied)
+        return f"已 kill {len(result.killed)} / 仍剩 {remaining}"
+    if result.status == ENFORCE_STATUS_FAILED:
+        return "kill 失败 — 须手动介入"
+    if result.status == ENFORCE_STATUS_RACED_GONE:
+        return "进程已自然退出"
+    return f"status={result.status}"
+
+
+def _format_enforcement_block(
+    result: EnforceResult,
+    project: str,
+    task_id: str,
+    queue_dir: Path,
+) -> str:
+    """Human-readable enforcement summary embedded in the .529-suspected marker.
+
+    Every interpolation of ``task_id`` / paths goes through
+    ``shlex.quote`` so a hostile or whitespace-bearing task id can't
+    break the shell snippets the operator might copy-paste.
+    """
+    quoted_task = shlex.quote(task_id)
+    heartbeat_path = shlex.quote(str(queue_dir / f"{task_id}.heartbeat"))
+    marker_path = shlex.quote(str(queue_dir / f"{task_id}.529-suspected"))
+
+    if result.status == ENFORCE_STATUS_STOP_AUTO:
+        return (
+            "## Enforcement (v5.4 / 2026-05-29)\n"
+            "STOP_AUTO 已置位 — watchdog **未** kill 任何进程 (operator pause).\n"
+            f"放行后须**手动** `rm {marker_path}` (+ 让 heartbeat 重新 stale) 才能让\n"
+            "下次扫描重跑 enforce，否则 marker 永久 short-circuit 后续 mode 6 扫描.\n"
+            "或手动 kill:\n"
+            f"  pgrep -fa -- {heartbeat_path} | awk '{{print $1}}' | xargs -r kill\n"
+        )
+    if result.status == ENFORCE_STATUS_PGREP_UNAVAILABLE:
+        return (
+            "## Enforcement (v5.4 / 2026-05-29)\n"
+            "pgrep 不可用（缺失 / 超时 / rc>1）— watchdog 未能扫描进程.\n"
+            "手动定位:\n"
+            f"  ps -eo pid,command | grep -F {heartbeat_path}\n"
+        )
+    if result.status == ENFORCE_STATUS_NO_MATCH:
+        return (
+            "## Enforcement (v5.4 / 2026-05-29)\n"
+            "watchdog 未找到匹配 heartbeat 路径的进程 — Claude tab 可能已退出,\n"
+            "或 heartbeat subshell 早已被 SIGHUP. 若 codex / Bash wrapper 仍 wedged:\n"
+            f"  pgrep -fa -- codex      # 查看所有 codex 进程\n"
+            f"  pgrep -fa -- {quoted_task}    # 模糊匹配 task id\n"
+        )
+
+    lines = ["## Enforcement (v5.4 / 2026-05-29)"]
+    if result.killed:
+        pid_list = ", ".join(str(p) for p in result.killed)
+        lines.append(
+            f"已 kill {len(result.killed)} 进程: PIDs {pid_list}"
+            " (SIGTERM → 5s grace → SIGKILL escalation)"
+        )
+    if result.still_alive:
+        pid_list = ", ".join(str(p) for p in result.still_alive)
+        lines.append(
+            f"⚠️ SIGKILL 后仍存活: PIDs {pid_list} — 可能是 zombie 或 D-state."
+            " 手动检查: `ps -p <pid> -o stat,command`"
+        )
+    if result.permission_denied:
+        pid_list = ", ".join(str(p) for p in result.permission_denied)
+        lines.append(
+            f"⚠️ 权限拒绝: PIDs {pid_list} — watchdog 无权 signal"
+            "（root 进程或 sandbox），需主人介入."
+        )
+    if result.raced_gone:
+        pid_list = ", ".join(str(p) for p in result.raced_gone)
+        lines.append(
+            f"已自然退出 (signal 前已 gone): PIDs {pid_list}"
+        )
+    return "\n".join(lines) + "\n"
 
 
 # ─── mode 5: cross-project orphan scan ──────────────────────────────────────
