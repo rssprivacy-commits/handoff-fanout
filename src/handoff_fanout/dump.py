@@ -17,27 +17,34 @@ This module has zero ERP-specific content. Markdown blocks like the V3.6
 redlines or in-house legislation are injected via
 ``config.Config.inject_blocks``.
 """
+
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
-import os
 import re
 import subprocess
 import sys
 import time
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
-from handoff_fanout import atomic, config as _config, templates
+from handoff_fanout import atomic, templates
+from handoff_fanout import config as _config
 from handoff_fanout.git_guard import git_guard_dir
 
 # v5 protocol constants
 SCHEMA_VERSION = 2
 SPECIAL_MARKERS = {
-    "_fanin_triggered", "_fan_in_started", "_fan_in_heartbeat",
-    "_fan_in_done", "_watchdog_triggered", "_aborted", "_corrupted",
+    "_fanin_triggered",
+    "_fan_in_started",
+    "_fan_in_heartbeat",
+    "_fan_in_done",
+    "_watchdog_triggered",
+    "_aborted",
+    "_corrupted",
 }
 HANDOFF_ROLE_MAIN = "main"
 HANDOFF_ROLE_SUB_TASK = "sub-task"
@@ -64,9 +71,7 @@ def handoff_root() -> Path:
 
 def validate_task_id(task_id: str) -> None:
     if not TASK_ID_RE.match(task_id):
-        raise SystemExit(
-            f"❌ task-id must be kebab-case (a-z 0-9 -). got: {task_id!r}"
-        )
+        raise SystemExit(f"❌ task-id must be kebab-case (a-z 0-9 -). got: {task_id!r}")
     if len(task_id) > 60:
         raise SystemExit(f"❌ task-id too long ({len(task_id)} > 60): {task_id}")
 
@@ -82,7 +87,11 @@ def validate_project_slug(slug: str) -> None:
 def run(cmd: list[str], cwd: Path, timeout: float = 10.0) -> str:
     try:
         r = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, cwd=str(cwd),
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(cwd),
         )
         return (r.stdout or "").strip()
     except Exception as e:
@@ -90,7 +99,7 @@ def run(cmd: list[str], cwd: Path, timeout: float = 10.0) -> str:
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    return datetime.now(UTC).astimezone().isoformat(timespec="seconds")
 
 
 def load_manifest(batch_dir: Path) -> dict | None:
@@ -178,15 +187,9 @@ def expand_ownership(spec: dict, workspace: Path) -> set[str]:
             raise ValueError(f"path escapes workspace: {raw_path}")
         if not target_dir.is_dir():
             return set()
-        return {
-            str(p.relative_to(ws_resolved))
-            for p in target_dir.rglob("*") if p.is_file()
-        }
+        return {str(p.relative_to(ws_resolved)) for p in target_dir.rglob("*") if p.is_file()}
     if typ == "glob":
-        return {
-            str(p.relative_to(ws_resolved))
-            for p in workspace.glob(raw_path) if p.is_file()
-        }
+        return {str(p.relative_to(ws_resolved)) for p in workspace.glob(raw_path) if p.is_file()}
     raise ValueError(f"unknown ownership type: {typ}")
 
 
@@ -261,16 +264,19 @@ def get_roadmap_excerpt(cfg: _config.Config) -> str:
         return "(roadmap unreadable)"
     matches = list(re.finditer(rm.section_regex, content, re.DOTALL))
     if matches:
-        slice_ = matches[-rm.max_sections:]
+        slice_ = matches[-rm.max_sections :]
         return "\n\n".join(m.group(0)[: rm.max_chars_per_section] for m in slice_)
-    return content[-rm.fallback_tail_chars:]
+    return content[-rm.fallback_tail_chars :]
 
 
 # ─── role.env writing (used by sub-task / fan-in handoffs) ──────────────────
 
 
 def write_role_env(
-    env_path: Path, role: str, batch_id: str, workspace: Path,
+    env_path: Path,
+    role: str,
+    batch_id: str,
+    workspace: Path,
     sub_task_id: str | None = None,
 ) -> None:
     """Write the role-env file that sub-task / fan-in tabs source on every Bash call."""
@@ -324,10 +330,16 @@ def write_active_dump(
 
     md_path = queue_dir / f"{task}.md"
     handoff_content = templates.build_handoff_md(
-        task=task, project=project, workspace=workspace,
-        next_brief=next_brief, status=status, tests=tests,
-        baseline=baseline, roadmap_excerpt=roadmap_excerpt,
-        inject_blocks=cfg.inject_blocks, handoff_home=cfg.home,
+        task=task,
+        project=project,
+        workspace=workspace,
+        next_brief=next_brief,
+        status=status,
+        tests=tests,
+        baseline=baseline,
+        roadmap_excerpt=roadmap_excerpt,
+        inject_blocks=cfg.inject_blocks,
+        handoff_home=cfg.home,
         handoff_md_path=md_path,
     )
     md_path.write_text(handoff_content, encoding="utf-8")
@@ -343,7 +355,8 @@ def write_active_dump(
         blocked_file = queue_dir / f"{task}.BLOCKED.md"
         blocked_file.write_text(
             templates.build_blocked_md(
-                project=project, task=task,
+                project=project,
+                task=task,
                 head=baseline.get("git_head", "(unknown)"),
                 reason=osascript_subtitle or "",
             ),
@@ -373,23 +386,22 @@ def write_active_dump(
 
 def _notify(message: str, title: str, subtitle: str, sound: str | None = None) -> None:
     """Best-effort macOS notification (no-op on other platforms)."""
-    osa = (
-        f'display notification "{message}" '
-        f'with title "{title}" subtitle "{subtitle}"'
-    )
+    osa = f'display notification "{message}" with title "{title}" subtitle "{subtitle}"'
     if sound:
         osa += f' sound name "{sound}"'
-    try:
+    with contextlib.suppress(FileNotFoundError, subprocess.TimeoutExpired):
         subprocess.run(["osascript", "-e", osa], check=False, timeout=5)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
 
 
 # ─── batch open (fan-out) ───────────────────────────────────────────────────
 
 
 def handle_open_batch(
-    args, cfg: _config.Config, workspace: Path, project: str, queue_dir: Path,
+    args,
+    cfg: _config.Config,
+    workspace: Path,
+    project: str,
+    queue_dir: Path,
 ) -> int:
     manifest_input = Path(args.open_batch)
     if not manifest_input.exists():
@@ -397,7 +409,7 @@ def handle_open_batch(
     try:
         manifest = json.loads(manifest_input.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
-        raise SystemExit(f"❌ manifest JSON parse failed: {e}")
+        raise SystemExit(f"❌ manifest JSON parse failed: {e}") from e
 
     if manifest.get("schema_version") != SCHEMA_VERSION:
         raise SystemExit(f"❌ schema_version must = {SCHEMA_VERSION}")
@@ -421,14 +433,12 @@ def handle_open_batch(
 
     for st in sub_tasks:
         if st.get("depends_on"):
-            raise SystemExit(
-                f"❌ depends_on must be [] in v5 (violator: {st['id']})"
-            )
+            raise SystemExit(f"❌ depends_on must be [] in v5 (violator: {st['id']})")
 
     try:
         validate_ownership_no_overlap(sub_tasks, workspace)
     except ValueError as e:
-        raise SystemExit(f"❌ Gate A failed: {e}")
+        raise SystemExit(f"❌ Gate A failed: {e}") from e
 
     batch_dir = handoff_root() / project / "batches" / batch_id
     if batch_dir.exists():
@@ -456,11 +466,17 @@ def handle_open_batch(
         write_role_env(env_path, HANDOFF_ROLE_SUB_TASK, batch_id, workspace, sub_id)
 
         content = templates.build_sub_task_handoff_md(
-            task=sub_id, project=project, workspace=workspace,
-            next_brief=st["brief"], batch_id=batch_id, sub_task_id=sub_id,
-            file_ownership=st["file_ownership"], baseline=baseline,
+            task=sub_id,
+            project=project,
+            workspace=workspace,
+            next_brief=st["brief"],
+            batch_id=batch_id,
+            sub_task_id=sub_id,
+            file_ownership=st["file_ownership"],
+            baseline=baseline,
             roadmap_excerpt=roadmap_excerpt,
-            inject_blocks=cfg.inject_blocks, handoff_home=cfg.home,
+            inject_blocks=cfg.inject_blocks,
+            handoff_home=cfg.home,
             git_guard_path=git_guard_dir(),
         )
         atomic.write_with_fsync(queue_dir / f"{sub_id}.md", content)
@@ -478,18 +494,22 @@ def handle_open_batch(
             queue_dir / f"{sub_id}.uri",
             f"WORKSPACE={workspace}\nURI={uri}\n",
         )
-        print(f"[open-batch]   sub-task {sub_id} (#{idx+1}/{len(sub_tasks)}) written")
+        print(f"[open-batch]   sub-task {sub_id} (#{idx + 1}/{len(sub_tasks)}) written")
 
     print(f"[open-batch] ✅ batch {batch_id} opened with {len(sub_tasks)} sub-tasks")
     _notify(
         f"batch {batch_id}: {len(sub_tasks)} sub-tasks launching",
-        f"v5 fan-out / {project}", batch_id,
+        f"v5 fan-out / {project}",
+        batch_id,
     )
     return 0
 
 
 def trigger_fan_in_if_ready(
-    project: str, workspace: Path, batch_id: str, queue_dir: Path,
+    project: str,
+    workspace: Path,
+    batch_id: str,
+    queue_dir: Path,
     cfg: _config.Config | None = None,
 ) -> bool:
     """If all sub-tasks have ``.done``/``.blocked``, atomic-create the trigger and dump fan-in."""
@@ -528,9 +548,15 @@ def trigger_fan_in_if_ready(
 
     write_role_env(batch_dir / "fan-in.env", HANDOFF_ROLE_FAN_IN, batch_id, workspace)
     content = templates.build_fan_in_handoff_md(
-        project=project, workspace=workspace, batch_id=batch_id,
-        manifest=manifest, done_files=done_set, blocked_files=blocked_set,
-        baseline=baseline, inject_blocks=cfg.inject_blocks, handoff_home=cfg.home,
+        project=project,
+        workspace=workspace,
+        batch_id=batch_id,
+        manifest=manifest,
+        done_files=done_set,
+        blocked_files=blocked_set,
+        baseline=baseline,
+        inject_blocks=cfg.inject_blocks,
+        handoff_home=cfg.home,
     )
     atomic.write_with_fsync(queue_dir / f"{fan_in_task}.md", content)
 
@@ -543,59 +569,76 @@ def trigger_fan_in_if_ready(
 
     _notify(
         f"batch {batch_id} complete → fan-in tab starting",
-        f"v5 fan-in / {project}", fan_in_task,
+        f"v5 fan-in / {project}",
+        fan_in_task,
     )
     return True
 
 
 def handle_batch_done(
-    args, cfg: _config.Config, workspace: Path, project: str, queue_dir: Path,
+    args,
+    cfg: _config.Config,
+    workspace: Path,
+    project: str,
+    queue_dir: Path,
 ) -> int:
     if not args.batch_id:
         raise SystemExit("❌ --batch-done requires --batch-id")
     batch_dir = handoff_root() / project / "batches" / args.batch_id
     if not batch_dir.exists():
         blocked_file = queue_dir / f"{args.task}.BLOCKED.md"
-        atomic.write_with_fsync(blocked_file, (
-            f"# BLOCKED — sub-task `{args.task}`\n\n"
-            f"Reason: batch_dir vanished ({batch_dir})\n"
-            f"Time: {datetime.now()}\n"
-        ))
+        atomic.write_with_fsync(
+            blocked_file,
+            (
+                f"# BLOCKED — sub-task `{args.task}`\n\n"
+                f"Reason: batch_dir vanished ({batch_dir})\n"
+                f"Time: {datetime.now()}\n"
+            ),
+        )
         print(f"[batch-done] batch_dir missing, BLOCKED written to {blocked_file}")
         return 1
     sub_task_id = args.task.removesuffix("-done")
     summary_path = batch_dir / f"{sub_task_id}.done"
-    atomic.write_with_fsync(summary_path, (
-        f"sub_task_id: {sub_task_id}\n"
-        f"completed_at: {now_iso()}\n"
-        f"summary: {args.next_brief}\n"
-    ))
+    atomic.write_with_fsync(
+        summary_path,
+        (f"sub_task_id: {sub_task_id}\ncompleted_at: {now_iso()}\nsummary: {args.next_brief}\n"),
+    )
     print(f"[batch-done] {summary_path} written")
     trigger_fan_in_if_ready(project, workspace, args.batch_id, queue_dir, cfg=cfg)
     return 0
 
 
 def handle_batch_blocked(
-    args, cfg: _config.Config, workspace: Path, project: str, queue_dir: Path,
+    args,
+    cfg: _config.Config,
+    workspace: Path,
+    project: str,
+    queue_dir: Path,
 ) -> int:
     if not args.batch_id:
         raise SystemExit("❌ --batch-blocked requires --batch-id")
     batch_dir = handoff_root() / project / "batches" / args.batch_id
     if not batch_dir.exists():
         blocked_file = queue_dir / f"{args.task}.BLOCKED.md"
-        atomic.write_with_fsync(blocked_file, (
-            f"# BLOCKED — sub-task `{args.task}`\n\n"
-            f"Reason: batch_dir vanished ({batch_dir})\n"
-            f"Original reason: {args.blocked_reason}\n"
-        ))
+        atomic.write_with_fsync(
+            blocked_file,
+            (
+                f"# BLOCKED — sub-task `{args.task}`\n\n"
+                f"Reason: batch_dir vanished ({batch_dir})\n"
+                f"Original reason: {args.blocked_reason}\n"
+            ),
+        )
         return 1
     sub_task_id = args.task.removesuffix("-blocked")
     blocked_path = batch_dir / f"{sub_task_id}.blocked"
-    atomic.write_with_fsync(blocked_path, (
-        f"sub_task_id: {sub_task_id}\n"
-        f"blocked_at: {now_iso()}\n"
-        f"reason: {args.blocked_reason or '(unspecified)'}\n"
-    ))
+    atomic.write_with_fsync(
+        blocked_path,
+        (
+            f"sub_task_id: {sub_task_id}\n"
+            f"blocked_at: {now_iso()}\n"
+            f"reason: {args.blocked_reason or '(unspecified)'}\n"
+        ),
+    )
     print(f"[batch-blocked] {blocked_path} written")
     trigger_fan_in_if_ready(project, workspace, args.batch_id, queue_dir, cfg=cfg)
     return 0
@@ -636,16 +679,18 @@ def find_orphans(project_filter: str | None = None) -> list[dict]:
             launched_paths = []
             if launched_dir.is_dir():
                 launched_paths = sorted(launched_dir.glob(f"{task_id}-*.txt"))
-            out.append({
-                "project": proj_dir.name,
-                "task": task_id,
-                "spawned_path": spawned,
-                "submitted_path": ack_dir / f"{task_id}.submitted",
-                "queued_path": ack_dir / f"{task_id}.queued",
-                "blocked_md_path": queue_dir / f"{task_id}.BLOCKED.md",
-                "launched_paths": launched_paths,
-                "age_seconds": time.time() - spawned.stat().st_mtime,
-            })
+            out.append(
+                {
+                    "project": proj_dir.name,
+                    "task": task_id,
+                    "spawned_path": spawned,
+                    "submitted_path": ack_dir / f"{task_id}.submitted",
+                    "queued_path": ack_dir / f"{task_id}.queued",
+                    "blocked_md_path": queue_dir / f"{task_id}.BLOCKED.md",
+                    "launched_paths": launched_paths,
+                    "age_seconds": time.time() - spawned.stat().st_mtime,
+                }
+            )
     return out
 
 
@@ -673,8 +718,7 @@ def handle_cleanup_orphan(args) -> int:
 
     cleaned = 0
     for o in orphans:
-        for p in [o["spawned_path"], o["submitted_path"], o["queued_path"],
-                  o["blocked_md_path"]]:
+        for p in [o["spawned_path"], o["submitted_path"], o["queued_path"], o["blocked_md_path"]]:
             try:
                 p.unlink(missing_ok=True)
             except OSError as e:
@@ -692,10 +736,17 @@ def handle_cleanup_orphan(args) -> int:
     recovery_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     record = recovery_dir / f"orphans-{ts}.json"
-    record.write_text(json.dumps([
-        {"project": o["project"], "task": o["task"], "age_seconds": o["age_seconds"]}
-        for o in orphans
-    ], ensure_ascii=False, indent=2), encoding="utf-8")
+    record.write_text(
+        json.dumps(
+            [
+                {"project": o["project"], "task": o["task"], "age_seconds": o["age_seconds"]}
+                for o in orphans
+            ],
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     print(f"📝 留档: {record}")
 
     if getattr(args, "kill_spawned", False):
@@ -705,7 +756,9 @@ def handle_cleanup_orphan(args) -> int:
         print(tasks_md)
         _notify(
             f"{len(orphans)} tabs need manual close (see terminal)",
-            "v5.2 cleanup-orphan", "kill-spawned", sound="Basso",
+            "v5.2 cleanup-orphan",
+            "kill-spawned",
+            sound="Basso",
         )
     return 0
 
@@ -718,37 +771,49 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="handoff-dump",
         description="Generate handoff queue files for the next task or batch.",
     )
-    ap.add_argument("--task", default=None,
-                    help="kebab-case task ID (optional under --cleanup-orphan)")
-    ap.add_argument("--next", dest="next_brief", default=None,
-                    help="one-line brief of the next task")
-    ap.add_argument("--project", default=None,
-                    help="project slug; defaults to basename(cwd)")
-    ap.add_argument("--workspace", default=None,
-                    help="absolute path to project root; defaults to cwd")
-    ap.add_argument("--status", default="active",
-                    choices=["active", "done", "blocked"])
+    ap.add_argument(
+        "--task", default=None, help="kebab-case task ID (optional under --cleanup-orphan)"
+    )
+    ap.add_argument(
+        "--next", dest="next_brief", default=None, help="one-line brief of the next task"
+    )
+    ap.add_argument("--project", default=None, help="project slug; defaults to basename(cwd)")
+    ap.add_argument(
+        "--workspace", default=None, help="absolute path to project root; defaults to cwd"
+    )
+    ap.add_argument("--status", default="active", choices=["active", "done", "blocked"])
     ap.add_argument("--blocked-reason", default="")
     ap.add_argument("--tests", default="")
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--batch-id", default=None,
-                    help="v5 batch ID (current task is sub-task or fan-in)")
-    ap.add_argument("--batch-done", action="store_true",
-                    help="mark sub-task done + try fan-in trigger")
-    ap.add_argument("--batch-blocked", action="store_true",
-                    help="mark sub-task blocked")
-    ap.add_argument("--batch-fan-in", action="store_true",
-                    help="(internal) mark this as the fan-in dump")
-    ap.add_argument("--open-batch", default=None,
-                    help="path to a manifest.json: opens a fan-out batch")
-    ap.add_argument("--file-ownership", default=None,
-                    help="(internal) sub-task file_ownership JSON")
-    ap.add_argument("--cleanup-orphan", action="store_true",
-                    help="list / delete orphan ack residue (default dry-run)")
-    ap.add_argument("--apply", action="store_true",
-                    help="with --cleanup-orphan: actually delete residue")
-    ap.add_argument("--kill-spawned", action="store_true",
-                    help="with --cleanup-orphan --apply: notify user to close tabs")
+    ap.add_argument(
+        "--batch-id", default=None, help="v5 batch ID (current task is sub-task or fan-in)"
+    )
+    ap.add_argument(
+        "--batch-done", action="store_true", help="mark sub-task done + try fan-in trigger"
+    )
+    ap.add_argument("--batch-blocked", action="store_true", help="mark sub-task blocked")
+    ap.add_argument(
+        "--batch-fan-in", action="store_true", help="(internal) mark this as the fan-in dump"
+    )
+    ap.add_argument(
+        "--open-batch", default=None, help="path to a manifest.json: opens a fan-out batch"
+    )
+    ap.add_argument(
+        "--file-ownership", default=None, help="(internal) sub-task file_ownership JSON"
+    )
+    ap.add_argument(
+        "--cleanup-orphan",
+        action="store_true",
+        help="list / delete orphan ack residue (default dry-run)",
+    )
+    ap.add_argument(
+        "--apply", action="store_true", help="with --cleanup-orphan: actually delete residue"
+    )
+    ap.add_argument(
+        "--kill-spawned",
+        action="store_true",
+        help="with --cleanup-orphan --apply: notify user to close tabs",
+    )
     return ap
 
 
@@ -798,11 +863,17 @@ def main(argv: list[str] | None = None) -> int:
         roadmap_excerpt = get_roadmap_excerpt(cfg)
         md_path = queue_dir / f"{args.task}.md"
         content = templates.build_handoff_md(
-            task=args.task, project=project, workspace=workspace,
-            next_brief=args.next_brief, status=args.status,
-            tests=args.tests or None, baseline=baseline,
-            roadmap_excerpt=roadmap_excerpt, inject_blocks=cfg.inject_blocks,
-            handoff_home=cfg.home, handoff_md_path=md_path,
+            task=args.task,
+            project=project,
+            workspace=workspace,
+            next_brief=args.next_brief,
+            status=args.status,
+            tests=args.tests or None,
+            baseline=baseline,
+            roadmap_excerpt=roadmap_excerpt,
+            inject_blocks=cfg.inject_blocks,
+            handoff_home=cfg.home,
+            handoff_md_path=md_path,
         )
         print("=" * 60)
         print(f"DRY-RUN: target paths\n  {md_path}\n  {queue_dir / f'{args.task}.uri'}")
@@ -812,9 +883,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     return write_active_dump(
-        cfg=cfg, project=project, task=args.task, workspace=workspace,
-        next_brief=args.next_brief, status=args.status,
-        tests=args.tests or None, baseline=baseline, queue_dir=queue_dir,
+        cfg=cfg,
+        project=project,
+        task=args.task,
+        workspace=workspace,
+        next_brief=args.next_brief,
+        status=args.status,
+        tests=args.tests or None,
+        baseline=baseline,
+        queue_dir=queue_dir,
         osascript_subtitle=args.blocked_reason or None,
     )
 

@@ -12,11 +12,12 @@ not hardcoded; instead, the caller supplies them via ``inject_blocks`` from
 Templates are plain f-strings (no Jinja dependency) so the wheel stays
 zero-dep.
 """
+
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
 
 
 def _join_inject_blocks(blocks: Iterable[str]) -> str:
@@ -26,8 +27,7 @@ def _join_inject_blocks(blocks: Iterable[str]) -> str:
 def _format_baseline_block(baseline: dict) -> str:
     """Render the baseline header — only fields actually present are shown."""
     lines = [
-        f"**HEAD**: `{baseline.get('git_head', '(unknown)')}` "
-        f"({baseline.get('branch', 'main')})",
+        f"**HEAD**: `{baseline.get('git_head', '(unknown)')}` ({baseline.get('branch', 'main')})",
     ]
     for k, v in baseline.items():
         if k in {"git_head", "branch", "last_3_commits"}:
@@ -82,13 +82,13 @@ pytest {tests} 2>&1 | tail -10
 
 ```bash
 cd {workspace}
-git log --oneline -1                          # 应 = {baseline.get('git_head', '(unknown)')}
+git log --oneline -1                          # 应 = {baseline.get("git_head", "(unknown)")}
 git status -sb                                 # 工作区干净
 ```
 
 近 3 commits:
 ```
-{baseline.get('last_3_commits', '(unavailable)')}
+{baseline.get("last_3_commits", "(unavailable)")}
 ```
 {test_section}
 
@@ -168,9 +168,7 @@ def build_sub_task_handoff_md(
     git_guard_path: Path,
 ) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    ownership_md = "\n".join(
-        f"- type=`{o['type']}` path=`{o['path']}`" for o in file_ownership
-    )
+    ownership_md = "\n".join(f"- type=`{o['type']}` path=`{o['path']}`" for o in file_ownership)
     role_env_path = handoff_home / project / "batches" / batch_id / f"{sub_task_id}.env"
     batch_dir_disp = handoff_home / project / "batches" / batch_id
     inject_section = _join_inject_blocks(inject_blocks)
@@ -180,7 +178,7 @@ def build_sub_task_handoff_md(
     return f"""\
 # Handoff v5 SUB-TASK — `{project}` / `{task}`
 
-**生成**: {now} | **HEAD**: `{baseline.get('git_head', '(unknown)')}` | **batch**: `{batch_id}` | **sub-task**: `{sub_task_id}`
+**生成**: {now} | **HEAD**: `{baseline.get("git_head", "(unknown)")}` | **batch**: `{batch_id}` | **sub-task**: `{sub_task_id}`
 
 ## 🛡 第零步: 孤儿自检 (v5.2 / 必跑 / 缺则立即 BLOCKED)
 
@@ -250,7 +248,7 @@ echo $! > /tmp/heartbeat-{sub_task_id}.pid
 ```bash
 cd {workspace}
 source {role_env_path}
-git log --oneline -1                          # 应 = {baseline.get('git_head', '(unknown)')}
+git log --oneline -1                          # 应 = {baseline.get("git_head", "(unknown)")}
 git status -sb                                 # 工作区干净
 ```
 
@@ -345,7 +343,7 @@ def build_fan_in_handoff_md(
     return f"""\
 # Handoff v5 FAN-IN — `{project}` / `{fan_in_task}`
 
-**生成**: {now} | **HEAD**: `{baseline.get('git_head', '(unknown)')}` | **batch**: `{batch_id}`
+**生成**: {now} | **HEAD**: `{baseline.get("git_head", "(unknown)")}` | **batch**: `{batch_id}`
 
 ## 你的角色: FAN-IN tab
 
@@ -368,8 +366,8 @@ echo "💓 heartbeat daemon pid=$HEARTBEAT_PID"
 ## Batch 信息
 
 - batch_id: `{batch_id}`
-- 拆分依据: {manifest.get('split_rationale', '(N/A)')}
-- Amdahl 估算: {manifest.get('amdahl_estimate', {}).get('estimated_speedup', 'N/A')}x
+- 拆分依据: {manifest.get("split_rationale", "(N/A)")}
+- Amdahl 估算: {manifest.get("amdahl_estimate", {}).get("estimated_speedup", "N/A")}x
 
 ## Sub-task 状态
 
@@ -424,7 +422,7 @@ git log --oneline HEAD@{{1}}..HEAD
 
 ```bash
 xargs git add < /tmp/owned_changes.txt
-git commit -m "feat({batch_id}): 汇总 {len(done_files)}/{len(manifest['sub_tasks'])} sub-task"
+git commit -m "feat({batch_id}): 汇总 {len(done_files)}/{len(manifest["sub_tasks"])} sub-task"
 ```
 
 ### Step 6: 跑全量回归测试
@@ -464,8 +462,14 @@ def build_blocked_md(*, project: str, task: str, head: str, reason: str) -> str:
 
 
 def build_orphan_blocked_md(
-    *, project: str, task_id: str, age_seconds: float, grace_seconds: float,
-    handoff_home: Path, workspace_root: Path, now_iso: str,
+    *,
+    project: str,
+    task_id: str,
+    age_seconds: float,
+    grace_seconds: float,
+    handoff_home: Path,
+    workspace_root: Path,
+    now_iso: str,
 ) -> str:
     return (
         f"# BLOCKED — orphan sub-task `{task_id}` (watchdog mode 5)\n\n"

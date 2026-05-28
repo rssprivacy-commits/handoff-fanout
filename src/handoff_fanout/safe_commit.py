@@ -32,9 +32,11 @@ CLI::
     handoff-safe-commit -m "MSG" -- file1 file2 ...
     handoff-safe-commit -F /path/to/msg.txt --allow-empty -- file1
 """
+
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import subprocess
 import sys
@@ -59,7 +61,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     msg_group = p.add_mutually_exclusive_group(required=True)
     msg_group.add_argument("-m", "--message", help="Commit message (passed to git commit -m).")
-    msg_group.add_argument("-F", "--file", help="Read commit message from file (passed to git commit -F).")
+    msg_group.add_argument(
+        "-F", "--file", help="Read commit message from file (passed to git commit -F)."
+    )
     p.add_argument(
         "extra_args",
         nargs=argparse.REMAINDER,
@@ -73,7 +77,7 @@ def _split_files(extra: list[str]) -> tuple[list[str], list[str]]:
     if "--" not in extra:
         return extra, []
     idx = extra.index("--")
-    return extra[:idx], extra[idx + 1:]
+    return extra[:idx], extra[idx + 1 :]
 
 
 def _run_git(args: list[str], **kwargs) -> subprocess.CompletedProcess:
@@ -192,10 +196,8 @@ def _commit_under_lock(args: argparse.Namespace, git_extra: list[str], files: li
             )
             return r.returncode
     finally:
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(expected_file)
-        except OSError:
-            pass
 
     return _post_audit(expected)
 

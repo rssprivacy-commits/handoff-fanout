@@ -19,6 +19,7 @@ otherwise the same, covering:
 The tests provide their own minimal ``pre-commit`` hook so they don't
 depend on any project-level pre-commit infrastructure.
 """
+
 from __future__ import annotations
 
 import os
@@ -28,7 +29,6 @@ import time
 from pathlib import Path
 
 import pytest
-
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_ROOT / "src"
@@ -80,9 +80,7 @@ def gitrepo(tmp_path):
     env["HANDOFF_SAFE_COMMIT_RETRY_WAIT"] = "1"
     # Make sure the package is importable from the subprocess regardless
     # of whether the user installed it editable.
-    env["PYTHONPATH"] = (
-        f"{SRC_DIR}{os.pathsep}{env.get('PYTHONPATH', '')}".rstrip(os.pathsep)
-    )
+    env["PYTHONPATH"] = f"{SRC_DIR}{os.pathsep}{env.get('PYTHONPATH', '')}".rstrip(os.pathsep)
     env.pop("HANDOFF_ROLE", None)
     env.pop("HANDOFF_EXPECTED_FILES", None)
     env.pop("HANDOFF_SAFE_COMMIT_BYPASS", None)
@@ -95,11 +93,19 @@ def _safe_commit(gitrepo, message, files, extra_env=None, expect_rc=0):
     if extra_env:
         env.update(extra_env)
     cmd = [
-        sys.executable, "-m", "handoff_fanout.safe_commit",
-        "-m", message, "--",
+        sys.executable,
+        "-m",
+        "handoff_fanout.safe_commit",
+        "-m",
+        message,
+        "--",
     ] + files
     result = subprocess.run(
-        cmd, cwd=gitrepo["repo"], env=env, capture_output=True, text=True,
+        cmd,
+        cwd=gitrepo["repo"],
+        env=env,
+        capture_output=True,
+        text=True,
     )
     if expect_rc is not None:
         assert result.returncode == expect_rc, (
@@ -111,8 +117,12 @@ def _safe_commit(gitrepo, message, files, extra_env=None, expect_rc=0):
 
 def _git(gitrepo, *args, check=True):
     result = subprocess.run(
-        ["git", *args], cwd=gitrepo["repo"], env=gitrepo["env"],
-        capture_output=True, text=True, check=check,
+        ["git", *args],
+        cwd=gitrepo["repo"],
+        env=gitrepo["env"],
+        capture_output=True,
+        text=True,
+        check=check,
     )
     return result.stdout
 
@@ -177,9 +187,7 @@ def test_safe_commit_clears_stale_lock_and_proceeds(gitrepo):
     repo = gitrepo["repo"]
     (repo / "after_stale.txt").write_text("ok\n")
     result = _safe_commit(gitrepo, "after stale lock", ["after_stale.txt"])
-    assert "锁陈旧" in result.stderr, (
-        f"expected stale-clear stderr: {result.stderr!r}"
-    )
+    assert "锁陈旧" in result.stderr, f"expected stale-clear stderr: {result.stderr!r}"
 
     log = _git(gitrepo, "log", "--oneline").strip().splitlines()
     assert len(log) == 2
@@ -215,7 +223,9 @@ def test_safe_commit_bypass_env_var_skips_self_check(gitrepo, tmp_path):
     repo = gitrepo["repo"]
     (repo / "with_bypass.txt").write_text("bypass\n")
     result = _safe_commit(
-        gitrepo, "with bypass", ["with_bypass.txt"],
+        gitrepo,
+        "with bypass",
+        ["with_bypass.txt"],
         extra_env={"HANDOFF_SAFE_COMMIT_BYPASS": "1"},
     )
     assert result.returncode == 0
@@ -242,7 +252,11 @@ def test_pre_commit_seg5_rejects_when_actual_has_extras(gitrepo, tmp_path):
 
     hook = repo / ".git" / "hooks" / "pre-commit"
     result = subprocess.run(
-        ["bash", str(hook)], cwd=repo, env=env, capture_output=True, text=True,
+        ["bash", str(hook)],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
     )
     assert result.returncode != 0, "segment 5 must reject (actual b.txt outside expected)"
     assert "PRECOMMIT_HIJACK_REJECT" in result.stderr or "hijack" in result.stderr.lower()
@@ -263,11 +277,13 @@ def test_pre_commit_seg5_passes_when_actual_subset_of_expected(gitrepo, tmp_path
 
     hook = repo / ".git" / "hooks" / "pre-commit"
     result = subprocess.run(
-        ["bash", str(hook)], cwd=repo, env=env, capture_output=True, text=True,
+        ["bash", str(hook)],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
     )
-    assert result.returncode == 0, (
-        f"segment 5 should pass on subset: stderr={result.stderr!r}"
-    )
+    assert result.returncode == 0, f"segment 5 should pass on subset: stderr={result.stderr!r}"
 
 
 def test_pre_commit_seg5_skipped_when_env_var_unset(gitrepo):
@@ -281,6 +297,10 @@ def test_pre_commit_seg5_skipped_when_env_var_unset(gitrepo):
 
     hook = repo / ".git" / "hooks" / "pre-commit"
     result = subprocess.run(
-        ["bash", str(hook)], cwd=repo, env=env, capture_output=True, text=True,
+        ["bash", str(hook)],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
     )
     assert result.returncode == 0

@@ -1,7 +1,7 @@
 """Shared pytest fixtures."""
+
 from __future__ import annotations
 
-import os
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
@@ -17,7 +17,9 @@ def git_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     succeed under CI (which doesn't have a global git user by default).
     """
     subprocess.run(["git", "init", "--quiet", "--initial-branch=main"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "config", "user.email", "test@handoff-fanout.local"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@handoff-fanout.local"], cwd=tmp_path, check=True
+    )
     subprocess.run(["git", "config", "user.name", "handoff-fanout test"], cwd=tmp_path, check=True)
     subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=tmp_path, check=True)
     monkeypatch.chdir(tmp_path)

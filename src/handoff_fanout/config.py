@@ -15,6 +15,7 @@ Resolution order:
 The home directory itself is resolved from ``$HANDOFF_HOME`` (env var) or
 defaults to ``~/.handoff``.
 """
+
 from __future__ import annotations
 
 import json
@@ -38,6 +39,7 @@ class HookSpec:
     whose first match group becomes the stored value (useful for trimming
     long output down to a version string).
     """
+
     name: str
     command: list[str]
     regex: str | None = None
@@ -46,6 +48,7 @@ class HookSpec:
 @dataclass
 class RoadmapSpec:
     """Optional roadmap file whose phase sections are excerpted into prompts."""
+
     path: str | None = None
     section_regex: str = r"#### Phase[^\n]*\n(.*?)(?=\n#### |\Z)"
     max_sections: int = 2

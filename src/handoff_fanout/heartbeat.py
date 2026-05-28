@@ -18,6 +18,7 @@ Four subcommands:
 
   - ``status`` dumps the batch's state-machine markers for debugging.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -26,10 +27,11 @@ import os
 import signal
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
-from handoff_fanout import atomic, config as _config
+from handoff_fanout import atomic
+from handoff_fanout import config as _config
 
 HEARTBEAT_INTERVAL = 60
 HEARTBEAT_MAX_LIFETIME = 3 * 60 * 60  # 3 hours
@@ -66,15 +68,13 @@ def load_manifest(batch_dir: Path) -> dict:
     try:
         return json.loads(f.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
-        raise SystemExit(f"❌ manifest.json corrupt: {e}")
+        raise SystemExit(f"❌ manifest.json corrupt: {e}") from e
 
 
 def resolve_project(batch_dir: Path) -> str:
     abs_dir = batch_dir.resolve()
     if abs_dir.parent.name != "batches":
-        raise SystemExit(
-            f"❌ batch_dir not under batches/: {abs_dir}"
-        )
+        raise SystemExit(f"❌ batch_dir not under batches/: {abs_dir}")
     return abs_dir.parent.parent.name
 
 
@@ -101,8 +101,7 @@ def cmd_heartbeat(batch_dir: Path) -> int:
 
     heartbeat.touch()
     print(
-        f"💓 heartbeat daemon pid={os.getpid()} batch={batch_id} "
-        f"interval={HEARTBEAT_INTERVAL}s",
+        f"💓 heartbeat daemon pid={os.getpid()} batch={batch_id} interval={HEARTBEAT_INTERVAL}s",
         file=sys.stderr,
     )
 
@@ -190,7 +189,7 @@ def cmd_complete(
         "amdahl_estimated": round(amdahl_est, 3),
         "amdahl_actual": round(amdahl_act, 3),
         "summary": (summary or "")[:200],
-        "completed_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "completed_at": datetime.now(UTC).astimezone().isoformat(timespec="seconds"),
     }
     line = json.dumps(record, ensure_ascii=False) + "\n"
 
@@ -252,8 +251,13 @@ def cmd_status(batch_dir: Path) -> int:
         return 2
 
     markers = [
-        "_fanin_triggered", "_fan_in_started", "_fan_in_heartbeat",
-        "_fan_in_done", "_watchdog_triggered", "_aborted", "_corrupted",
+        "_fanin_triggered",
+        "_fan_in_started",
+        "_fan_in_heartbeat",
+        "_fan_in_done",
+        "_watchdog_triggered",
+        "_aborted",
+        "_corrupted",
     ]
     print(f"# Batch {batch_dir.name}")
     print(f"# Path  {batch_dir}")

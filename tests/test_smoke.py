@@ -1,4 +1,5 @@
 """Smoke test: package imports and exposes version. Lands first so CI has a green target."""
+
 import handoff_fanout
 
 

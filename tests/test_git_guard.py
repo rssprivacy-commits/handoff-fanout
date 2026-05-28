@@ -6,6 +6,7 @@ Covers:
   - fan-in role:   all commands pass through (sole committer)
   - main / unset:  all commands pass through
 """
+
 from __future__ import annotations
 
 import os

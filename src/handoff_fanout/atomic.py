@@ -9,6 +9,7 @@ The handoff protocol relies on three POSIX guarantees on local filesystems:
 These guarantees do NOT hold on NFS / SMB / FUSE in general — handoff state
 files must live on a local disk (the default ``~/.handoff/`` is fine).
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -112,12 +113,10 @@ def acquire_dir_lock(
             continue
         # Success.
         pid_file = lock_path / "pid"
-        try:
+        # If we can't write the pid file something is wrong, but we still
+        # hold the lock — proceed and let the caller surface the error.
+        with contextlib.suppress(OSError):
             pid_file.write_text(f"{os.getpid()}\n")
-        except OSError:
-            # If we can't write the pid file something is wrong, but we still
-            # hold the lock — proceed and let the caller surface the error.
-            pass
         try:
             yield lock_path
         finally:
@@ -133,10 +132,8 @@ def acquire_dir_lock(
 def _force_clear_lock(lock_path: Path) -> None:
     pid_file = lock_path / "pid"
     if pid_file.exists():
-        try:
+        with contextlib.suppress(FileNotFoundError):
             pid_file.unlink()
-        except FileNotFoundError:
-            pass
     try:
         lock_path.rmdir()
     except FileNotFoundError:

@@ -24,21 +24,24 @@ watchdog covers the failure modes:
 
 Intended to run via ``launchd`` / cron, every ~10 min.
 """
+
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from handoff_fanout import atomic, config as _config, dump, templates
+from handoff_fanout import atomic, dump, templates
+from handoff_fanout import config as _config
 
-LOCK_STALE_SECONDS = 1800        # 30 min — a prior watchdog still running past this is wedged
-HEARTBEAT_STALE_SECONDS = 180    # 3 min — fan-in heartbeat decay
+LOCK_STALE_SECONDS = 1800  # 30 min — a prior watchdog still running past this is wedged
+HEARTBEAT_STALE_SECONDS = 180  # 3 min — fan-in heartbeat decay
 SUB_TASK_HEARTBEAT_STALE_SECONDS = 300  # 5 min — sub-task heartbeat decay (529 detection)
-ORPHAN_GRACE_SECONDS = 300       # 5 min — orphan candidate must be older than this
+ORPHAN_GRACE_SECONDS = 300  # 5 min — orphan candidate must be older than this
 
 
 def handoff_root() -> Path:
@@ -70,10 +73,8 @@ def acquire_lock() -> int | None:
 
 def release_lock(fd: int) -> None:
     os.close(fd)
-    try:
+    with contextlib.suppress(FileNotFoundError):
         lock_path().unlink()
-    except FileNotFoundError:
-        pass
 
 
 # ─── helpers ────────────────────────────────────────────────────────────────
@@ -83,7 +84,7 @@ def parse_iso_utc(s: str) -> datetime:
     try:
         return datetime.fromisoformat(s)
     except Exception:
-        return datetime.now(timezone.utc)
+        return datetime.now(UTC)
 
 
 def _infer_workspace(cfg: _config.Config, project: str) -> Path | None:
@@ -125,7 +126,7 @@ def scan_batch(batch_dir: Path, cfg: _config.Config) -> None:
     if finished == expected and not (batch_dir / "_fanin_triggered").exists():
         print(f"[watchdog] mode 1 ({project}/{batch_id}): complete but not triggered")
         if not workspace:
-            print(f"  ❌ cannot locate workspace, skip")
+            print("  ❌ cannot locate workspace, skip")
             return
         queue_dir = cfg.queue_dir(project)
         dump.trigger_fan_in_if_ready(project, workspace, batch_id, queue_dir, cfg=cfg)
@@ -139,12 +140,12 @@ def scan_batch(batch_dir: Path, cfg: _config.Config) -> None:
         else:
             stale = time.time() - (batch_dir / "_fan_in_started").stat().st_mtime
         if stale > HEARTBEAT_STALE_SECONDS:
-            print(f"[watchdog] mode 2 ({project}/{batch_id}): fan-in heartbeat stale ({stale:.0f}s)")
+            print(
+                f"[watchdog] mode 2 ({project}/{batch_id}): fan-in heartbeat stale ({stale:.0f}s)"
+            )
             for marker in ("_fan_in_started", "_fanin_triggered"):
-                try:
+                with contextlib.suppress(FileNotFoundError):
                     (batch_dir / marker).unlink()
-                except FileNotFoundError:
-                    pass
             if workspace:
                 queue_dir = cfg.queue_dir(project)
                 dump.trigger_fan_in_if_ready(project, workspace, batch_id, queue_dir, cfg=cfg)
@@ -160,19 +161,24 @@ def scan_batch(batch_dir: Path, cfg: _config.Config) -> None:
         heartbeat = batch_dir / f"{sub_id}.heartbeat"
         if not heartbeat.exists():
             env = batch_dir / f"{sub_id}.env"
-            if env.exists() and (time.time() - env.stat().st_mtime) > SUB_TASK_HEARTBEAT_STALE_SECONDS:
-                _mark_529_suspected(batch_dir, sub_id, project, batch_id,
-                                    reason="no heartbeat and env >5min old")
+            if (
+                env.exists()
+                and (time.time() - env.stat().st_mtime) > SUB_TASK_HEARTBEAT_STALE_SECONDS
+            ):
+                _mark_529_suspected(
+                    batch_dir, sub_id, project, batch_id, reason="no heartbeat and env >5min old"
+                )
             continue
         stale = time.time() - heartbeat.stat().st_mtime
         if stale > SUB_TASK_HEARTBEAT_STALE_SECONDS:
-            _mark_529_suspected(batch_dir, sub_id, project, batch_id,
-                                reason=f"heartbeat stale {stale:.0f}s")
+            _mark_529_suspected(
+                batch_dir, sub_id, project, batch_id, reason=f"heartbeat stale {stale:.0f}s"
+            )
 
     # Mode 3: timeout degradation
     created_at = parse_iso_utc(manifest.get("created_at", ""))
     timeout = timedelta(hours=manifest.get("timeout_hours", 3))
-    now = datetime.now(timezone.utc).astimezone()
+    now = datetime.now(UTC).astimezone()
     if now - created_at > timeout:
         if (batch_dir / "_watchdog_triggered").exists():
             return
@@ -182,37 +188,55 @@ def scan_batch(batch_dir: Path, cfg: _config.Config) -> None:
         if not workspace:
             print("  ❌ cannot locate workspace, skip")
             return
-        _dump_degraded_fan_in(cfg, project, workspace, batch_id, manifest,
-                              done, blocked, expected - finished)
+        _dump_degraded_fan_in(
+            cfg, project, workspace, batch_id, manifest, done, blocked, expected - finished
+        )
 
 
 def _mark_529_suspected(
-    batch_dir: Path, sub_id: str, project: str, batch_id: str, reason: str,
+    batch_dir: Path,
+    sub_id: str,
+    project: str,
+    batch_id: str,
+    reason: str,
 ) -> None:
     marker = batch_dir / f"{sub_id}.529-suspected"
     if not atomic.atomic_create(marker):
         return
-    atomic.write_with_fsync(marker, (
-        f"sub_task_id: {sub_id}\n"
-        f"detected_at: {dump.now_iso()}\n"
-        f"reason: {reason}\n"
-        f"batch_dir: {batch_dir}\n\n"
-        f"## Possible cause\n"
-        f"Provider 529 (overloaded) — sub-task tab is stuck in a retry loop or\n"
-        f"an unhandled exception path.\n\n"
-        f"## Manual recovery\n"
-        f"1. Open the sub-task's Claude tab and read the error.\n"
-        f"2. If confirmed: `touch {batch_dir}/{sub_id}.retry` to re-dump it.\n"
-        f"3. To give up: `touch {batch_dir}/{sub_id}.blocked` (triggers degraded fan-in).\n"
-    ))
+    atomic.write_with_fsync(
+        marker,
+        (
+            f"sub_task_id: {sub_id}\n"
+            f"detected_at: {dump.now_iso()}\n"
+            f"reason: {reason}\n"
+            f"batch_dir: {batch_dir}\n\n"
+            f"## Possible cause\n"
+            f"Provider 529 (overloaded) — sub-task tab is stuck in a retry loop or\n"
+            f"an unhandled exception path.\n\n"
+            f"## Manual recovery\n"
+            f"1. Open the sub-task's Claude tab and read the error.\n"
+            f"2. If confirmed: `touch {batch_dir}/{sub_id}.retry` to re-dump it.\n"
+            f"3. To give up: `touch {batch_dir}/{sub_id}.blocked` (triggers degraded fan-in).\n"
+        ),
+    )
     print(f"  [watchdog mode 4] 529-suspected: {project}/{batch_id}/{sub_id} ({reason})")
-    _notify(f"{sub_id}: {reason}", "v5.1 watchdog / 529-suspected",
-            f"{project}/{batch_id}", sound="Basso")
+    _notify(
+        f"{sub_id}: {reason}",
+        "v5.1 watchdog / 529-suspected",
+        f"{project}/{batch_id}",
+        sound="Basso",
+    )
 
 
 def _dump_degraded_fan_in(
-    cfg: _config.Config, project: str, workspace: Path, batch_id: str,
-    manifest: dict, done: set[str], blocked: set[str], missing: set[str],
+    cfg: _config.Config,
+    project: str,
+    workspace: Path,
+    batch_id: str,
+    manifest: dict,
+    done: set[str],
+    blocked: set[str],
+    missing: set[str],
 ) -> None:
     queue_dir = cfg.queue_dir(project)
     queue_dir.mkdir(parents=True, exist_ok=True)
@@ -220,13 +244,23 @@ def _dump_degraded_fan_in(
     baseline = dump.detect_baseline(workspace, cfg=cfg)
 
     dump.write_role_env(
-        batch_dir / "fan-in.env", dump.HANDOFF_ROLE_FAN_IN, batch_id, workspace,
+        batch_dir / "fan-in.env",
+        dump.HANDOFF_ROLE_FAN_IN,
+        batch_id,
+        workspace,
     )
     content = templates.build_fan_in_handoff_md(
-        project=project, workspace=workspace, batch_id=batch_id,
-        manifest=manifest, done_files=done, blocked_files=blocked,
-        baseline=baseline, inject_blocks=cfg.inject_blocks, handoff_home=cfg.home,
-        degraded=True, missing=missing,
+        project=project,
+        workspace=workspace,
+        batch_id=batch_id,
+        manifest=manifest,
+        done_files=done,
+        blocked_files=blocked,
+        baseline=baseline,
+        inject_blocks=cfg.inject_blocks,
+        handoff_home=cfg.home,
+        degraded=True,
+        missing=missing,
     )
     fan_in_task = manifest["fan_in_task"] + "-watchdog"
     atomic.write_with_fsync(queue_dir / f"{fan_in_task}.md", content)
@@ -239,7 +273,9 @@ def _dump_degraded_fan_in(
     print(f"  [watchdog] degraded fan-in dumped: queue/{fan_in_task}.{{md,uri}}")
     _notify(
         f"batch {batch_id} timed out / missing {len(missing)}",
-        f"v5 watchdog / {project}", batch_id, sound="Basso",
+        f"v5 watchdog / {project}",
+        batch_id,
+        sound="Basso",
     )
 
 
@@ -285,16 +321,21 @@ def _mark_orphan(proj_dir: Path, task_id: str, age_seconds: float) -> None:
     cfg = _config.load()
     blocked_md = queue_dir / f"{task_id}.BLOCKED.md"
     content = templates.build_orphan_blocked_md(
-        project=project, task_id=task_id,
-        age_seconds=age_seconds, grace_seconds=ORPHAN_GRACE_SECONDS,
-        handoff_home=cfg.home, workspace_root=cfg.workspace_root,
+        project=project,
+        task_id=task_id,
+        age_seconds=age_seconds,
+        grace_seconds=ORPHAN_GRACE_SECONDS,
+        handoff_home=cfg.home,
+        workspace_root=cfg.workspace_root,
         now_iso=dump.now_iso(),
     )
     atomic.write_with_fsync(blocked_md, content)
     print(f"  [watchdog mode 5] orphan: {project}/{task_id} (age={age_seconds:.0f}s)")
     _notify(
         f"{task_id} orphan ({age_seconds:.0f}s)",
-        "v5.2 watchdog / orphan", project, sound="Basso",
+        "v5.2 watchdog / orphan",
+        project,
+        sound="Basso",
     )
 
 
@@ -302,16 +343,11 @@ def _mark_orphan(proj_dir: Path, task_id: str, age_seconds: float) -> None:
 
 
 def _notify(message: str, title: str, subtitle: str, sound: str | None = None) -> None:
-    osa = (
-        f'display notification "{message}" '
-        f'with title "{title}" subtitle "{subtitle}"'
-    )
+    osa = f'display notification "{message}" with title "{title}" subtitle "{subtitle}"'
     if sound:
         osa += f' sound name "{sound}"'
-    try:
+    with contextlib.suppress(FileNotFoundError, subprocess.TimeoutExpired):
         subprocess.run(["osascript", "-e", osa], check=False, timeout=5)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
 
 
 # ─── entry point ────────────────────────────────────────────────────────────

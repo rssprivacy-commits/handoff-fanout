@@ -13,6 +13,7 @@ Each test still covers one of three code paths:
 
 No external services; pure filesystem.
 """
+
 from __future__ import annotations
 
 import json
@@ -25,7 +26,6 @@ import pytest
 
 from handoff_fanout import dump, watchdog
 
-
 DEFAULT_PROJECT = "test-project"
 
 
@@ -37,8 +37,11 @@ def _setup_project(root: Path, project: str = DEFAULT_PROJECT) -> dict:
     (proj / "launched").mkdir(parents=True)
     (proj / "batches").mkdir(parents=True)
     return {
-        "proj": proj, "ack": proj / "ack", "queue": proj / "queue",
-        "launched": proj / "launched", "batches": proj / "batches",
+        "proj": proj,
+        "ack": proj / "ack",
+        "queue": proj / "queue",
+        "launched": proj / "launched",
+        "batches": proj / "batches",
     }
 
 

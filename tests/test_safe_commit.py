@@ -4,10 +4,10 @@ These tests run real ``git`` commands inside a per-test tmp repo. They
 cover the three defense layers: expected-files invariant, ``--only``
 restriction, and the cross-process lock.
 """
+
 from __future__ import annotations
 
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -22,7 +22,9 @@ def _write(p: Path, content: str = "x") -> None:
 def _last_commit_files() -> set[str]:
     r = subprocess.run(
         ["git", "show", "--name-only", "--pretty=format:", "HEAD"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     return {ln for ln in r.stdout.splitlines() if ln.strip()}
 
@@ -49,9 +51,7 @@ def test_happy_path_commits_only_specified_files(git_repo: Path, lock_in_tmp: Pa
     assert landed == {"a.txt", "b.txt"}, f"unexpected landed set: {landed}"
 
 
-def test_pre_commit_hook_hijack_is_caught_by_post_audit(
-    git_repo: Path, lock_in_tmp: Path
-) -> None:
+def test_pre_commit_hook_hijack_is_caught_by_post_audit(git_repo: Path, lock_in_tmp: Path) -> None:
     """A pre-commit hook that auto-stages an extra file slips past the
     layer-2 snapshot AND past ``git commit --only`` (git docs: hooks
     modify the temporary index that ``--only`` builds). The layer-4
@@ -71,8 +71,7 @@ def test_pre_commit_hook_hijack_is_caught_by_post_audit(
     assert rc == 2, "post-audit must return exit 2 when hijack lands"
     landed = _last_commit_files()
     assert landed == {"a.txt", "intruder.txt"}, (
-        "documents the limitation: --only does NOT block hook auto-stage; "
-        f"got {landed}"
+        f"documents the limitation: --only does NOT block hook auto-stage; got {landed}"
     )
 
 
@@ -117,7 +116,10 @@ def test_pre_existing_staged_file_is_preserved(git_repo: Path, lock_in_tmp: Path
     # preexist.txt remains staged for a future commit.
     staged_after = subprocess.run(
         ["git", "diff", "--cached", "--name-only"],
-        cwd=git_repo, capture_output=True, text=True, check=True,
+        cwd=git_repo,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout.split()
     assert "preexist.txt" in staged_after
 
@@ -138,7 +140,11 @@ def test_deleted_but_tracked_file_is_accepted(git_repo: Path, lock_in_tmp: Path)
     assert rc == 0
     # File is gone from HEAD.
     lstree = subprocess.run(
-        ["git", "ls-tree", "HEAD"], cwd=git_repo, capture_output=True, text=True, check=True,
+        ["git", "ls-tree", "HEAD"],
+        cwd=git_repo,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout
     assert "doomed.txt" not in lstree
 

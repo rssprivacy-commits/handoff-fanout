@@ -1,4 +1,5 @@
 """Locate the bundled `git` wrapper that PATH-blocks sub-task commits."""
+
 from __future__ import annotations
 
 from pathlib import Path

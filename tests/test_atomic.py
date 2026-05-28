@@ -1,4 +1,5 @@
 """Tests for atomic_create / write_with_fsync / acquire_dir_lock."""
+
 from __future__ import annotations
 
 import os
@@ -68,9 +69,11 @@ def test_acquire_dir_lock_contention_fails_after_retries(tmp_path: Path) -> None
     lock = tmp_path / "busy.lock"
     lock.mkdir()  # simulate another process holding it
     (lock / "pid").write_text("99999\n")
-    with pytest.raises(LockAcquisitionError) as exc:
-        with acquire_dir_lock(lock, retries=2, wait_seconds=0.05):
-            pass
+    with (
+        pytest.raises(LockAcquisitionError) as exc,
+        acquire_dir_lock(lock, retries=2, wait_seconds=0.05),
+    ):
+        pass
     assert "99999" in str(exc.value)
 
 
@@ -89,7 +92,6 @@ def test_acquire_dir_lock_stale_lock_is_force_cleared(tmp_path: Path) -> None:
 
 def test_acquire_dir_lock_released_on_exception(tmp_path: Path) -> None:
     lock = tmp_path / "boom.lock"
-    with pytest.raises(RuntimeError, match="user error"):
-        with acquire_dir_lock(lock):
-            raise RuntimeError("user error")
+    with pytest.raises(RuntimeError, match="user error"), acquire_dir_lock(lock):
+        raise RuntimeError("user error")
     assert not lock.exists(), "lock must be released even on exception"

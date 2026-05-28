@@ -4,6 +4,7 @@ The hook is the Layer 2 invariant check: it rejects a commit when the staged
 file set is not a subset of ``$HANDOFF_EXPECTED_FILES``. These tests invoke
 the script directly with various stagings to lock in its contract.
 """
+
 from __future__ import annotations
 
 import os
@@ -37,8 +38,11 @@ def _run_hook(repo: Path, expected: str | None) -> subprocess.CompletedProcess:
     if expected is not None:
         env["HANDOFF_EXPECTED_FILES"] = expected
     return subprocess.run(
-        ["bash", str(HOOK)], cwd=str(repo), env=env,
-        capture_output=True, text=True,
+        ["bash", str(HOOK)],
+        cwd=str(repo),
+        env=env,
+        capture_output=True,
+        text=True,
     )
 
 
