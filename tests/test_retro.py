@@ -193,6 +193,28 @@ def test_R04_bypass_missing_deadline_returns_bypass_error(handoff_home, workspac
     assert "missing-follow-up-deadline" in err
 
 
+def test_R04b_bypass_path_traversal_follow_task_rejected(handoff_home, workspace, monkeypatch):
+    # Phase 4e R2 / P0-2: a follow_up_retro_task_id with path separators must be
+    # rejected at the validation boundary so the shell overdue scanner can never
+    # resolve an out-of-tree evidence file from it.
+    monkeypatch.setenv("HANDOFF_RETRO_BYPASS", "1")
+    override = handoff_home / PROJECT / "ack" / f"{TASK}.retro.override.json"
+    override.parent.mkdir(parents=True, exist_ok=True)
+    deadline = (datetime.now(UTC) + timedelta(minutes=30)).isoformat(timespec="seconds")
+    override.write_text(
+        json.dumps(
+            {
+                "follow_up_retro_task_id": "../../../tmp/evil",
+                "follow_up_deadline": deadline,
+            }
+        )
+    )
+    code, err = _run_dump(workspace=workspace)
+    assert code == 6
+    assert "ERR-BYPASS" in err
+    assert "invalid-follow-up-task" in err
+
+
 def test_R05_head_drift_within_tolerance_passes_with_warning(handoff_home, workspace):
     payload = _make_payload(workspace)
     # Simulate "another commit landed since precheck": evidence head is OK

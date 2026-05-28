@@ -579,6 +579,15 @@ def _validate_override(path: Path) -> tuple[dict | None, GateResult | None]:
             "missing-follow-up-task",
             "override JSON missing follow_up_retro_task_id",
         )
+    # P0: follow_up_retro_task_id is interpolated into a precheck/<task> evidence
+    # path by the shell overdue scanner. Restrict to [a-z0-9-] (same charset the
+    # shell guard enforces) so a crafted "../foreign" can never resolve an
+    # out-of-tree file there.
+    if not re.fullmatch(r"[a-z0-9-]+", follow_task):
+        return None, _bypass(
+            "invalid-follow-up-task",
+            f"follow_up_retro_task_id has illegal chars (need [a-z0-9-]): {follow_task!r}",
+        )
     if not follow_deadline or not isinstance(follow_deadline, str):
         return None, _bypass(
             "missing-follow-up-deadline",
