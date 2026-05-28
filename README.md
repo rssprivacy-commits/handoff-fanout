@@ -9,6 +9,8 @@
 
 **[中文文档 / Chinese README](README.zh.md)**
 
+![30-second demo](docs/demo/handoff-fanout-demo.gif)
+
 ---
 
 ## The problem

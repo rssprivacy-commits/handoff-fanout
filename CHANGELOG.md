@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] — 2026-05-29
+
+First stable release. Engine extracted from a year-old production ERP project,
+hardened by three documented commit-hijack incidents (now blocked at four
+independent layers) and ported to a project-agnostic API with bilingual docs,
+CI matrix, an idempotent installer, and a 30-second demo GIF.
+
+### Added — Phase A4 (release)
+
+- **`docs/demo/handoff-fanout-demo.gif`** — 30 s VHS-captured demo
+  (864 KB, well under the 2 MB budget). Covers `dump` → `.uri` sidecar →
+  handoff markdown → Layer 2 hijack rejection.
+- **`docs/demo/demo.tape`** — committed VHS tape so the GIF stays
+  reproducible across future releases.
+- **README badges + demo embed** — top-of-page GIF in both
+  [README.md](README.md) and [README.zh.md](README.zh.md).
+- **ERP-side thin-shim migration** (downstream consumer) —
+  `dharmaxis-group/erp-system@54ab453` replaces 4 hand-rolled handoff
+  scripts (1292 + 388 + 383 + 225 = 2288 lines) with ~25-line shims that
+  import `handoff_fanout`. ERP-specific behaviour (`V3.6` redlines,
+  `主人立法`, `docker compose alembic current` baseline hook, roadmap
+  excerpt path) now lives in the consumer's `~/.claude-handoff/config.json`.
+  Validates the project-agnostic split.
+
 ### Added — Phase A3 (docs / install / CI)
 
 - **Bilingual README** ([README.md](README.md) + [README.zh.md](README.zh.md))
@@ -70,9 +94,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [x] `install/install.sh` idempotent installer (bin/ + launchd plist + git hooks + config)
 - [x] GitHub Actions CI (Python 3.11/3.12/3.13 × ubuntu/macos)
 - [x] Layer 2 pre-commit hook regression tests (9 cases)
-- [/] 30-second demo gif (recording script committed; gif asset capture pending)
-- [ ] ERP-side migration: `scripts/dump-handoff.py` → thin wrapper around `handoff dump`
-- [ ] v1.0.0 tag + GitHub Release
+- [x] 30-second demo gif (captured via VHS, 864 KB)
+- [x] ERP-side migration: `scripts/dump-handoff.py` → thin wrapper around `handoff dump`
+- [x] v1.0.0 tag + GitHub Release
 
 ## [0.1.0] — 2026-05-29
 

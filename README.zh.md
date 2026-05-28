@@ -9,6 +9,8 @@
 
 **[English README](README.md)**
 
+![30 秒演示](docs/demo/handoff-fanout-demo.gif)
+
 ---
 
 ## 它解决什么问题
