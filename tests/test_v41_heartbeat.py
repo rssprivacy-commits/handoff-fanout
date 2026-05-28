@@ -71,6 +71,50 @@ def test_build_handoff_md_heartbeat_pid_kill_hint():
     assert "kill $(cat /tmp/heartbeat-task-x.pid)" in md
 
 
+def test_build_handoff_md_contains_timeout_caveat():
+    """§第一步.5 — closes the 5/29 04:05 codex-stuck-19min follow-up.
+
+    Without a proactive ``timeout`` instruction, a hung codex / ``claude -p``
+    call freezes the whole session and starves the heartbeat, so watchdog
+    mode 6 only ever reacts after the fact. The caveat tells the session to
+    bound long-running CLI calls up front; mode 6 stays the passive backstop.
+    """
+    md = _render_handoff()
+    assert "§第一步.5" in md
+    assert "timeout 300 codex exec" in md
+    # placed between the heartbeat step and baseline — proactive, before work
+    assert md.index("第一步: 启动 heartbeat") < md.index("§第一步.5") < md.index(
+        "第二步: Baseline 验证"
+    )
+
+
+def _render_sub_task(sub_task_id: str = "sub-foo", project: str = "demo") -> str:
+    return templates.build_sub_task_handoff_md(
+        task="parent-task",
+        project=project,
+        workspace=Path("/tmp/ws"),
+        next_brief="do the sub thing",
+        batch_id="batch-1",
+        sub_task_id=sub_task_id,
+        file_ownership=[{"type": "glob", "path": "src/foo/**"}],
+        baseline={"git_head": "abc123", "last_3_commits": "abc123 do thing\n"},
+        roadmap_excerpt="(none)",
+        inject_blocks=[],
+        handoff_home=Path("/home/x/.claude-handoff"),
+        git_guard_path=Path("/home/x/.claude-handoff/demo/batches/batch-1/git-guard"),
+    )
+
+
+def test_build_sub_task_handoff_md_contains_timeout_caveat():
+    """Symmetric §第二步.5 — sub-task sessions run pytest / codex too."""
+    md = _render_sub_task()
+    assert "§第二步.5" in md
+    assert "timeout 300 <cmd>" in md
+    assert md.index("第二步: 启动 heartbeat") < md.index("§第二步.5") < md.index(
+        "第三步: Baseline 验证"
+    )
+
+
 # ─── B: watchdog mode 6 scan ────────────────────────────────────────────────
 
 
