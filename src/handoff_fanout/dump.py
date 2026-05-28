@@ -424,7 +424,7 @@ def write_active_dump(
 
     # §7.6 — write ack/<task>.old_ready when retro evidence drove the dump.
     if retro_evidence_path is not None:
-        _write_old_ready(
+        old_ready_path = _write_old_ready(
             project=project,
             task=task,
             workspace=workspace,
@@ -432,6 +432,16 @@ def write_active_dump(
             ack_dir=cfg.ack_dir(project),
             home=cfg.home,
         )
+        if old_ready_path is None:
+            # The gate passed with an evidence file, yet old_ready couldn't be
+            # written (evidence vanished / unreadable between the gate and here).
+            # Don't fail the already-published dump, but make it loud: autoclose
+            # silently won't fire without this artifact.
+            print(
+                "[dump] ⚠️  retro evidence supplied but old_ready was NOT written "
+                "(evidence vanished/unreadable); autoclose will not trigger for "
+                f"{project}/{task}"
+            )
 
     _notify(next_brief, f"自动接续 / {project}", task)
     print(f"[dump] ✅ active dump complete for {project}/{task}")

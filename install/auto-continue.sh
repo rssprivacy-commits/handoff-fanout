@@ -40,6 +40,10 @@ HANDOFF_VSCODE_CHECK="${HANDOFF_VSCODE_CHECK:-1}"
 # autoclose feature gate: default OFF, opt-in via this env or via the
 # autoclose.enabled sentinel files documented in v4 改进 #6.
 HANDOFF_AUTOCLOSE_ENABLED="${HANDOFF_AUTOCLOSE_ENABLED:-0}"
+# python3 is a hard dependency of this system (the dump/precheck CLIs are a
+# Python package); the overdue scanner uses it for timezone-correct ISO-8601
+# comparison. Overridable so tests can point at a specific interpreter.
+HANDOFF_PYTHON_CMD="${HANDOFF_PYTHON_CMD:-python3}"
 
 CODE_BIN="${HANDOFF_CODE_BIN:-/usr/local/bin/code}"
 [ ! -x "$CODE_BIN" ] && CODE_BIN="/opt/homebrew/bin/code"
@@ -220,15 +224,50 @@ mtime_sec() {
     /usr/bin/stat -f %m "$1" 2>/dev/null
 }
 
-# stale lock cleanup: rmdir if older than ttl seconds. Always idempotent.
+# Timezone-correct "is now (UTC) strictly past <deadline>?" — exit 0 = overdue.
+# A lexical string compare on ISO-8601 mis-sorts mixed offsets (P0: a
+# `+08:00` deadline compared against a `+00:00` 'now' string sorts wrong, and a
+# bare-date or `Z`-suffixed deadline sorts wrong too), so delegate the parse to
+# python3. Naive (tz-less) deadlines are assumed UTC. Any parse error exits
+# non-zero so the caller treats it as "not overdue" (fail-safe: never fabricate
+# an overdue gate the next dump would hard-fail on).
+iso_now_past_deadline() {
+    "$HANDOFF_PYTHON_CMD" - "$1" <<'PY' 2>/dev/null
+import sys
+from datetime import datetime, timezone
+raw = sys.argv[1].strip().replace("Z", "+00:00")
+try:
+    dt = datetime.fromisoformat(raw)
+except ValueError:
+    sys.exit(2)
+if dt.tzinfo is None:
+    dt = dt.replace(tzinfo=timezone.utc)
+sys.exit(0 if datetime.now(timezone.utc) > dt else 1)
+PY
+}
+
+# Release a per-task lock dir created by mkdir + a `pid` ownership file.
+release_lock() {
+    rm -f "$1/pid" 2>/dev/null || true
+    rmdir "$1" 2>/dev/null || true
+}
+
+# stale lock cleanup: recycle only when the recorded owner pid is gone AND the
+# dir is older than ttl seconds. Checking pid liveness first (P1) stops a slow
+# but still-running holder from having its lock stolen on the TTL alone.
 clean_stale_lock() {
     local lock="$1"; local ttl="$2"
     [ -d "$lock" ] || return 0
+    local pid=""
+    [ -f "$lock/pid" ] && pid=$(cat "$lock/pid" 2>/dev/null)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        return 0  # owner alive — never recycle regardless of age
+    fi
     local mt; mt=$(mtime_sec "$lock") || return 0
     [ -z "$mt" ] && return 0
     local now; now=$(/bin/date +%s)
     if [ "$((now - mt))" -gt "$ttl" ]; then
-        rmdir "$lock" 2>/dev/null || true
+        release_lock "$lock"
     fi
 }
 
@@ -300,11 +339,20 @@ scan_overdue_overrides() {
         follow_task=$(json_get "$ovr" "follow_up_retro_task_id")
         [ -z "$deadline" ] && continue
         [ -z "$follow_task" ] && continue
-        # Awk-friendly ISO-8601 comparison — both strings are timespec="seconds"
-        # so lexicographic compare matches chronological order.
-        if [ "$now_iso" \< "$deadline" ] || [ "$now_iso" = "$deadline" ]; then
-            continue
-        fi
+        # P0: follow_up_retro_task_id is interpolated into a precheck/<task>
+        # evidence path below. Reject anything outside kebab-case so a crafted
+        # value (e.g. "../foreign") can't resolve an out-of-tree file and
+        # falsely clear the overdue gate.
+        case "$follow_task" in
+            *[!a-z0-9-]*)
+                log "OVERDUE-SKIP: project=$project task=$task — unsafe follow_task '$follow_task'"
+                continue ;;
+        esac
+        # P0: timezone-correct overdue check. A lexical compare mis-sorts mixed
+        # offsets (a `+08:00` deadline vs the `+00:00` 'now', or a bare-date /
+        # `Z`-suffixed deadline), silently disabling the gate. iso_now_past_deadline
+        # exits 0 only when now(UTC) is strictly past the (tz-normalized) deadline.
+        iso_now_past_deadline "$deadline" || continue
         local follow_evid="$precheck_dir/$follow_task.retro.evidence.json"
         local audit="$ack_dir/$task.retro.retry_audit.jsonl"
         local overdue_marker="$ack_dir/$task.retro_overdue.txt"
@@ -320,13 +368,18 @@ scan_overdue_overrides() {
             continue
         fi
         if [ ! -f "$overdue_marker" ]; then
-            printf '{"event":"overdue","task":"%s","deadline":"%s","now":"%s"}\n' \
-                "$task" "$deadline" "$now_iso" > "$overdue_marker"
-            "$HANDOFF_OSASCRIPT_CMD" -e \
-                "display notification \"Follow-up retro overdue: $task\" with title \"Handoff\"" \
-                2>>"$LOG" || true
-            log "OVERDUE: project=$project task=$task deadline=$deadline"
-            OVERDUE_MARKED=$((OVERDUE_MARKED + 1))
+            # P2: atomic first-writer-wins. Two concurrent launchd runs can both
+            # pass the -f test above; noclobber makes the redirect fail for all
+            # but the first, so only one writer notifies.
+            if ( set -o noclobber
+                 printf '{"event":"overdue","task":"%s","deadline":"%s","now":"%s"}\n' \
+                    "$task" "$deadline" "$now_iso" > "$overdue_marker" ) 2>/dev/null; then
+                "$HANDOFF_OSASCRIPT_CMD" -e \
+                    "display notification \"Follow-up retro overdue: $task\" with title \"Handoff\"" \
+                    2>>"$LOG" || true
+                log "OVERDUE: project=$project task=$task deadline=$deadline"
+                OVERDUE_MARKED=$((OVERDUE_MARKED + 1))
+            fi
         fi
     done
 }
@@ -350,7 +403,12 @@ autoclose_enabled_for_project() {
     return 1
 }
 
-KNOWN_SCHEMA_VERSIONS="v5.4.1"
+# Watcher-readable allow-list. MUST track dump.py OLD_READY_SCHEMA_VERSION
+# (= handoff_precheck.EVIDENCE_SCHEMA_VERSION). Keep prior versions here so an
+# old_ready written by an earlier build still autocloses (P1: backward compat).
+# An unknown version fails closed (writes autoclose_failed.txt, logged — never
+# closes a tab on a schema it can't verify).
+KNOWN_SCHEMA_VERSIONS="v5.4.1 v5.4.0"
 
 # Validate old_ready then trigger the helper URI. All failure paths leave a
 # `<task>.autoclose_failed.txt` next to the ack files so the watcher won't
@@ -412,6 +470,27 @@ try_autoclose() {
 
     local nonce; nonce=$(json_get "$old_ready" "nonce")
 
+    # P0: task / project / nonce are interpolated unescaped into the helper URI
+    # query below. task & project are kebab-constrained upstream (dump-time
+    # validate_task_id / validate_project_slug + the .submitted filename), but
+    # nonce is operator-supplied — reject any value that could inject extra
+    # query params (& # = / space …) so the helper can never be steered onto the
+    # wrong tab and close an unrelated session.
+    case "$task$project" in
+        *[!a-z0-9-]*)
+            printf 'task_id: %s\nreason: unsafe_uri_param\nfield: task_or_project\ntime: %s\n' \
+                "$task" "$(now_iso_utc)" > "$failed_marker"
+            log "AUTOCLOSE-FAIL: project=$project task=$task reason=unsafe_uri_param(task/project)"
+            return 0 ;;
+    esac
+    case "$nonce" in
+        *[!A-Za-z0-9._-]*)
+            printf 'task_id: %s\nreason: unsafe_uri_param\nfield: nonce\nnonce: %s\ntime: %s\n' \
+                "$task" "$nonce" "$(now_iso_utc)" > "$failed_marker"
+            log "AUTOCLOSE-FAIL: project=$project task=$task reason=unsafe_uri_param(nonce)"
+            return 0 ;;
+    esac
+
     # Per-task lock (§7.3 — locks/<task>.autoclose.lock, 5min stale TTL).
     mkdir -p "$locks"
     local lock="$locks/$task.autoclose.lock"
@@ -420,10 +499,11 @@ try_autoclose() {
         log "AUTOCLOSE-SKIP: project=$project task=$task — lock held"
         return 0
     fi
-    trap 'rmdir "$lock" 2>/dev/null || true' RETURN
+    echo "$$" > "$lock/pid" 2>/dev/null || true
+    trap 'release_lock "$lock"' RETURN
     # Re-check sentinels after acquiring the lock (TOCTOU defence per v4 #4).
     if [ -f "$done_marker" ] || [ -f "$failed_marker" ]; then
-        rmdir "$lock" 2>/dev/null || true
+        release_lock "$lock"
         trap - RETURN
         return 0
     fi
@@ -439,7 +519,7 @@ try_autoclose() {
             "$task" "$nonce" "$(now_iso_utc)" > "$failed_marker"
         log "AUTOCLOSE-FAIL: project=$project task=$task reason=open_uri_failed"
     fi
-    rmdir "$lock" 2>/dev/null || true
+    release_lock "$lock"
     trap - RETURN
 }
 

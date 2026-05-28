@@ -92,8 +92,10 @@ if [ -f "$EVID" ]; then
     [ -f "$OLDREADY" ] && jq '{{session_id_kind, retro_evidence_hash, commit_hash}}' "$OLDREADY"
     echo "✅ 前任 retro evidence 在位 — 可推进 task"
 else
-    echo "⚠️  前任无 retro.evidence.json — Phase 4a opt-in 阶段，legacy 路径容忍。"
-    echo "   待 HANDOFF_RETRO_MANDATE=1 全局启用后，此情况须写 queue/$TASK.BLOCKED.md 通知主人裁决。"
+    echo "⛔ 前任无 retro.evidence.json — HANDOFF_RETRO_MANDATE=1 已拨 (Phase 4c, 2026-05-29)。"
+    echo "   不要代签、不要自己补跑 precheck 假装前任复盘过 (spec §2.3 Q9)。"
+    echo "   立即写 queue/$TASK.BLOCKED.md 注明 '前任缺 retro evidence' 并通知主人裁决；"
+    echo "   仅在主人显式授权后用 'handoff precheck --mode forensic_retro' 补登记。"
 fi
 ```
 

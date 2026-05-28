@@ -567,3 +567,79 @@ def test_D3_no_old_ready_when_retro_evidence_omitted(tmp_path, monkeypatch):
     assert rc == 0
     old_ready = home / PROJECT / "ack" / f"{TASK}.old_ready"
     assert not old_ready.exists()
+
+
+# ─── Phase 4e R2 gap-close — codex R1 P0/P1 regressions ─────────────────────
+#
+# These pin the fixes for the 2026-05-29 codex R1 audit of the Phase 4d
+# implementation. The overdue-scanner timezone cases (V05-V07) lock in
+# tz-correct ISO-8601 handling across the formats live overrides actually use
+# (Z / ±offset / naive). V08 + A13 + A14 are strict regressions that FAIL on
+# the pre-fix code.
+
+
+def test_V05_non_utc_past_deadline_writes_marker(home, stubbed_env):
+    # P0-1: a +08:00 deadline must be parsed timezone-aware, not lexically.
+    _write_override(home, TASK, "2020-06-05T00:00:00+08:00", "next-task")
+    _run_script(stubbed_env)
+    marker = home / PROJECT / "ack" / f"{TASK}.retro_overdue.txt"
+    assert marker.exists()
+
+
+def test_V06_naive_date_only_past_deadline_writes_marker(home, stubbed_env):
+    # P0-1: a bare date (no time, no tz) is assumed UTC midnight.
+    _write_override(home, TASK, "2020-01-01", "next-task")
+    _run_script(stubbed_env)
+    marker = home / PROJECT / "ack" / f"{TASK}.retro_overdue.txt"
+    assert marker.exists()
+
+
+def test_V07_future_non_utc_deadline_no_marker(home, stubbed_env):
+    # P0-1: a far-future +08:00 deadline must NOT be flagged overdue.
+    _write_override(home, TASK, "2099-01-01T00:00:00+08:00", "next-task")
+    _run_script(stubbed_env)
+    marker = home / PROJECT / "ack" / f"{TASK}.retro_overdue.txt"
+    assert not marker.exists()
+
+
+def test_V08_path_traversal_follow_task_is_skipped(home, stubbed_env):
+    # P0-2: a follow_task with path separators must be skipped, never used to
+    # resolve a foreign evidence file. Deadline is past, so WITHOUT the guard
+    # the scanner would write an overdue marker; the guard suppresses it.
+    _write_override(home, TASK, "2020-01-01T00:00:00+00:00", "../../../tmp/evil")
+    _run_script(stubbed_env)
+    marker = home / PROJECT / "ack" / f"{TASK}.retro_overdue.txt"
+    override = home / PROJECT / "ack" / f"{TASK}.retro.override.json"
+    assert not marker.exists()
+    assert override.exists()  # not cleared by a crafted follow_task
+
+
+def test_A13_unsafe_nonce_rejected_before_uri(home, stubbed_env):
+    # P0-3: a nonce with URI-significant chars must fail closed, never reach the
+    # helper URI (which could otherwise be steered onto the wrong tab).
+    evidence = _make_evidence(home, nonce="ok")
+    _write_old_ready(home, TASK, evidence, nonce="bad&project=other")
+    _touch_submitted(home, TASK)
+
+    _run_script(stubbed_env)
+    failed = home / PROJECT / "ack" / f"{TASK}.autoclose_failed.txt"
+    done = home / PROJECT / "ack" / f"{TASK}.autoclose_done"
+    assert failed.exists()
+    assert not done.exists()
+    assert "unsafe_uri_param" in failed.read_text()
+    open_sink = Path(stubbed_env["_OPEN_SINK"])
+    assert not open_sink.exists() or "task_id" not in open_sink.read_text()
+
+
+def test_A14_prior_schema_version_v540_accepted(home, stubbed_env):
+    # P1-2: an old_ready written by an earlier build (v5.4.0) must still
+    # autoclose — the watcher allow-list keeps prior versions for compat.
+    evidence = _make_evidence(home, nonce="compat")
+    _write_old_ready(home, TASK, evidence, nonce="compat", schema_version="v5.4.0")
+    _touch_submitted(home, TASK)
+
+    _run_script(stubbed_env)
+    done = home / PROJECT / "ack" / f"{TASK}.autoclose_done"
+    failed = home / PROJECT / "ack" / f"{TASK}.autoclose_failed.txt"
+    assert done.exists(), list((home / PROJECT / "ack").iterdir())
+    assert not failed.exists()
