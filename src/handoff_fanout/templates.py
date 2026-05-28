@@ -1,0 +1,490 @@
+"""Markdown templates rendered into handoff queue files.
+
+Three top-level builders, one per file kind:
+  - ``build_handoff_md`` — the standard single-task baton handed to the next session.
+  - ``build_sub_task_handoff_md`` — given to each fan-out worker tab (role=sub-task).
+  - ``build_fan_in_handoff_md`` — given to the tab that consolidates a finished batch.
+
+Project-specific blocks (e.g. accounting redlines, in-house legislation) are
+not hardcoded; instead, the caller supplies them via ``inject_blocks`` from
+``handoff_fanout.config.Config``.
+
+Templates are plain f-strings (no Jinja dependency) so the wheel stays
+zero-dep.
+"""
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable
+
+
+def _join_inject_blocks(blocks: Iterable[str]) -> str:
+    return "\n\n".join(b.rstrip() for b in blocks if b and b.strip())
+
+
+def _format_baseline_block(baseline: dict) -> str:
+    """Render the baseline header — only fields actually present are shown."""
+    lines = [
+        f"**HEAD**: `{baseline.get('git_head', '(unknown)')}` "
+        f"({baseline.get('branch', 'main')})",
+    ]
+    for k, v in baseline.items():
+        if k in {"git_head", "branch", "last_3_commits"}:
+            continue
+        if v in (None, "", "(N/A)"):
+            continue
+        lines.append(f"**{k}**: `{v}`")
+    return "\n".join(lines)
+
+
+def build_handoff_md(
+    *,
+    task: str,
+    project: str,
+    workspace: Path,
+    next_brief: str,
+    status: str,
+    tests: str | None,
+    baseline: dict,
+    roadmap_excerpt: str,
+    inject_blocks: Iterable[str],
+    handoff_home: Path,
+    handoff_md_path: Path,
+) -> str:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    baseline_block = _format_baseline_block(baseline)
+
+    test_section = ""
+    if tests:
+        test_section = f"""
+### 测试基线
+```bash
+cd {workspace}
+pytest {tests} 2>&1 | tail -10
+# 期望全 PASS / fail 即停 + dump --status blocked
+```
+"""
+
+    inject_section = _join_inject_blocks(inject_blocks)
+    if inject_section:
+        inject_section = "\n" + inject_section + "\n"
+
+    return f"""\
+# Handoff — project `{project}` / task `{task}`
+
+**生成**: {now}
+**Project**: `{project}` ({workspace})
+{baseline_block}
+**Status**: `{status}`
+
+## 第一步: Baseline 验证 (新会话开局必跑)
+
+```bash
+cd {workspace}
+git log --oneline -1                          # 应 = {baseline.get('git_head', '(unknown)')}
+git status -sb                                 # 工作区干净
+```
+
+近 3 commits:
+```
+{baseline.get('last_3_commits', '(unavailable)')}
+```
+{test_section}
+
+## 当前进度 (roadmap 摘要)
+
+{roadmap_excerpt}
+
+## 下一步任务 (task: `{task}`)
+
+{next_brief}
+
+## 必读 (按顺序 / 项目相关)
+
+1. 本文件 (`{handoff_md_path}`)
+2. 项目 CLAUDE.md / AGENTS.md (`{workspace}/CLAUDE.md`)
+3. 当前 task 涉及的源文件
+{inject_section}
+## STOP 控制 (主人秒级介入)
+
+```bash
+touch {handoff_home}/STOP_AUTO                       # 全局暂停所有项目
+touch {handoff_home}/{project}/STOP_AUTO              # 仅暂停本项目
+touch {handoff_home}/done                            # 全局永久停所有
+touch {handoff_home}/{project}/queue/{task}.done      # 仅停本 task
+```
+
+中文快捷指令 (任何会话有效):
+- `暂停` / `pause` → touch {handoff_home}/STOP_AUTO
+- `放行` / `resume` → rm STOP_AUTO
+- `永久停` / `done` → touch {handoff_home}/done
+- `状态` / `status` → ls {handoff_home}/*/queue/
+
+## AI 自检 (闭环前)
+
+4 触发场景任一命中 → 必沉淀全局 skill:
+1. 写 > 30 行复用脚本
+2. 跨项目共享库
+3. 文档提取 / 邮箱 / OCR / 银行
+4. 绕守护 / 解锁
+
+## 启动指令
+
+按主人 5/27 立法自主推进 task `{task}` (project `{project}`). 闭环后调:
+
+```bash
+cd {workspace}
+handoff dump \\
+    --task <next-task-id> \\
+    --next "<next-task-brief>" \\
+    --status active \\
+    --tests "<test-files>"
+# project + workspace 自动从 cwd 推断
+```
+
+成功 → launchd / cron WatchPaths 1 秒内 spawn 新 Claude tab.
+
+## 并发会话提示
+
+Queue 模式: 本会话只负责自己的 task `{task}`. 同项目内其他 task 由各自会话推进.
+跨项目: 主人可能并行推其他项目, 本会话仅在 `{project}` 内活动.
+"""
+
+
+def build_sub_task_handoff_md(
+    *,
+    task: str,
+    project: str,
+    workspace: Path,
+    next_brief: str,
+    batch_id: str,
+    sub_task_id: str,
+    file_ownership: list[dict],
+    baseline: dict,
+    roadmap_excerpt: str,
+    inject_blocks: Iterable[str],
+    handoff_home: Path,
+    git_guard_path: Path,
+) -> str:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ownership_md = "\n".join(
+        f"- type=`{o['type']}` path=`{o['path']}`" for o in file_ownership
+    )
+    role_env_path = handoff_home / project / "batches" / batch_id / f"{sub_task_id}.env"
+    batch_dir_disp = handoff_home / project / "batches" / batch_id
+    inject_section = _join_inject_blocks(inject_blocks)
+    if inject_section:
+        inject_section = "\n" + inject_section + "\n"
+
+    return f"""\
+# Handoff v5 SUB-TASK — `{project}` / `{task}`
+
+**生成**: {now} | **HEAD**: `{baseline.get('git_head', '(unknown)')}` | **batch**: `{batch_id}` | **sub-task**: `{sub_task_id}`
+
+## 🛡 第零步: 孤儿自检 (v5.2 / 必跑 / 缺则立即 BLOCKED)
+
+**触发原因**: 历史 case 发现 spawn 完成后 batch_dir 被外部 rm, sub-task tab
+在没有 env / manifest 的壳中跑成孤儿. 本步骤是孤儿自我识别 + 优雅退出.
+**任何 Bash 操作之前必须先跑这个 block**:
+
+```bash
+ORPHAN_FAIL=""
+[ -d "{batch_dir_disp}" ] || ORPHAN_FAIL="batch_dir 不存在: {batch_dir_disp}"
+[ -z "$ORPHAN_FAIL" ] && [ -f "{role_env_path}" ] || ORPHAN_FAIL="${{ORPHAN_FAIL:-env 文件不存在: {role_env_path}}}"
+[ -z "$ORPHAN_FAIL" ] && [ -d "{git_guard_path}" ] || ORPHAN_FAIL="${{ORPHAN_FAIL:-git wrapper 目录不存在: {git_guard_path}}}"
+[ -z "$ORPHAN_FAIL" ] && [ -f "{batch_dir_disp}/manifest.json" ] || ORPHAN_FAIL="${{ORPHAN_FAIL:-manifest.json 不存在}}"
+
+if [ -n "$ORPHAN_FAIL" ]; then
+    echo "❌ 孤儿自检失败: $ORPHAN_FAIL"
+    mkdir -p {handoff_home}/{project}/queue
+    cat > {handoff_home}/{project}/queue/{sub_task_id}.BLOCKED.md <<EOF
+# BLOCKED — orphan sub-task ({sub_task_id})
+
+Reason: $ORPHAN_FAIL
+Detected at: $(date -Iseconds)
+Batch: {batch_id}
+Workspace: {workspace}
+
+## 主人恢复路径
+1. handoff dump --cleanup-orphan 列孤儿
+2. 确认无误后 --cleanup-orphan --apply 清残留
+3. 手动关闭本 VS Code Claude tab (task: {sub_task_id})
+EOF
+    exit 1
+fi
+echo "✅ 孤儿自检通过 (batch_dir + env + git_guard + manifest 全在)"
+```
+
+## ⚠️ 第一步: 角色环境 (v5 hard rule)
+
+**本 tab 是 sub-task 角色, 禁 git commit/push/rebase/reset/cherry-pick/tag/revert.**
+
+每次 Bash 调用必须先 source 角色环境 (强制):
+
+```bash
+source {role_env_path}
+```
+
+这会设置:
+- `HANDOFF_ROLE=sub-task`
+- `HANDOFF_BATCH_ID={batch_id}`
+- `HANDOFF_SUB_TASK_ID={sub_task_id}`
+- `PATH={git_guard_path}:$PATH` (git wrapper 接管)
+
+git wrapper + pre-commit hook 双保险: sub-task 角色调 commit 会被物理拦截.
+
+## 第二步: 启动 heartbeat (v5.1 / 529 风暴防御)
+
+```bash
+( while true; do
+    touch {handoff_home}/{project}/batches/{batch_id}/{sub_task_id}.heartbeat
+    sleep 60
+  done ) &
+echo $! > /tmp/heartbeat-{sub_task_id}.pid
+# 闭环前 kill: kill $(cat /tmp/heartbeat-{sub_task_id}.pid)
+```
+
+## 第三步: Baseline 验证
+
+```bash
+cd {workspace}
+source {role_env_path}
+git log --oneline -1                          # 应 = {baseline.get('git_head', '(unknown)')}
+git status -sb                                 # 工作区干净
+```
+
+## 文件领域 (file_ownership 严格不可越界)
+
+{ownership_md}
+
+**越界行为**: fan-in tab 会 grep working tree diff 抓到越界文件 + dump BLOCKED. 你的工作会被回滚.
+
+## 当前进度 (roadmap 摘要)
+
+{roadmap_excerpt}
+
+## 你的任务 (sub-task `{sub_task_id}`)
+
+{next_brief}
+
+## 闭环规范
+
+**只在 file_ownership 范围内改文件**. 不要 git commit (会被 wrapper 拦). 完成后:
+
+```bash
+cd {workspace}
+source {role_env_path}
+handoff dump \\
+    --task {sub_task_id}-done \\
+    --next "(by fan-in tab)" \\
+    --batch-id {batch_id} \\
+    --batch-done
+```
+
+失败 → `--batch-blocked` + `--blocked-reason "<reason>"`.
+
+## STOP 控制
+
+```bash
+touch {handoff_home}/STOP_AUTO                                    # 全局暂停
+touch {handoff_home}/{project}/STOP_AUTO                            # 项目暂停
+touch {handoff_home}/{project}/batches/{batch_id}/STOP              # batch 暂停
+```
+{inject_section}"""
+
+
+def build_fan_in_handoff_md(
+    *,
+    project: str,
+    workspace: Path,
+    batch_id: str,
+    manifest: dict,
+    done_files: set[str],
+    blocked_files: set[str],
+    baseline: dict,
+    inject_blocks: Iterable[str],
+    handoff_home: Path,
+    degraded: bool = False,
+    missing: set[str] | None = None,
+) -> str:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    fan_in_task = manifest["fan_in_task"]
+    next_after = manifest.get("next_after_fanin", "(待定)")
+    role_env_path = handoff_home / project / "batches" / batch_id / "fan-in.env"
+    batch_dir = handoff_home / project / "batches" / batch_id
+
+    sub_tasks_md = "\n".join(
+        f"- `{st['id']}`: {st['brief']} "
+        f"({'✅ done' if st['id'] in done_files else '❌ blocked' if st['id'] in blocked_files else '⚠️ missing'})"
+        for st in manifest["sub_tasks"]
+    )
+
+    degraded_section = ""
+    if degraded:
+        missing_str = ", ".join(sorted(missing or [])) or "(none)"
+        degraded_section = f"""
+
+## ⚠️ DEGRADED MODE (watchdog 超时降级)
+
+`missing_sub_tasks` (无 .done 无 .blocked): {missing_str}
+
+按 v5 §7.2 详细化:
+1. `git status --porcelain=v1` 快照半成品
+2. 按 file_ownership 归属分类: accept / orphan / unknown
+3. 如 orphan 或 unknown 非空 → dump --status blocked + 三选一让主人裁决:
+   - A. 采纳 (orphan 视同 missing sub-task 完成)
+   - B. 回滚 (git checkout -- + rm)
+   - C. 移 recovery (mv 到 .recovery/{batch_id}/)
+"""
+
+    inject_section = _join_inject_blocks(inject_blocks)
+    if inject_section:
+        inject_section = "\n" + inject_section + "\n"
+
+    return f"""\
+# Handoff v5 FAN-IN — `{project}` / `{fan_in_task}`
+
+**生成**: {now} | **HEAD**: `{baseline.get('git_head', '(unknown)')}` | **batch**: `{batch_id}`
+
+## 你的角色: FAN-IN tab
+
+汇总所有 sub-task 结果 + 统一 commit + 跑回归测试 + 推进下一个 task.
+
+## 第一步: 启动状态机 (v5 §4.6)
+
+```bash
+cd {workspace}
+source {role_env_path}    # 设置 HANDOFF_ROLE=fan-in (git wrapper 放行 commit)
+
+# atomic_create _fan_in_started + 开启心跳后台 (60s touch _fan_in_heartbeat)
+handoff heartbeat heartbeat {batch_dir} &
+HEARTBEAT_PID=$!
+echo "💓 heartbeat daemon pid=$HEARTBEAT_PID"
+```
+
+崩溃恢复: watchdog 3 min 检测心跳失活, 自动重 dump 让你重启 (幂等).
+
+## Batch 信息
+
+- batch_id: `{batch_id}`
+- 拆分依据: {manifest.get('split_rationale', '(N/A)')}
+- Amdahl 估算: {manifest.get('amdahl_estimate', {}).get('estimated_speedup', 'N/A')}x
+
+## Sub-task 状态
+
+{sub_tasks_md}
+{degraded_section}
+
+## 必做 7 步 (v5 §6.2)
+
+### Step 2: working tree 全量审计
+
+```bash
+cd {workspace}
+source {role_env_path}
+git diff --name-only HEAD > /tmp/modified.txt
+git diff --cached --name-only > /tmp/staged.txt
+git ls-files --others --exclude-standard > /tmp/untracked.txt
+cat /tmp/modified.txt /tmp/staged.txt /tmp/untracked.txt | sort -u > /tmp/all_changes.txt
+wc -l /tmp/all_changes.txt
+```
+
+### Step 3: file_ownership 守纪律
+
+```bash
+python3 -c "
+import json, sys
+from pathlib import Path
+from handoff_fanout.dump import expand_ownership
+mf = json.load(open('{batch_dir}/manifest.json'))
+ws = Path('{workspace}')
+all_owned = set()
+for st in mf['sub_tasks']:
+    for spec in st['file_ownership']:
+        all_owned |= expand_ownership(spec, ws)
+all_changes = set(open('/tmp/all_changes.txt').read().splitlines())
+out_of_scope = all_changes - all_owned
+print(f'all_changes: {{len(all_changes)}} / owned: {{len(all_owned)}}')
+if out_of_scope:
+    print('❌ 越界:', out_of_scope)
+    sys.exit(1)
+print('✅ file_ownership pass')
+"
+```
+
+### Step 4: 验证无擅自 commit
+
+```bash
+git log --oneline HEAD@{{1}}..HEAD
+# 期待: 空 (sub-task 被 git wrapper 拦截了)
+```
+
+### Step 5: 统一 git add + commit (仅 file_ownership 范围)
+
+```bash
+xargs git add < /tmp/owned_changes.txt
+git commit -m "feat({batch_id}): 汇总 {len(done_files)}/{len(manifest['sub_tasks'])} sub-task"
+```
+
+### Step 6: 跑全量回归测试
+
+```bash
+pytest tests/ 2>&1 | tail -30
+```
+
+### Step 7: 状态机收尾 + 记录 metrics
+
+```bash
+handoff heartbeat complete {batch_dir} \\
+    --actual-minutes <wall-time-min> \\
+    --amdahl-actual <实际 speedup> \\
+    --summary "<batch 汇总>"
+```
+
+### Step 8: dump 下一个 task
+
+```bash
+cd {workspace}
+handoff dump \\
+    --task {next_after} \\
+    --next "<brief>" \\
+    --status active
+```
+{inject_section}"""
+
+
+def build_blocked_md(*, project: str, task: str, head: str, reason: str) -> str:
+    return (
+        f"# BLOCKED — project `{project}` / task `{task}`\n\n"
+        f"Generated: {datetime.now()}\n"
+        f"HEAD: {head}\n\n"
+        f"## Reason\n{reason or '(unspecified)'}\n"
+    )
+
+
+def build_orphan_blocked_md(
+    *, project: str, task_id: str, age_seconds: float, grace_seconds: float,
+    handoff_home: Path, workspace_root: Path, now_iso: str,
+) -> str:
+    return (
+        f"# BLOCKED — orphan sub-task `{task_id}` (watchdog mode 5)\n\n"
+        f"Detected at: {now_iso}\n"
+        f"Spawned age: {age_seconds:.0f}s (> {grace_seconds:.0f}s grace)\n"
+        f"Project: {project}\n\n"
+        f"## 判定依据\n"
+        f"`ack/{task_id}.spawned` 文件存在 (launchd 已派会话), 但:\n"
+        f"- `queue/{task_id}.md` 不存在 (task 文件被消费/清掉)\n"
+        f"- `queue/{task_id}.done` 不存在 (未闭环)\n"
+        f"- `queue/{task_id}.BLOCKED.md` 不存在 (无 BLOCKED 记录)\n\n"
+        f"= **孤儿 tab**: 任务调度环境仍在跑, 但没任务可做.\n\n"
+        f"## 可能原因\n"
+        f"1. batch_dir 被外部 rm (cleanup 未级联清 spawned tab)\n"
+        f"2. STOP_AUTO 之前/期间清了 queue/*.md\n"
+        f"3. dump spawn 中途崩, 已 spawn 的 tab 留下成孤儿\n\n"
+        f"## 主人恢复路径\n"
+        f"1. 查 `{handoff_home}/{project}/launched/{task_id}-*.txt` 确认是哪次 spawn\n"
+        f"2. 跑 `handoff dump --cleanup-orphan` 列所有孤儿\n"
+        f"3. 确认后 `--cleanup-orphan --apply` 清残留\n"
+        f"4. 手动关闭 IDE 中 task=`{task_id}` 的 Claude tab\n"
+    )

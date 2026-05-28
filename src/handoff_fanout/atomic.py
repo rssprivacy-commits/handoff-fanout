@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import os
+import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -95,6 +96,11 @@ def acquire_dir_lock(
     if lock_path.exists():
         age = time.time() - lock_path.stat().st_mtime
         if age > stale_seconds:
+            print(
+                f"handoff-safe-commit: 锁陈旧 stale lock at {lock_path} "
+                f"(age={age:.0f}s > {stale_seconds:.0f}s) — force clearing",
+                file=sys.stderr,
+            )
             _force_clear_lock(lock_path)
 
     for attempt in range(retries):
