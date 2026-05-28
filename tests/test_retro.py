@@ -495,3 +495,141 @@ def test_resolve_session_id_falls_back_when_unset(monkeypatch):
     sid, kind = handoff_precheck.resolve_session_id()
     assert kind == "fallback-fingerprint"
     assert sid.startswith("fp-")
+
+
+# ─── §7.13 reason-on-non-pass enforcement (B1 invariant) ─────────────────────
+
+
+def _run_precheck(
+    *,
+    workspace: Path,
+    project=PROJECT,
+    task=TASK,
+    phase0: list[str] | None = None,
+    phase1: list[str] | None = None,
+    extra: list[str] | None = None,
+) -> tuple[int, str]:
+    """Invoke handoff_precheck.main and capture stderr."""
+    argv = ["--task", task, "--project", project, "--workspace", str(workspace), "--no-lock"]
+    for kv in phase0 or []:
+        argv += ["--phase0-status", kv]
+    for kv in phase1 or []:
+        argv += ["--phase1-status", kv]
+    if extra:
+        argv += extra
+    import io
+
+    old_stderr = sys.stderr
+    buf = io.StringIO()
+    sys.stderr = buf
+    try:
+        code = handoff_precheck.main(argv)
+    finally:
+        sys.stderr = old_stderr
+    return code, buf.getvalue()
+
+
+def _all_pass_flags() -> tuple[list[str], list[str]]:
+    return (
+        [f"{k}=✅" for k in handoff_precheck.PHASE0_KEYS],
+        [f"{k}=✅" for k in handoff_precheck.PHASE1_KEYS],
+    )
+
+
+def test_parse_phase_kv_inline_reason():
+    out = handoff_precheck._parse_phase_kv(["audit=⚠️:codex pending: see R1"])
+    assert out["audit"]["status"] == "⚠️"
+    # colon inside the reason is preserved (split on first colon only)
+    assert out["audit"]["reason"] == "codex pending: see R1"
+
+
+def test_parse_phase_kv_status_only_has_no_reason():
+    out = handoff_precheck._parse_phase_kv(["memory=✅"])
+    assert out["memory"] == {"status": "✅"}
+
+
+def test_cli_warning_without_reason_rejected(handoff_home, workspace):
+    p0, p1 = _all_pass_flags()
+    # override audit to ⚠️ with no reason
+    p0 = [f for f in p0 if not f.startswith("audit=")] + ["audit=⚠️"]
+    code, err = _run_precheck(workspace=workspace, phase0=p0, phase1=p1)
+    assert code == 1
+    assert "ERR-FATAL reason-required" in err
+    assert "phase0.audit" in err
+    # no evidence file should have been written
+    assert not (handoff_home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json").exists()
+
+
+def test_cli_skip_without_reason_rejected(handoff_home, workspace):
+    p0, p1 = _all_pass_flags()
+    p1 = [f for f in p1 if not f.startswith("codex=")] + ["codex=skip"]
+    code, err = _run_precheck(workspace=workspace, phase0=p0, phase1=p1)
+    assert code == 1
+    assert "reason-required" in err
+    assert "phase1.codex" in err
+
+
+def test_cli_status_with_reason_accepted(handoff_home, workspace):
+    p0, p1 = _all_pass_flags()
+    p0 = [f for f in p0 if not f.startswith("audit=")] + ["audit=⚠️:codex pending review"]
+    p1 = [f for f in p1 if not f.startswith("codex=")] + ["codex=skip:not a code change"]
+    code, err = _run_precheck(workspace=workspace, phase0=p0, phase1=p1)
+    assert code == 0, err
+    ev = handoff_home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json"
+    assert ev.exists()
+    payload = json.loads(ev.read_text())
+    assert payload["phase0"]["audit"]["reason"] == "codex pending review"
+    assert payload["phase1"]["codex"]["reason"] == "not a code change"
+
+
+def test_cli_all_pass_without_reason_accepted(handoff_home, workspace):
+    """Backward compat: ✅ statuses need no reason."""
+    p0, p1 = _all_pass_flags()
+    code, err = _run_precheck(workspace=workspace, phase0=p0, phase1=p1)
+    assert code == 0, err
+    ev = handoff_home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json"
+    assert ev.exists()
+
+
+def test_cli_emitted_evidence_passes_gate(handoff_home, workspace):
+    """End-to-end: CLI evidence with reasons survives the dump gate."""
+    p0, p1 = _all_pass_flags()
+    p0 = [f for f in p0 if not f.startswith("audit=")] + ["audit=⚠️:codex queued"]
+    code, err = _run_precheck(workspace=workspace, phase0=p0, phase1=p1)
+    assert code == 0, err
+    ev = handoff_home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json"
+    dcode, derr = _run_dump(workspace=workspace, retro_evidence=ev)
+    assert dcode == 0, derr
+
+
+def test_gate_warning_without_reason_rejected(handoff_home, workspace):
+    """Defence-in-depth: hand-crafted evidence bypassing the CLI is rejected."""
+    payload = _make_payload(
+        workspace, phase0_overrides={"audit": {"status": "⚠️"}}
+    )
+    ev = _write_evidence(handoff_home, payload)
+    code, err = _run_dump(workspace=workspace, retro_evidence=ev)
+    assert code == 4
+    assert "ERR-RETRY" in err
+    assert "phase0-status-missing-reason" in err
+
+
+def test_gate_failed_status_without_reason_rejected(handoff_home, workspace):
+    payload = _make_payload(
+        workspace, phase1_overrides={"prs": {"status": "❌"}}
+    )
+    ev = _write_evidence(handoff_home, payload)
+    code, err = _run_dump(workspace=workspace, retro_evidence=ev)
+    assert code == 4
+    assert "phase1-status-missing-reason" in err
+
+
+def test_gate_non_pass_with_reason_accepted(handoff_home, workspace):
+    payload = _make_payload(
+        workspace,
+        phase0_overrides={"tests": {"status": "skip", "reason": "no test surface"}},
+        phase1_overrides={"prs": {"status": "❌", "reason": "no PR opened"}},
+    )
+    ev = _write_evidence(handoff_home, payload)
+    code, err = _run_dump(workspace=workspace, retro_evidence=ev)
+    assert code == 0, err

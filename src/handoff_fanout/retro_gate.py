@@ -41,6 +41,7 @@ from handoff_fanout.handoff_precheck import (
     PHASE0_KEYS,
     PHASE1_KEYS,
     PHASE_STATUS_VALID,
+    STATUS_REQUIRING_REASON,
     compute_evidence_hash,
 )
 
@@ -457,10 +458,10 @@ def _validate_phase_status(payload: dict) -> GateResult | None:
                     f"{section}-status-invalid",
                     f"{section}.{k}.status={status!r} not in {sorted(PHASE_STATUS_VALID)}",
                 )
-            if status == "skip" and not entry.get("reason"):
+            if status in STATUS_REQUIRING_REASON and not entry.get("reason"):
                 return _retry(
-                    f"{section}-skip-missing-reason",
-                    f"{section}.{k} status=skip requires reason",
+                    f"{section}-status-missing-reason",
+                    f"{section}.{k} status={status} requires reason (only ✅ may omit it)",
                 )
     return None
 

@@ -40,6 +40,11 @@ PHASE0_KEYS = ("memory", "tests", "audit", "commit", "code_review")
 PHASE1_KEYS = ("codex", "claude_md", "l2_memory", "tests", "prs")
 PHASE_STATUS_VALID = {"✅", "⚠️", "❌", "skip"}
 
+# Any non-✅ status is a claim that an item was partial / skipped / failed.
+# Such a claim is meaningless without a reason, so the gate (and the CLI
+# that emits evidence) require one. ✅ ("done") needs no explanation.
+STATUS_REQUIRING_REASON = {"⚠️", "❌", "skip"}
+
 MODE_NORMAL = "normal"
 MODE_FORENSIC_RETRO = "forensic_retro"
 MODE_VALID = {MODE_NORMAL, MODE_FORENSIC_RETRO}
@@ -295,7 +300,14 @@ def write_evidence(payload: dict, output: Path) -> None:
 
 
 def _parse_phase_kv(values: list[str] | None) -> dict:
-    """Parse ``--phase0-status item=status`` pairs into a dict."""
+    """Parse ``--phaseN-status item=status[:reason]`` pairs into a dict.
+
+    Grammar: ``item=status`` or ``item=status:reason text here``. The status
+    is everything between ``=`` and the first ``:``; the reason is everything
+    after that first ``:`` (verbatim, stripped — colons inside the reason are
+    preserved). Valid statuses (✅/⚠️/❌/skip) never contain a colon, so the
+    split is unambiguous.
+    """
     out: dict[str, dict] = {}
     if not values:
         return out
@@ -305,8 +317,44 @@ def _parse_phase_kv(values: list[str] | None) -> dict:
         k, v = raw.split("=", 1)
         k = k.strip()
         v = v.strip()
-        out[k] = {"status": v}
+        if ":" in v:
+            status, reason = v.split(":", 1)
+            entry: dict = {"status": status.strip()}
+            reason = reason.strip()
+            if reason:
+                entry["reason"] = reason
+        else:
+            entry = {"status": v}
+        out[k] = entry
     return out
+
+
+def _status_and_reason(entry: object) -> tuple[str | None, str | None]:
+    """Normalize a phase-status entry (str or dict) to ``(status, reason)``."""
+    if isinstance(entry, str):
+        return entry, None
+    if isinstance(entry, dict):
+        return entry.get("status"), entry.get("reason")
+    return None, None
+
+
+def check_reason_required(statuses: dict, keys: tuple[str, ...], section: str) -> str | None:
+    """Return an error string when a non-✅ status lacks a reason, else ``None``.
+
+    Enforces the v5.4 §7.13 invariant at the CLI surface: any ⚠️/❌/skip
+    status must carry a reason so retro evidence cannot be a ceremonial
+    checkbox. The dump-side gate re-checks this (defence in depth).
+    """
+    for k, entry in statuses.items():
+        if k not in keys:
+            continue
+        status, reason = _status_and_reason(entry)
+        if status in STATUS_REQUIRING_REASON and not reason:
+            return (
+                f"ERR-FATAL reason-required: {section}.{k} status={status!r} requires a "
+                f"reason — use --{section}-status {k}={status}:<why it was not ✅>"
+            )
+    return None
 
 
 def _load_phase_file(path: Path | None) -> dict:
@@ -346,13 +394,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--phase0-status",
         action="append",
         default=[],
-        help="repeatable; e.g. --phase0-status memory=✅",
+        help="repeatable; item=status[:reason]. ✅ needs no reason; ⚠️/❌/skip "
+        "require one, e.g. --phase0-status audit=⚠️:codex pending",
     )
     ap.add_argument(
         "--phase1-status",
         action="append",
         default=[],
-        help="repeatable; e.g. --phase1-status codex=⚠️",
+        help="repeatable; item=status[:reason]. ⚠️/❌/skip require a reason, "
+        "e.g. --phase1-status codex=skip:not a code change",
     )
     ap.add_argument(
         "--phase-status-file",
@@ -387,6 +437,14 @@ def main(argv: list[str] | None = None) -> int:
     p1 = dict(file_overrides.get("phase1", {}))
     p0.update(_parse_phase_kv(args.phase0_status))
     p1.update(_parse_phase_kv(args.phase1_status))
+
+    reason_err = (
+        check_reason_required(p0, PHASE0_KEYS, "phase0")
+        or check_reason_required(p1, PHASE1_KEYS, "phase1")
+    )
+    if reason_err:
+        sys.stderr.write(reason_err + "\n")
+        return 1
 
     output = (
         Path(args.output)
