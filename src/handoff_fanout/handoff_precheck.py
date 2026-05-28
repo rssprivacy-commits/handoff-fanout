@@ -349,7 +349,8 @@ def check_reason_required(statuses: dict, keys: tuple[str, ...], section: str) -
         if k not in keys:
             continue
         status, reason = _status_and_reason(entry)
-        if status in STATUS_REQUIRING_REASON and not reason:
+        reason_ok = isinstance(reason, str) and reason.strip()
+        if status in STATUS_REQUIRING_REASON and not reason_ok:
             return (
                 f"ERR-FATAL reason-required: {section}.{k} status={status!r} requires a "
                 f"reason — use --{section}-status {k}={status}:<why it was not ✅>"

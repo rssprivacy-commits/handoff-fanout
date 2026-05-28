@@ -655,3 +655,25 @@ def test_gate_non_pass_with_reason_accepted(handoff_home, workspace):
     ev = _write_evidence(handoff_home, payload)
     code, err = _run_dump(workspace=workspace, retro_evidence=ev)
     assert code == 0, err
+
+
+def test_cli_check_reason_rejects_whitespace_only():
+    """Codex P2: a whitespace-only reason is not a reason."""
+    err = handoff_precheck.check_reason_required(
+        {"audit": {"status": "⚠️", "reason": "   "}},
+        handoff_precheck.PHASE0_KEYS,
+        "phase0",
+    )
+    assert err is not None
+    assert "reason-required" in err
+
+
+def test_gate_whitespace_only_reason_rejected(handoff_home, workspace):
+    """Codex P2 defence-in-depth: hand-edited blank reason can't bypass the gate."""
+    payload = _make_payload(
+        workspace, phase0_overrides={"audit": {"status": "⚠️", "reason": "   "}}
+    )
+    ev = _write_evidence(handoff_home, payload)
+    code, err = _run_dump(workspace=workspace, retro_evidence=ev)
+    assert code == 4
+    assert "phase0-status-missing-reason" in err

@@ -458,10 +458,13 @@ def _validate_phase_status(payload: dict) -> GateResult | None:
                     f"{section}-status-invalid",
                     f"{section}.{k}.status={status!r} not in {sorted(PHASE_STATUS_VALID)}",
                 )
-            if status in STATUS_REQUIRING_REASON and not entry.get("reason"):
+            reason = entry.get("reason")
+            if status in STATUS_REQUIRING_REASON and (
+                not isinstance(reason, str) or not reason.strip()
+            ):
                 return _retry(
                     f"{section}-status-missing-reason",
-                    f"{section}.{k} status={status} requires reason (only ✅ may omit it)",
+                    f"{section}.{k} status={status} requires a non-empty reason (only ✅ may omit it)",
                 )
     return None
 
