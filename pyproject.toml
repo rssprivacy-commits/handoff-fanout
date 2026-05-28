@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "handoff-fanout"
-version = "1.0.0"
+version = "1.1.0"
 description = "Project-agnostic auto-handoff & parallel fan-out for AI coding sessions (Claude Code / Cursor / Aider). 5-layer defense against orphan tasks, git index hijack, and stale handoffs."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -57,6 +57,7 @@ handoff-dump = "handoff_fanout.dump:main"
 handoff-watchdog = "handoff_fanout.watchdog:main"
 handoff-heartbeat = "handoff_fanout.heartbeat:main"
 handoff-safe-commit = "handoff_fanout.safe_commit:main"
+handoff-precheck = "handoff_fanout.handoff_precheck:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/handoff_fanout"]

@@ -1,0 +1,1023 @@
+"""v5.4 retro-evidence gate.
+
+dump-handoff.py asks this module ``check_retro_gate(...)``; the result drives
+the seven-tier exit code protocol from spec §7.1 and triggers any
+side-effects mandated by §7.2-§7.7 (counter bump, BLOCKED artifact,
+warnings.txt, audit jsonl).
+
+The module never writes the queue/ack file the dump itself produces; that
+remains dump.py's job. Here we only touch:
+
+  * ``locks/precheck.lock`` and ``locks/dump.lock``  (§7.3)
+  * ``locks/<task>.retro.attempt.lock``              (§7.3)
+  * ``ack/<task>.retro.attempt_n.txt``               (§7.2)
+  * ``ack/<task>.retro.retry_audit.jsonl``           (§7.2 / §7.3)
+  * ``ack/<task>.retro.warnings.txt``                (§7.7)
+  * ``queue/<task>.BLOCKED.md``                      (§7.4 / §7.2)
+
+Any new artifact added here must also be documented in §7 of the spec.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+
+from handoff_fanout import atomic
+from handoff_fanout import config as _config
+from handoff_fanout.handoff_precheck import (
+    EVIDENCE_KIND_RETRO,
+    EVIDENCE_SCHEMA_VERSION,
+    MODE_FORENSIC_RETRO,
+    MODE_VALID,
+    PHASE0_KEYS,
+    PHASE1_KEYS,
+    PHASE_STATUS_VALID,
+    compute_evidence_hash,
+)
+
+# ─── exit codes (§7.1) ──────────────────────────────────────────────────────
+
+EXIT_OK = 0
+EXIT_FATAL = 1
+EXIT_BLOCKED = 2
+EXIT_LOCKED = 3
+EXIT_RETRY = 4
+EXIT_BYPASS = 6  # exit 5 is intentionally unassigned per §7.1
+
+PREFIX_OK = "OK"
+PREFIX_FATAL = "ERR-FATAL"
+PREFIX_BLOCKED = "ERR-BLOCKED"
+PREFIX_LOCKED = "ERR-LOCKED"
+PREFIX_RETRY = "ERR-RETRY"
+PREFIX_BYPASS = "ERR-BYPASS"
+
+# ─── defaults from §7.7 ─────────────────────────────────────────────────────
+
+DEFAULT_HEAD_FRESHNESS = {
+    "last_commit_max_age_sec": 300,
+    "head_at_precheck_drift_tolerance_sec": 30,
+    "head_stale_action": "retry",  # retry | block | warn-ok
+}
+HEAD_STALE_ACTIONS = {"retry", "block", "warn-ok"}
+
+DEFAULT_FOLLOW_UP = {
+    "default_deadline_minutes": 30,
+    "project_block_on_overdue": True,
+    "scan_interval_sec": 60,
+}
+
+# attempt_n state machine (§7.2)
+ATTEMPT_MAX = 2
+PRECHECK_LOCK_STALE_SEC = 300.0
+DUMP_LOCK_STALE_SEC = 300.0
+ATTEMPT_LOCK_STALE_SEC = 60.0
+
+NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+# ─── result type ────────────────────────────────────────────────────────────
+
+
+@dataclass
+class GateResult:
+    """Single source of truth for a gate outcome.
+
+    ``exit_code`` ↔ ``prefix`` mapping comes from §7.1 — never construct one
+    without the other. ``subcode`` is the machine-parseable token after the
+    prefix (``retro-missing-phase0-memory`` etc.); ``message`` is the
+    human-readable tail.
+    """
+
+    exit_code: int
+    prefix: str
+    subcode: str = ""
+    message: str = ""
+
+    @property
+    def is_ok(self) -> bool:
+        return self.exit_code == EXIT_OK
+
+    def emit(self) -> None:
+        """Write the stderr prefix line per §7.1 contract."""
+        if self.exit_code == EXIT_OK and not self.subcode:
+            return
+        head = f"{self.prefix}"
+        if self.subcode:
+            head += f" {self.subcode}"
+        if self.message:
+            head += f": {self.message}"
+        sys.stderr.write(head + "\n")
+
+
+def _ok() -> GateResult:
+    return GateResult(EXIT_OK, PREFIX_OK)
+
+
+def _retry(subcode: str, msg: str = "") -> GateResult:
+    return GateResult(EXIT_RETRY, PREFIX_RETRY, subcode, msg)
+
+
+def _blocked(subcode: str, msg: str = "") -> GateResult:
+    return GateResult(EXIT_BLOCKED, PREFIX_BLOCKED, subcode, msg)
+
+
+def _locked(subcode: str, msg: str = "") -> GateResult:
+    return GateResult(EXIT_LOCKED, PREFIX_LOCKED, subcode, msg)
+
+
+def _bypass(subcode: str, msg: str = "") -> GateResult:
+    return GateResult(EXIT_BYPASS, PREFIX_BYPASS, subcode, msg)
+
+
+def _fatal(subcode: str, msg: str = "") -> GateResult:
+    return GateResult(EXIT_FATAL, PREFIX_FATAL, subcode, msg)
+
+
+# ─── path helpers ───────────────────────────────────────────────────────────
+
+
+def _home() -> Path:
+    return _config.home_dir()
+
+
+def _ack_dir(project: str) -> Path:
+    return _home() / project / "ack"
+
+
+def _locks_dir(project: str) -> Path:
+    return _home() / project / "locks"
+
+
+def _queue_dir(project: str) -> Path:
+    return _home() / project / "queue"
+
+
+def _config_path(project: str) -> Path:
+    return _home() / project / "handoff.config.json"
+
+
+def _attempt_path(project: str, task: str) -> Path:
+    return _ack_dir(project) / f"{task}.retro.attempt_n.txt"
+
+
+def _audit_path(project: str, task: str) -> Path:
+    return _ack_dir(project) / f"{task}.retro.retry_audit.jsonl"
+
+
+def _warnings_path(project: str, task: str) -> Path:
+    return _ack_dir(project) / f"{task}.retro.warnings.txt"
+
+
+def _override_path(project: str, task: str) -> Path:
+    return _ack_dir(project) / f"{task}.retro.override.json"
+
+
+def _blocked_md_path(project: str, task: str) -> Path:
+    return _queue_dir(project) / f"{task}.BLOCKED.md"
+
+
+# ─── small utils ────────────────────────────────────────────────────────────
+
+
+def _iso_now() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _git(args: list[str], cwd: Path) -> str:
+    try:
+        r = subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+            cwd=str(cwd),
+        )
+        return (r.stdout or "").strip()
+    except (subprocess.SubprocessError, OSError):
+        return ""
+
+
+# ─── config loader (§7.7) ───────────────────────────────────────────────────
+
+
+def load_project_config(project: str) -> dict:
+    """Return merged ``{head_freshness, follow_up}`` dict.
+
+    Missing / malformed file → defaults. Unknown ``head_stale_action`` value
+    is coerced to ``retry`` (the safe default) with a warning printed once.
+    """
+    out = {
+        "head_freshness": dict(DEFAULT_HEAD_FRESHNESS),
+        "follow_up": dict(DEFAULT_FOLLOW_UP),
+    }
+    path = _config_path(project)
+    if not path.exists():
+        return out
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        sys.stderr.write(f"# handoff.config.json malformed ({e}); using defaults\n")
+        return out
+    for section in ("head_freshness", "follow_up"):
+        if isinstance(data.get(section), dict):
+            out[section].update(data[section])
+    if out["head_freshness"].get("head_stale_action") not in HEAD_STALE_ACTIONS:
+        out["head_freshness"]["head_stale_action"] = "retry"
+    return out
+
+
+# ─── audit + counter (§7.2) ─────────────────────────────────────────────────
+
+
+def _audit_append(project: str, task: str, record: dict) -> None:
+    """Append a single JSON line to the per-task retry audit trail."""
+    p = _audit_path(project, task)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    record.setdefault("timestamp", _iso_now())
+    line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+    with open(p, "a", encoding="utf-8") as fh:
+        fh.write(line)
+
+
+def _read_attempt_n(project: str, task: str) -> tuple[int | None, str]:
+    """Return ``(value, raw)`` for the attempt counter.
+
+    ``value`` is ``None`` when the file is missing or empty (treat as 0).
+    Multi-line files have all but the first stripped; non-numeric / >2
+    values are surfaced to the caller as ``value=-1`` so they can emit a
+    corruption-class BLOCKED result without re-reading.
+    """
+    p = _attempt_path(project, task)
+    if not p.exists():
+        return None, ""
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except OSError:
+        return -1, "<read-failed>"
+    body = raw.strip()
+    if not body:
+        with contextlib.suppress(OSError):
+            p.unlink()
+        return None, raw
+    first = body.splitlines()[0].strip()
+    if first not in {"0", "1", "2"}:
+        return -1, raw
+    return int(first), raw
+
+
+def _write_attempt_n_atomic(project: str, task: str, n: int) -> None:
+    p = _attempt_path(project, task)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.parent / f"{p.name}.tmp.{os.getpid()}.{time.monotonic_ns()}"
+    fd = os.open(str(tmp), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+    try:
+        os.write(fd, f"{n}\n".encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(tmp, p)
+
+
+def _quarantine_corrupt_counter(project: str, task: str, raw: str) -> Path:
+    """Rename a corrupt counter file out of the way per §7.2.
+
+    Returns the destination path so callers can include it in audit entries.
+    """
+    p = _attempt_path(project, task)
+    if not p.exists():
+        dst_dir = p.parent
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst = dst_dir / f"{p.name}.corrupt-{int(time.time())}"
+        dst.write_text(raw, encoding="utf-8")
+        return dst
+    dst = p.parent / f"{p.name}.corrupt-{int(time.time())}"
+    try:
+        os.rename(p, dst)
+    except OSError:
+        dst.write_text(raw, encoding="utf-8")
+        with contextlib.suppress(OSError):
+            p.unlink()
+    return dst
+
+
+def _clear_attempt_on_success(project: str, task: str, evidence_hash: str, sid: str) -> None:
+    p = _attempt_path(project, task)
+    if p.exists():
+        attempt_n_at_success, _ = _read_attempt_n(project, task)
+        with contextlib.suppress(OSError):
+            p.unlink()
+    else:
+        attempt_n_at_success = 0
+    _audit_append(
+        project,
+        task,
+        {
+            "event": "success",
+            "attempt_n_at_success": attempt_n_at_success if attempt_n_at_success is not None else 0,
+            "evidence_hash": evidence_hash,
+            "tab_session_id": sid,
+        },
+    )
+
+
+# ─── BLOCKED.md (§7.4) ──────────────────────────────────────────────────────
+
+
+def _write_blocked_md(
+    *,
+    project: str,
+    task: str,
+    subcode: str,
+    attempt_n: int,
+    evidence_path: Path | None,
+    evidence_hash: str | None,
+    head: str,
+    session_id: str,
+    reason: str,
+) -> Path:
+    """Append-write a BLOCKED.md artifact; idempotent across multiple blocks."""
+    target = _blocked_md_path(project, task)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    existed = target.exists()
+    ev_path = str(evidence_path) if evidence_path else "(none)"
+    ev_hash = evidence_hash if evidence_hash else "N/A"
+    sep = f"\n## 二次 block {_iso_now()}\n\n" if existed else ""
+    body = (
+        f"{sep}# BLOCKED — {task}\n\n"
+        f"**status**: blocked\n"
+        f"**blocked_at**: {_iso_now()}\n"
+        f"**blocked_by**: {subcode}\n"
+        f"**attempt_n**: {attempt_n}\n"
+        f"**evidence_path**: {ev_path}\n"
+        f"**evidence_hash**: {ev_hash}\n"
+        f"**HEAD_at_block**: {head}\n"
+        f"**tab_session_id**: {session_id}\n\n"
+        f"## 阻塞原因 (人类可读)\n\n{reason}\n\n"
+        "## 主人裁决路径\n\n"
+        "1. 手动审 evidence (上方 `evidence_path` 指向的 JSON)\n"
+        f"2. 若 AI 应继续 → `rm {target}` + `touch {_override_path(project, task)}`\n"
+        f"3. 若 task 应彻底放弃 → `touch {_queue_dir(project) / f'{task}.done'}`\n\n"
+        "## audit trail\n\n"
+        f"见 `{_audit_path(project, task)}` 完整历史 (含 attempt 0/1/2 三次失败原因).\n"
+    )
+    with open(target, "a", encoding="utf-8") as fh:
+        fh.write(body)
+    return target
+
+
+# ─── warnings sink (§7.7) ───────────────────────────────────────────────────
+
+
+def _append_warning(project: str, task: str, line: str) -> None:
+    p = _warnings_path(project, task)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a", encoding="utf-8") as fh:
+        fh.write(line.rstrip() + "\n")
+
+
+# ─── evidence loading + validation ──────────────────────────────────────────
+
+
+def _load_evidence(path: Path) -> tuple[dict | None, GateResult | None]:
+    """Read + sanity-check an evidence JSON file.
+
+    Returns ``(payload, None)`` on success or ``(None, result)`` when the
+    file can't be loaded or fails its self-hash. Schema-version mismatches
+    and structural errors are mapped to ``ERR-RETRY`` (fatal-class — won't
+    bump the counter) per §7.5.
+    """
+    if not path.exists():
+        return None, _retry("evidence-missing", f"evidence not found: {path}")
+    try:
+        raw = path.read_text(encoding="utf-8")
+        payload = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as e:
+        return None, _retry("evidence-corrupt", f"evidence JSON invalid: {e}")
+    if not isinstance(payload, dict):
+        return None, _retry("evidence-corrupt", "evidence must be a JSON object")
+    if payload.get("schema_version") != EVIDENCE_SCHEMA_VERSION:
+        return None, _retry(
+            "schema-version-unknown",
+            f"got {payload.get('schema_version')!r}, expected {EVIDENCE_SCHEMA_VERSION!r}",
+        )
+    if payload.get("evidence_kind") != EVIDENCE_KIND_RETRO:
+        return None, _retry(
+            "evidence-kind-mismatch",
+            f"expected retro, got {payload.get('evidence_kind')!r}",
+        )
+    declared = payload.get("evidence_hash")
+    if not isinstance(declared, str) or len(declared) != 64:
+        return None, _retry("evidence-hash-missing", "evidence_hash field absent or malformed")
+    recomputed = compute_evidence_hash(payload)
+    if recomputed != declared:
+        return None, _retry(
+            "evidence-hash-mismatch",
+            "canonical hash does not match declared evidence_hash",
+        )
+    return payload, None
+
+
+def _validate_phase_status(payload: dict) -> GateResult | None:
+    """Check every required phase status is one of ✅/⚠️/❌/skip.
+
+    Missing item, missing ``status`` field, or unknown enum value → fail.
+    """
+    for section, keys in (("phase0", PHASE0_KEYS), ("phase1", PHASE1_KEYS)):
+        items = payload.get(section)
+        if not isinstance(items, dict):
+            return _retry(
+                f"{section}-missing",
+                f"{section} section absent or not an object",
+            )
+        for k in keys:
+            entry = items.get(k)
+            if not isinstance(entry, dict):
+                return _retry(
+                    f"{section}-item-missing",
+                    f"{section}.{k} missing or not an object",
+                )
+            status = entry.get("status")
+            if status is None:
+                return _retry(
+                    f"{section}-status-missing",
+                    f"{section}.{k}.status missing",
+                )
+            if status not in PHASE_STATUS_VALID:
+                return _retry(
+                    f"{section}-status-invalid",
+                    f"{section}.{k}.status={status!r} not in {sorted(PHASE_STATUS_VALID)}",
+                )
+            if status == "skip" and not entry.get("reason"):
+                return _retry(
+                    f"{section}-skip-missing-reason",
+                    f"{section}.{k} status=skip requires reason",
+                )
+    return None
+
+
+# ─── HEAD freshness (§7.7) ──────────────────────────────────────────────────
+
+
+def _last_commit_age_sec(workspace: Path) -> int:
+    iso = _git(["log", "-1", "--format=%cI"], workspace)
+    if not iso:
+        return -1
+    try:
+        ts = datetime.fromisoformat(iso)
+    except ValueError:
+        return -1
+    return int((datetime.now(ts.tzinfo) - ts).total_seconds())
+
+
+def _precheck_drift_sec(payload: dict) -> int:
+    """Seconds between ``head_at_precheck_timestamp`` and now.
+
+    Returns ``-1`` when the timestamp is missing or unparseable so callers
+    can route to the strict failure path.
+    """
+    ts_raw = payload.get("head_at_precheck_timestamp", "")
+    if not isinstance(ts_raw, str) or not ts_raw:
+        return -1
+    try:
+        ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return -1
+    return int((datetime.now(ts.tzinfo) - ts).total_seconds())
+
+
+def _check_head_freshness(
+    payload: dict,
+    workspace: Path,
+    cfg: dict,
+    project: str,
+    task: str,
+) -> tuple[GateResult | None, list[str]]:
+    """Three-tier HEAD freshness gate.
+
+    Returns ``(result_or_None, warnings_to_record)``. A ``None`` result means
+    the gate passed (the dump can proceed); warnings are still appended
+    to ``retro.warnings.txt`` for human audit.
+
+    "Drift" is the wall-clock distance between ``head_at_precheck_timestamp``
+    (when precheck snapshotted HEAD) and now — i.e. how stale the evidence
+    is regardless of whether more commits have landed since.
+    """
+    head_now = _git(["rev-parse", "HEAD"], workspace)
+    head_evidence = payload.get("head_at_precheck", "")
+    last_age = _last_commit_age_sec(workspace)
+    drift = _precheck_drift_sec(payload)
+
+    max_age = int(cfg["head_freshness"]["last_commit_max_age_sec"])
+    drift_tolerance = int(cfg["head_freshness"]["head_at_precheck_drift_tolerance_sec"])
+    action = cfg["head_freshness"]["head_stale_action"]
+
+    warnings: list[str] = []
+
+    if not head_now:
+        return _retry("head-unknown", "git rev-parse HEAD failed"), warnings
+    if drift == -1:
+        return _retry(
+            "head-timestamp-invalid",
+            "head_at_precheck_timestamp missing or unparseable",
+        ), warnings
+
+    head_matches = head_now == head_evidence
+    commit_fresh = 0 <= last_age <= max_age
+
+    if head_matches and commit_fresh:
+        return None, warnings
+
+    if (not head_matches) and drift <= drift_tolerance:
+        warnings.append(
+            f"head-drift-within-tolerance: {_iso_now()} drift={drift}s "
+            f"head_now={head_now} head_evidence={head_evidence}"
+        )
+        return None, warnings
+
+    msg = (
+        f"head_now={head_now} head_evidence={head_evidence} "
+        f"last_commit_age={last_age}s max_age={max_age}s drift={drift}s"
+    )
+    if action == "warn-ok":
+        warnings.append(f"head-stale-warn-ok: {msg}")
+        return None, warnings
+    if action == "block":
+        return _blocked("head-stale-fatal", msg), warnings
+    return _retry("head-stale-resubmit", msg), warnings
+
+
+# ─── bypass + follow-up gates ───────────────────────────────────────────────
+
+
+def _validate_override(path: Path) -> tuple[dict | None, GateResult | None]:
+    if not path.exists():
+        return None, _bypass(
+            "missing-override",
+            f"bypass requires {path} with follow_up_retro_task_id + follow_up_deadline",
+        )
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        return None, _bypass("override-corrupt", f"{path}: {e}")
+    if not isinstance(data, dict):
+        return None, _bypass("override-corrupt", f"{path}: not a JSON object")
+    follow_task = data.get("follow_up_retro_task_id")
+    follow_deadline = data.get("follow_up_deadline")
+    if not follow_task or not isinstance(follow_task, str):
+        return None, _bypass(
+            "missing-follow-up-task",
+            "override JSON missing follow_up_retro_task_id",
+        )
+    if not follow_deadline or not isinstance(follow_deadline, str):
+        return None, _bypass(
+            "missing-follow-up-deadline",
+            "override JSON missing follow_up_deadline",
+        )
+    try:
+        datetime.fromisoformat(follow_deadline.replace("Z", "+00:00"))
+    except ValueError:
+        return None, _bypass(
+            "invalid-follow-up-deadline",
+            f"follow_up_deadline not ISO-8601: {follow_deadline!r}",
+        )
+    return data, None
+
+
+def _check_follow_up_overdue(project: str, cfg: dict) -> GateResult | None:
+    """If any task in this project has an overdue follow-up retro marker, block.
+
+    Spec §7.9: project-scoped block; cross-project dumps are unaffected.
+    """
+    if not cfg["follow_up"].get("project_block_on_overdue", True):
+        return None
+    ack = _ack_dir(project)
+    if not ack.exists():
+        return None
+    for marker in ack.glob("*.retro_overdue.txt"):
+        return _bypass(
+            "follow-up-overdue",
+            f"another task has overdue retro: {marker.name}; resolve before dumping",
+        )
+    return None
+
+
+# ─── locks (§7.3) ───────────────────────────────────────────────────────────
+
+
+@contextlib.contextmanager
+def _ordered_locks(project: str, task: str):
+    """Acquire precheck.lock → dump.lock in the required §7.3 order.
+
+    The retro.attempt.lock is held briefly per-counter-write inside the
+    state-machine code, not over the full critical section.
+    """
+    lock_root = _locks_dir(project)
+    lock_root.mkdir(parents=True, exist_ok=True)
+    precheck = lock_root / "precheck.lock"
+    dump = lock_root / "dump.lock"
+    try:
+        with atomic.acquire_dir_lock(
+            precheck, stale_seconds=PRECHECK_LOCK_STALE_SEC, retries=1, wait_seconds=0.0
+        ):
+            try:
+                with atomic.acquire_dir_lock(
+                    dump, stale_seconds=DUMP_LOCK_STALE_SEC, retries=1, wait_seconds=0.0
+                ):
+                    yield
+            except atomic.LockAcquisitionError as e:
+                raise _LockHeld("dump-lock-held", precheck=False, dump=True) from e
+    except atomic.LockAcquisitionError as e:
+        if isinstance(e.__cause__, _LockHeld):
+            raise
+        raise _LockHeld("precheck-lock-held", precheck=True, dump=False) from e
+
+
+class _LockHeld(Exception):
+    """Internal signal: a §7.3 lock was held by a sibling tab."""
+
+    def __init__(self, subcode: str, *, precheck: bool, dump: bool):
+        super().__init__(subcode)
+        self.subcode = subcode
+        self.precheck = precheck
+        self.dump = dump
+
+
+@contextlib.contextmanager
+def _attempt_lock(project: str, task: str):
+    """Short-lived lock around the attempt_n.txt read-modify-write window."""
+    lock_root = _locks_dir(project)
+    lock_root.mkdir(parents=True, exist_ok=True)
+    lock = lock_root / f"{task}.retro.attempt.lock"
+    try:
+        with atomic.acquire_dir_lock(
+            lock, stale_seconds=ATTEMPT_LOCK_STALE_SEC, retries=1, wait_seconds=0.0
+        ):
+            yield
+    except atomic.LockAcquisitionError as e:
+        raise _LockHeld("attempt-lock-held", precheck=False, dump=False) from e
+
+
+# ─── failure routing (counter bump + BLOCKED) ───────────────────────────────
+
+
+# Subcodes whose retry would not change the outcome — they bypass the counter.
+FATAL_CLASS_SUBCODES = frozenset(
+    {
+        "evidence-hash-mismatch",
+        "evidence-hash-missing",
+        "evidence-corrupt",
+        "schema-version-unknown",
+        "evidence-kind-mismatch",
+        "nonce-mismatch",
+    }
+)
+
+
+def _is_fatal_class(subcode: str) -> bool:
+    return subcode in FATAL_CLASS_SUBCODES
+
+
+def _handle_validation_failure(
+    *,
+    project: str,
+    task: str,
+    failure: GateResult,
+    payload: dict | None,
+    evidence_path: Path | None,
+    session_id: str,
+    head: str,
+) -> GateResult:
+    """Apply the §7.2 counter logic to a soft-retry failure.
+
+    Fatal-class failures (hash mismatch, schema unknown, nonce mismatch)
+    short-circuit without touching the counter — retrying would not help,
+    so leaving the counter steady avoids penalising legitimate manual fixes.
+
+    Already-terminal failures (``EXIT_BLOCKED``, e.g. ``head-stale-fatal``
+    when the project is configured with ``head_stale_action=block``) write
+    a BLOCKED.md artifact per §7.4 but bypass the counter entirely — the
+    block action is a deliberate hard stop, not a retry budget.
+    """
+    if failure.exit_code == EXIT_BLOCKED:
+        _audit_append(
+            project,
+            task,
+            {
+                "event": "blocked-direct",
+                "subcode": failure.subcode,
+                "tab_session_id": session_id,
+            },
+        )
+        current, _ = _read_attempt_n(project, task)
+        attempt_for_log = current if isinstance(current, int) and current >= 0 else 0
+        _write_blocked_md(
+            project=project,
+            task=task,
+            subcode=failure.subcode,
+            attempt_n=attempt_for_log,
+            evidence_path=evidence_path,
+            evidence_hash=(payload or {}).get("evidence_hash") if payload else None,
+            head=head,
+            session_id=session_id,
+            reason=failure.message,
+        )
+        return failure
+
+    if _is_fatal_class(failure.subcode):
+        _audit_append(
+            project,
+            task,
+            {
+                "event": "fatal-class-failure",
+                "subcode": failure.subcode,
+                "tab_session_id": session_id,
+            },
+        )
+        return failure
+
+    try:
+        with _attempt_lock(project, task):
+            current, raw = _read_attempt_n(project, task)
+            if current == -1:
+                dst = _quarantine_corrupt_counter(project, task, raw)
+                _audit_append(
+                    project,
+                    task,
+                    {
+                        "event": "counter-corrupt",
+                        "subcode": "counter-corrupted",
+                        "quarantine": str(dst),
+                        "tab_session_id": session_id,
+                    },
+                )
+                _write_blocked_md(
+                    project=project,
+                    task=task,
+                    subcode="counter-corrupted",
+                    attempt_n=-1,
+                    evidence_path=evidence_path,
+                    evidence_hash=(payload or {}).get("evidence_hash") if payload else None,
+                    head=head,
+                    session_id=session_id,
+                    reason=(
+                        f"attempt_n.txt 内容损坏 (非 0/1/2), 已 quarantine 到 {dst}; "
+                        "请主人确认 task 是否应继续, 然后清除 BLOCKED.md."
+                    ),
+                )
+                return _blocked("counter-corrupted", f"quarantined corrupt counter → {dst}")
+
+            n = current if current is not None else 0
+            if n >= ATTEMPT_MAX:
+                _audit_append(
+                    project,
+                    task,
+                    {
+                        "event": "attempt-exhausted",
+                        "subcode": failure.subcode,
+                        "attempt_n": n,
+                        "tab_session_id": session_id,
+                    },
+                )
+                _write_blocked_md(
+                    project=project,
+                    task=task,
+                    subcode="retro-attempt-exhausted",
+                    attempt_n=n,
+                    evidence_path=evidence_path,
+                    evidence_hash=(payload or {}).get("evidence_hash") if payload else None,
+                    head=head,
+                    session_id=session_id,
+                    reason=(
+                        f"attempt_n=2 reached after 3 retries; original failure: "
+                        f"{failure.subcode} — {failure.message}"
+                    ),
+                )
+                return _blocked(
+                    "retro-attempt-exhausted",
+                    f"attempt_n={n} reached after 3 retries (last subcode={failure.subcode})",
+                )
+            new_n = n + 1
+            _write_attempt_n_atomic(project, task, new_n)
+            _audit_append(
+                project,
+                task,
+                {
+                    "event": "retry-allowed",
+                    "subcode": failure.subcode,
+                    "attempt_n_after": new_n,
+                    "tab_session_id": session_id,
+                },
+            )
+            return _retry(
+                failure.subcode,
+                f"{failure.message} (attempt_n={new_n}/{ATTEMPT_MAX})",
+            )
+    except _LockHeld as e:
+        _audit_append(
+            project,
+            task,
+            {
+                "event": "lock-contention",
+                "lock": "attempt.lock",
+                "subcode": e.subcode,
+                "tab_session_id": session_id,
+            },
+        )
+        return _locked(e.subcode, "another tab is updating attempt counter")
+
+
+# ─── public entry point ─────────────────────────────────────────────────────
+
+
+def check_retro_gate(
+    *,
+    project: str,
+    task: str,
+    workspace: Path,
+    evidence_path: Path | None,
+    bypass_enabled: bool,
+    mandate_enabled: bool,
+    nonce: str | None = None,
+    config: dict | None = None,
+    session_id: str = "",
+) -> GateResult:
+    """Run the v5.4 retro evidence gate.
+
+    Returns a :class:`GateResult` whose ``exit_code`` matches §7.1. Callers
+    are responsible for emitting the result (``GateResult.emit``) and for
+    short-circuiting their own work when ``is_ok`` is false.
+    """
+    if config is None:
+        config = load_project_config(project)
+    sid = session_id or "(no-session-id)"
+
+    _ack_dir(project).mkdir(parents=True, exist_ok=True)
+
+    overdue = _check_follow_up_overdue(project, config)
+    if overdue is not None:
+        _audit_append(
+            project,
+            task,
+            {"event": "follow-up-overdue-block", "tab_session_id": sid},
+        )
+        return overdue
+
+    if bypass_enabled:
+        override_data, override_err = _validate_override(_override_path(project, task))
+        if override_err is not None:
+            _audit_append(
+                project,
+                task,
+                {
+                    "event": "bypass-rejected",
+                    "subcode": override_err.subcode,
+                    "tab_session_id": sid,
+                },
+            )
+            return override_err
+        _audit_append(
+            project,
+            task,
+            {
+                "event": "bypass-accepted",
+                "follow_up_task": override_data.get("follow_up_retro_task_id"),
+                "follow_up_deadline": override_data.get("follow_up_deadline"),
+                "tab_session_id": sid,
+            },
+        )
+        return _ok()
+
+    if evidence_path is None:
+        if not mandate_enabled:
+            return _ok()
+        return _retry(
+            "retro-evidence-missing",
+            "no --retro-evidence and no HANDOFF_RETRO_BYPASS; supply evidence file",
+        )
+
+    try:
+        with _ordered_locks(project, task):
+            payload, load_err = _load_evidence(evidence_path)
+            if load_err is not None:
+                return _handle_validation_failure(
+                    project=project,
+                    task=task,
+                    failure=load_err,
+                    payload=None,
+                    evidence_path=evidence_path,
+                    session_id=sid,
+                    head=_git(["rev-parse", "HEAD"], workspace),
+                )
+
+            if nonce is not None:
+                if not NONCE_RE.match(nonce):
+                    return _handle_validation_failure(
+                        project=project,
+                        task=task,
+                        failure=_retry("nonce-invalid-format", "nonce fails ^[A-Za-z0-9_-]{1,128}$"),
+                        payload=payload,
+                        evidence_path=evidence_path,
+                        session_id=sid,
+                        head=payload.get("head_at_precheck", ""),
+                    )
+                if payload.get("nonce") != nonce:
+                    return _handle_validation_failure(
+                        project=project,
+                        task=task,
+                        failure=_retry(
+                            "nonce-mismatch",
+                            f"caller nonce={nonce!r} payload nonce={payload.get('nonce')!r}",
+                        ),
+                        payload=payload,
+                        evidence_path=evidence_path,
+                        session_id=sid,
+                        head=payload.get("head_at_precheck", ""),
+                    )
+
+            mode = payload.get("mode", "normal")
+            forensic = mode == MODE_FORENSIC_RETRO
+            if mode not in MODE_VALID:
+                return _handle_validation_failure(
+                    project=project,
+                    task=task,
+                    failure=_retry("mode-invalid", f"mode={mode!r} not in {sorted(MODE_VALID)}"),
+                    payload=payload,
+                    evidence_path=evidence_path,
+                    session_id=sid,
+                    head=payload.get("head_at_precheck", ""),
+                )
+
+            if not forensic:
+                phase_err = _validate_phase_status(payload)
+                if phase_err is not None:
+                    return _handle_validation_failure(
+                        project=project,
+                        task=task,
+                        failure=phase_err,
+                        payload=payload,
+                        evidence_path=evidence_path,
+                        session_id=sid,
+                        head=payload.get("head_at_precheck", ""),
+                    )
+
+                head_err, warnings = _check_head_freshness(
+                    payload, workspace, config, project, task
+                )
+                for w in warnings:
+                    _append_warning(project, task, w)
+                if head_err is not None:
+                    return _handle_validation_failure(
+                        project=project,
+                        task=task,
+                        failure=head_err,
+                        payload=payload,
+                        evidence_path=evidence_path,
+                        session_id=sid,
+                        head=payload.get("head_at_precheck", ""),
+                    )
+            else:
+                _audit_append(
+                    project,
+                    task,
+                    {
+                        "event": "forensic-retro-bypass-strict-checks",
+                        "tab_session_id": sid,
+                    },
+                )
+
+            if not forensic:
+                _clear_attempt_on_success(
+                    project, task, payload.get("evidence_hash", ""), sid
+                )
+            else:
+                _audit_append(
+                    project,
+                    task,
+                    {
+                        "event": "forensic-retro-success",
+                        "evidence_hash": payload.get("evidence_hash", ""),
+                        "tab_session_id": sid,
+                    },
+                )
+            return _ok()
+    except _LockHeld as e:
+        _audit_append(
+            project,
+            task,
+            {
+                "event": "lock-contention",
+                "subcode": e.subcode,
+                "tab_session_id": sid,
+            },
+        )
+        return _locked(e.subcode, "another tab is processing this task")

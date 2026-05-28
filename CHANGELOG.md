@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-05-29
+
+v5.4 retro-evidence gate — Phase 4a tool layer. Adds the precheck CLI that
+captures Phase 0 / Phase 1 evidence, and gates `handoff-dump` on that
+evidence so AI sessions can no longer skip the closure protocol silently.
+
+### Added
+
+- **`handoff_fanout.handoff_precheck`** — new module / CLI
+  (`handoff-precheck` entry point + `handoff precheck` subcommand). Builds
+  `precheck/<task>.retro.evidence.json` with the 5 Phase 0 items
+  (`memory`, `tests`, `audit`, `commit`, `code_review`) and 5 Phase 1
+  items (`codex`, `claude_md`, `l2_memory`, `tests`, `prs`), each tagged
+  ✅/⚠️/❌/skip. Hash is SHA-256 over canonical JSON with `evidence_hash`
+  excluded (spec §7.5).
+- **`handoff_fanout.retro_gate`** — gate module imported by `dump`.
+  Implements the 7-tier exit code protocol (§7.1: 0/1/2/3/4/6 — exit 5 is
+  intentionally unassigned), the stderr prefix grammar
+  (`OK:` / `ERR-FATAL:` / `ERR-BLOCKED:` / `ERR-LOCKED:` / `ERR-RETRY:` /
+  `ERR-BYPASS:`), the §7.2 attempt-counter state machine
+  (`ack/<task>.retro.attempt_n.txt` with atomic write + corrupt-file
+  quarantine), the §7.3 lock hierarchy (`precheck.lock` → `dump.lock` →
+  `<task>.retro.attempt.lock` with deadlock-free ordering and stale
+  cleanup), the §7.7 three-tier HEAD freshness gate (configurable via
+  `handoff.config.json:head_freshness.head_stale_action ∈
+  {retry, block, warn-ok}`), and the §7.4 BLOCKED.md artifact schema.
+- **`handoff_fanout.dump --retro-evidence FILE`** — new flag activates the
+  v5.4 gate. Also honours `HANDOFF_RETRO_BYPASS=1` (requires an
+  `ack/<task>.retro.override.json` with `follow_up_retro_task_id` +
+  ISO-8601 `follow_up_deadline`) and `HANDOFF_RETRO_MANDATE=1` (enforce
+  even without the flag; intended for Phase 4b CLAUDE.md activation).
+- **§7.8 fingerprint algorithm — revised for D-1 probe results.** The
+  previous spec referenced `VSCODE_MACHINE_ID` / `VSCODE_WORKSPACE_FILE`
+  env vars, neither of which Claude Code on macOS exposes to subprocess
+  env. The new fallback fingerprint uses `ioreg -rd1 -c
+  IOPlatformExpertDevice` for the machine UUID and `os.getcwd()` for the
+  workspace path, joined with ASCII unit-separator and SHA-256-truncated
+  to 128 bits. `CLAUDE_CODE_SESSION_ID` remains the primary key when
+  exposed (confirmed exposed in the 2026-05-29 D-1 probe).
+- **`tests/test_retro.py`** — 14 single-axis (R-01..R-14) + 4 combination
+  (C-01..C-04) cases covering the full §7.11 retro matrix, plus 4
+  library-level sanity checks for hash / fingerprint / session-id
+  resolution. Subprocess-based R-14 verifies the 5-tab race converges to
+  1 winner + 4 `ERR-LOCKED` losers.
+
+### Changed
+
+- **Bumped to v1.1.0** (minor — backward compatible; ERP shim's legacy
+  `--task --next --status active` invocation continues to work because
+  the gate is skipped when neither `--retro-evidence` nor the two env
+  switches are set).
+- **`handoff_fanout.cli`** — added `precheck` subcommand to the unified
+  dispatcher.
+
 ## [1.0.0] — 2026-05-29
 
 First stable release. Engine extracted from a year-old production ERP project,

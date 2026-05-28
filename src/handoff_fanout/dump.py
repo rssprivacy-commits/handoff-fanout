@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -31,9 +32,10 @@ import urllib.parse
 from datetime import UTC, datetime
 from pathlib import Path
 
-from handoff_fanout import atomic, templates
+from handoff_fanout import atomic, retro_gate, templates
 from handoff_fanout import config as _config
 from handoff_fanout.git_guard import git_guard_dir
+from handoff_fanout.handoff_precheck import resolve_session_id
 
 # v5 protocol constants
 SCHEMA_VERSION = 2
@@ -137,6 +139,43 @@ def assert_batch_alive(batch_dir: Path, stage: str) -> None:
             f"❌ manifest.json 在 spawn 期消失 (stage={stage}): {batch_dir}/manifest.json\n"
             f"   manifest vanished mid-spawn; already-written sub-tasks may now be orphans."
         )
+
+
+def _run_retro_gate(
+    args: argparse.Namespace,
+    workspace: Path,
+    project: str,
+) -> retro_gate.GateResult | None:
+    """Decide whether the v5.4 retro gate runs and return its verdict.
+
+    Returns ``None`` when the gate is intentionally skipped (legacy mode):
+    no ``--retro-evidence`` was passed and neither ``HANDOFF_RETRO_MANDATE``
+    nor ``HANDOFF_RETRO_BYPASS`` is set. Batch-mode sub commands also skip
+    the gate — fan-out / fan-in dumps are governed by their own protocol
+    (manifest + role.env) and are out of scope for v5.4 Phase 4a.
+    """
+    if args.batch_done or args.batch_blocked or args.open_batch or args.batch_fan_in:
+        return None
+
+    bypass = os.environ.get("HANDOFF_RETRO_BYPASS") == "1"
+    mandate = os.environ.get("HANDOFF_RETRO_MANDATE") == "1"
+    evidence_path = Path(args.retro_evidence) if args.retro_evidence else None
+
+    if evidence_path is None and not bypass and not mandate:
+        # legacy path: no gate, preserve pre-v5.4 ERP shim behaviour
+        return None
+
+    sid, _ = resolve_session_id()
+    return retro_gate.check_retro_gate(
+        project=project,
+        task=args.task,
+        workspace=workspace,
+        evidence_path=evidence_path,
+        bypass_enabled=bypass,
+        mandate_enabled=mandate,
+        nonce=args.nonce,
+        session_id=sid,
+    )
 
 
 def any_stop_auto(project: str, batch_id: str | None = None) -> str | None:
@@ -814,6 +853,20 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="with --cleanup-orphan --apply: notify user to close tabs",
     )
+    # v5.4 retro-evidence gate (§7.1 / §7.2 / §7.7).
+    # The gate is skipped entirely when no flag and no env is set so legacy
+    # callers (ERP shim's pre-v5.4 invocations) continue working unchanged.
+    # Phase 4b will flip on ``HANDOFF_RETRO_MANDATE`` via CLAUDE.md.
+    ap.add_argument(
+        "--retro-evidence",
+        default=None,
+        help="path to precheck/<task>.retro.evidence.json (activates v5.4 gate)",
+    )
+    ap.add_argument(
+        "--nonce",
+        default=None,
+        help="optional per-task nonce; must match payload.nonce when present (§7.2)",
+    )
     return ap
 
 
@@ -841,6 +894,11 @@ def main(argv: list[str] | None = None) -> int:
     if stop_path:
         print(f"[dump] STOP detected at {stop_path}, exit 0 (no write)")
         return 0
+
+    gate_result = _run_retro_gate(args, workspace, project)
+    if gate_result is not None and not gate_result.is_ok:
+        gate_result.emit()
+        return gate_result.exit_code
 
     if args.open_batch:
         return handle_open_batch(args, cfg, workspace, project, queue_dir)
