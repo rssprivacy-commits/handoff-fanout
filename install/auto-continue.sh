@@ -260,6 +260,7 @@ clean_stale_lock() {
     [ -d "$lock" ] || return 0
     local pid=""
     [ -f "$lock/pid" ] && pid=$(cat "$lock/pid" 2>/dev/null)
+    case "$pid" in ''|*[!0-9]*) pid="" ;; esac  # ignore empty/garbage pid file
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         return 0  # owner alive — never recycle regardless of age
     fi
@@ -351,8 +352,14 @@ scan_overdue_overrides() {
         # P0: timezone-correct overdue check. A lexical compare mis-sorts mixed
         # offsets (a `+08:00` deadline vs the `+00:00` 'now', or a bare-date /
         # `Z`-suffixed deadline), silently disabling the gate. iso_now_past_deadline
-        # exits 0 only when now(UTC) is strictly past the (tz-normalized) deadline.
-        iso_now_past_deadline "$deadline" || continue
+        # exits 0=overdue / 1=not-yet / >=2=parse-or-python-failure.
+        local odrc; iso_now_past_deadline "$deadline"; odrc=$?
+        if [ "$odrc" -ne 0 ]; then
+            # rc>=2 means we couldn't decide (bad deadline / python3 missing) —
+            # fail safe (don't mark overdue) but log so the gate can't go dark silently.
+            [ "$odrc" -ge 2 ] && log "OVERDUE-SCAN-WARN: project=$project task=$task — undecidable deadline (rc=$odrc) deadline=$deadline"
+            continue
+        fi
         local follow_evid="$precheck_dir/$follow_task.retro.evidence.json"
         local audit="$ack_dir/$task.retro.retry_audit.jsonl"
         local overdue_marker="$ack_dir/$task.retro_overdue.txt"
@@ -499,7 +506,8 @@ try_autoclose() {
         log "AUTOCLOSE-SKIP: project=$project task=$task — lock held"
         return 0
     fi
-    echo "$$" > "$lock/pid" 2>/dev/null || true
+    echo "$$" > "$lock/pid" 2>/dev/null \
+        || log "AUTOCLOSE-WARN: project=$project task=$task — pid file unwritable (stale-lock detection degraded to TTL)"
     trap 'release_lock "$lock"' RETURN
     # Re-check sentinels after acquiring the lock (TOCTOU defence per v4 #4).
     if [ -f "$done_marker" ] || [ -f "$failed_marker" ]; then
