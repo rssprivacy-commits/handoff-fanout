@@ -1,0 +1,33 @@
+{
+  "_comment": "handoff-fanout config (referenced from $HANDOFF_HOME/config.json). Drop unused keys; all fields are optional with safe defaults.",
+
+  "inject_blocks": [
+    "## Project red lines (example)\n- never edit src/legacy/ without an ADR\n- treasury operations must go through journal_service.post_entry()"
+  ],
+
+  "baseline_hooks": [
+    {
+      "_comment": "Each hook runs in the workspace dir; the captured output is added to the handoff baseline block. `regex` is optional — when set, the first match group is stored.",
+      "name": "Alembic",
+      "command": ["alembic", "current"],
+      "regex": "([a-z0-9_]+)\\s*\\(head\\)"
+    },
+    {
+      "name": "PythonVersion",
+      "command": ["python3", "-V"]
+    }
+  ],
+
+  "roadmap": {
+    "_comment": "Optional file whose phase sections are excerpted into the handoff prompt.",
+    "path": "~/Projects/my-repo/project-files/roadmap.md",
+    "section_regex": "#### Phase[^\\n]*\\n(.*?)(?=\\n#### |\\Z)",
+    "max_sections": 2,
+    "max_chars_per_section": 1200,
+    "fallback_tail_chars": 3000
+  },
+
+  "uri_template": "vscode://anthropic.claude-code/open?prompt={prompt}",
+
+  "workspace_root": "~/Projects"
+}
