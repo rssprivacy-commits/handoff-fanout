@@ -1,0 +1,67 @@
+#!/bin/bash
+# handoff-fanout — git wrapper for sub-task role tabs.
+#
+# PURPOSE
+#   When you fan one task into N parallel sub-task tabs, only the fan-in tab
+#   may commit. Sub-task tabs must stay in their file_ownership lane and
+#   never touch shared git state. This wrapper enforces that physically by
+#   sitting earlier on $PATH than the real `git`.
+#
+# ROLE BEHAVIOR (driven by $HANDOFF_ROLE)
+#   sub-task → reject commit / push / rebase / cherry-pick / reset / revert /
+#              tag / am / format-patch / merge with exit 99
+#   fan-in   → pass through (the fan-in tab is the sole committer)
+#   main     → pass through (top-level session is unrestricted)
+#   unset    → pass through (running outside a handoff context)
+#
+# INSTALL
+#   Place this directory on $PATH BEFORE the real git, e.g.:
+#     export PATH="/path/to/handoff-fanout/git-guard:$PATH"
+#   The handoff-fanout `.env` file (sourced by sub-task tabs) does this for you.
+#
+# EMERGENCY BYPASS
+#   HANDOFF_ROLE= git commit ...     # one-off, audited by fan-in tab
+#
+# See docs/PROTOCOL.md for the full role model.
+
+# Locate the real `git`, skipping this wrapper's directory.
+REAL_GIT=""
+for candidate in /opt/homebrew/bin/git /usr/local/bin/git /usr/bin/git; do
+    if [ -x "$candidate" ]; then
+        REAL_GIT="$candidate"
+        break
+    fi
+done
+if [ -z "$REAL_GIT" ]; then
+    SELF_DIR="$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")"
+    REAL_GIT="$(/usr/bin/which -a git 2>/dev/null | grep -v "$SELF_DIR" | head -1)"
+fi
+if [ -z "$REAL_GIT" ] || [ ! -x "$REAL_GIT" ]; then
+    echo "handoff-fanout git-guard: real git not found on PATH" >&2
+    exit 127
+fi
+
+# Sub-task role: physically block mutating commands.
+if [ "$HANDOFF_ROLE" = "sub-task" ]; then
+    case "$1" in
+        commit|push|rebase|cherry-pick|reset|revert|tag|am|format-patch|merge)
+            cat >&2 <<EOF
+handoff-fanout git-guard — sub-task role is forbidden from \`git $1\`.
+
+  Sub-task tabs must stay within their file_ownership boundary. The fan-in
+  tab is the sole committer (see docs/PROTOCOL.md §"Role model").
+
+  HANDOFF_ROLE=$HANDOFF_ROLE
+  HANDOFF_BATCH_ID=${HANDOFF_BATCH_ID:-?}
+  HANDOFF_SUB_TASK_ID=${HANDOFF_SUB_TASK_ID:-?}
+
+  Emergency bypass (audited by fan-in tab):
+    HANDOFF_ROLE= git $*
+
+EOF
+            exit 99
+            ;;
+    esac
+fi
+
+exec "$REAL_GIT" "$@"
