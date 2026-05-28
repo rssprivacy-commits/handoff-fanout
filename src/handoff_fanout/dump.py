@@ -412,15 +412,40 @@ def write_active_dump(
     uri_path.write_text(f"WORKSPACE={workspace}\nURI={uri}\n", encoding="utf-8")
     print(f"[dump] wrote {uri_path}")
 
-    try:
-        p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-        p.communicate(input=handoff_content.encode("utf-8"))
-    except (FileNotFoundError, OSError):
-        pass
+    _maybe_pbcopy(handoff_content)
 
     _notify(next_brief, f"自动接续 / {project}", task)
     print(f"[dump] ✅ active dump complete for {project}/{task}")
     return 0
+
+
+def _maybe_pbcopy(content: str) -> None:
+    """Copy handoff content to the macOS clipboard, with two safety guards.
+
+    Skips the real ``pbcopy`` call when either env var is *present* in
+    ``os.environ`` (presence is the contract — empty string still skips):
+
+      * ``PYTEST_CURRENT_TEST`` — auto-set by pytest for each running test
+        (including pytest-xdist worker subprocesses); prevents
+        fixture-tmpdir handoff content (e.g. ``project=demo``) from
+        silently hijacking the user's clipboard during a test run.
+      * ``HANDOFF_NO_PBCOPY`` — manual opt-out for CI, headless sessions,
+        or any caller that wants the side effect suppressed.
+
+    Key-presence (``in os.environ``) rather than truthiness so callers
+    can use ``HANDOFF_NO_PBCOPY=`` (empty) and still suppress, matching
+    the documented "set the env var to skip" contract.
+
+    The original ``FileNotFoundError`` / ``OSError`` swallow is preserved
+    so non-macOS hosts (no ``pbcopy`` binary) keep working.
+    """
+    if "PYTEST_CURRENT_TEST" in os.environ or "HANDOFF_NO_PBCOPY" in os.environ:
+        return
+    try:
+        p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+        p.communicate(input=content.encode("utf-8"))
+    except (FileNotFoundError, OSError):
+        pass
 
 
 def _notify(message: str, title: str, subtitle: str, sound: str | None = None) -> None:

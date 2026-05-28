@@ -9,6 +9,38 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def no_pbcopy_during_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defense-in-depth: fail loudly if any test lets ``pbcopy`` escape.
+
+    ``dump._maybe_pbcopy`` already short-circuits when ``PYTEST_CURRENT_TEST``
+    is set, but this autouse wrapper around ``subprocess.Popen`` is the
+    sentinel: any future code path (or test that monkey-patches the guard
+    away) that pipes into ``pbcopy`` raises here instead of silently
+    overwriting the user's clipboard.
+
+    Non-``pbcopy`` ``Popen`` calls (git, osascript, etc.) pass through to
+    the real implementation untouched.
+    """
+    real_popen = subprocess.Popen
+
+    def guarded_popen(argv, *args, **kwargs):
+        first = None
+        if isinstance(argv, list | tuple) and argv:
+            first = str(argv[0])
+        elif isinstance(argv, str):
+            first = argv.split()[0] if argv.split() else None
+        if first and "pbcopy" in first.rsplit("/", 1)[-1]:
+            raise AssertionError(
+                f"pbcopy escaped during pytest run: argv={argv!r}. "
+                "dump._maybe_pbcopy should have suppressed this — check "
+                "PYTEST_CURRENT_TEST handling or new clipboard call sites."
+            )
+        return real_popen(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", guarded_popen)
+
+
 @pytest.fixture
 def git_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """Initialise a throwaway git repo in ``tmp_path`` and chdir into it.

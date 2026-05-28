@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] — 2026-05-29
+
+Bug fix: `handoff dump --status active` no longer pollutes the user's
+clipboard during pytest runs.
+
+Root cause (主人 2026-05-29 03:50+): the active path in `dump.main`
+unconditionally piped the rendered handoff markdown into `pbcopy`.
+`tests/test_retro.py` exercises `dump.main(argv)` end-to-end against
+tmpdir fixtures with `project=demo` / `task=demo-task`. Every test run
+silently replaced whatever the user had on the clipboard with the
+fixture handoff text. 主人 hit this while pasting a handwritten
+`v310-sub4-r5-p0-fixes` BLOCKED report and got `project=demo` /
+`task=demo-task` sample text instead — within a hair of executing the
+wrong path from a hijacked paste.
+
+### Fixed
+
+- **`dump._maybe_pbcopy(content)`** — new helper wraps the existing
+  `subprocess.Popen(["pbcopy"], …)` call site. Skips the real call when
+  either env var is set:
+  - `PYTEST_CURRENT_TEST` (auto-set by pytest for every running test —
+    zero-config protection for any future test that exercises
+    `dump.main()`).
+  - `HANDOFF_NO_PBCOPY` (manual opt-out for CI, headless sessions, or
+    scripted callers).
+
+  Preserves the existing `FileNotFoundError` / `OSError` swallow so
+  non-macOS hosts keep working.
+- **`tests/test_no_clipboard_pollution.py`** — 10 cases: 7 unit (both
+  env guards skip when set, both env guards skip when set to empty
+  string, both unset still copies, missing-binary soft-fail, EPIPE
+  soft-fail) + 2 integration through `dump.main()` (active path with
+  retro evidence does not pipe pbcopy under pytest /
+  `HANDOFF_NO_PBCOPY`) + 1 sanity (pytest auto-sets
+  `PYTEST_CURRENT_TEST`). Guard uses `"VAR" in os.environ` (presence,
+  not truthiness) so empty string still suppresses — matches the
+  documented contract.
+- **`tests/conftest.py` autouse fixture `no_pbcopy_during_tests`** —
+  session-wide sentinel that wraps `subprocess.Popen` and raises
+  `AssertionError` if any test lets a `pbcopy` command escape (defence
+  in depth — catches future regressions in unrelated tests).
+
+### Notes
+
+- Non-pytest, non-`HANDOFF_NO_PBCOPY` callers (the real launchd /
+  auto-continue path the user spawns) keep the original clipboard copy
+  behaviour — this only fences off test runs.
+
 ## [1.2.0] — 2026-05-29
 
 v4.1 single-task 529-detection symmetry. Plugs the gap where
