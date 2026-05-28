@@ -42,7 +42,9 @@ MINIMAL_PRE_COMMIT = r"""#!/bin/bash
 FAIL=0
 if [ -n "$HANDOFF_EXPECTED_FILES" ] && [ -f "$HANDOFF_EXPECTED_FILES" ]; then
   EXP=$(sort -u < "$HANDOFF_EXPECTED_FILES")
-  ACTUAL=$(git diff --cached --name-only | sort -u)
+  # core.quotepath=false: keep CJK/non-ASCII paths verbatim UTF-8 (matches the
+  # real ERP/install hooks); bare git octal-escapes them and trips a false hijack.
+  ACTUAL=$(git -c core.quotepath=false diff --cached --name-only | sort -u)
   EXTRA=$(comm -23 <(echo "$ACTUAL") <(echo "$EXP") || true)
   if [ -n "$EXTRA" ]; then
     echo "PRECOMMIT_HIJACK_REJECT: extra=$EXTRA" >&2
@@ -146,6 +148,27 @@ def test_safe_commit_serial_two_calls_both_succeed(gitrepo):
     show2 = _git(gitrepo, "show", "--stat", "--name-only", "--pretty=format:", "HEAD")
     assert "file2.txt" in show2
     assert "file1.txt" not in show2
+
+
+def test_safe_commit_cjk_filename_passes_segment5(gitrepo):
+    """A Chinese-named file must commit cleanly through wrapper + segment-5 hook.
+
+    Regression for the core.quotepath false-positive: git octal-escapes
+    non-ASCII paths in ``diff --cached --name-only`` so the staged set never
+    matches the UTF-8 expected list, and every CJK-named file was wrongly
+    rejected as a hijack by both the wrapper and the pre-commit hook.
+    """
+    repo = gitrepo["repo"]
+    fname = "部署任务栈.md"
+    (repo / fname).write_text("roadmap\n")
+    _safe_commit(gitrepo, "add cjk doc", [fname], expect_rc=0)
+
+    show = subprocess.run(
+        ["git", "-c", "core.quotepath=false", "show", "--name-only",
+         "--pretty=format:", "HEAD"],
+        cwd=repo, env=gitrepo["env"], capture_output=True, text=True, check=True,
+    ).stdout
+    assert fname in show
 
 
 # ─── 2: hijack rejection via segment 5 ──────────────────────────────────────

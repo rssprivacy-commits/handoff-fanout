@@ -51,6 +51,33 @@ def test_happy_path_commits_only_specified_files(git_repo: Path, lock_in_tmp: Pa
     assert landed == {"a.txt", "b.txt"}, f"unexpected landed set: {landed}"
 
 
+def test_cjk_filename_commits_cleanly(git_repo: Path, lock_in_tmp: Path) -> None:
+    """CJK (non-ASCII) filenames must not trip the expected-files invariant.
+
+    git's default ``core.quotepath=true`` octal-escapes non-ASCII paths in
+    ``diff --cached --name-only`` (e.g. ``部署任务栈.md`` →
+    ``\\351\\203\\250...``). Without normalization the staged set comes back
+    escaped while ``expected`` is plain UTF-8, so the subset check raises a
+    spurious hijack false-positive on every Chinese-named file.
+    """
+    fname = "部署任务栈.md"
+    _write(git_repo / fname, "x")
+    _write(git_repo / "b.txt", "beta")  # NOT in expected list
+
+    rc = safe_commit.main(["-m", "add cjk", "--", fname])
+    assert rc == 0, "CJK filename must commit cleanly (no quotepath false-positive)"
+
+    r = subprocess.run(
+        ["git", "-c", "core.quotepath=false", "show", "--name-only",
+         "--pretty=format:", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    landed = {ln for ln in r.stdout.splitlines() if ln.strip()}
+    assert landed == {fname}, f"unexpected landed set: {landed}"
+
+
 def test_pre_commit_hook_hijack_is_caught_by_post_audit(git_repo: Path, lock_in_tmp: Path) -> None:
     """A pre-commit hook that auto-stages an extra file slips past the
     layer-2 snapshot AND past ``git commit --only`` (git docs: hooks

@@ -81,8 +81,13 @@ def _split_files(extra: list[str]) -> tuple[list[str], list[str]]:
 
 
 def _run_git(args: list[str], **kwargs) -> subprocess.CompletedProcess:
+    # core.quotepath=false: emit non-ASCII (e.g. CJK) paths verbatim UTF-8 rather
+    # than git's default octal-escaped form. Without this the staged/landed name
+    # sets come back escaped while ``expected`` (from the user-supplied file list)
+    # is plain UTF-8, so the subset checks raise a spurious hijack false-positive
+    # on any Chinese-named file.
     return subprocess.run(
-        ["git", *args],
+        ["git", "-c", "core.quotepath=false", *args],
         capture_output=True,
         text=True,
         check=False,
