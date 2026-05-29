@@ -564,8 +564,13 @@ def build_codex_audit_block(
     # R2 P1: the failure proof must be machine-verifiable, not free-form — each
     # attempt needs an exit code, a hashed stderr, and a timestamp.
     attempts = bypass["codex_failure_attempts"]
-    if not isinstance(attempts, list) or not attempts:
-        raise ValueError("codex_failure_attempts must be a non-empty list")
+    # R2-P1 (Phase D): the builder enforces the SAME MIN_CODEX_FAILURES floor as
+    # the gate (_gate_bypass) and the producer (write_bypass_override), so a block
+    # the gate would later reject can never be assembled here in the first place.
+    if not isinstance(attempts, list) or len(attempts) < MIN_CODEX_FAILURES:
+        raise ValueError(
+            f"codex_failure_attempts must have >= MIN_CODEX_FAILURES={MIN_CODEX_FAILURES} entries"
+        )
     for a in attempts:
         if not isinstance(a, dict):
             raise ValueError("each codex_failure_attempt must be an object")

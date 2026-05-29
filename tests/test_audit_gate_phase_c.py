@@ -44,6 +44,7 @@ def _full_block() -> dict:
 
 
 def _bypass_block(follow: str = "audit-redo-phase-c") -> dict:
+    # Phase D R1/R2: builder enforces MIN_CODEX_FAILURES (3).
     return codex_audit.build_codex_audit_block(
         handoff_precheck.AUDIT_MODE_BYPASS,
         bypass={
@@ -51,8 +52,9 @@ def _bypass_block(follow: str = "audit-redo-phase-c") -> dict:
                 {
                     "exit": 1,
                     "stderr_hash": "sha256:" + "0" * 64,
-                    "timestamp": "2026-05-30T00:00:00+00:00",
+                    "timestamp": f"2026-05-30T0{i}:00:00+00:00",
                 }
+                for i in range(3)
             ],
             "follow_up_audit_task_id": follow,
         },

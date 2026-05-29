@@ -199,24 +199,41 @@ def test_build_block_docs_only_mode():
     assert block["audit_runs"] == runs
 
 
+def _valid_attempts(n=3):
+    # Phase D R1/R2: builder/gate/producer all enforce MIN_CODEX_FAILURES (3).
+    return [
+        {
+            "exit": 124,
+            "stderr_hash": "sha256:" + "e" * 64,
+            "timestamp": f"2026-05-30T0{i}:00:00+08:00",
+        }
+        for i in range(n)
+    ]
+
+
 def test_build_block_bypass_mode():
     block = codex_audit.build_codex_audit_block(
         handoff_precheck.AUDIT_MODE_BYPASS,
         bypass={
-            "codex_failure_attempts": [
-                {
-                    "exit": 124,
-                    "stderr_hash": "sha256:" + "e" * 64,
-                    "timestamp": "2026-05-30T00:00:00+08:00",
-                }
-            ],
+            "codex_failure_attempts": _valid_attempts(3),
             "override_ref": "ack/demo-task.retro.override.json",
             "follow_up_audit_task_id": "demo-task-audit-followup",
         },
     )
     assert block["audit_mode"] == "codex_unavailable_bypass"
-    assert block["codex_failure_attempts"]
+    assert len(block["codex_failure_attempts"]) == 3
     assert block["follow_up_audit_task_id"] == "demo-task-audit-followup"
+
+
+def test_build_block_bypass_rejects_too_few_failures():
+    with pytest.raises(ValueError, match="MIN_CODEX_FAILURES"):
+        codex_audit.build_codex_audit_block(
+            handoff_precheck.AUDIT_MODE_BYPASS,
+            bypass={
+                "codex_failure_attempts": _valid_attempts(2),
+                "follow_up_audit_task_id": "x-followup",
+            },
+        )
 
 
 def test_build_block_bypass_requires_failure_proof():
@@ -750,11 +767,14 @@ def test_build_block_bypass_rejects_bad_follow_up_slug():
 
 
 def test_build_block_bypass_rejects_bad_attempt_shape():
+    # 3 attempts so the MIN_CODEX_FAILURES floor passes and the per-attempt shape
+    # check (bad stderr_hash on the last) is what raises.
     with pytest.raises(ValueError, match="stderr_hash"):
         codex_audit.build_codex_audit_block(
             handoff_precheck.AUDIT_MODE_BYPASS,
             bypass={
-                "codex_failure_attempts": [{"exit": 1, "stderr_hash": "nope", "timestamp": "t"}],
+                "codex_failure_attempts": _valid_attempts(2)
+                + [{"exit": 1, "stderr_hash": "nope", "timestamp": "t"}],
                 "follow_up_audit_task_id": "x-followup",
             },
         )
@@ -765,9 +785,7 @@ def test_build_block_bypass_rejects_unsafe_override_ref():
         codex_audit.build_codex_audit_block(
             handoff_precheck.AUDIT_MODE_BYPASS,
             bypass={
-                "codex_failure_attempts": [
-                    {"exit": 1, "stderr_hash": "sha256:" + "e" * 64, "timestamp": "t"}
-                ],
+                "codex_failure_attempts": _valid_attempts(3),
                 "follow_up_audit_task_id": "x-followup",
                 "override_ref": "/etc/passwd",
             },
