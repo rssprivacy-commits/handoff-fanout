@@ -219,3 +219,60 @@ def test_g7_override_expired_ack_blocked(handoff_home, tmp_path, monkeypatch):
     )
     assert out.klass == "blocked"
     assert out.subcode == "codex-audit-override-invalid"
+
+
+# ─── Task 4: bypass sidecar producer ─────────────────────────────────────────
+
+
+def _attempts(n):
+    return [
+        {
+            "exit": 1,
+            "stderr_hash": "sha256:" + "c" * 64,
+            "timestamp": f"2026-05-30T0{i}:00:00+00:00",
+        }
+        for i in range(n)
+    ]
+
+
+def test_write_bypass_override_schema_and_deadline(handoff_home):
+    created = "2026-05-30T00:00:00+00:00"
+    art = codex_audit.write_bypass_override(
+        PROJECT, TASK, "redo-audit-x", _attempts(3), "codex unavailable: timeout", created
+    )
+    assert art["schema_version"] == "1.0"
+    assert art["kind"] == "codex_audit_bypass"
+    assert art["task"] == TASK
+    assert art["follow_up_audit_task_id"] == "redo-audit-x"
+    assert art["follow_up_deadline"] == "2026-05-31T00:00:00+00:00"  # created + 1d
+    assert len(art["codex_failure_attempts"]) == 3
+    # on disk at the scanner-contract path
+    p = codex_audit.bypass_override_path(PROJECT, TASK)
+    assert p.name == f"{TASK}.audit.override.json"
+    assert json.loads(p.read_text()) == art
+    # audit trail records the write
+    trail = handoff_home / PROJECT / "ack" / f"{TASK}.audit.retry_audit.jsonl"
+    lines = [json.loads(x) for x in trail.read_text().splitlines() if x.strip()]
+    assert any(e.get("event") == "bypass-override-written" for e in lines)
+
+
+def test_write_bypass_override_too_few_failures_rejected(handoff_home):
+    with pytest.raises(ValueError, match="MIN_CODEX_FAILURES|at least"):
+        codex_audit.write_bypass_override(
+            PROJECT, TASK, "redo-audit-x", _attempts(2), "codex down", "2026-05-30T00:00:00+00:00"
+        )
+
+
+def test_write_bypass_override_bad_follow_id_rejected(handoff_home):
+    with pytest.raises(ValueError, match="follow_up_audit_task_id|slug"):
+        codex_audit.write_bypass_override(
+            PROJECT, TASK, "Bad Id!", _attempts(3), "codex down", "2026-05-30T00:00:00+00:00"
+        )
+
+
+def test_write_bypass_override_newline_follow_id_rejected(handoff_home):
+    # the producer must reject a trailing-newline slug (mirror fullmatch contract)
+    with pytest.raises(ValueError, match="follow_up_audit_task_id|slug"):
+        codex_audit.write_bypass_override(
+            PROJECT, TASK, "redo-x\n", _attempts(3), "codex down", "2026-05-30T00:00:00+00:00"
+        )

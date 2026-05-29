@@ -256,6 +256,91 @@ def load_owner_ack(project: str, task: str, finding_hash: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+# ─── bypass sidecar producer (Component B) — design §3 ──────────────────────
+# When codex is genuinely unavailable, audit-close auto-writes this sidecar so
+# the Phase C overdue scanner (auto-continue.sh scan_overdue_kind) and the dump
+# gate (_check_follow_up_overdue) can enforce the re-audit debt. NO owner click:
+# codex being down is a MACHINE fact (owner ruling #2); the safety net is the
+# machine failure proof + the forced follow-up task + the overdue deadline.
+
+
+def bypass_override_path(project: str, task: str) -> Path:
+    """``$HANDOFF_HOME/<project>/ack/<task>.audit.override.json`` — the sidecar the
+    Phase C scanner reads (follow_up_audit_task_id + follow_up_deadline)."""
+    _validate_ids(project, task)
+    return _config.home_dir() / project / "ack" / f"{task}.audit.override.json"
+
+
+def write_bypass_override(
+    project: str,
+    task: str,
+    follow_up_audit_task_id: str,
+    codex_failure_attempts: list[dict],
+    reason: str,
+    created_at: str,
+) -> dict:
+    """Write the codex_unavailable_bypass sidecar. Returns the artifact dict.
+
+    Validates the honest-path threshold (>= :data:`MIN_CODEX_FAILURES`
+    machine-proven failures) and the follow-up slug (isinstance str + fullmatch —
+    the SAME contract as build_codex_audit_block / _gate_bypass /
+    forced_follow_up_task; a trailing-newline or non-str slug must be rejected
+    here too or the owed follow-up silently never reaches old_ready). Deadline =
+    ``created_at`` + :data:`BYPASS_FOLLOW_UP_DEADLINE_DAYS`.
+    """
+    _validate_ids(project, task)
+    if not isinstance(follow_up_audit_task_id, str) or not _pc.TASK_ID_RE.fullmatch(
+        follow_up_audit_task_id
+    ):
+        raise ValueError(
+            "follow_up_audit_task_id must be a slug [a-z0-9-] "
+            f"(got {follow_up_audit_task_id!r})"
+        )
+    if (
+        not isinstance(codex_failure_attempts, list)
+        or len(codex_failure_attempts) < MIN_CODEX_FAILURES
+    ):
+        count = len(codex_failure_attempts) if isinstance(codex_failure_attempts, list) else "non-list"
+        raise ValueError(
+            f"bypass needs at least MIN_CODEX_FAILURES={MIN_CODEX_FAILURES} "
+            f"machine-proven codex failures; got {count}"
+        )
+    for a in codex_failure_attempts:
+        if not isinstance(a, dict):
+            raise ValueError("each codex_failure_attempt must be an object")
+        if not isinstance(a.get("exit"), int) or isinstance(a.get("exit"), bool):
+            raise ValueError("codex_failure_attempt.exit must be an int")
+        if not _SHA256_REF_RE.match(str(a.get("stderr_hash", ""))):
+            raise ValueError("codex_failure_attempt.stderr_hash must be sha256:<64 hex>")
+        if not isinstance(a.get("timestamp"), str) or not a["timestamp"].strip():
+            raise ValueError("codex_failure_attempt.timestamp must be a non-empty string")
+    deadline = _add_days_iso(created_at, BYPASS_FOLLOW_UP_DEADLINE_DAYS)
+    artifact = {
+        "schema_version": BYPASS_OVERRIDE_SCHEMA_VERSION,
+        "kind": "codex_audit_bypass",
+        "task": task,
+        "follow_up_audit_task_id": follow_up_audit_task_id,
+        "follow_up_deadline": deadline,
+        "codex_failure_attempts": list(codex_failure_attempts),
+        "created_at": created_at,
+        "reason": reason,
+    }
+    path = bypass_override_path(project, task)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic.atomic_replace(path, json.dumps(artifact, ensure_ascii=False, sort_keys=True) + "\n")
+    _append_audit_trail(
+        project,
+        task,
+        {
+            "event": "bypass-override-written",
+            "follow_up_audit_task_id": follow_up_audit_task_id,
+            "follow_up_deadline": deadline,
+            "failure_count": len(codex_failure_attempts),
+        },
+    )
+    return artifact
+
+
 # ─── findings hashing (sidecar manifest — R2-P0-3) ──────────────────────────
 
 
