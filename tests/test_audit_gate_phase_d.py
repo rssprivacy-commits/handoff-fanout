@@ -44,9 +44,9 @@ def test_compute_owner_ack_token_is_canonical_sha256():
     approved = "2026-05-30T00:00:00+00:00"
     nonce = "nonce123"
     tok = codex_audit.compute_owner_ack_token(TASK, FHASH, nonce, approved)
-    expected = "sha256:" + hashlib.sha256(
-        f"{TASK}\n{FHASH}\n{nonce}\n{approved}".encode()
-    ).hexdigest()
+    expected = (
+        "sha256:" + hashlib.sha256(f"{TASK}\n{FHASH}\n{nonce}\n{approved}".encode()).hexdigest()
+    )
     assert tok == expected
     # deterministic
     assert tok == codex_audit.compute_owner_ack_token(TASK, FHASH, nonce, approved)
@@ -91,9 +91,7 @@ def test_write_and_load_owner_ack_roundtrip(handoff_home):
     # trail line written
     trail = handoff_home / PROJECT / "ack" / f"{TASK}.audit.retry_audit.jsonl"
     lines = [json.loads(x) for x in trail.read_text().splitlines() if x.strip()]
-    assert any(
-        e.get("event") == "owner-ack-written" and e["finding_hash"] == FHASH for e in lines
-    )
+    assert any(e.get("event") == "owner-ack-written" and e["finding_hash"] == FHASH for e in lines)
 
 
 def test_load_owner_ack_missing_returns_none(handoff_home):

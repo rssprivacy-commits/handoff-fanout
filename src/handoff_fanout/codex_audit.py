@@ -293,14 +293,15 @@ def write_bypass_override(
         follow_up_audit_task_id
     ):
         raise ValueError(
-            "follow_up_audit_task_id must be a slug [a-z0-9-] "
-            f"(got {follow_up_audit_task_id!r})"
+            f"follow_up_audit_task_id must be a slug [a-z0-9-] (got {follow_up_audit_task_id!r})"
         )
     if (
         not isinstance(codex_failure_attempts, list)
         or len(codex_failure_attempts) < MIN_CODEX_FAILURES
     ):
-        count = len(codex_failure_attempts) if isinstance(codex_failure_attempts, list) else "non-list"
+        count = (
+            len(codex_failure_attempts) if isinstance(codex_failure_attempts, list) else "non-list"
+        )
         raise ValueError(
             f"bypass needs at least MIN_CODEX_FAILURES={MIN_CODEX_FAILURES} "
             f"machine-proven codex failures; got {count}"
