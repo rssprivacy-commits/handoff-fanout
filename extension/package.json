@@ -11,6 +11,11 @@
   "categories": [
     "Other"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rssprivacy-commits/handoff-fanout.git",
+    "directory": "extension"
+  },
   "main": "./dist/extension.js",
   "activationEvents": [
     "onUri"
@@ -23,6 +28,7 @@
     "pretest": "tsc -p ./tsconfig.test.json",
     "test": "mocha \"out/test/*.test.js\"",
     "test:integration": "tsc -p ./tsconfig.test.json && node ./out/test/integration/runIntegration.js",
+    "package": "npm run build && vsce package --no-dependencies --out handoff-helper.vsix",
     "vscode:prepublish": "npm run build"
   },
   "devDependencies": {
@@ -30,6 +36,7 @@
     "@types/node": "^18.19.0",
     "@types/vscode": "^1.85.0",
     "@vscode/test-electron": "^2.3.9",
+    "@vscode/vsce": "^3.9.1",
     "esbuild": "^0.20.0",
     "mocha": "^10.3.0",
     "typescript": "^5.4.0"

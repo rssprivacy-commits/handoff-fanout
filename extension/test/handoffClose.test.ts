@@ -73,24 +73,20 @@ describe("isValidNonce", () => {
 });
 
 describe("parseQuery / isClosePath (URI contract)", () => {
-  it("accepts both /close and /autoclose paths, rejects others", () => {
-    assert.strictEqual(isClosePath("/close"), true);
+  it("accepts only the canonical /autoclose path, rejects legacy /close and others", () => {
     assert.strictEqual(isClosePath("/autoclose"), true);
+    assert.strictEqual(isClosePath("/close"), false); // legacy form dropped in D-2
     assert.strictEqual(isClosePath("/open"), false);
   });
-  it("parses task from `task` param", () => {
-    const p = parseQuery("task=t1&nonce=" + VALID_NONCE + "&project=erp");
+  it("parses task_id (the canonical param) into params.task", () => {
+    const p = parseQuery("task_id=t1&nonce=" + VALID_NONCE + "&project=erp");
     assert.strictEqual(p.task, "t1");
     assert.strictEqual(p.nonce, VALID_NONCE);
     assert.strictEqual(p.project, "erp");
   });
-  it("falls back to `task_id` alias when `task` absent", () => {
-    const p = parseQuery("task_id=t2&nonce=" + VALID_NONCE);
-    assert.strictEqual(p.task, "t2");
-  });
-  it("prefers `task` over `task_id` when both present", () => {
-    const p = parseQuery("task=primary&task_id=alias");
-    assert.strictEqual(p.task, "primary");
+  it("ignores the legacy `task` param (no longer accepted)", () => {
+    const p = parseQuery("task=legacy&nonce=" + VALID_NONCE);
+    assert.strictEqual(p.task, null);
   });
 });
 

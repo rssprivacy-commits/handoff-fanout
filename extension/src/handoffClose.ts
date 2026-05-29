@@ -18,23 +18,27 @@ export interface HandoffCloseParams {
   project: string | null;
 }
 
-// URI contract: vscode://dharmaxis.handoff-helper/<path>?task=..&nonce=..&project=..
+// Canonical URI contract (settled in D-2):
+//   vscode://dharmaxis.handoff-helper/autoclose?task_id=<id>&nonce=<hex>&project=<slug>
 //
-// The D-1 brief documents path `/close` with param `task`; the v4 design docs
-// (and the D-2 watcher in auto-continue.sh) use `/autoclose` with `task_id`.
-// To avoid a cross-component break before D-2 canonicalizes the contract, we
-// accept BOTH path spellings and BOTH param names. The discrepancy is flagged
-// for the master to settle in D-2.
-export const CLOSE_PATHS: ReadonlySet<string> = new Set(["/close", "/autoclose"]);
+// D-1 provisionally accepted both `/close`|`/autoclose` paths and `task`|`task_id`
+// params to avoid a cross-component break before the contract was pinned. D-2
+// canonicalizes to the single form the launchd watcher actually emits — see
+// install/auto-continue.sh `try_autoclose`, which hardcodes
+// `/autoclose?task_id=…&nonce=…&project=…`. The legacy `/close` path and `task`
+// param are dropped: there is no producer of those forms (the watcher is the
+// sole emitter), so tightening the receiver to match the sender removes
+// unreachable surface rather than breaking any caller.
+export const AUTOCLOSE_PATH = "/autoclose";
 
 export function isClosePath(path: string): boolean {
-  return CLOSE_PATHS.has(path);
+  return path === AUTOCLOSE_PATH;
 }
 
 export function parseQuery(query: string): HandoffCloseParams {
   const p = new URLSearchParams(query);
   return {
-    task: p.get("task") ?? p.get("task_id"),
+    task: p.get("task_id"),
     nonce: p.get("nonce"),
     project: p.get("project"),
   };
