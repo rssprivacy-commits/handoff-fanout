@@ -664,11 +664,19 @@ def _check_follow_up_overdue(project: str, cfg: dict) -> GateResult | None:
     ack = _ack_dir(project)
     if not ack.exists():
         return None
-    for marker in ack.glob("*.retro_overdue.txt"):
-        return _bypass(
-            "follow-up-overdue",
-            f"another task has overdue retro: {marker.name}; resolve before dumping",
-        )
+    # Both follow-up debts block the project: the v5.4 retro overdue
+    # (*.retro_overdue.txt) and the Phase C codex-audit bypass overdue
+    # (*.audit_overdue.txt). The shell overdue scanner writes both via the same
+    # machinery (auto-continue.sh scan_overdue_kind); the gate must read both or
+    # the codex-audit marker would be write-only (R1 P1). The audit kind stays
+    # dormant until the bypass-override producer lands (deferred, spec §7.3).
+    for pattern in ("*.retro_overdue.txt", "*.audit_overdue.txt"):
+        for marker in ack.glob(pattern):
+            kind = "codex-audit" if marker.name.endswith(".audit_overdue.txt") else "retro"
+            return _bypass(
+                "follow-up-overdue",
+                f"another task has overdue {kind} follow-up: {marker.name}; resolve before dumping",
+            )
     return None
 
 

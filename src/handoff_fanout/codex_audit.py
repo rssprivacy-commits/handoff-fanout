@@ -146,6 +146,43 @@ def compute_findings_hash(findings: dict) -> str:
     return hashlib.sha256(_pc.canonical_json_bytes(findings)).hexdigest()
 
 
+def compute_codex_audit_hash(block: dict) -> str:
+    """SHA-256 hex over the *canonical* bytes of a ``codex_audit`` block.
+
+    Written into ``old_ready.codex_audit_hash`` (Phase C) so a new session (§0)
+    and the autoclose watcher can detect tampering of the audit block between
+    the dump and the next spawn. Plain hex, matching the
+    ``old_ready.retro_evidence_hash`` style (not the ``sha256:`` ref form).
+    """
+    return hashlib.sha256(_pc.canonical_json_bytes(block)).hexdigest()
+
+
+def forced_follow_up_task(block: dict) -> str | None:
+    """The task the *next* session is forced to run, or ``None`` (Phase C §1.3).
+
+    Only ``codex_unavailable_bypass`` constrains the next task: bypass means the
+    session skipped its codex audit, so it *owes* one — the next session's first
+    task MUST be the bypass's ``follow_up_audit_task_id`` (it is not free to
+    continue roadmap on un-audited code). Every other mode (full / empty_diff /
+    docs_only) audited in place and imposes no constraint, so returns ``None``.
+
+    Returns ``None`` (no constraint, fail-open for the non-bypass majority) when
+    the block isn't a dict, isn't bypass mode, or its follow-up isn't a valid
+    kebab slug — a malformed bypass block is caught at build time
+    (:func:`build_codex_audit_block`), so this stays a pure, defensive reader.
+    """
+    if not isinstance(block, dict):
+        return None
+    if block.get("audit_mode") != _pc.AUDIT_MODE_BYPASS:
+        return None
+    follow = block.get("follow_up_audit_task_id")
+    # fullmatch, not match: ``$`` matches before a trailing newline (R2 P2), so a
+    # ``"audit-redo-x\n"`` slug must not slip through into next_session_forced_task.
+    if isinstance(follow, str) and _pc.TASK_ID_RE.fullmatch(follow):
+        return follow
+    return None
+
+
 def derive_verdict(findings: dict) -> str:
     """``"pass"`` iff no original finding is P0/P1, else ``"fail"`` (spec §3.1).
 
@@ -301,7 +338,10 @@ def build_codex_audit_block(
             "proof of >=N codex failures)"
         )
     follow = bypass.get("follow_up_audit_task_id")
-    if not follow or not _pc.TASK_ID_RE.match(follow):
+    # fullmatch, not match: Python's ``$`` matches before a trailing newline, so
+    # ``.match("audit-redo-x\n")`` would pass and a newline-bearing slug would
+    # land in evidence + old_ready.next_session_forced_task (R2 P2).
+    if not follow or not isinstance(follow, str) or not _pc.TASK_ID_RE.fullmatch(follow):
         raise ValueError(
             "codex_unavailable_bypass requires follow_up_audit_task_id as a slug [a-z0-9-]"
         )
@@ -828,7 +868,12 @@ def _gate_bypass(block: dict) -> AuditGateOutcome:
                 "failure attempt stderr_hash must be sha256:<64 hex>",
             )
     follow = block.get("follow_up_audit_task_id")
-    if not follow or not _pc.TASK_ID_RE.match(str(follow)):
+    # Mirror the producer (build_codex_audit_block) and reader
+    # (forced_follow_up_task) exactly: isinstance str + fullmatch (R3 P1). The
+    # old ``match(str(follow))`` accepted a non-string ``123`` or a trailing-
+    # newline slug here, which forced_follow_up_task then rejects — so the gate
+    # would pass a bypass whose owed follow-up silently never reaches old_ready.
+    if not isinstance(follow, str) or not _pc.TASK_ID_RE.fullmatch(follow):
         return AuditGateOutcome(
             "bypass",
             "codex-audit-bypass-no-failure-proof",

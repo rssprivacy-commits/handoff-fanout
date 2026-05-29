@@ -372,29 +372,78 @@ json_get() {
 # precheck/<follow_task>.retro.evidence.json before that deadline. If the
 # deadline passes without the evidence appearing, this scanner stamps an
 # overdue marker the next dump in the same project hard-fails on (exit 6).
+#
+# Phase C (codex audit gate, spec §6 / §4 module table): the SAME machinery is
+# reused for the codex-audit bypass debt — ack/<task>.audit.override.json with
+# a follow_up_audit_task_id. scan_overdue_kind is the parameterized core; the
+# two kinds differ only in glob suffix / follow-key / marker names. NOTE: the
+# codex-audit override *producer* (the bypass sidecar artifact carrying
+# follow_up_audit_task_id + follow_up_deadline) is an owner-decision item
+# deferred to before Phase D (spec §7.3); until it lands no *.audit.override.json
+# files exist, so the codex kind is dormant-but-ready and a strict no-op.
 
-scan_overdue_overrides() {
-    local proj_dir="$1"
+# Is the follow-up debt actually satisfied by the follow-up evidence file?
+#   $1 evidence file (already confirmed to exist)
+#   $2 require_audit  — "1" = codex-audit kind (needs a real audit), else retro
+# Retro debt clears on mere evidence existence. Codex-audit debt is stricter
+# (R1 P1-2): the owed audit must have actually run, so the follow-up evidence
+# must carry a top-level codex_audit block whose audit_mode is a real (non-
+# bypass) mode. This is parsed STRUCTURALLY via python3 (R2 P1): a flat key
+# scan (json_get) is spoofable by a stray "audit_mode" elsewhere in the JSON
+# (e.g. an extra phase-status field), which would falsely discharge the debt.
+# The non-bypass enum is mirrored from handoff_precheck.AUDIT_MODE_* — keep in
+# sync. Any parse error / missing block ⇒ not satisfied (fail-safe: keep owing).
+follow_up_satisfied() {
+    local evid="$1" require_audit="$2"
+    [ "$require_audit" = "1" ] || return 0
+    "$HANDOFF_PYTHON_CMD" - "$evid" <<'PY' 2>/dev/null
+import json
+import sys
+
+NON_BYPASS = {"full_codex_audit", "empty_diff_attestation", "docs_only_light_audit"}
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, ValueError):
+    sys.exit(1)
+block = data.get("codex_audit") if isinstance(data, dict) else None
+mode = block.get("audit_mode") if isinstance(block, dict) else None
+sys.exit(0 if mode in NON_BYPASS else 1)
+PY
+}
+
+# Generic overdue scanner for one override "kind".
+#   $2 glob_suffix   — file suffix after the task id (e.g. "retro.override.json")
+#   $3 follow_key     — JSON key holding the follow-up task id
+#   $4 marker_suffix  — overdue marker file suffix (e.g. "retro_overdue.txt")
+#   $5 audit_suffix   — closing-audit jsonl suffix (e.g. "retro.retry_audit.jsonl")
+#   $6 kind_label     — human label for the notification / log line
+#   $7 require_audit  — "1" ⇒ follow-up must carry a real (non-bypass) codex audit
+# The follow-up clears on precheck/<follow_task>.retro.evidence.json for both
+# kinds; the codex kind additionally requires that evidence to prove the audit.
+scan_overdue_kind() {
+    local proj_dir="$1" glob_suffix="$2" follow_key="$3"
+    local marker_suffix="$4" audit_suffix="$5" kind_label="$6" require_audit="${7:-0}"
     local project; project=$(basename "$proj_dir")
     local ack_dir="$proj_dir/ack"
     local precheck_dir="$proj_dir/precheck"
     [ -d "$ack_dir" ] || return 0
     local now_iso; now_iso=$(now_iso_utc)
-    for ovr in "$ack_dir"/*.retro.override.json; do
+    for ovr in "$ack_dir"/*."$glob_suffix"; do
         [ -f "$ovr" ] || continue
-        local task; task=$(basename "$ovr" .retro.override.json)
+        local task; task=$(basename "$ovr" ".$glob_suffix")
         local deadline follow_task
         deadline=$(json_get "$ovr" "follow_up_deadline")
-        follow_task=$(json_get "$ovr" "follow_up_retro_task_id")
+        follow_task=$(json_get "$ovr" "$follow_key")
         [ -z "$deadline" ] && continue
         [ -z "$follow_task" ] && continue
-        # P0: follow_up_retro_task_id is interpolated into a precheck/<task>
-        # evidence path below. Reject anything outside kebab-case so a crafted
-        # value (e.g. "../foreign") can't resolve an out-of-tree file and
-        # falsely clear the overdue gate.
+        # P0: the follow task id is interpolated into a precheck/<task> evidence
+        # path below. Reject anything outside kebab-case so a crafted value
+        # (e.g. "../foreign") can't resolve an out-of-tree file and falsely
+        # clear the overdue gate.
         case "$follow_task" in
             *[!a-z0-9-]*)
-                log "OVERDUE-SKIP: project=$project task=$task — unsafe follow_task '$follow_task'"
+                log "OVERDUE-SKIP: kind=$kind_label project=$project task=$task — unsafe follow_task '$follow_task'"
                 continue ;;
         esac
         # P0: timezone-correct overdue check. A lexical compare mis-sorts mixed
@@ -405,19 +454,28 @@ scan_overdue_overrides() {
         if [ "$odrc" -ne 0 ]; then
             # rc>=2 means we couldn't decide (bad deadline / python3 missing) —
             # fail safe (don't mark overdue) but log so the gate can't go dark silently.
-            [ "$odrc" -ge 2 ] && log "OVERDUE-SCAN-WARN: project=$project task=$task — undecidable deadline (rc=$odrc) deadline=$deadline"
+            [ "$odrc" -ge 2 ] && log "OVERDUE-SCAN-WARN: kind=$kind_label project=$project task=$task — undecidable deadline (rc=$odrc) deadline=$deadline"
             continue
         fi
         local follow_evid="$precheck_dir/$follow_task.retro.evidence.json"
-        local audit="$ack_dir/$task.retro.retry_audit.jsonl"
-        local overdue_marker="$ack_dir/$task.retro_overdue.txt"
-        if [ -f "$follow_evid" ]; then
-            # Follow-up retro arrived: unlink any prior overdue marker + the
-            # override (§7.9 解除条件), then append the closing audit line.
+        local audit="$ack_dir/$task.$audit_suffix"
+        local overdue_marker="$ack_dir/$task.$marker_suffix"
+        if [ -f "$follow_evid" ] && follow_up_satisfied "$follow_evid" "$require_audit"; then
+            # Follow-up arrived (and, for codex-audit, actually carries the owed
+            # audit): unlink any prior overdue marker + the override (§7.9 解除
+            # 条件), then append the closing audit line. An evidence file that
+            # does NOT discharge the debt falls through to overdue marking below.
             if [ -f "$overdue_marker" ]; then
                 rm -f "$overdue_marker"
-                printf '{"event":"follow-up-closed","follow_task":"%s","closed_at":"%s"}\n' \
-                    "$follow_task" "$now_iso" >> "$audit"
+                # R4 P2: keep the retro line byte-identical to its pre-Phase-C
+                # shape (no `kind` field); only the new codex-audit kind tags it.
+                if [ "$kind_label" = "retro" ]; then
+                    printf '{"event":"follow-up-closed","follow_task":"%s","closed_at":"%s"}\n' \
+                        "$follow_task" "$now_iso" >> "$audit"
+                else
+                    printf '{"event":"follow-up-closed","kind":"%s","follow_task":"%s","closed_at":"%s"}\n' \
+                        "$kind_label" "$follow_task" "$now_iso" >> "$audit"
+                fi
             fi
             rm -f "$ovr"
             continue
@@ -425,18 +483,34 @@ scan_overdue_overrides() {
         if [ ! -f "$overdue_marker" ]; then
             # P2: atomic first-writer-wins. Two concurrent launchd runs can both
             # pass the -f test above; noclobber makes the redirect fail for all
-            # but the first, so only one writer notifies.
+            # but the first, so only one writer notifies. R4 P2: retro marker
+            # bytes are preserved verbatim; only codex-audit adds the `kind` tag.
             if ( set -o noclobber
-                 printf '{"event":"overdue","task":"%s","deadline":"%s","now":"%s"}\n' \
-                    "$task" "$deadline" "$now_iso" > "$overdue_marker" ) 2>/dev/null; then
+                 if [ "$kind_label" = "retro" ]; then
+                     printf '{"event":"overdue","task":"%s","deadline":"%s","now":"%s"}\n' \
+                        "$task" "$deadline" "$now_iso" > "$overdue_marker"
+                 else
+                     printf '{"event":"overdue","kind":"%s","task":"%s","deadline":"%s","now":"%s"}\n' \
+                        "$kind_label" "$task" "$deadline" "$now_iso" > "$overdue_marker"
+                 fi ) 2>/dev/null; then
                 "$HANDOFF_OSASCRIPT_CMD" -e \
-                    "display notification \"Follow-up retro overdue: $task\" with title \"Handoff\"" \
+                    "display notification \"Follow-up $kind_label overdue: $task\" with title \"Handoff\"" \
                     2>>"$LOG" || true
-                log "OVERDUE: project=$project task=$task deadline=$deadline"
+                log "OVERDUE: kind=$kind_label project=$project task=$task deadline=$deadline"
                 OVERDUE_MARKED=$((OVERDUE_MARKED + 1))
             fi
         fi
     done
+}
+
+# v5.4 retro mandate (HANDOFF_RETRO_BYPASS) + Phase C codex-audit bypass share
+# the same overdue machinery, differing only by override kind.
+scan_overdue_overrides() {
+    local proj_dir="$1"
+    scan_overdue_kind "$proj_dir" "retro.override.json" "follow_up_retro_task_id" \
+        "retro_overdue.txt" "retro.retry_audit.jsonl" "retro" "0"
+    scan_overdue_kind "$proj_dir" "audit.override.json" "follow_up_audit_task_id" \
+        "audit_overdue.txt" "audit.retry_audit.jsonl" "codex-audit" "1"
 }
 
 for PROJ_DIR in "$HANDOFF_ROOT"/*/; do

@@ -89,7 +89,7 @@ EVID="$HOME/.claude-handoff/$PROJ/precheck/$TASK.retro.evidence.json"
 OLDREADY="$HOME/.claude-handoff/$PROJ/ack/$TASK.old_ready"
 if [ -f "$EVID" ]; then
     jq '{{head, mode, phase0, phase1, next_brief, evidence_hash}}' "$EVID" 2>/dev/null || cat "$EVID"
-    [ -f "$OLDREADY" ] && jq '{{session_id_kind, retro_evidence_hash, commit_hash}}' "$OLDREADY"
+    [ -f "$OLDREADY" ] && jq '{{session_id_kind, retro_evidence_hash, commit_hash, codex_audit_hash, codex_audit_mode, next_session_forced_task}}' "$OLDREADY"
     echo "✅ 前任 retro evidence 在位 — 可推进 task"
 else
     echo "⛔ 前任无 retro.evidence.json — HANDOFF_RETRO_MANDATE=1 已拨 (Phase 4c, 2026-05-29)。"
@@ -97,9 +97,21 @@ else
     echo "   立即写 queue/$TASK.BLOCKED.md 注明 '前任缺 retro evidence' 并通知主人裁决；"
     echo "   仅在主人显式授权后用 'handoff precheck --mode forensic_retro' 补登记。"
 fi
+
+# Phase C — codex 审计 bypass 强制 follow-up (spec §1.3)。前任若 codex 审计走
+# bypass (codex 不可用), 它欠一次审计 → 下一棒 (=本会话) 的首任务**必须**是前任
+# 记录的 follow-up task, 不得继续 roadmap (否则 = 在未审代码上接着干)。
+FORCED=$([ -f "$OLDREADY" ] && jq -r '.next_session_forced_task // empty' "$OLDREADY" 2>/dev/null)
+if [ -n "$FORCED" ] && [ "$FORCED" != "$TASK" ]; then
+    echo "⛔ 前任 codex 审计 bypass — 强制 follow-up = '$FORCED', 但本会话 task = '$TASK'。"
+    echo "   bypass = 欠一次审计, 下一棒先还债 (spec §1.3)。不要继续 roadmap。"
+    echo "   立即写 queue/$TASK.BLOCKED.md 注明 '跳过 codex audit follow-up' 并通知主人裁决。"
+fi
 ```
 
 **新会话不代签** (v5.4 spec §2.3 Q9): 缺 evidence 时**不要**自己跑 `handoff precheck` 假装补做 — Phase 0/1 是老会话对自身工作的闭环声明，新会话无法证明。若主人明确授权 forensic retro，用 `handoff precheck --mode forensic_retro` 显式标记。
+
+**Phase C — codex 审计门禁状态** (mandate OFF / 当前阶段): old_ready 的 `codex_audit_hash` / `codex_audit_mode` / `next_session_forced_task` 为审计门禁元数据 (spec §6 Phase C)。`HANDOFF_AUDIT_MANDATE` **未拨** (Phase D 才拨) → 上面的 forced-follow-up 检查目前是**会话自律**警示, 非工具层硬拒。详 `project-files/handoff/codex-audit-gate-spec-draft.md` §1.3 / §6。
 
 ## 第一步: 启动 heartbeat (v5.1+ / 529 风暴防御 / v4.1 单 task 模式)
 
@@ -231,6 +243,29 @@ handoff dump \\
 | 6 / `ERR-BYPASS:` | bypass 字段缺 / follow-up overdue | 补 trail 字段后 re-dump |
 
 **当前阶段** (Phase 4c flipped 2026-05-29 / 已拨): `HANDOFF_RETRO_MANDATE=1` 在 `~/.zshenv` + `launchctl setenv` + `auto-continue.plist EnvironmentVariables` 三路径全量生效。不带 `--retro-evidence` 调 dump → exit 4 `ERR-RETRY` 拒绝; 紧急 P0 走 `HANDOFF_RETRO_BYPASS=1` + `ack/<task>.retro.override.json` (含 `follow_up_retro_task_id` + ISO-8601 `follow_up_deadline`)。
+
+### §-1.5 codex 审计门禁 — audit-close 流程 (Phase C / mandate OFF / spec §6)
+
+本 task 若**改了代码** (非纯文档), 闭环时应跑 codex 审计并用 `handoff audit-close` 替代裸 `handoff dump` —— 它在**单进程持锁内**把 codex 审计块 (机器可校验) 折进 retro evidence 再 dump, HEAD 不会在审计与 dump 之间漂移 (spec §1.6 / R2-P0-6)。
+
+```bash
+cd {workspace}
+# 1) 跑 codex 审计 → 登记机器产物 (按 spec §3 / Phase B 已能记录)
+handoff audit-run --task <next-task-id> --run-index 1 ...        # 写 codex-findings.json + sidecar manifest
+handoff audit-disposition --task <next-task-id> ...             # 每个 P0/P1 一条 disposition
+
+# 2) audit-close: full 模式 (有代码改动) — 把审计块折进 evidence + dump 一气呵成
+handoff audit-close \\
+    --task <next-task-id> --next "<brief>" --status active \\
+    --audit-mode full_codex_audit --run-record '<run-record-json>' \\
+    --phase0-status memory=✅ ... --phase1-status codex=✅ ...
+```
+
+**4 模式** (gate 在 Phase D 机器裁定 / Phase C 仅记录): `full_codex_audit` (有代码改动) / `empty_diff_attestation` (diff 为空) / `docs_only_light_audit` (纯文档, prompts/CLAUDE.md/schema/SQL 不算) / `codex_unavailable_bypass` (codex 不可用)。
+
+**bypass = 欠债** (spec §1.3): codex 真不可用时走 `--audit-mode codex_unavailable_bypass --bypass-file <f>` (含 `codex_failure_attempts` 机器失败证明 + `follow_up_audit_task_id`)。**下一棒 `--task` 必须 = `follow_up_audit_task_id`** —— dump 会把它写进 `old_ready.next_session_forced_task`, 新会话 §0 校验; 接了别的 task = §0 拦下 (mandate on 后硬拒)。
+
+**当前阶段** (Phase C / mandate OFF): `HANDOFF_AUDIT_MANDATE` 未拨, dump gate 暂**不**强制 G0-G9, audit-close 只**记录**审计块 (不阻断旧流程)。Phase D 三路径拨 `HANDOFF_AUDIT_MANDATE=1` 后才达成"缺陷不下传"。详 `project-files/handoff/codex-audit-gate-spec-draft.md` §6。⚠️ Phase D 拨前必补: `owner_ack_token` 加密验证 (§7.3) + bypass sidecar artifact (主人裁决项)。
 
 成功 → launchd / cron WatchPaths 1 秒内 spawn 新 Claude tab.
 

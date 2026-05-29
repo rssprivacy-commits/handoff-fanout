@@ -513,6 +513,25 @@ def _write_old_ready(
         "retro_evidence_path": rel_path,
         "retro_evidence_path_absolute": str(evidence_path.resolve()),
     }
+
+    # Phase C — surface the codex audit block so the next session (§0) and the
+    # autoclose watcher can verify it. ``codex_audit_hash`` lets them detect a
+    # tampered block; ``next_session_forced_task`` is set ONLY for a bypass
+    # (the next session owes the skipped audit, spec §1.3). Non-bypass modes
+    # impose no forced task. Lazy import: codex_audit imports dump (in
+    # main_audit_close) so a top-level import here would risk a cycle.
+    codex_audit = payload.get("codex_audit")
+    if isinstance(codex_audit, dict):
+        from handoff_fanout import codex_audit as _ca
+
+        old_ready["codex_audit_hash"] = _ca.compute_codex_audit_hash(codex_audit)
+        mode = codex_audit.get("audit_mode")
+        if isinstance(mode, str):
+            old_ready["codex_audit_mode"] = mode
+        forced = _ca.forced_follow_up_task(codex_audit)
+        if forced is not None:
+            old_ready["next_session_forced_task"] = forced
+
     ack_dir.mkdir(parents=True, exist_ok=True)
     out = ack_dir / f"{task}.old_ready"
     atomic.write_with_fsync(
