@@ -276,3 +276,81 @@ def test_write_bypass_override_newline_follow_id_rejected(handoff_home):
         codex_audit.write_bypass_override(
             PROJECT, TASK, "redo-x\n", _attempts(3), "codex down", "2026-05-30T00:00:00+00:00"
         )
+
+
+# ─── Task 5: audit-close auto-writes the bypass sidecar (end-to-end) ──────────
+
+
+def test_audit_close_bypass_writes_sidecar(handoff_home, tmp_path, monkeypatch):
+    ws = _ws(tmp_path, monkeypatch)
+    bypass = {
+        "codex_failure_attempts": _attempts(3),
+        "follow_up_audit_task_id": "redo-audit-next",
+    }
+    bypass_file = tmp_path / "bypass.json"
+    bypass_file.write_text(json.dumps(bypass))
+    argv = [
+        "--task",
+        TASK,
+        "--project",
+        PROJECT_WS,
+        "--workspace",
+        str(ws),
+        "--next",
+        "next brief",
+        "--audit-mode",
+        "codex_unavailable_bypass",
+        "--bypass-file",
+        str(bypass_file),
+        "--status",
+        "active",
+    ]
+    for k in handoff_precheck.PHASE0_KEYS:
+        argv += ["--phase0-status", f"{k}=✅"]
+    for k in handoff_precheck.PHASE1_KEYS:
+        argv += ["--phase1-status", f"{k}=✅"]
+    rc = codex_audit.main_audit_close(argv)
+    assert rc == 0, rc
+    sidecar = codex_audit.bypass_override_path(PROJECT_WS, TASK)
+    assert sidecar.exists()
+    data = json.loads(sidecar.read_text())
+    assert data["follow_up_audit_task_id"] == "redo-audit-next"
+    assert data["kind"] == "codex_audit_bypass"
+    # the follow-up deadline must be parseable ISO-8601 (scanner contract)
+    datetime.fromisoformat(data["follow_up_deadline"].replace("Z", "+00:00"))
+
+
+def test_audit_close_full_mode_writes_no_sidecar(handoff_home, tmp_path, monkeypatch):
+    # a non-bypass close must NOT emit a bypass sidecar (no false debt).
+    ws = _ws(tmp_path, monkeypatch)
+    head = _head(ws)
+    rec = codex_audit.write_findings_artifact(
+        PROJECT_WS,
+        TASK,
+        1,
+        {"run_index": 1, "input_commit": head, "original_findings": []},
+        input_commit=head,
+    )
+    argv = [
+        "--task",
+        TASK,
+        "--project",
+        PROJECT_WS,
+        "--workspace",
+        str(ws),
+        "--next",
+        "next brief",
+        "--audit-mode",
+        "full_codex_audit",
+        "--run-record",
+        json.dumps(rec),
+        "--status",
+        "active",
+    ]
+    for k in handoff_precheck.PHASE0_KEYS:
+        argv += ["--phase0-status", f"{k}=✅"]
+    for k in handoff_precheck.PHASE1_KEYS:
+        argv += ["--phase1-status", f"{k}=✅"]
+    rc = codex_audit.main_audit_close(argv)
+    assert rc == 0, rc
+    assert not codex_audit.bypass_override_path(PROJECT_WS, TASK).exists()

@@ -1890,6 +1890,25 @@ def main_audit_close(argv: list[str] | None = None) -> int:
                 sys.stderr.write(f"ERR-FATAL codex-audit-block-invalid: {e}\n")
                 return 1
 
+            # Component B: when codex is unavailable, auto-emit the bypass sidecar
+            # the Phase C overdue scanner reads (design §3 / owner ruling #2 — no
+            # owner click; codex-down is a machine fact). The builder above has
+            # already validated the bypass fields; this persists them so the
+            # re-audit debt is enforceable. created_at = the audit-close moment.
+            if args.audit_mode == _pc.AUDIT_MODE_BYPASS and bypass is not None:
+                try:
+                    write_bypass_override(
+                        project,
+                        args.task,
+                        bypass.get("follow_up_audit_task_id"),
+                        bypass.get("codex_failure_attempts") or [],
+                        bypass.get("reason") or "codex unavailable",
+                        datetime.now(UTC).isoformat(timespec="seconds"),
+                    )
+                except ValueError as e:
+                    sys.stderr.write(f"ERR-FATAL bypass-sidecar-invalid: {e}\n")
+                    return 1
+
             evidence = _pc.build_evidence(
                 task_id=args.task,
                 project=project,
