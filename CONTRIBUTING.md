@@ -11,15 +11,29 @@ Thanks for your interest. This project is small enough that contributions are ev
 
 ## Dev setup
 
+This repo ships a `uv.lock`, so `uv` is the recommended toolchain:
+
 ```bash
 git clone https://github.com/rssprivacy-commits/handoff-fanout.git
 cd handoff-fanout
+uv sync --extra dev --extra lint     # creates .venv with pytest + pytest-asyncio + ruff
+```
+
+The `dev` and `lint` extras are NOT installed by a bare `uv sync` — without
+them `.venv/bin/python -m pytest` fails with `No module named pytest`, and a
+`uv run --with pytest` shortcut still omits `pytest-asyncio` (you'll see a
+spurious `Unknown config option: asyncio_mode` warning). Always include both
+extras.
+
+Plain pip works too:
+
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev,lint]"
 ```
 
-The `-e` install also wires up the four `handoff-*` console scripts so you can test them locally without re-installing.
+The editable install also wires up the `handoff-*` console scripts so you can test them locally without re-installing.
 
 ## Running tests
 
