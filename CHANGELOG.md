@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`handoff prune`** (`eeedecc`) — new subcommand + `handoff-prune` console
+  script. Scans every project queue and removes leftover `.heartbeat` /
+  `.529-suspected` / `.uri` sidecars for *terminal* tasks (those with a
+  `.done` / `.BLOCKED.md` marker), never touching history or active/unknown
+  tasks. Dry-run by default; `--execute` to apply, `--project` to scope.
+  Built after a real erp-system queue accumulated 81 `.md` / 8 heartbeat / 4
+  stale `529` files with no command to clean them.
+- **Accessibility preflight before auto-submit** (`428abc1`) —
+  `install/auto-continue.sh` now runs a non-destructive `UI elements enabled`
+  probe before the Enter keystroke. When the Accessibility grant is missing it
+  skips the doomed keystroke, writes an `accessibility-missing` ack, and raises
+  one rate-limited notification (once per run + once per 6h) instead of a
+  silent per-task WARN. Spawn-loop `open` / frontmost / keystroke now route
+  through the existing `HANDOFF_*_CMD` env overrides (were hardcoded), so the
+  submit path is testable — covered by 4 new spawn-path tests.
+
+### Fixed
+
+- **Heartbeat leak on terminal states** (`6c88f79`) — `dump` left
+  `queue/<task>.heartbeat` (and the sub-task batch heartbeat) on disk after a
+  task went `done` / `blocked`, so the heartbeat read stale forever and
+  watchdog mode 4/6 mis-flagged finished tasks as `529-suspected`. All four
+  terminal paths (single-task done/blocked + batch done/blocked) now
+  `unlink(missing_ok=True)` the heartbeat. 5 regression tests.
+
+### Changed
+
+- **Dev setup docs** (`258615b`) — `CONTRIBUTING.md` now documents the
+  uv-native `uv sync --extra dev --extra lint` flow as the recommended path and
+  warns that a bare `uv sync` (or `uv run --with pytest`) omits the dev extras.
+
 ## [1.4.0] — 2026-05-29
 
 v5.4 Phase 4e codex audit fixes + watchdog mode 6 enforcement + precheck
