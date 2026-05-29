@@ -38,6 +38,10 @@ def main(argv: list[str] | None = None) -> int:
         "precheck",
         help="v5.4 retro-evidence precheck (see `handoff-precheck --help`)",
     )
+    sub.add_parser(
+        "prune",
+        help="Remove leftover heartbeat/529/uri sidecars for terminal tasks (dry-run by default)",
+    )
 
     # We parse only the first arg, then delegate the rest to the subcommand's own argparse.
     args, rest = parser.parse_known_args(argv)
@@ -62,6 +66,10 @@ def main(argv: list[str] | None = None) -> int:
         from handoff_fanout import handoff_precheck
 
         return handoff_precheck.main(rest)
+    if args.subcommand == "prune":
+        from handoff_fanout import prune
+
+        return prune.main(rest)
 
     parser.print_help(sys.stderr)
     return 2
