@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.1] — 2026-05-29
+
+### Fixed
+
+- **`__version__` no longer drifts from the release** — `__init__.py` hardcoded
+  `1.4.0` and was never bumped, so the published 1.5.0 wheel reported itself as
+  `1.4.0` via `handoff --version`. `__version__` now reads from installed
+  package metadata (`importlib.metadata.version`), making pyproject the single
+  source of truth.
+
 ## [1.5.0] — 2026-05-29
 
 Queue-hygiene + auto-submit reliability release. Two new features (the `handoff
