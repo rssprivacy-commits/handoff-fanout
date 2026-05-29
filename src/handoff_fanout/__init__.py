@@ -1,3 +1,3 @@
 """handoff-fanout: project-agnostic auto-handoff & parallel fan-out for AI coding sessions."""
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"

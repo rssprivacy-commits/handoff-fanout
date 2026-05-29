@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-05-29
+
+v5.4 Phase 4e codex audit fixes + watchdog mode 6 enforcement + precheck
+reason enforcement + CJK path hardening. Bundles every change merged to
+`main` since v1.3.0 (Phase 4d). MINOR bump: `357e2fd` adds a new
+**required** reason field for non-`✅` retro statuses, a
+backward-incompatible CLI contract change for callers that previously
+submitted `⚠️`/`❌`/`skip` without a reason — so this is not patch-safe.
+
+### Added
+
+- **`watchdog` mode 6 auto-kill** (`5b5d9b7`) — the stale-task watcher
+  now actively kills processes whose heartbeat went silent past the
+  threshold and returns a structured `EnforceResult`, rather than only
+  flagging `.529-suspected`. Complements the per-session `timeout`
+  caveat below (active prevention) with passive recovery.
+- **`templates` §第一步.5 timeout-wrap caveat** (`da45e9a`) — generated
+  handoff prompts now instruct sessions to wrap long-running external
+  CLI calls (codex / `claude -p` / `gh` / full `pytest`) in `timeout`,
+  after a 19-minute codex hang froze a session and starved its
+  heartbeat on 2026-05-29.
+- **`precheck` reason enforcement** (`357e2fd`, `f2d8bd3`) — any non-`✅`
+  retro status (`⚠️` / `❌` / `skip`) now requires a non-empty reason at
+  both the CLI and gate layers; whitespace-only reasons are rejected.
+  Defends against ceremonial evidence (8-sample audit found 7/8 with
+  zero reasons = pass-in-name-only).
+
+### Fixed
+
+- **v5.4 Phase 4e codex R1 P0/P1 hardening** (`2b7942f`) — autoclose &
+  follow-up overdue scanner hardened: timezone-aware deadline parsing
+  (no lexical string compare), `follow_up` task-id path-traversal guard,
+  and URI-nonce validation.
+- **v5.4 Phase 4e P0-2 defense-in-depth** (`6d2998a`) — the retro gate
+  rejects non-kebab-case `follow_up` task ids as a second layer.
+- **v5.4 Phase 4e R2 P2 observability** (`8ac6e02`) — no silent failures
+  in the autoclose watcher; every skipped/aborted path is logged.
+- **safe-commit CJK path normalization** (`89d3fe4`) — `git` invocations
+  use `core.quotepath=false` so CJK file paths no longer trip false
+  positives in the segment-5 hijack check.
+- **install-hook file-path contract + CJK + dual-mode** (`bb983f9`) —
+  the installed pre-commit hook accepts safe-commit's file-path
+  `HANDOFF_EXPECTED_FILES` contract (alongside the legacy colon form)
+  and handles CJK paths under both modes.
+
 ## [1.3.0] — 2026-05-29
 
 v5.4 Phase 4d — D-3 `old_ready` writer + D-4 autoclose & follow-up
