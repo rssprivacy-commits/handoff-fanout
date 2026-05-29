@@ -66,6 +66,18 @@ packages = ["src/handoff_fanout"]
 [tool.hatch.build.targets.wheel.shared-data]
 "src/handoff_fanout/git_guard/git" = "share/handoff-fanout/git-guard/git"
 
+[tool.hatch.build.targets.sdist]
+# The VS Code extension is a separate artifact distributed via its own channel,
+# not part of the pip-installable Python package. Without this exclude hatchling
+# globs the whole tree into the sdist and ships extension/node_modules (~23MB of
+# junk) to PyPI. Keep the sdist to the Python package + docs + install assets.
+exclude = [
+  "/extension",
+  "/dist",
+  "/.github",
+  "/.venv",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
