@@ -457,7 +457,7 @@ autoclose_enabled_for_project() {
 # old_ready written by an earlier build still autocloses (P1: backward compat).
 # An unknown version fails closed (writes autoclose_failed.txt, logged — never
 # closes a tab on a schema it can't verify).
-KNOWN_SCHEMA_VERSIONS="v5.4.1 v5.4.0"
+KNOWN_SCHEMA_VERSIONS="5.5.0 v5.4.1 v5.4.0"
 
 # Validate old_ready then trigger the helper URI. All failure paths leave a
 # `<task>.autoclose_failed.txt` next to the ack files so the watcher won't

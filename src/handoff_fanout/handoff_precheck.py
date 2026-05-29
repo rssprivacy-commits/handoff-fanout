@@ -32,9 +32,52 @@ from pathlib import Path
 from handoff_fanout import atomic
 from handoff_fanout import config as _config
 
-EVIDENCE_SCHEMA_VERSION = "v5.4.1"
+EVIDENCE_SCHEMA_VERSION = "5.5.0"
+# The gate accepts any version in this set so an in-flight v5.4.1 evidence file
+# (written by the previous release, consumed by the next dump) still passes
+# during the migration window — spec §2.5 / R2-P1-5. The builder always emits
+# EVIDENCE_SCHEMA_VERSION; the older entries exist only for read compatibility.
+SUPPORTED_EVIDENCE_SCHEMA_VERSIONS = (EVIDENCE_SCHEMA_VERSION, "v5.4.1")
 EVIDENCE_KIND_RETRO = "retro"
 EVIDENCE_KIND_AGGREGATE = "fan_in_aggregate"
+
+# ─── codex audit gate constants (spec §3.5 / §4.4 / §1.7) ───────────────────
+# Phase A introduces the *evidence capability* only (mandate OFF): these
+# constants pin the four audit modes, the convergence bounds, and the
+# disposition vocabulary that the Phase B retro_gate (G0-G9) will enforce.
+
+AUDIT_MODE_FULL = "full_codex_audit"
+AUDIT_MODE_EMPTY_DIFF = "empty_diff_attestation"
+AUDIT_MODE_DOCS_ONLY = "docs_only_light_audit"
+AUDIT_MODE_BYPASS = "codex_unavailable_bypass"
+AUDIT_MODES = (
+    AUDIT_MODE_FULL,
+    AUDIT_MODE_EMPTY_DIFF,
+    AUDIT_MODE_DOCS_ONLY,
+    AUDIT_MODE_BYPASS,
+)
+
+# Convergence bounds (spec §4.4): MAX_AUDIT_RUNS caps the audit→fix→re-audit
+# loop (initial audit counts as run 1); MAX_INDEP_REVIEW caps independent
+# refute reviews so a refuted finding cannot livelock the gate.
+MAX_AUDIT_RUNS = 3
+MAX_INDEP_REVIEW = 2
+
+DISPOSITION_FIXED = "fixed"
+DISPOSITION_REFUTED = "independent_reviewer_refuted"
+DISPOSITION_OWNER_OVERRIDE = "owner_override"
+DISPOSITION_DEFERRED = "deferred"
+DISPOSITION_TYPES = (
+    DISPOSITION_FIXED,
+    DISPOSITION_REFUTED,
+    DISPOSITION_OWNER_OVERRIDE,
+    DISPOSITION_DEFERRED,
+)
+
+AUDIT_SEVERITIES = ("P0", "P1", "P2", "P3")
+# Only P2/P3 may be deferred (recorded, not blocking). P0/P1 must be fixed,
+# independently refuted, or owner-overridden (spec §3.1 / G4 / G8).
+DEFERRABLE_SEVERITIES = ("P2", "P3")
 
 PHASE0_KEYS = ("memory", "tests", "audit", "commit", "code_review")
 PHASE1_KEYS = ("codex", "claude_md", "l2_memory", "tests", "prs")
@@ -276,12 +319,20 @@ def build_evidence(
     nonce: str | None = None,
     phase0: dict | None = None,
     phase1: dict | None = None,
+    codex_audit: dict | None = None,
 ) -> dict:
     """Assemble + hash a retro-evidence payload.
 
     Callers typically supply per-item status via ``phase0`` / ``phase1``;
     when omitted, every item defaults to ``skip`` with reason ``unsupplied``
     which the dump-side gate will reject (so missing input is detected).
+
+    ``codex_audit`` is the optional Phase A audit block (see
+    :func:`handoff_fanout.codex_audit.build_codex_audit_block`). When omitted
+    the payload is byte-for-byte identical to a pre-5.5.0 retro evidence (minus
+    the schema version), so existing flows are unaffected. When present it is
+    folded into the hashed payload — tampering with the block invalidates
+    ``evidence_hash``.
     """
     if mode not in MODE_VALID:
         raise ValueError(f"mode must be one of {sorted(MODE_VALID)}; got {mode!r}")
@@ -313,6 +364,8 @@ def build_evidence(
     }
     if nonce:
         payload["nonce"] = nonce
+    if codex_audit is not None:
+        payload["codex_audit"] = codex_audit
     payload["evidence_hash"] = compute_evidence_hash(payload)
     return payload
 

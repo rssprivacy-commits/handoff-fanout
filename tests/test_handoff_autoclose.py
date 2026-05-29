@@ -516,7 +516,7 @@ def test_D3_dump_writes_old_ready_when_retro_evidence_supplied(tmp_path, monkeyp
     old_ready = home / PROJECT / "ack" / f"{TASK}.old_ready"
     assert old_ready.exists()
     body = json.loads(old_ready.read_text())
-    assert body["schema_version"] == "v5.4.1"
+    assert body["schema_version"] == "5.5.0"  # tracks OLD_READY_SCHEMA_VERSION bump
     assert body["task_id"] == TASK
     assert body["nonce"] == "d3check"
     assert body["dump_success"] is True
@@ -636,6 +636,20 @@ def test_A14_prior_schema_version_v540_accepted(home, stubbed_env):
     # autoclose — the watcher allow-list keeps prior versions for compat.
     evidence = _make_evidence(home, nonce="compat")
     _write_old_ready(home, TASK, evidence, nonce="compat", schema_version="v5.4.0")
+    _touch_submitted(home, TASK)
+
+    _run_script(stubbed_env)
+    done = home / PROJECT / "ack" / f"{TASK}.autoclose_done"
+    failed = home / PROJECT / "ack" / f"{TASK}.autoclose_failed.txt"
+    assert done.exists(), list((home / PROJECT / "ack").iterdir())
+    assert not failed.exists()
+
+
+def test_A15_current_schema_version_550_accepted(home, stubbed_env):
+    # Phase A bumped OLD_READY_SCHEMA_VERSION to 5.5.0; the watcher allow-list
+    # MUST track it (else every new old_ready fails autoclose as unknown).
+    evidence = _make_evidence(home, nonce="v55")
+    _write_old_ready(home, TASK, evidence, nonce="v55", schema_version="5.5.0")
     _touch_submitted(home, TASK)
 
     _run_script(stubbed_env)

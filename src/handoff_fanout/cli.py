@@ -42,6 +42,18 @@ def main(argv: list[str] | None = None) -> int:
         "prune",
         help="Remove leftover heartbeat/529/uri sidecars for terminal tasks (dry-run by default)",
     )
+    sub.add_parser(
+        "audit-run",
+        help="Register one codex audit run (findings artifact + sidecar manifest)",
+    )
+    sub.add_parser(
+        "audit-disposition",
+        help="Validate + persist one disposition for an original codex finding",
+    )
+    sub.add_parser(
+        "audit-close",
+        help="Single-process: assemble codex_audit block → write evidence → dump",
+    )
 
     # We parse only the first arg, then delegate the rest to the subcommand's own argparse.
     args, rest = parser.parse_known_args(argv)
@@ -70,6 +82,18 @@ def main(argv: list[str] | None = None) -> int:
         from handoff_fanout import prune
 
         return prune.main(rest)
+    if args.subcommand == "audit-run":
+        from handoff_fanout import codex_audit
+
+        return codex_audit.main_audit_run(rest)
+    if args.subcommand == "audit-disposition":
+        from handoff_fanout import codex_audit
+
+        return codex_audit.main_audit_disposition(rest)
+    if args.subcommand == "audit-close":
+        from handoff_fanout import codex_audit
+
+        return codex_audit.main_audit_close(rest)
 
     parser.print_help(sys.stderr)
     return 2

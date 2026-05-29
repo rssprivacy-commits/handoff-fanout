@@ -35,13 +35,13 @@ from handoff_fanout import atomic
 from handoff_fanout import config as _config
 from handoff_fanout.handoff_precheck import (
     EVIDENCE_KIND_RETRO,
-    EVIDENCE_SCHEMA_VERSION,
     MODE_FORENSIC_RETRO,
     MODE_VALID,
     PHASE0_KEYS,
     PHASE1_KEYS,
     PHASE_STATUS_VALID,
     STATUS_REQUIRING_REASON,
+    SUPPORTED_EVIDENCE_SCHEMA_VERSIONS,
     build_evidence,
     compute_evidence_hash,
 )
@@ -417,10 +417,15 @@ def _load_evidence(path: Path) -> tuple[dict | None, GateResult | None]:
         return None, _retry("evidence-corrupt", f"evidence JSON invalid: {e}")
     if not isinstance(payload, dict):
         return None, _retry("evidence-corrupt", "evidence must be a JSON object")
-    if payload.get("schema_version") != EVIDENCE_SCHEMA_VERSION:
+    # Accept any version in the supported set so an in-flight v5.4.1 evidence
+    # written by the previous release still passes during the 5.5.0 migration
+    # window (fail-open, mandate OFF — spec §2.5 / R2-P1-5). Truly unknown
+    # versions remain a fatal-class RETRY.
+    if payload.get("schema_version") not in SUPPORTED_EVIDENCE_SCHEMA_VERSIONS:
         return None, _retry(
             "schema-version-unknown",
-            f"got {payload.get('schema_version')!r}, expected {EVIDENCE_SCHEMA_VERSION!r}",
+            f"got {payload.get('schema_version')!r}, "
+            f"expected one of {list(SUPPORTED_EVIDENCE_SCHEMA_VERSIONS)}",
         )
     if payload.get("evidence_kind") != EVIDENCE_KIND_RETRO:
         return None, _retry(
@@ -1000,6 +1005,14 @@ def _attempt_realign(
         for k in ("session_id", "session_id_kind"):
             if k in payload:
                 new_payload[k] = payload[k]
+        # Preserve the Phase A codex audit block verbatim — re-align refreshes
+        # the HEAD binding, it does NOT re-audit, so the recorded findings /
+        # dispositions must survive (else a sibling-HEAD move silently erases the
+        # audit evidence). When Phase B turns the audit mandate on, the gate's
+        # G0 (input_commit == HEAD) will force a re-audit if the refreshed HEAD
+        # invalidates these runs; that is Phase B's job, not re-align's.
+        if "codex_audit" in payload:
+            new_payload["codex_audit"] = payload["codex_audit"]
         # The in-process builder must have observed the same HEAD we validated;
         # if not (e.g. its rev-parse failed → "(unknown)"), abort this attempt.
         if new_payload.get("head_at_precheck") != head_now:
