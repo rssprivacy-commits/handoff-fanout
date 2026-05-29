@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "handoff-fanout"
-version = "1.4.0"
+version = "1.5.0"
 description = "Project-agnostic auto-handoff & parallel fan-out for AI coding sessions (Claude Code / Cursor / Aider). 5-layer defense against orphan tasks, git index hijack, and stale handoffs."
 readme = "README.md"
 requires-python = ">=3.11"

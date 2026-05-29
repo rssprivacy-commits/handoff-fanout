@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-05-29
+
+Queue-hygiene + auto-submit reliability release. Two new features (the `handoff
+prune` janitor and the auto-continue Accessibility preflight) plus a heartbeat
+leak fix, all surfaced by observing real erp-system queue/handoff behavior.
+MINOR bump: backward-compatible additions, no contract changes.
+
 ### Added
 
 - **`handoff prune`** (`eeedecc`) — new subcommand + `handoff-prune` console
