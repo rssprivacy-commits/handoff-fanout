@@ -166,9 +166,10 @@ def _run_retro_gate(
 
     bypass = os.environ.get("HANDOFF_RETRO_BYPASS") == "1"
     mandate = os.environ.get("HANDOFF_RETRO_MANDATE") == "1"
+    audit_mandate = os.environ.get("HANDOFF_AUDIT_MANDATE") == "1"
     evidence_path = Path(args.retro_evidence) if args.retro_evidence else None
 
-    if evidence_path is None and not bypass and not mandate:
+    if evidence_path is None and not bypass and not mandate and not audit_mandate:
         # legacy path: no gate, preserve pre-v5.4 ERP shim behaviour
         return None
 
@@ -180,6 +181,7 @@ def _run_retro_gate(
         evidence_path=evidence_path,
         bypass_enabled=bypass,
         mandate_enabled=mandate,
+        audit_mandate_enabled=audit_mandate,
         nonce=args.nonce,
         session_id=sid,
     )

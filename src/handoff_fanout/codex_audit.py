@@ -28,7 +28,10 @@ import argparse
 import hashlib
 import json
 import re
+import subprocess
 import sys
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from handoff_fanout import atomic
@@ -74,6 +77,16 @@ def _is_safe_relpath(p: object) -> bool:
         return False
     parts = p.split("/")
     return ".." not in parts and "" not in parts
+
+
+def _nonempty_str(v: object) -> str | None:
+    """Return the stripped value iff ``v`` is a non-blank string, else ``None``.
+
+    Trust tokens (reviewer session id, owner ack token) must be real non-empty
+    strings — a truthy non-string (``["x"]``, ``{"a":1}``) or a whitespace-only
+    string must NOT satisfy a ``if not token`` presence check (codex R5).
+    """
+    return v.strip() if isinstance(v, str) and v.strip() else None
 
 
 def _audit_lock_path(project: str, task: str) -> Path:
@@ -137,11 +150,20 @@ def derive_verdict(findings: dict) -> str:
     """``"pass"`` iff no original finding is P0/P1, else ``"fail"`` (spec §3.1).
 
     The verdict is *derived*, never trusted from the AI: a run is clean only
-    when codex surfaced no blocking-severity finding.
+    when codex surfaced no blocking-severity finding. Fail closed (``"fail"``)
+    when ``original_findings`` is not a list (codex R6: a dict-shaped value would
+    otherwise iterate its keys, never see the P0/P1, and derive a false pass).
     """
-    blocking = {"P0", "P1"}
-    for f in findings.get("original_findings", []) or []:
-        if isinstance(f, dict) and f.get("severity") in blocking:
+    of = findings.get("original_findings")
+    if not isinstance(of, list):
+        return "fail"
+    for f in of:
+        if not isinstance(f, dict):
+            continue
+        sev = _severity(f)
+        # Blocking, OR an unrecognized non-empty severity → fail closed (codex
+        # R8-2): a typo'd / spoofed severity must never read as a clean pass.
+        if sev in ("P0", "P1") or (sev and sev not in _pc.AUDIT_SEVERITIES):
             return "fail"
     return "pass"
 
@@ -474,6 +496,829 @@ def append_disposition(project: str, task: str, disposition: dict) -> list[dict]
     return existing
 
 
+# ─── Phase B gate: evaluate_audit_gate (G0-G9 — spec §1 / §5) ───────────────
+#
+# This is the *enforcement* layer. With the audit mandate OFF (the only state
+# Phase B ships in) ``retro_gate`` never calls it; turning ``HANDOFF_AUDIT_MANDATE``
+# on (Phase D) makes the dump gate run it before clearing a task for handoff.
+#
+# The gate returns a neutral :class:`AuditGateOutcome` (NOT a retro_gate
+# ``GateResult``) so this module need not import ``retro_gate`` — retro_gate maps
+# the outcome class to its own exit-code protocol. The subcode strings here are
+# the spec §5 contract verbatim.
+
+# The empty tree object name (git's well-known SHA for an empty directory) —
+# used as the diff base when a session's oldest commit is the repo root.
+_EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+# A bypass needs at least this many machine-recorded codex failures (spec §1.3
+# "gate 校验次数 ≥ 阈值"). The Phase A builder requires the list be non-empty;
+# the gate re-checks the count so hand-crafted evidence can't shrink it to 0.
+BYPASS_MIN_FAILURES = 1
+
+# docs_only legitimacy (spec §2.2): only these suffixes may be "docs", and
+# CLAUDE.md / AGENTS.md / GEMINI.md / anything under prompts/ are force-full
+# even though they are .md — they steer the agent, so they need a real audit.
+DOC_SUFFIXES = (".md", ".rst", ".txt")
+FORCE_FULL_DOC_BASENAMES = ("CLAUDE.md", "AGENTS.md", "GEMINI.md")
+
+
+@dataclass
+class AuditGateOutcome:
+    """Neutral result of :func:`evaluate_audit_gate`.
+
+    ``klass`` ∈ {``ok``, ``retry``, ``blocked``, ``fatal``, ``bypass``} maps to
+    the retro_gate exit-code protocol (§7.1) by the caller. ``subcode`` is the
+    spec §5 machine token; ``message`` is the human tail.
+    """
+
+    klass: str
+    subcode: str = ""
+    message: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.klass == "ok"
+
+
+_AUDIT_OK = AuditGateOutcome("ok")
+
+
+def _audit_git(args: list[str], cwd: Path) -> tuple[int, str]:
+    """Run git, returning ``(returncode, stdout)``; ``(-1, "")`` if unspawnable.
+
+    Returning the rc lets the gate distinguish a genuinely-empty result (rc 0,
+    e.g. an empty diff) from a git failure (rc != 0) — critical for fail-closed
+    behaviour: a failed ``git diff`` must never read as "no changes".
+    """
+    try:
+        r = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        return r.returncode, r.stdout or ""
+    except (subprocess.SubprocessError, OSError):
+        return -1, ""
+
+
+def _resolve_commit(workspace: Path, ref: str) -> str | None:
+    """Resolve ``ref`` to a full commit SHA, or ``None`` if it isn't a commit."""
+    if not isinstance(ref, str) or not _GIT_SHA_RE.match(ref):
+        return None
+    rc, out = _audit_git(["rev-parse", "--verify", f"{ref}^{{commit}}"], workspace)
+    out = out.strip()
+    return out if rc == 0 and out else None
+
+
+def _commit_equals(workspace: Path, a: str, b: str) -> bool:
+    """True iff ``a`` and ``b`` resolve to the same commit (handles abbrev SHAs)."""
+    ra = _resolve_commit(workspace, a)
+    rb = _resolve_commit(workspace, b)
+    return ra is not None and ra == rb
+
+
+# Field families that contribute to a finding's stable identity (codex R1-F5 /
+# R2-2). Only a TRUE per-finding id may key the identity by itself. A rule /
+# check id is NOT unique per finding (one rule fires on many sites), so it folds
+# into the location+text identity rather than standing alone — else two distinct
+# findings of the same rule in different files would collide onto one hash.
+_IDENTITY_UNIQUE_ID_KEYS = ("id", "finding_id", "uuid")
+_IDENTITY_RULE_KEYS = ("rule", "rule_id", "check")
+_IDENTITY_LOC_KEYS = ("file", "path", "location", "loc")
+_IDENTITY_TEXT_KEYS = ("title", "text", "description", "summary", "message")
+
+
+def _first_str(finding: dict, keys) -> str:
+    for k in keys:
+        v = finding.get(k)
+        if isinstance(v, (str, int)) and not isinstance(v, bool) and str(v).strip():
+            return str(v).strip()
+    return ""
+
+
+def _severity(finding: dict) -> str:
+    """Normalized severity: ``strip().upper()`` (codex R8-2).
+
+    Centralized so ``"P1 "`` / ``" p1"`` can't evade the ``{P0,P1}`` membership
+    check in one place but not another. Returns ``""`` for a missing severity.
+    """
+    return str(finding.get("severity", "")).strip().upper()
+
+
+def _normalize_finding_text(finding: dict) -> str:
+    """Whitespace-collapsed, lowercased text of a finding's first textual field."""
+    raw = _first_str(finding, _IDENTITY_TEXT_KEYS)
+    return " ".join(raw.lower().split())
+
+
+def finding_identity(finding: dict) -> dict:
+    """Stable identity core for a codex finding (spec §2.2 union/dedup).
+
+    A true per-finding ``id`` keys the identity by itself, so the SAME finding
+    restated across audit rounds dedups even if its wording drifts. Without one,
+    the identity is severity + rule + location + line + text together (codex
+    R2-2): a ``rule``/``check`` alone never stands as identity, so two distinct
+    findings of the same rule in different files / lines do NOT collide onto one
+    disposition.
+    """
+    sev = _severity(finding)
+    uid = _first_str(finding, _IDENTITY_UNIQUE_ID_KEYS)
+    if uid:
+        return {"severity": sev, "id": uid}
+    ident = {"severity": sev}
+    rule = _first_str(finding, _IDENTITY_RULE_KEYS)
+    if rule:
+        ident["rule"] = rule
+    loc = _first_str(finding, _IDENTITY_LOC_KEYS)
+    if loc:
+        ident["loc"] = loc
+    line = finding.get("line")
+    if isinstance(line, int) and not isinstance(line, bool):
+        ident["line"] = line
+    text = _normalize_finding_text(finding)
+    if text:
+        ident["text"] = text
+    return ident
+
+
+def has_finding_identity(finding: dict) -> bool:
+    """False when a finding has neither a unique id NOR (location or text).
+
+    A rule/check id alone does NOT count (codex R2-2) — it can't distinguish two
+    sites of the same rule. Such an unbindable finding is rejected rather than
+    letting many distinct findings collide onto a single disposition.
+    """
+    if _first_str(finding, _IDENTITY_UNIQUE_ID_KEYS):
+        return True
+    return bool(_first_str(finding, _IDENTITY_LOC_KEYS) or _normalize_finding_text(finding))
+
+
+def compute_finding_hash(finding: dict) -> str:
+    """Stable ``sha256:<64hex>`` identity for a codex finding (spec §2.2 union).
+
+    Hashes :func:`finding_identity` — NOT the raw object — so a finding restated
+    across rounds dedups, and a disposition keyed to this hash binds to the
+    finding regardless of which round surfaced it. The ``sha256:`` prefix
+    matches the disposition ``finding_hash`` format.
+    """
+    return (
+        "sha256:" + hashlib.sha256(_pc.canonical_json_bytes(finding_identity(finding))).hexdigest()
+    )
+
+
+def finding_presence_hash(finding: dict) -> str | None:
+    """Severity- AND id-NEUTRAL location/text hash for the G5 "is it gone?" check.
+
+    ``None`` when the finding has no stable presence basis (only an id). A
+    "fixed" P0/P1 must be GONE from the last run — not merely downgraded to P2
+    (codex R7) NOR reappearing under a fresh ``id`` (codex R8-1). The AI controls
+    the ``id``, so id-equality can't prove a fix; presence keys on the stable
+    location/rule/text instead, and a blocking finding lacking ANY of those can't
+    be fix-verified (the gate fails closed in G5).
+    """
+    # NOTE: deliberately excludes ``line`` (codex R10). Line numbers shift when
+    # unrelated edits land above a finding, so a still-present issue would look
+    # "gone" if line were part of the presence key. Presence keys on the stable
+    # rule + file-path + text; the binding identity (compute_finding_hash) keeps
+    # line for precise disposition matching, but "is it gone?" must not.
+    ident: dict = {}
+    rule = _first_str(finding, _IDENTITY_RULE_KEYS)
+    if rule:
+        ident["rule"] = rule
+    loc = _first_str(finding, _IDENTITY_LOC_KEYS)
+    if loc:
+        ident["loc"] = loc
+    text = _normalize_finding_text(finding)
+    if text:
+        ident["text"] = text
+    if not ident:
+        return None
+    return "sha256:" + hashlib.sha256(_pc.canonical_json_bytes(ident)).hexdigest()
+
+
+def classify_artifact_state(project: str, task: str, run_index: int) -> str:
+    """``"ok"`` / ``"missing"`` / ``"tampered"`` for a run's findings artifact.
+
+    Splits :func:`verify_findings_artifact`'s boolean into the two failure
+    classes the gate routes differently (spec §3 P2): a *missing* artifact is a
+    RETRY (re-run the audit), a *tampered* one (hash mismatch / non-canonical
+    rewrite) is FATAL.
+    """
+    fpath = findings_path(project, task, run_index)
+    mpath = manifest_path(project, task, run_index)
+    # Absent files are genuinely missing → RETRY (re-run the audit).
+    if not fpath.exists() or not mpath.exists():
+        return "missing"
+    # A PRESENT manifest that won't parse, or carries the wrong algo, is a
+    # tamper event — downgrading it to "missing" (RETRY) would let an attacker
+    # corrupt the manifest to dodge the FATAL classification (codex R1-F6 P2).
+    manifest = read_findings_manifest(project, task, run_index)
+    if not manifest or manifest.get("algo") != "sha256":
+        return "tampered"
+    try:
+        raw = fpath.read_bytes()
+    except OSError:
+        return "missing"
+    if hashlib.sha256(raw).hexdigest() != manifest.get("sha256"):
+        return "tampered"
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return "tampered"
+    if _pc.canonical_json_bytes(parsed) != raw:
+        return "tampered"
+    return "ok"
+
+
+def _read_run_findings(project: str, task: str, run_index: int) -> dict | None:
+    try:
+        parsed = json.loads(findings_path(project, task, run_index).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def discover_run_indices(project: str, task: str) -> set[int]:
+    """Integer run indices that have a findings artifact persisted on disk.
+
+    The gate cross-checks this against the caller-listed ``audit_runs`` so a
+    failing early run can't be omitted from evidence (codex R2-1). A run dir
+    counts only when its ``codex-findings.json`` exists — a bare directory does
+    not pretend to be a run.
+    """
+    base = audit_base_dir(project, task)
+    if not base.is_dir():
+        return set()
+    out: set[int] = set()
+    for child in base.iterdir():
+        if child.is_dir() and child.name.isdigit() and (child / FINDINGS_FILENAME).exists():
+            out.add(int(child.name))
+    return out
+
+
+def _is_doc_path(path: str) -> bool:
+    """True iff ``path`` may legitimately be part of a docs-only change (spec §2.2)."""
+    base = path.rsplit("/", 1)[-1]
+    if base in FORCE_FULL_DOC_BASENAMES:
+        return False
+    if path == "prompts" or path.startswith("prompts/") or "/prompts/" in path:
+        return False
+    return any(path.endswith(suf) for suf in DOC_SUFFIXES)
+
+
+def _is_expired(iso: str) -> bool:
+    """True when ``iso`` is in the past or unparseable (fail-closed)."""
+    try:
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return datetime.now(dt.tzinfo) > dt
+
+
+def _audit_base_from_session(payload: dict, workspace: Path) -> str | None:
+    """Derive the change base for a docs-only diff from the session commit set.
+
+    The session's oldest commit's parent is the base; if that commit is the
+    repo root (no parent), fall back to the empty-tree object. Returns ``None``
+    when the snapshot is absent / malformed → caller fails closed (spec §1.2).
+    """
+    sc = payload.get("session_commits")
+    if not isinstance(sc, list) or not sc:
+        return None
+    if not all(isinstance(c, str) and _GIT_SHA_RE.match(c) for c in sc):
+        return None
+    oldest = sc[-1]  # session_commits is newest-first
+    rc, out = _audit_git(["rev-parse", "--verify", f"{oldest}~1"], workspace)
+    if rc == 0 and out.strip():
+        return out.strip()
+    # oldest is the root commit → diff against the empty tree
+    return _EMPTY_TREE_SHA
+
+
+def _gate_bypass(block: dict) -> AuditGateOutcome:
+    """codex_unavailable_bypass: accept ONLY with machine failure proof +
+    forced follow-up (spec §1.3). A valid bypass lets the dump proceed (the
+    audit debt is owed by the next session); an invalid one is a BYPASS error."""
+    attempts = block.get("codex_failure_attempts")
+    if not isinstance(attempts, list) or len(attempts) < BYPASS_MIN_FAILURES:
+        return AuditGateOutcome(
+            "bypass",
+            "codex-audit-bypass-no-failure-proof",
+            f"bypass needs >= {BYPASS_MIN_FAILURES} recorded codex failure attempts",
+        )
+    for a in attempts:
+        if (
+            not isinstance(a, dict)
+            or not isinstance(a.get("exit"), int)
+            or isinstance(a.get("exit"), bool)
+        ):
+            return AuditGateOutcome(
+                "bypass", "codex-audit-bypass-no-failure-proof", "malformed failure attempt"
+            )
+        if not _SHA256_REF_RE.match(str(a.get("stderr_hash", ""))):
+            return AuditGateOutcome(
+                "bypass",
+                "codex-audit-bypass-no-failure-proof",
+                "failure attempt stderr_hash must be sha256:<64 hex>",
+            )
+    follow = block.get("follow_up_audit_task_id")
+    if not follow or not _pc.TASK_ID_RE.match(str(follow)):
+        return AuditGateOutcome(
+            "bypass",
+            "codex-audit-bypass-no-failure-proof",
+            "bypass needs a follow_up_audit_task_id (next session owes the audit)",
+        )
+    return _AUDIT_OK
+
+
+def _gate_empty_diff(block: dict, workspace: Path, head_now: str) -> AuditGateOutcome:
+    """empty_diff_attestation: G0 (attested head == HEAD) + machine-recompute the
+    diff is actually empty (spec §1.2 / §2.1). Closes the "empty diff 跳审" path."""
+    att = block.get("empty_diff_attestation")
+    if not isinstance(att, dict):
+        return AuditGateOutcome("retry", "codex-audit-required", "empty_diff missing attestation")
+    head = att.get("head")
+    base = att.get("base")
+    if _resolve_commit(workspace, head if isinstance(head, str) else "") is None:
+        return AuditGateOutcome(
+            "retry", "codex-audit-required", "empty_diff attestation head is not a repo commit"
+        )
+    # G0: the attested HEAD must still be the live HEAD.
+    if not _commit_equals(workspace, head, head_now):
+        return AuditGateOutcome(
+            "retry",
+            "codex-audit-head-moved",
+            f"empty_diff attested head {head} != current HEAD {head_now}",
+        )
+    if _resolve_commit(workspace, base if isinstance(base, str) else "") is None:
+        return AuditGateOutcome(
+            "retry", "codex-audit-base-missing", f"empty_diff base {base!r} not in repo"
+        )
+    rc, diff_out = _audit_git(["diff", "--no-color", base, head], workspace)
+    if rc != 0:
+        return AuditGateOutcome("retry", "codex-audit-base-missing", "git diff base..head failed")
+    if diff_out.strip() != "":
+        return AuditGateOutcome(
+            "retry",
+            "codex-audit-required",
+            "empty_diff attested but base..head diff is non-empty — full audit required",
+        )
+    recomputed = "sha256:" + hashlib.sha256(diff_out.encode("utf-8")).hexdigest()
+    if att.get("diff_hash") != recomputed:
+        return AuditGateOutcome(
+            "fatal",
+            "codex-audit-tampered",
+            "empty_diff diff_hash does not match the recomputed diff",
+        )
+    return _AUDIT_OK
+
+
+# Reviewer-artifact verdicts that count as a refutation (spec §1.7). The other
+# required fields (independent_run_id / original_finding_hash / artifact_hash /
+# reviewer_session_id) are validated explicitly + by type in the refute path.
+_REFUTE_VERDICTS = ("refuted", "refute", "rejected", "reject", "not_a_bug", "false_positive")
+
+
+def _validate_reviewer_refute(
+    disposition: dict, fhash: str, session_id, project: str
+) -> AuditGateOutcome | None:
+    """G6 anti-forgery for ``independent_reviewer_refuted`` (spec §1.7).
+
+    Returns ``None`` when the refutation is genuine, else the gate outcome.
+    Beyond "different session id + artifact exists" (the weak Phase-B-first
+    check), this parses the reviewer artifact and requires it to (a) carry all
+    §1.7 fields, (b) record a refuting verdict, (c) be bound to THIS finding
+    hash, and (d) name a reviewer session that both matches the disposition and
+    differs from the audited session — so a dummy ``{}`` file no longer passes.
+    """
+    # R4-1: the independence proof is "reviewer session != audited session". If
+    # the audited session_id is absent (hand-crafted evidence that omits it),
+    # that comparison is vacuously satisfied — so fail closed when it's missing,
+    # else a refute could be accepted without proving any independence at all.
+    if not isinstance(session_id, str) or not session_id.strip():
+        return AuditGateOutcome(
+            "retry",
+            "codex-audit-refute-no-reviewer",
+            f"finding {fhash} refute rejected: evidence has no session_id to prove independence",
+        )
+    sid_norm = session_id.strip()
+    # R5: a reviewer session id must be a real non-empty string — a whitespace
+    # or non-string truthy value (`[ ]`, `{}`) must not pass as "a reviewer".
+    reviewer_sid = _nonempty_str(disposition.get("reviewer_session_id"))
+    if not reviewer_sid:
+        return AuditGateOutcome(
+            "retry",
+            "codex-audit-refute-no-reviewer",
+            f"finding {fhash} refuted without a non-empty reviewer_session_id",
+        )
+    if reviewer_sid == sid_norm:
+        return AuditGateOutcome(
+            "blocked",
+            "codex-audit-refute-same-session",
+            f"finding {fhash} refuted by the same session — independent review required",
+        )
+    art = disposition.get("independent_reviewer_artifact")
+    if not art or not _is_safe_relpath(art):
+        return AuditGateOutcome(
+            "retry",
+            "codex-audit-refute-no-reviewer",
+            f"finding {fhash} reviewer artifact path invalid",
+        )
+    art_path = _project_home(project) / art
+    if not art_path.exists():
+        return AuditGateOutcome(
+            "retry", "codex-audit-refute-no-reviewer", f"finding {fhash} reviewer artifact missing"
+        )
+    try:
+        rev = json.loads(art_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return AuditGateOutcome(
+            "retry",
+            "codex-audit-refute-no-reviewer",
+            f"finding {fhash} reviewer artifact unreadable",
+        )
+    # R6: validate each §1.7 field by TYPE, not bare truthiness — a non-string
+    # truthy value (`["x"]`, `{"fake": true}`) must not satisfy an id / hash.
+    if not isinstance(rev, dict):
+        return AuditGateOutcome(
+            "retry",
+            "codex-audit-refute-no-reviewer",
+            f"finding {fhash} reviewer artifact not an object",
+        )
+    if not _nonempty_str(rev.get("independent_run_id")):
+        return AuditGateOutcome(
+            "retry",
+            "codex-audit-refute-no-reviewer",
+            f"finding {fhash} reviewer artifact independent_run_id must be a non-empty string",
+        )
+    if not _SHA256_REF_RE.match(str(rev.get("artifact_hash", ""))):
+        return AuditGateOutcome(
+            "retry",
+            "codex-audit-refute-no-reviewer",
+            f"finding {fhash} reviewer artifact_hash must be sha256:<64 hex>",
+        )
+    verdict = rev.get("verdict")
+    if not isinstance(verdict, str) or verdict.lower() not in _REFUTE_VERDICTS:
+        return AuditGateOutcome(
+            "retry",
+            "codex-audit-refute-no-reviewer",
+            f"finding {fhash} reviewer verdict {verdict!r} is not a refutation",
+        )
+    if rev.get("original_finding_hash") != fhash:
+        return AuditGateOutcome(
+            "retry",
+            "codex-audit-refute-no-reviewer",
+            f"reviewer artifact bound to {rev.get('original_finding_hash')!r}, not finding {fhash}",
+        )
+    art_sid = _nonempty_str(rev.get("reviewer_session_id"))
+    if not art_sid or art_sid != reviewer_sid:
+        return AuditGateOutcome(
+            "retry",
+            "codex-audit-refute-no-reviewer",
+            f"finding {fhash} reviewer artifact session disagrees with disposition",
+        )
+    # The artifact's own recorded reviewer must also differ from the audited
+    # session (defends against an artifact that lies in the disposition but
+    # records the audited session internally).
+    if art_sid == sid_norm:
+        return AuditGateOutcome(
+            "blocked",
+            "codex-audit-refute-same-session",
+            f"finding {fhash} reviewer artifact session == audited session",
+        )
+    return None
+
+
+def _gate_full(
+    block: dict,
+    payload: dict,
+    workspace: Path,
+    project: str,
+    task: str,
+    head_now: str,
+    mode: str,
+) -> AuditGateOutcome:
+    """full_codex_audit / docs_only_light_audit: the G2-G9 body.
+
+    G9 round cap → G2 artifact integrity (missing=RETRY / tampered=FATAL) →
+    G0 last run audited current HEAD → docs_only content-diff legitimacy →
+    G3 every P0/P1 (union across rounds) has a disposition → G4-G8 each
+    disposition actually resolves its finding.
+    """
+    runs = block.get("audit_runs")
+    disps = block.get("dispositions") or []
+    if not isinstance(runs, list) or not runs:
+        return AuditGateOutcome("retry", "codex-audit-required", f"{mode} requires audit_runs")
+    if not isinstance(disps, list):
+        return AuditGateOutcome("retry", "codex-audit-required", "dispositions must be a list")
+    # G9: bound the audit→fix→re-audit loop.
+    if len(runs) > _pc.MAX_AUDIT_RUNS:
+        return AuditGateOutcome(
+            "blocked",
+            "codex-audit-rounds-exceeded",
+            f"{len(runs)} audit runs > MAX_AUDIT_RUNS={_pc.MAX_AUDIT_RUNS}",
+        )
+
+    run_indices: list[int] = []
+    for rec in runs:
+        if (
+            not isinstance(rec, dict)
+            or not isinstance(rec.get("run_index"), int)
+            or isinstance(rec.get("run_index"), bool)
+        ):
+            return AuditGateOutcome("retry", "codex-audit-missing", "malformed run record")
+        ri = rec["run_index"]
+        # G2: artifact must exist and be byte-intact.
+        state = classify_artifact_state(project, task, ri)
+        if state == "missing":
+            return AuditGateOutcome(
+                "retry", "codex-audit-missing", f"run {ri} findings artifact missing"
+            )
+        if state == "tampered":
+            return AuditGateOutcome(
+                "fatal", "codex-audit-tampered", f"run {ri} findings artifact hash mismatch"
+            )
+        rec_err = validate_run_record(project, task, rec)
+        if rec_err:
+            return AuditGateOutcome("retry", "codex-audit-missing", f"run {ri}: {rec_err}")
+        run_indices.append(ri)
+
+    # R2-1: the union is only as complete as the runs listed. An attacker could
+    # run a FAILING audit (run 1), then list ONLY a later clean run (run 2) so
+    # the round-1 P0/P1 never enters the union. Defeat omission by (a) requiring
+    # the listed runs to be exactly the runs PERSISTED on disk for this task, and
+    # (b) requiring them contiguous 1..max so an early run can't be skipped.
+    listed = sorted(set(run_indices))
+    if len(listed) != len(run_indices):
+        return AuditGateOutcome("retry", "codex-audit-missing", "duplicate run_index in audit_runs")
+    discovered = sorted(discover_run_indices(project, task))
+    if listed != discovered:
+        return AuditGateOutcome(
+            "retry",
+            "codex-audit-findings-unbound",
+            f"audit_runs {listed} != on-disk audit runs {discovered}; "
+            "every persisted run must be represented (no omitting a failing run)",
+        )
+    if listed != list(range(1, listed[-1] + 1)):
+        return AuditGateOutcome(
+            "retry",
+            "codex-audit-findings-unbound",
+            f"audit run indices {listed} are not contiguous from 1",
+        )
+
+    last_ri = max(run_indices)
+    last_rec = next(r for r in runs if r["run_index"] == last_ri)
+    # G0: the final (clean) re-audit must have been performed against the commit
+    # that is about to be handed off. A sibling commit after the last audit run
+    # moves HEAD and invalidates it.
+    if not _commit_equals(workspace, last_rec["input_commit"], head_now):
+        return AuditGateOutcome(
+            "retry",
+            "codex-audit-head-moved",
+            f"last audit run audited {last_rec['input_commit']} != current HEAD {head_now}",
+        )
+
+    # docs_only legitimacy: the machine decides the mode, not the AI (spec §2.2).
+    if mode == _pc.AUDIT_MODE_DOCS_ONLY:
+        base = _audit_base_from_session(payload, workspace)
+        if base is None:
+            return AuditGateOutcome(
+                "retry",
+                "codex-audit-base-missing",
+                "docs_only requires a derivable session base commit",
+            )
+        rc, out = _audit_git(["diff", "--name-only", base, head_now], workspace)
+        if rc != 0:
+            return AuditGateOutcome("retry", "codex-audit-base-missing", "docs_only diff failed")
+        for changed in (ln.strip() for ln in out.splitlines() if ln.strip()):
+            if not _is_doc_path(changed):
+                return AuditGateOutcome(
+                    "retry",
+                    "codex-audit-required",
+                    f"docs_only claimed but non-doc file changed: {changed} — full audit required",
+                )
+
+    # G3: union of every P0/P1 finding across ALL rounds (dedup by identity hash).
+    union: dict[str, str] = {}
+    # fhash → the SET of every severity-neutral presence hash seen for it across
+    # rounds. A set (not a scalar) so two distinct findings that share an id
+    # (codex R9) both register — G5 then requires ALL of them gone, not just the
+    # last one written. ``None`` entries mark a finding with no presence basis.
+    presence_by_fhash: dict[str, set[str | None]] = {}
+    for ri in run_indices:
+        f = _read_run_findings(project, task, ri)
+        if f is None:
+            return AuditGateOutcome("retry", "codex-audit-missing", f"run {ri} findings unreadable")
+        of = f.get("original_findings")
+        # Fail closed when original_findings is not a list (codex R6): a dict-
+        # shaped value would otherwise iterate as keys, hiding any P0/P1 inside.
+        if not isinstance(of, list):
+            return AuditGateOutcome(
+                "retry", "codex-audit-missing", f"run {ri} original_findings is not a list"
+            )
+        for finding in of:
+            if not isinstance(finding, dict):
+                continue
+            sev = _severity(finding)
+            # codex R8-2: an unrecognized non-empty severity (typo / spoof) must
+            # fail closed, not be silently treated as non-blocking.
+            if sev and sev not in _pc.AUDIT_SEVERITIES:
+                return AuditGateOutcome(
+                    "retry",
+                    "codex-audit-missing",
+                    f"run {ri} has a finding with unrecognized severity {sev!r}",
+                )
+            if sev in ("P0", "P1"):
+                # An identity-less P0/P1 can't be reliably bound to a disposition
+                # (every such finding would collide onto one hash) — reject so it
+                # can't be silently covered (codex R1-F5).
+                if not has_finding_identity(finding):
+                    return AuditGateOutcome(
+                        "retry",
+                        "codex-audit-findings-unbound",
+                        f"run {ri} has a {sev} finding with no stable identity "
+                        "(needs an id / location / text)",
+                    )
+                fh = compute_finding_hash(finding)
+                union[fh] = sev
+                presence_by_fhash.setdefault(fh, set()).add(finding_presence_hash(finding))
+
+    # The last run's presence set is severity-NEUTRAL so a "fixed" P0/P1 that
+    # merely reappears downgraded (e.g. P1→P2) is still detected as present.
+    last_findings = _read_run_findings(project, task, last_ri) or {}
+    last_of = last_findings.get("original_findings")
+    last_presence = {
+        ph
+        for x in (last_of if isinstance(last_of, list) else [])
+        if isinstance(x, dict)
+        for ph in [finding_presence_hash(x)]
+        if ph is not None
+    }
+
+    disp_by_hash: dict[str, dict] = {}
+    for d in disps:
+        if isinstance(d, dict) and isinstance(d.get("finding_hash"), str):
+            disp_by_hash[d["finding_hash"]] = d
+
+    refute_count = 0
+    for fhash, sev in union.items():
+        d = disp_by_hash.get(fhash)
+        if d is None:
+            return AuditGateOutcome(
+                "retry",
+                "codex-audit-findings-unbound",
+                f"{sev} finding {fhash} has no disposition",
+            )
+        # Dispatch on the disposition type FIRST, then let each branch validate
+        # its OWN required fields with the right exit class. A generic shape
+        # check up front would mis-classify (e.g. an AI-fabricated owner_override
+        # missing its ack token would surface as a soft RETRY "malformed" instead
+        # of the hard BLOCKED the spec mandates). Lesson: shape-vs-verifier
+        # separation (prior Phase B G7 regression).
+        disp = d.get("disposition")
+        if disp not in _pc.DISPOSITION_TYPES:
+            return AuditGateOutcome(
+                "retry",
+                "codex-audit-findings-unbound",
+                f"disposition for {fhash} has invalid type {disp!r}",
+            )
+        # G4: a P0/P1 may never be merely deferred.
+        if disp == _pc.DISPOSITION_DEFERRED:
+            return AuditGateOutcome(
+                "blocked",
+                "codex-audit-p0p1-unresolved",
+                f"{sev} finding {fhash} was deferred; P0/P1 must be fixed/refuted/overridden",
+            )
+        # G5: a fix needs a real fix_commit AND must be gone from the last run.
+        if disp == _pc.DISPOSITION_FIXED:
+            fix_commit = d.get("fix_commit")
+            if not fix_commit or not _GIT_SHA_RE.match(str(fix_commit)):
+                return AuditGateOutcome(
+                    "retry",
+                    "codex-audit-findings-unbound",
+                    f"finding {fhash} marked fixed without a valid fix_commit",
+                )
+            presences = presence_by_fhash.get(fhash, set())
+            if not presences or None in presences:
+                # A contributing finding had no stable location/text basis — the
+                # AI-controlled id alone can't prove it gone (codex R8-1). Fail closed.
+                return AuditGateOutcome(
+                    "retry",
+                    "codex-audit-findings-unbound",
+                    f"finding {fhash} marked fixed but has no location/text to verify it is gone",
+                )
+            # EVERY historical location for this identity must be gone from the
+            # last run — fixing one site while another (possibly downgraded) site
+            # of the same id persists is not a fix (codex R9).
+            if presences & last_presence:
+                return AuditGateOutcome(
+                    "retry",
+                    "codex-audit-fix-unverified",
+                    f"finding {fhash} marked fixed but still present (any severity) in the last run",
+                )
+        # G6: a refutation must come from a DIFFERENT session AND be backed by a
+        # reviewer artifact whose CONTENT proves the independent review of THIS
+        # finding (codex R1-F3 — previously only path-existence was checked).
+        elif disp == _pc.DISPOSITION_REFUTED:
+            refute_count += 1
+            verdict = _validate_reviewer_refute(d, fhash, payload.get("session_id"), project)
+            if verdict is not None:
+                return verdict
+        # G7: an owner override needs an owner ack token (AI-generated → blocked).
+        # R5: the token must be a real non-empty string — a truthy non-string
+        # (`{"fake": true}`) or whitespace must not satisfy it. (Cryptographic
+        # verification of the token against an owner-controlled source remains
+        # the deferred spec §7.3 R3-open contract for Phase D.)
+        elif disp == _pc.DISPOSITION_OWNER_OVERRIDE:
+            if not _nonempty_str(d.get("owner_ack_token")):
+                return AuditGateOutcome(
+                    "blocked",
+                    "codex-audit-override-no-ack-token",
+                    f"finding {fhash} owner_override without a non-empty owner_ack_token",
+                )
+            exp = d.get("expires_at")
+            if exp and _is_expired(exp):
+                return AuditGateOutcome(
+                    "blocked",
+                    "codex-audit-override-invalid",
+                    f"finding {fhash} owner_override expired at {exp}",
+                )
+
+    # §2.4: independent refutes are bounded so a finding can't livelock the gate.
+    if refute_count > _pc.MAX_INDEP_REVIEW:
+        return AuditGateOutcome(
+            "blocked",
+            "codex-audit-indep-review-exceeded",
+            f"{refute_count} independent refutes > MAX_INDEP_REVIEW={_pc.MAX_INDEP_REVIEW}",
+        )
+
+    # G8: every recorded deferral (P2/P3) must carry a scope ruling.
+    for d in disps:
+        if (
+            isinstance(d, dict)
+            and d.get("disposition") == _pc.DISPOSITION_DEFERRED
+            and d.get("original_severity") in _pc.DEFERRABLE_SEVERITIES
+            and not _nonempty_str(d.get("scope_ruling"))
+        ):
+            return AuditGateOutcome(
+                "retry",
+                "codex-audit-defer-invalid",
+                "deferred disposition needs a non-empty scope_ruling",
+            )
+    return _AUDIT_OK
+
+
+def evaluate_audit_gate(
+    payload: dict, workspace: Path, project: str, task: str
+) -> AuditGateOutcome:
+    """Run the G0-G9 audit gate over a retro-evidence payload (mandate-ON path).
+
+    Returns an :class:`AuditGateOutcome`; the caller (retro_gate) maps its
+    ``klass`` to the exit-code protocol. Assumes the audit mandate is enabled —
+    retro_gate guards the flag and only calls this when it is on.
+    """
+    block = payload.get("codex_audit")
+    if not isinstance(block, dict):
+        return AuditGateOutcome(
+            "retry", "codex-audit-required", "evidence carries no codex_audit block"
+        )
+    mode = block.get("audit_mode")
+    if mode not in _pc.AUDIT_MODES:
+        return AuditGateOutcome(
+            "retry", "codex-audit-required", f"unknown / missing audit_mode: {mode!r}"
+        )
+
+    rc, head_out = _audit_git(["rev-parse", "HEAD"], workspace)
+    head_now = head_out.strip()
+    if rc != 0 or not head_now:
+        return AuditGateOutcome("retry", "codex-audit-head-unknown", "git rev-parse HEAD failed")
+
+    # R3-2: the no-audit-needed modes (bypass / empty_diff) may not be used to
+    # sidestep a REAL audit that already ran. If any full-audit run artifact is
+    # persisted for this task, the gate forces full_codex_audit so a recorded
+    # P0/P1 can't be dodged by switching the declared mode.
+    if mode in (_pc.AUDIT_MODE_BYPASS, _pc.AUDIT_MODE_EMPTY_DIFF) and discover_run_indices(
+        project, task
+    ):
+        return AuditGateOutcome(
+            "retry",
+            "codex-audit-required",
+            f"{mode} not allowed: persisted audit runs exist for this task — use full_codex_audit",
+        )
+
+    if mode == _pc.AUDIT_MODE_BYPASS:
+        return _gate_bypass(block)
+    if mode == _pc.AUDIT_MODE_EMPTY_DIFF:
+        return _gate_empty_diff(block, workspace, head_now)
+    return _gate_full(block, payload, workspace, project, task, head_now, mode)
+
+
 # ─── CLI ────────────────────────────────────────────────────────────────────
 
 
@@ -527,6 +1372,11 @@ def main_audit_run(argv: list[str] | None = None) -> int:
     if not isinstance(findings, dict):
         sys.stderr.write("ERR-FATAL findings-file-invalid: must be a JSON object\n")
         return 1
+    # codex R6: original_findings must be a list so a dict-shaped value can't hide
+    # a P0/P1 from derive_verdict / the gate union. Reject at ingest (fail-closed).
+    if not isinstance(findings.get("original_findings"), list):
+        sys.stderr.write("ERR-FATAL findings-file-invalid: original_findings must be a list\n")
+        return 1
 
     input_commit = args.input_commit or findings.get("input_commit")
     if not input_commit:
@@ -541,6 +1391,17 @@ def main_audit_run(argv: list[str] | None = None) -> int:
     lock.parent.mkdir(parents=True, exist_ok=True)
     try:
         with atomic.acquire_dir_lock(lock, retries=5, wait_seconds=0.2):
+            # R3-1 (honest path): audit runs are append-only — refuse to OVERWRITE
+            # an existing run index, so a failing run can't be silently replaced
+            # with a clean one at the same index. (Deletion-then-recreate by a
+            # local writer is out of this CLI's reach; Phase C binds the audit
+            # hash into owner-controlled old_ready as the external tamper anchor.)
+            if findings_path(project, args.task, args.run_index).exists():
+                sys.stderr.write(
+                    f"ERR-FATAL run-index-exists: run {args.run_index} already has an artifact; "
+                    "audit runs are append-only — use the next index for a re-audit\n"
+                )
+                return 1
             record = write_findings_artifact(
                 project, args.task, args.run_index, findings, input_commit=input_commit
             )

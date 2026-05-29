@@ -181,6 +181,13 @@ def _attempt_path(project: str, task: str) -> Path:
     return _ack_dir(project) / f"{task}.retro.attempt_n.txt"
 
 
+def _audit_attempt_path(project: str, task: str) -> Path:
+    """Counter for audit-gate retries, ISOLATED from the retro attempt counter
+    (spec: audit_attempt_n隔离). An audit RETRY must not consume a retro retry
+    and vice versa — they are independent failure budgets."""
+    return _ack_dir(project) / f"{task}.audit.attempt_n.txt"
+
+
 def _audit_path(project: str, task: str) -> Path:
     return _ack_dir(project) / f"{task}.retro.retry_audit.jsonl"
 
@@ -261,15 +268,15 @@ def _audit_append(project: str, task: str, record: dict) -> None:
         fh.write(line)
 
 
-def _read_attempt_n(project: str, task: str) -> tuple[int | None, str]:
-    """Return ``(value, raw)`` for the attempt counter.
+def _read_counter(p: Path) -> tuple[int | None, str]:
+    """Return ``(value, raw)`` for an attempt-counter file at ``p``.
 
     ``value`` is ``None`` when the file is missing or empty (treat as 0).
     Multi-line files have all but the first stripped; non-numeric / >2
     values are surfaced to the caller as ``value=-1`` so they can emit a
-    corruption-class BLOCKED result without re-reading.
+    corruption-class BLOCKED result without re-reading. Path-parametric so the
+    retro counter and the isolated audit counter share one implementation.
     """
-    p = _attempt_path(project, task)
     if not p.exists():
         return None, ""
     try:
@@ -287,8 +294,7 @@ def _read_attempt_n(project: str, task: str) -> tuple[int | None, str]:
     return int(first), raw
 
 
-def _write_attempt_n_atomic(project: str, task: str, n: int) -> None:
-    p = _attempt_path(project, task)
+def _write_counter_atomic(p: Path, n: int) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.parent / f"{p.name}.tmp.{os.getpid()}.{time.monotonic_ns()}"
     fd = os.open(str(tmp), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
@@ -300,16 +306,14 @@ def _write_attempt_n_atomic(project: str, task: str, n: int) -> None:
     os.rename(tmp, p)
 
 
-def _quarantine_corrupt_counter(project: str, task: str, raw: str) -> Path:
+def _quarantine_corrupt(p: Path, raw: str) -> Path:
     """Rename a corrupt counter file out of the way per §7.2.
 
     Returns the destination path so callers can include it in audit entries.
     """
-    p = _attempt_path(project, task)
     if not p.exists():
-        dst_dir = p.parent
-        dst_dir.mkdir(parents=True, exist_ok=True)
-        dst = dst_dir / f"{p.name}.corrupt-{int(time.time())}"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        dst = p.parent / f"{p.name}.corrupt-{int(time.time())}"
         dst.write_text(raw, encoding="utf-8")
         return dst
     dst = p.parent / f"{p.name}.corrupt-{int(time.time())}"
@@ -320,6 +324,18 @@ def _quarantine_corrupt_counter(project: str, task: str, raw: str) -> Path:
         with contextlib.suppress(OSError):
             p.unlink()
     return dst
+
+
+def _read_attempt_n(project: str, task: str) -> tuple[int | None, str]:
+    return _read_counter(_attempt_path(project, task))
+
+
+def _write_attempt_n_atomic(project: str, task: str, n: int) -> None:
+    _write_counter_atomic(_attempt_path(project, task), n)
+
+
+def _quarantine_corrupt_counter(project: str, task: str, raw: str) -> Path:
+    return _quarantine_corrupt(_attempt_path(project, task), raw)
 
 
 def _clear_attempt_on_success(project: str, task: str, evidence_hash: str, sid: str) -> None:
@@ -698,18 +714,23 @@ class _LockHeld(Exception):
 
 
 @contextlib.contextmanager
-def _attempt_lock(project: str, task: str):
-    """Short-lived lock around the attempt_n.txt read-modify-write window."""
+def _attempt_lock(project: str, task: str, *, kind: str = "retro"):
+    """Short-lived lock around an attempt_n.txt read-modify-write window.
+
+    ``kind`` selects the lock file (``retro`` vs ``audit``) so the two isolated
+    counters serialize independently — an audit retry never blocks on the retro
+    attempt lock.
+    """
     lock_root = _locks_dir(project)
     lock_root.mkdir(parents=True, exist_ok=True)
-    lock = lock_root / f"{task}.retro.attempt.lock"
+    lock = lock_root / f"{task}.{kind}.attempt.lock"
     try:
         with atomic.acquire_dir_lock(
             lock, stale_seconds=ATTEMPT_LOCK_STALE_SEC, retries=1, wait_seconds=0.0
         ):
             yield
     except atomic.LockAcquisitionError as e:
-        raise _LockHeld("attempt-lock-held", precheck=False, dump=False) from e
+        raise _LockHeld(f"{kind}-attempt-lock-held", precheck=False, dump=False) from e
 
 
 # ─── failure routing (counter bump + BLOCKED) ───────────────────────────────
@@ -881,6 +902,168 @@ def _handle_validation_failure(
         return _locked(e.subcode, "another tab is updating attempt counter")
 
 
+# ─── audit gate failure routing (isolated audit_attempt_n) ──────────────────
+
+
+def _clear_audit_attempt_on_success(project: str, task: str) -> None:
+    """Drop the isolated audit counter once the audit gate passes."""
+    p = _audit_attempt_path(project, task)
+    if p.exists():
+        with contextlib.suppress(OSError):
+            p.unlink()
+
+
+def _handle_audit_failure(
+    *,
+    project: str,
+    task: str,
+    outcome,
+    payload: dict | None,
+    evidence_path: Path | None,
+    session_id: str,
+    head: str,
+) -> GateResult:
+    """Map a non-OK :class:`codex_audit.AuditGateOutcome` to a GateResult.
+
+    Mirrors :func:`_handle_validation_failure` but bumps the *isolated* audit
+    counter (``ack/<task>.audit.attempt_n.txt``). Class routing:
+      * ``fatal``  → ``ERR-FATAL`` (tamper; retry can't help, no counter touch)
+      * ``bypass`` → ``ERR-BYPASS`` (codex-unavailable bypass lacked failure proof)
+      * ``blocked``→ ``ERR-BLOCKED`` + BLOCKED.md (hard stop, owner decides)
+      * ``retry``  → bump audit_attempt_n; at ATTEMPT_MAX → BLOCKED.md
+    """
+    ev_hash = (payload or {}).get("evidence_hash") if payload else None
+
+    if outcome.klass == "fatal":
+        _audit_append(
+            project,
+            task,
+            {"event": "audit-fatal", "subcode": outcome.subcode, "tab_session_id": session_id},
+        )
+        return _fatal(outcome.subcode, outcome.message)
+
+    if outcome.klass == "bypass":
+        _audit_append(
+            project,
+            task,
+            {
+                "event": "audit-bypass-rejected",
+                "subcode": outcome.subcode,
+                "tab_session_id": session_id,
+            },
+        )
+        return _bypass(outcome.subcode, outcome.message)
+
+    if outcome.klass == "blocked":
+        _audit_append(
+            project,
+            task,
+            {"event": "audit-blocked", "subcode": outcome.subcode, "tab_session_id": session_id},
+        )
+        current, _ = _read_counter(_audit_attempt_path(project, task))
+        attempt_for_log = current if isinstance(current, int) and current >= 0 else 0
+        _write_blocked_md(
+            project=project,
+            task=task,
+            subcode=outcome.subcode,
+            attempt_n=attempt_for_log,
+            evidence_path=evidence_path,
+            evidence_hash=ev_hash,
+            head=head,
+            session_id=session_id,
+            reason=outcome.message,
+        )
+        return _blocked(outcome.subcode, outcome.message)
+
+    # retry-class → isolated audit counter
+    apath = _audit_attempt_path(project, task)
+    try:
+        with _attempt_lock(project, task, kind="audit"):
+            current, raw = _read_counter(apath)
+            if current == -1:
+                dst = _quarantine_corrupt(apath, raw)
+                _audit_append(
+                    project,
+                    task,
+                    {
+                        "event": "audit-counter-corrupt",
+                        "subcode": "audit-counter-corrupted",
+                        "quarantine": str(dst),
+                        "tab_session_id": session_id,
+                    },
+                )
+                _write_blocked_md(
+                    project=project,
+                    task=task,
+                    subcode="audit-counter-corrupted",
+                    attempt_n=-1,
+                    evidence_path=evidence_path,
+                    evidence_hash=ev_hash,
+                    head=head,
+                    session_id=session_id,
+                    reason=f"audit.attempt_n.txt 内容损坏, 已 quarantine 到 {dst}.",
+                )
+                return _blocked("audit-counter-corrupted", f"quarantined corrupt counter → {dst}")
+            n = current if current is not None else 0
+            if n >= ATTEMPT_MAX:
+                _audit_append(
+                    project,
+                    task,
+                    {
+                        "event": "audit-attempt-exhausted",
+                        "subcode": outcome.subcode,
+                        "attempt_n": n,
+                        "tab_session_id": session_id,
+                    },
+                )
+                _write_blocked_md(
+                    project=project,
+                    task=task,
+                    subcode="codex-audit-attempt-exhausted",
+                    attempt_n=n,
+                    evidence_path=evidence_path,
+                    evidence_hash=ev_hash,
+                    head=head,
+                    session_id=session_id,
+                    reason=(
+                        f"audit gate failed 3 times; last failure: {outcome.subcode} — "
+                        f"{outcome.message}"
+                    ),
+                )
+                return _blocked(
+                    "codex-audit-attempt-exhausted",
+                    f"audit_attempt_n={n} after 3 retries (last={outcome.subcode})",
+                )
+            new_n = n + 1
+            _write_counter_atomic(apath, new_n)
+            _audit_append(
+                project,
+                task,
+                {
+                    "event": "audit-retry-allowed",
+                    "subcode": outcome.subcode,
+                    "attempt_n_after": new_n,
+                    "tab_session_id": session_id,
+                },
+            )
+            return _retry(
+                outcome.subcode,
+                f"{outcome.message} (audit_attempt_n={new_n}/{ATTEMPT_MAX})",
+            )
+    except _LockHeld as e:
+        _audit_append(
+            project,
+            task,
+            {
+                "event": "lock-contention",
+                "lock": "audit.attempt.lock",
+                "subcode": e.subcode,
+                "tab_session_id": session_id,
+            },
+        )
+        return _locked(e.subcode, "another tab is updating the audit attempt counter")
+
+
 # ─── 1-B: dump-time re-align ─────────────────────────────────────────────────
 
 
@@ -1040,6 +1223,7 @@ def check_retro_gate(
     evidence_path: Path | None,
     bypass_enabled: bool,
     mandate_enabled: bool,
+    audit_mandate_enabled: bool = False,
     nonce: str | None = None,
     config: dict | None = None,
     session_id: str = "",
@@ -1091,11 +1275,32 @@ def check_retro_gate(
         return _ok()
 
     if evidence_path is None:
-        if not mandate_enabled:
+        if not mandate_enabled and not audit_mandate_enabled:
             return _ok()
-        return _retry(
-            "retro-evidence-missing",
-            "no --retro-evidence and no HANDOFF_RETRO_BYPASS; supply evidence file",
+        # Audit mandate takes precedence when set (with OR without retro mandate,
+        # codex R2-3): route through the isolated audit counter so repeated
+        # no-evidence dumps progress 0→1→2→BLOCKED rather than RETRY-looping. The
+        # codex_audit block can only ride on a retro-evidence file, so a missing
+        # one is an audit failure regardless of the retro mandate.
+        if not audit_mandate_enabled:
+            return _retry(
+                "retro-evidence-missing",
+                "no --retro-evidence and no HANDOFF_RETRO_BYPASS; supply evidence file",
+            )
+        from handoff_fanout import codex_audit
+
+        return _handle_audit_failure(
+            project=project,
+            task=task,
+            outcome=codex_audit.AuditGateOutcome(
+                "retry",
+                "codex-audit-required",
+                "HANDOFF_AUDIT_MANDATE set but no --retro-evidence; supply evidence with codex_audit",
+            ),
+            payload=None,
+            evidence_path=None,
+            session_id=sid,
+            head=_git(["rev-parse", "HEAD"], workspace),
         )
 
     try:
@@ -1219,6 +1424,54 @@ def check_retro_gate(
                         "tab_session_id": sid,
                     },
                 )
+
+            # Audit gate (G0-G9) runs whenever its mandate is on — INCLUDING
+            # forensic mode (codex R1-F1 P0). forensic_retro only relaxes the
+            # *retro* phase-status / freshness checks (a new session can't prove
+            # the old session's Phase 0/1); it must NOT become a self-declared
+            # field that skips the code audit, or any evidence with
+            # mode="forensic_retro" would bypass the gate. Genuine forensic
+            # recovery without an audit goes through the owner-approved
+            # HANDOFF_RETRO_BYPASS path (short-circuited at the top), which spec
+            # §1.1 exempts from G0-G9. It is the last gate before success so G0
+            # binds to the HEAD the dump is about to hand off, after re-align.
+            if audit_mandate_enabled:
+                from handoff_fanout import codex_audit
+
+                # R3-3: hold the per-task audit.lock across the WHOLE evaluation
+                # so a concurrent `audit-run` (which writes a new findings
+                # artifact under the same lock) can't slip a failing run in
+                # between discover_run_indices() and the union check. Lock order
+                # is precheck → dump → audit, matching `audit-close`, so nesting
+                # it inside the already-held _ordered_locks is deadlock-free.
+                audit_lock = _locks_dir(project) / f"{task}.audit.lock"
+                try:
+                    with atomic.acquire_dir_lock(audit_lock, retries=5, wait_seconds=0.2):
+                        audit_outcome = codex_audit.evaluate_audit_gate(
+                            payload, workspace, project, task
+                        )
+                except atomic.LockAcquisitionError:
+                    _audit_append(
+                        project,
+                        task,
+                        {
+                            "event": "lock-contention",
+                            "lock": "audit.lock",
+                            "tab_session_id": sid,
+                        },
+                    )
+                    return _locked("audit-lock-held", "another tab is writing audit runs")
+                if not audit_outcome.ok:
+                    return _handle_audit_failure(
+                        project=project,
+                        task=task,
+                        outcome=audit_outcome,
+                        payload=payload,
+                        evidence_path=evidence_path,
+                        session_id=sid,
+                        head=_git(["rev-parse", "HEAD"], workspace),
+                    )
+                _clear_audit_attempt_on_success(project, task)
 
             if not forensic:
                 _clear_attempt_on_success(project, task, payload.get("evidence_hash", ""), sid)
