@@ -1,0 +1,37 @@
+{
+  "name": "handoff-helper",
+  "displayName": "DHARMAXIS Handoff Helper",
+  "description": "Auto-closes a stale Claude Code tab after a handoff hands off to a freshly spawned tab. Driven by a URI invoked from the launchd watcher.",
+  "version": "0.1.0",
+  "publisher": "dharmaxis",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onUri"
+  ],
+  "contributes": {},
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node18",
+    "watch": "npm run build -- --watch",
+    "typecheck": "tsc --noEmit -p ./",
+    "pretest": "tsc -p ./tsconfig.test.json",
+    "test": "mocha \"out/test/*.test.js\"",
+    "test:integration": "tsc -p ./tsconfig.test.json && node ./out/test/integration/runIntegration.js",
+    "vscode:prepublish": "npm run build"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.6",
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/test-electron": "^2.3.9",
+    "esbuild": "^0.20.0",
+    "mocha": "^10.3.0",
+    "typescript": "^5.4.0"
+  }
+}
