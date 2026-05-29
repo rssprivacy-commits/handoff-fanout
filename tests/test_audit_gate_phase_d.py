@@ -354,3 +354,16 @@ def test_audit_close_full_mode_writes_no_sidecar(handoff_home, tmp_path, monkeyp
     rc = codex_audit.main_audit_close(argv)
     assert rc == 0, rc
     assert not codex_audit.bypass_override_path(PROJECT_WS, TASK).exists()
+
+
+# ─── Task 6: docs presence / honest-disclaimer regression guard ──────────────
+
+
+def test_templates_document_owner_override_and_bypass():
+    from handoff_fanout import templates
+
+    src = Path(templates.__file__).read_text(encoding="utf-8")
+    assert "owner_ack" in src
+    assert "audit.override.json" in src
+    # honest trust-model disclaimer must survive (no "crypto secure" over-claim)
+    assert "非加密" in src or "not cryptograph" in src.lower()

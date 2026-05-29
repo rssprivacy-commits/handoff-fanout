@@ -263,9 +263,11 @@ handoff audit-close \\
 
 **4 模式** (gate 在 Phase D 机器裁定 / Phase C 仅记录): `full_codex_audit` (有代码改动) / `empty_diff_attestation` (diff 为空) / `docs_only_light_audit` (纯文档, prompts/CLAUDE.md/schema/SQL 不算) / `codex_unavailable_bypass` (codex 不可用)。
 
-**bypass = 欠债** (spec §1.3): codex 真不可用时走 `--audit-mode codex_unavailable_bypass --bypass-file <f>` (含 `codex_failure_attempts` 机器失败证明 + `follow_up_audit_task_id`)。**下一棒 `--task` 必须 = `follow_up_audit_task_id`** —— dump 会把它写进 `old_ready.next_session_forced_task`, 新会话 §0 校验; 接了别的 task = §0 拦下 (mandate on 后硬拒)。
+**bypass = 欠债** (spec §1.3): codex 真不可用时走 `--audit-mode codex_unavailable_bypass --bypass-file <f>` (含 `codex_failure_attempts` 机器失败证明 ≥3 次 + `follow_up_audit_task_id`)。**下一棒 `--task` 必须 = `follow_up_audit_task_id`** —— dump 会把它写进 `old_ready.next_session_forced_task`, 新会话 §0 校验; 接了别的 task = §0 拦下 (mandate on 后硬拒)。audit-close bypass 模式**自动写** `ack/<task>.audit.override.json` (含 `follow_up_deadline` = now+1天), 无需主人点击 (codex 宕机是机器事实 / 主人裁决 #2); Phase C overdue scanner 到期未见重审 evidence → 下次 dump exit 6 拦。
 
-**当前阶段** (Phase C / mandate OFF): `HANDOFF_AUDIT_MANDATE` 未拨, dump gate 暂**不**强制 G0-G9, audit-close 只**记录**审计块 (不阻断旧流程)。Phase D 三路径拨 `HANDOFF_AUDIT_MANDATE=1` 后才达成"缺陷不下传"。详 `project-files/handoff/codex-audit-gate-spec-draft.md` §6。⚠️ Phase D 拨前必补: `owner_ack_token` 加密验证 (§7.3) + bypass sidecar artifact (主人裁决项)。
+**owner_override (豁免 finding / 需主人单按钮)**: AI 遇到一个它主张"豁免不修"的 P0/P1 → 调 AskUserQuestion 单按钮「确认豁免」(与 5/28 单按钮二段确认立法一致) → 主人点击后 AI 调 `write_owner_ack(...)` 写 `ack/<task>.owner_ack.<finding_hash_short>.json` (绑定 finding_hash + nonce + `owner_ack_token` 校验和 + 7天 `expires_at`) + 在 disposition 写 `disposition=owner_override` 带同一 `owner_ack_token`。gate G7 读 on-disk ack 校验: 存在 + schema 支持 + ack.finding_hash==该 finding + 重算 `sha256(task|finding_hash|nonce|approved_at)` 三方一致 + 未过期, 任一不满足 = BLOCKED。**诚实声明**: `owner_ack_token` = **防篡改 + 摩擦**绑定校验和, **非加密**; 防的是一次批准被静默复用到别的 finding / 无限期有效 / 无痕批准, **不防**恶意 AI 以主人身份伪造批准 (单用户场景接受 / 多用户上线再引入主人持密钥的 HMAC / 设计 §1 + §6)。
+
+**当前阶段** (Phase C / mandate OFF): `HANDOFF_AUDIT_MANDATE` 未拨, dump gate 暂**不**强制 G0-G9, audit-close 只**记录**审计块 (不阻断旧流程)。Phase D 三路径拨 `HANDOFF_AUDIT_MANDATE=1` 后才达成"缺陷不下传"。详 `project-files/handoff/codex-audit-gate-spec-draft.md` §6 + `owner-ack-token-design.md`。✅ Phase D 前置两项已补: `owner_ack_token` 绑定校验 (非加密 / G7) + bypass sidecar producer。
 
 成功 → launchd / cron WatchPaths 1 秒内 spawn 新 Claude tab.
 
