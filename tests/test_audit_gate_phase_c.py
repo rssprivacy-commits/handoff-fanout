@@ -121,14 +121,17 @@ def test_build_block_rejects_newline_follow_id():
 
 
 def _bypass_gate_block(follow) -> dict:
+    # Phase D R1-P1: gate enforces MIN_CODEX_FAILURES (3) — give 3 valid attempts
+    # so this helper isolates the follow-id check from the failure-count check.
     return {
         "audit_mode": "codex_unavailable_bypass",
         "codex_failure_attempts": [
             {
                 "exit": 1,
                 "stderr_hash": "sha256:" + "0" * 64,
-                "timestamp": "2026-05-30T00:00:00+00:00",
+                "timestamp": f"2026-05-30T0{i}:00:00+00:00",
             }
+            for i in range(3)
         ],
         "follow_up_audit_task_id": follow,
     }

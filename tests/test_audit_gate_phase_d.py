@@ -219,6 +219,100 @@ def test_g7_override_expired_ack_blocked(handoff_home, tmp_path, monkeypatch):
     assert out.subcode == "codex-audit-override-invalid"
 
 
+def test_g7_override_tampered_expiry_window_blocked(handoff_home, tmp_path, monkeypatch):
+    # R1-P1: expires_at is NOT covered by the token. A real, EXPIRED ack (approved
+    # 8 days ago) whose expires_at is hand-edited far into the future would be
+    # self-consistent on the token but must be caught by the approved+TTL binding.
+    ws = _ws(tmp_path, monkeypatch)
+    past = (datetime.now(UTC) - timedelta(days=8)).isoformat(timespec="seconds")
+    future = (datetime.now(UTC) + timedelta(days=365)).isoformat(timespec="seconds")
+    out = _gate_override(
+        handoff_home,
+        ws,
+        write_ack={"approved_at": past},
+        disp_overrides={"expires_at": future},
+    )
+    assert out.klass == "blocked"
+    assert out.subcode == "codex-audit-override-invalid"
+
+
+def test_g7_override_disk_ack_tampered_expiry_blocked(handoff_home, tmp_path, monkeypatch):
+    # Same attack but tampering the ON-DISK artifact's expires_at directly.
+    ws = _ws(tmp_path, monkeypatch)
+    head = _head(ws)
+    finding = {"id": "F1", "severity": "P0", "title": "bug F1"}
+    rec = codex_audit.write_findings_artifact(
+        PROJECT_WS,
+        TASK,
+        1,
+        {"run_index": 1, "input_commit": head, "original_findings": [finding]},
+        input_commit=head,
+    )
+    fhash = codex_audit.compute_finding_hash(finding)
+    past = (datetime.now(UTC) - timedelta(days=8)).isoformat(timespec="seconds")
+    nonce = "n1"
+    codex_audit.write_owner_ack(PROJECT_WS, TASK, fhash, "bug", nonce, past, "exempt")
+    # tamper the on-disk expires_at into the future (token unchanged → still self-consistent)
+    ack_path = codex_audit.owner_ack_path(PROJECT_WS, TASK, fhash)
+    data = json.loads(ack_path.read_text())
+    data["expires_at"] = (datetime.now(UTC) + timedelta(days=365)).isoformat()
+    ack_path.write_text(json.dumps(data, sort_keys=True))
+    token = codex_audit.compute_owner_ack_token(TASK, fhash, nonce, past)
+    disp = {
+        "finding_id": "F1",
+        "finding_hash": fhash,
+        "original_severity": "P0",
+        "disposition": "owner_override",
+        "owner_ack_token": token,
+        "expires_at": data["expires_at"],
+    }
+    block = {"audit_mode": "full_codex_audit", "audit_runs": [rec], "dispositions": [disp]}
+    p0 = {k: {"status": "✅"} for k in handoff_precheck.PHASE0_KEYS}
+    p1 = {k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS}
+    payload = handoff_precheck.build_evidence(
+        task_id=TASK, project=PROJECT_WS, workspace=ws, phase0=p0, phase1=p1, codex_audit=block
+    )
+    out = codex_audit.evaluate_audit_gate(payload, ws, PROJECT_WS, TASK)
+    assert out.klass == "blocked"
+    assert out.subcode == "codex-audit-override-invalid"
+
+
+def test_gate_bypass_enforces_min_codex_failures(handoff_home):
+    # R1-P1: the gate must enforce the SAME MIN_CODEX_FAILURES floor as the
+    # producer, so a hand-crafted evidence can't bypass with 1-2 failures.
+    assert codex_audit.BYPASS_MIN_FAILURES == codex_audit.MIN_CODEX_FAILURES == 3
+    for n in (1, 2):
+        block = {
+            "audit_mode": "codex_unavailable_bypass",
+            "codex_failure_attempts": [
+                {
+                    "exit": 1,
+                    "stderr_hash": "sha256:" + "0" * 64,
+                    "timestamp": f"2026-05-30T0{i}:00:00+00:00",
+                }
+                for i in range(n)
+            ],
+            "follow_up_audit_task_id": "redo-audit-x",
+        }
+        out = codex_audit._gate_bypass(block)
+        assert out.klass == "bypass"
+        assert out.subcode == "codex-audit-bypass-no-failure-proof"
+    # 3 is accepted
+    block3 = {
+        "audit_mode": "codex_unavailable_bypass",
+        "codex_failure_attempts": [
+            {
+                "exit": 1,
+                "stderr_hash": "sha256:" + "0" * 64,
+                "timestamp": f"2026-05-30T0{i}:00:00+00:00",
+            }
+            for i in range(3)
+        ],
+        "follow_up_audit_task_id": "redo-audit-x",
+    }
+    assert codex_audit._gate_bypass(block3).ok
+
+
 # ─── Task 4: bypass sidecar producer ─────────────────────────────────────────
 
 

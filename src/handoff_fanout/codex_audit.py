@@ -187,12 +187,17 @@ def _append_audit_trail(project: str, task: str, event: dict) -> None:
         fh.flush()
 
 
-def _add_days_iso(iso: str, days: int) -> str:
-    """Return ``iso`` shifted by ``days``, normalized to an offset-aware ISO-8601."""
+def _parse_iso_utc(iso: str) -> datetime:
+    """Parse an ISO-8601 string to an offset-aware datetime (raises on bad input)."""
     dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
-    return (dt + timedelta(days=days)).isoformat()
+    return dt
+
+
+def _add_days_iso(iso: str, days: int) -> str:
+    """Return ``iso`` shifted by ``days``, normalized to an offset-aware ISO-8601."""
+    return (_parse_iso_utc(iso) + timedelta(days=days)).isoformat()
 
 
 def write_owner_ack(
@@ -762,19 +767,21 @@ def append_disposition(project: str, task: str, disposition: dict) -> list[dict]
 # used as the diff base when a session's oldest commit is the repo root.
 _EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
-# A bypass needs at least this many machine-recorded codex failures (spec §1.3
-# "gate 校验次数 ≥ 阈值"). The Phase A builder requires the list be non-empty;
-# the gate re-checks the count so hand-crafted evidence can't shrink it to 0.
-BYPASS_MIN_FAILURES = 1
-
 # Owner-ack / bypass-producer constants (Phase D pre-req; design §2.2 / §3.1).
 OWNER_ACK_TTL_DAYS = 7  # owner_override exemption validity (owner ruling #4)
 BYPASS_FOLLOW_UP_DEADLINE_DAYS = 1  # short debt; next session should re-audit
-# The producer's honest threshold: how many machine-proven codex failures define
-# "codex unavailable" before write_bypass_override will emit the sidecar. This is
-# DISTINCT from BYPASS_MIN_FAILURES (the gate's loose floor) — the producer is
-# stricter so the honest path can't manufacture a bypass off a single hiccup.
+# The honest threshold for "codex unavailable": how many machine-proven failures
+# (exit≠0 / timeout, each with a hashed stderr) the producer requires before it
+# will emit a bypass sidecar (design §3.1). The gate enforces the SAME floor
+# (R1-P1): a hand-crafted bypass evidence routed straight through
+# `handoff dump --retro-evidence` must clear the same ≥3-failure bar the honest
+# producer path does, or the threshold is decorative.
 MIN_CODEX_FAILURES = 3
+# A bypass needs at least this many machine-recorded codex failures (spec §1.3
+# "gate 校验次数 ≥ 阈值"). Unified with MIN_CODEX_FAILURES so producer and gate
+# agree — the design's safety net (§3.3 "gate _gate_bypass 已校验 N 次") depends
+# on the gate checking the real N, not a looser floor.
+BYPASS_MIN_FAILURES = MIN_CODEX_FAILURES
 OWNER_ACK_SCHEMA_VERSION = "1.0"
 BYPASS_OVERRIDE_SCHEMA_VERSION = "1.0"
 SUPPORTED_OWNER_ACK_SCHEMA_VERSIONS = ("1.0",)
@@ -1553,12 +1560,38 @@ def _gate_full(
                     "codex-audit-override-invalid",
                     f"finding {fhash} owner-ack token not self-consistent",
                 )
+            # Expiry binding (R1-P1): expires_at is NOT covered by the token, so a
+            # truly-expired ack could otherwise be revived by hand-editing only
+            # expires_at into the future. Pin it to approved_at + TTL (the value
+            # write_owner_ack derives) AND require it unexpired.
             exp = ack.get("expires_at")
-            if not _nonempty_str(exp) or _is_expired(exp):
+            if not _nonempty_str(exp):
                 return AuditGateOutcome(
                     "blocked",
                     "codex-audit-override-invalid",
-                    f"finding {fhash} owner_override ack expired/invalid at {exp!r}",
+                    f"finding {fhash} owner_override ack missing expires_at",
+                )
+            try:
+                exp_dt = _parse_iso_utc(exp)
+                approved_dt = _parse_iso_utc(approved_at)
+            except ValueError:
+                return AuditGateOutcome(
+                    "blocked",
+                    "codex-audit-override-invalid",
+                    f"finding {fhash} owner_override ack has unparseable timestamps",
+                )
+            if exp_dt != approved_dt + timedelta(days=OWNER_ACK_TTL_DAYS):
+                return AuditGateOutcome(
+                    "blocked",
+                    "codex-audit-override-invalid",
+                    f"finding {fhash} owner-ack expires_at != approved_at + "
+                    f"{OWNER_ACK_TTL_DAYS}d (tampered window)",
+                )
+            if _is_expired(exp):
+                return AuditGateOutcome(
+                    "blocked",
+                    "codex-audit-override-invalid",
+                    f"finding {fhash} owner_override ack expired at {exp}",
                 )
             # Trace the consumption (篡改证据 / design §2.4).
             _append_audit_trail(

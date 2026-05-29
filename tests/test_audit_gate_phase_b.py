@@ -550,14 +550,17 @@ def test_g9_rounds_exceeded_blocked(handoff_home, workspace):
 
 
 def test_bypass_valid_passes(handoff_home, workspace):
+    # Phase D R1-P1: the gate now enforces MIN_CODEX_FAILURES (3), same as the
+    # producer — a valid bypass needs >=3 machine-proven failures.
     block = {
         "audit_mode": "codex_unavailable_bypass",
         "codex_failure_attempts": [
             {
                 "exit": 124,
                 "stderr_hash": "sha256:" + "e" * 64,
-                "timestamp": "2026-05-30T00:00:00+08:00",
+                "timestamp": f"2026-05-30T0{i}:00:00+08:00",
             }
+            for i in range(3)
         ],
         "follow_up_audit_task_id": "demo-task-audit-followup",
     }
