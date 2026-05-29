@@ -395,6 +395,10 @@ def write_active_dump(
     if status == "done":
         (queue_dir / f"{task}.done").touch()
         (queue_dir / f"{task}.uri").unlink(missing_ok=True)
+        # Terminal state: stop the heartbeat from outliving the task. A leaked
+        # heartbeat keeps ticking stale and watchdog mode 6 mis-flags the done
+        # task as 529-suspected.
+        (queue_dir / f"{task}.heartbeat").unlink(missing_ok=True)
         print(f"[dump] ✅ {project}/{task} marked done")
         return 0
 
@@ -410,6 +414,8 @@ def write_active_dump(
             encoding="utf-8",
         )
         (queue_dir / f"{task}.uri").unlink(missing_ok=True)
+        # Terminal state — same heartbeat cleanup as the done path.
+        (queue_dir / f"{task}.heartbeat").unlink(missing_ok=True)
         print(f"[dump] ⛔ BLOCKED written to {blocked_file}")
         _notify(osascript_subtitle or task, f"自动接续 / {project}", task, sound="Basso")
         return 0
@@ -764,6 +770,9 @@ def handle_batch_done(
         (f"sub_task_id: {sub_task_id}\ncompleted_at: {now_iso()}\nsummary: {args.next_brief}\n"),
     )
     print(f"[batch-done] {summary_path} written")
+    # Terminal state: drop the sub-task heartbeat so the watchdog's mode-4/6
+    # stale sweep doesn't mis-flag a completed sub-task.
+    (batch_dir / f"{sub_task_id}.heartbeat").unlink(missing_ok=True)
     trigger_fan_in_if_ready(project, workspace, args.batch_id, queue_dir, cfg=cfg)
     return 0
 
@@ -800,6 +809,8 @@ def handle_batch_blocked(
         ),
     )
     print(f"[batch-blocked] {blocked_path} written")
+    # Terminal state — same heartbeat cleanup as the batch-done path.
+    (batch_dir / f"{sub_task_id}.heartbeat").unlink(missing_ok=True)
     trigger_fan_in_if_ready(project, workspace, args.batch_id, queue_dir, cfg=cfg)
     return 0
 
