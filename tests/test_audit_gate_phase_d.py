@@ -98,3 +98,124 @@ def test_write_and_load_owner_ack_roundtrip(handoff_home):
 
 def test_load_owner_ack_missing_returns_none(handoff_home):
     assert codex_audit.load_owner_ack(PROJECT, TASK, FHASH) is None
+
+
+# ─── Task 3: G7 verifies the on-disk owner-ack artifact ──────────────────────
+
+PROJECT_WS = "demo"
+
+
+def _ws(tmp_path, monkeypatch):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    for args in (
+        ["git", "init", "--quiet", "--initial-branch=main"],
+        ["git", "config", "user.email", "t@t.test"],
+        ["git", "config", "user.name", "t"],
+        ["git", "config", "commit.gpgsign", "false"],
+    ):
+        subprocess.run(args, cwd=ws, check=True)
+    (ws / "README.md").write_text("test\n")
+    subprocess.run(["git", "add", "README.md"], cwd=ws, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=ws, check=True)
+    monkeypatch.chdir(ws)
+    return ws
+
+
+def _head(ws):
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ws, capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def _gate_override(handoff_home, ws, *, disp_overrides=None, write_ack=None):
+    """Build a full-audit block with one P0 finding owner_override'd; return outcome.
+
+    write_ack: dict of kwargs (nonce/approved_at/finding_hash overrides) for
+        write_owner_ack, or None to skip writing the artifact entirely.
+    disp_overrides: dict merged into the disposition (to inject mismatches).
+    """
+    head = _head(ws)
+    finding = {"id": "F1", "severity": "P0", "title": "bug F1"}
+    rec = codex_audit.write_findings_artifact(
+        PROJECT_WS,
+        TASK,
+        1,
+        {"run_index": 1, "input_commit": head, "original_findings": [finding]},
+        input_commit=head,
+    )
+    fhash = codex_audit.compute_finding_hash(finding)
+    approved = datetime.now(UTC).isoformat(timespec="seconds")
+    nonce = "nonce-xyz"
+    if write_ack is not None:
+        codex_audit.write_owner_ack(
+            PROJECT_WS,
+            TASK,
+            write_ack.get("finding_hash", fhash),
+            "bug F1",
+            write_ack.get("nonce", nonce),
+            write_ack.get("approved_at", approved),
+            "exempt: false positive",
+        )
+    token = codex_audit.compute_owner_ack_token(TASK, fhash, nonce, approved)
+    disp = {
+        "finding_id": "F1",
+        "finding_hash": fhash,
+        "original_severity": "P0",
+        "disposition": "owner_override",
+        "owner_ack_token": token,
+        "expires_at": codex_audit._add_days_iso(approved, 7),
+    }
+    if disp_overrides:
+        disp.update(disp_overrides)
+    block = {"audit_mode": "full_codex_audit", "audit_runs": [rec], "dispositions": [disp]}
+    p0 = {k: {"status": "✅"} for k in handoff_precheck.PHASE0_KEYS}
+    p1 = {k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS}
+    payload = handoff_precheck.build_evidence(
+        task_id=TASK, project=PROJECT_WS, workspace=ws, phase0=p0, phase1=p1, codex_audit=block
+    )
+    return codex_audit.evaluate_audit_gate(payload, ws, PROJECT_WS, TASK)
+
+
+def test_g7_override_with_valid_ack_passes(handoff_home, tmp_path, monkeypatch):
+    ws = _ws(tmp_path, monkeypatch)
+    out = _gate_override(handoff_home, ws, write_ack={})
+    assert out.ok, (out.klass, out.subcode, out.detail)
+
+
+def test_g7_override_no_ack_artifact_blocked(handoff_home, tmp_path, monkeypatch):
+    ws = _ws(tmp_path, monkeypatch)
+    out = _gate_override(handoff_home, ws, write_ack=None)  # token present but no file
+    assert out.klass == "blocked"
+    assert out.subcode == "codex-audit-override-no-ack-token"
+
+
+def test_g7_override_token_mismatch_blocked(handoff_home, tmp_path, monkeypatch):
+    ws = _ws(tmp_path, monkeypatch)
+    # ack on disk is for a DIFFERENT nonce → recomputed token won't match disposition
+    out = _gate_override(handoff_home, ws, write_ack={"nonce": "other-nonce"})
+    assert out.klass == "blocked"
+    assert out.subcode == "codex-audit-override-invalid"
+
+
+def test_g7_override_finding_hash_binding_mismatch_blocked(handoff_home, tmp_path, monkeypatch):
+    ws = _ws(tmp_path, monkeypatch)
+    # disposition claims a different finding_hash than the union finding's →
+    # the real finding has no disposition (unbound).
+    other = "sha256:" + "b" * 64
+    out = _gate_override(handoff_home, ws, write_ack={}, disp_overrides={"finding_hash": other})
+    assert out.klass in ("retry", "blocked")
+    assert not out.ok
+
+
+def test_g7_override_expired_ack_blocked(handoff_home, tmp_path, monkeypatch):
+    ws = _ws(tmp_path, monkeypatch)
+    past = (datetime.now(UTC) - timedelta(days=8)).isoformat(timespec="seconds")
+    out = _gate_override(
+        handoff_home,
+        ws,
+        write_ack={"approved_at": past},
+        disp_overrides={"expires_at": codex_audit._add_days_iso(past, 7)},
+    )
+    assert out.klass == "blocked"
+    assert out.subcode == "codex-audit-override-invalid"

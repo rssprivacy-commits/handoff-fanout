@@ -1412,25 +1412,80 @@ def _gate_full(
             verdict = _validate_reviewer_refute(d, fhash, payload.get("session_id"), project)
             if verdict is not None:
                 return verdict
-        # G7: an owner override needs an owner ack token (AI-generated → blocked).
-        # R5: the token must be a real non-empty string — a truthy non-string
-        # (`{"fake": true}`) or whitespace must not satisfy it. (Cryptographic
-        # verification of the token against an owner-controlled source remains
-        # the deferred spec §7.3 R3-open contract for Phase D.)
+        # G7: an owner override must be backed by a real ON-DISK owner-ack
+        # artifact, bound to THIS finding, self-consistent, and unexpired.
+        # TRUST MODEL (design §1 / owner ruling #1): anti-tamper + friction, NOT
+        # cryptography — an AI with the owner's identity can write a
+        # self-consistent ack. This catches silent REUSE (finding_hash binding),
+        # indefinite validity (expiry) and trace-less approval (the audit jsonl
+        # below); it does NOT stop a malicious forger (owner-held-key, design §6).
+        # R5: the disposition token must be a real non-empty string first.
         elif disp == _pc.DISPOSITION_OWNER_OVERRIDE:
-            if not _nonempty_str(d.get("owner_ack_token")):
+            token = _nonempty_str(d.get("owner_ack_token"))
+            if not token:
                 return AuditGateOutcome(
                     "blocked",
                     "codex-audit-override-no-ack-token",
                     f"finding {fhash} owner_override without a non-empty owner_ack_token",
                 )
-            exp = d.get("expires_at")
-            if exp and _is_expired(exp):
+            ack = load_owner_ack(project, task, fhash)
+            if not isinstance(ack, dict):
+                return AuditGateOutcome(
+                    "blocked",
+                    "codex-audit-override-no-ack-token",
+                    f"finding {fhash} owner_override has no on-disk owner-ack artifact",
+                )
+            if ack.get("schema_version") not in SUPPORTED_OWNER_ACK_SCHEMA_VERSIONS:
                 return AuditGateOutcome(
                     "blocked",
                     "codex-audit-override-invalid",
-                    f"finding {fhash} owner_override expired at {exp}",
+                    f"finding {fhash} owner-ack schema_version "
+                    f"{ack.get('schema_version')!r} unsupported",
                 )
+            # Binding: the ack must be FOR this finding (catch reuse elsewhere).
+            if ack.get("finding_hash") != fhash:
+                return AuditGateOutcome(
+                    "blocked",
+                    "codex-audit-override-invalid",
+                    f"finding {fhash} owner-ack binds a different finding "
+                    f"{ack.get('finding_hash')!r}",
+                )
+            # Self-consistency: recompute the binding checksum; the disposition
+            # token, the ack token and the recompute must ALL agree.
+            nonce = ack.get("nonce")
+            approved_at = ack.get("approved_at")
+            if not isinstance(nonce, str) or not isinstance(approved_at, str):
+                return AuditGateOutcome(
+                    "blocked",
+                    "codex-audit-override-invalid",
+                    f"finding {fhash} owner-ack missing nonce/approved_at",
+                )
+            recomputed = compute_owner_ack_token(task, fhash, nonce, approved_at)
+            if not (recomputed == ack.get("owner_ack_token") == token):
+                return AuditGateOutcome(
+                    "blocked",
+                    "codex-audit-override-invalid",
+                    f"finding {fhash} owner-ack token not self-consistent",
+                )
+            exp = ack.get("expires_at")
+            if not _nonempty_str(exp) or _is_expired(exp):
+                return AuditGateOutcome(
+                    "blocked",
+                    "codex-audit-override-invalid",
+                    f"finding {fhash} owner_override ack expired/invalid at {exp!r}",
+                )
+            # Trace the consumption (篡改证据 / design §2.4).
+            _append_audit_trail(
+                project,
+                task,
+                {
+                    "event": "owner-override-consumed",
+                    "finding_hash": fhash,
+                    "nonce": nonce,
+                    "approved_at": approved_at,
+                    "expires_at": exp,
+                },
+            )
 
     # §2.4: independent refutes are bounded so a finding can't livelock the gate.
     if refute_count > _pc.MAX_INDEP_REVIEW:

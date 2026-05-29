@@ -469,22 +469,45 @@ def test_g7_override_without_ack_token_blocked(handoff_home, workspace):
 
 
 def test_g7_override_with_ack_token_passes(handoff_home, workspace):
+    # Phase D: G7 now requires a real on-disk owner-ack artifact (binding +
+    # self-consistent + unexpired), not a bare token. Write one, then pass.
     head = _head(workspace)
     f = _finding("P0", "F1")
     rec = _write_run(workspace, 1, head, [f])
     fhash = codex_audit.compute_finding_hash(f)
-    disp = _disp("owner_override", fhash, severity="P0", owner_ack_token="owner-token-abc")
+    approved = datetime.now(UTC).isoformat(timespec="seconds")
+    nonce = "n1"
+    codex_audit.write_owner_ack(PROJECT, TASK, fhash, "bug", nonce, approved, "exempt")
+    token = codex_audit.compute_owner_ack_token(TASK, fhash, nonce, approved)
+    disp = _disp(
+        "owner_override",
+        fhash,
+        severity="P0",
+        owner_ack_token=token,
+        expires_at=codex_audit._add_days_iso(approved, 7),
+    )
     block = {"audit_mode": "full_codex_audit", "audit_runs": [rec], "dispositions": [disp]}
     assert _gate(workspace, block).ok
 
 
 def test_g7_override_expired_blocked(handoff_home, workspace):
+    # Phase D: an expired on-disk ack still blocks (override-invalid). The ack is
+    # written with a >7d-old approved_at so its derived expiry is in the past.
     head = _head(workspace)
     f = _finding("P0", "F1")
     rec = _write_run(workspace, 1, head, [f])
     fhash = codex_audit.compute_finding_hash(f)
-    past = (datetime.now(UTC) - timedelta(hours=1)).isoformat(timespec="seconds")
-    disp = _disp("owner_override", fhash, severity="P0", owner_ack_token="tok", expires_at=past)
+    past = (datetime.now(UTC) - timedelta(days=8)).isoformat(timespec="seconds")
+    nonce = "n1"
+    codex_audit.write_owner_ack(PROJECT, TASK, fhash, "bug", nonce, past, "exempt")
+    token = codex_audit.compute_owner_ack_token(TASK, fhash, nonce, past)
+    disp = _disp(
+        "owner_override",
+        fhash,
+        severity="P0",
+        owner_ack_token=token,
+        expires_at=codex_audit._add_days_iso(past, 7),
+    )
     block = {"audit_mode": "full_codex_audit", "audit_runs": [rec], "dispositions": [disp]}
     out = _gate(workspace, block)
     assert out.klass == "blocked" and out.subcode == "codex-audit-override-invalid"
