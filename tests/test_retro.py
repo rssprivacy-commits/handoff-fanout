@@ -534,6 +534,51 @@ def test_R14_concurrent_dumps_cleanly_serialized(handoff_home, workspace):
             assert b"precheck-lock-held" in err, f"locked proc has wrong error: {err!r}"
 
 
+def test_R14b_dump_locked_out_when_precheck_lock_held(handoff_home, workspace):
+    """Deterministic companion to R14 (codex P1): R14's relaxed assertions allow
+    an all-success outcome, so on their own they cannot prove the dump path
+    actually honors the lock. Here we hold ``precheck.lock`` from THIS process
+    (flock is cross-process) and run a dump in a SUBPROCESS — it must be locked
+    out: exit 3 with ``precheck-lock-held``. A broken/bypassed dump lock would
+    let the dump through and fail this test.
+
+    A subprocess is required: ``acquire_dir_lock`` is re-entrant within a single
+    process (the per-process fd registry), so an in-process ``dump.main`` would
+    simply re-enter the lock we hold and never observe contention.
+    """
+    from handoff_fanout import atomic
+
+    payload = _make_payload(workspace)
+    ev = _write_evidence(handoff_home, payload)
+    lock_path = handoff_home / PROJECT / "locks" / "precheck.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cli = [sys.executable, "-m", "handoff_fanout.dump"]
+    argv = [
+        "--task",
+        TASK,
+        "--next",
+        "blocked",
+        "--project",
+        PROJECT,
+        "--workspace",
+        str(workspace),
+        "--status",
+        "active",
+        "--retro-evidence",
+        str(ev),
+    ]
+    env = dict(os.environ)
+    env["HANDOFF_HOME"] = str(handoff_home)
+    env.pop("HANDOFF_RETRO_BYPASS", None)
+    env.pop("HANDOFF_RETRO_MANDATE", None)
+
+    with atomic.acquire_dir_lock(lock_path, retries=1, wait_seconds=0.0):
+        proc = subprocess.run(cli + argv, env=env, capture_output=True, timeout=30)
+    assert proc.returncode == 3, f"dump must be locked out; got {proc.returncode}: {proc.stderr!r}"
+    assert b"precheck-lock-held" in proc.stderr, f"wrong lock error: {proc.stderr!r}"
+
+
 # ─── C-01 .. C-04 ───────────────────────────────────────────────────────────
 
 
