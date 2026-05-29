@@ -44,7 +44,7 @@ def _osascript_stub(path: Path, sink: Path, *, ui_enabled: str, keystroke_exit: 
 
 def _recording_stub(path: Path, sink: Path) -> None:
     path.write_text(
-        "#!/bin/bash\n" f'printf "%s\\n" "$*" >> "{sink}"\n' "exit 0\n",
+        f'#!/bin/bash\nprintf "%s\\n" "$*" >> "{sink}"\nexit 0\n',
         encoding="utf-8",
     )
     path.chmod(0o755)

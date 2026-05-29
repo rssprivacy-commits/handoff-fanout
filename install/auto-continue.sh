@@ -262,8 +262,14 @@ now_iso_utc() {
 }
 
 mtime_sec() {
-    # macOS `stat -f %m` returns the epoch mtime; -L follows symlinks.
-    /usr/bin/stat -f %m "$1" 2>/dev/null
+    # Epoch mtime, portable across BSD/macOS (`stat -f %m`) and GNU/Linux
+    # (`stat -c %Y`). Production autoclose only runs on macOS, but the test
+    # suite exercises this on Linux CI — a BSD-only form there returns empty,
+    # which made clean_stale_lock silently skip recycling (A08 red on ubuntu).
+    case "$(uname)" in
+        Darwin) /usr/bin/stat -f %m "$1" 2>/dev/null ;;
+        *) stat -c %Y "$1" 2>/dev/null ;;
+    esac
 }
 
 # Timezone-correct "is now (UTC) strictly past <deadline>?" — exit 0 = overdue.

@@ -49,11 +49,16 @@ def _run_single(home: Path, ws: Path, task: str, status: str, monkeypatch) -> in
     monkeypatch.delenv("HANDOFF_RETRO_BYPASS", raising=False)
     return dump.main(
         [
-            "--task", task,
-            "--next", "next thing",
-            "--project", PROJECT,
-            "--workspace", str(ws),
-            "--status", status,
+            "--task",
+            task,
+            "--next",
+            "next thing",
+            "--project",
+            PROJECT,
+            "--workspace",
+            str(ws),
+            "--status",
+            status,
         ],
     )
 
@@ -136,9 +141,7 @@ def test_batch_blocked_removes_sub_task_heartbeat(isolated_handoff_home, tmp_pat
     hb = batch_dir / f"{sub_task_id}.heartbeat"
     hb.write_text("")
 
-    args = SimpleNamespace(
-        batch_id=batch_id, task=f"{sub_task_id}-blocked", blocked_reason="stuck"
-    )
+    args = SimpleNamespace(batch_id=batch_id, task=f"{sub_task_id}-blocked", blocked_reason="stuck")
     rc = dump.handle_batch_blocked(args, cfg, tmp_path, PROJECT, queue)
 
     assert rc == 0

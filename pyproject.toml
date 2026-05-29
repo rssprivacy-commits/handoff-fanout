@@ -42,7 +42,11 @@ dev = [
     "pytest-asyncio>=0.23",
 ]
 lint = [
-    "ruff>=0.5",
+    # Pinned exactly: ruff's lint/format rules evolve between releases, so an
+    # unpinned spec lets a CI-side ruff upgrade fail `format --check` on
+    # unchanged code (which is exactly what drifted the whole tree to red on
+    # 0.15.5). Bump this deliberately, re-running `ruff format` in the same PR.
+    "ruff==0.15.5",
 ]
 
 [project.urls]

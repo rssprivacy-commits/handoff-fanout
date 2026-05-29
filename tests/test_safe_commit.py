@@ -68,8 +68,7 @@ def test_cjk_filename_commits_cleanly(git_repo: Path, lock_in_tmp: Path) -> None
     assert rc == 0, "CJK filename must commit cleanly (no quotepath false-positive)"
 
     r = subprocess.run(
-        ["git", "-c", "core.quotepath=false", "show", "--name-only",
-         "--pretty=format:", "HEAD"],
+        ["git", "-c", "core.quotepath=false", "show", "--name-only", "--pretty=format:", "HEAD"],
         capture_output=True,
         text=True,
         check=True,

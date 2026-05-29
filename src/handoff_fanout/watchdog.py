@@ -565,10 +565,7 @@ def _is_test_runner(cmd: str) -> bool:
         for tok in tokens[1:]:
             if Path(tok).name in runner_basenames:
                 return True
-    for tok in tokens[1:]:
-        if Path(tok).name in runner_basenames:
-            return True
-    return False
+    return any(Path(tok).name in runner_basenames for tok in tokens[1:])
 
 
 def _kill_pid(pid: int) -> str:
@@ -701,9 +698,7 @@ def _format_enforcement_block(
         )
     if result.raced_gone:
         pid_list = ", ".join(str(p) for p in result.raced_gone)
-        lines.append(
-            f"已自然退出 (signal 前已 gone): PIDs {pid_list}"
-        )
+        lines.append(f"已自然退出 (signal 前已 gone): PIDs {pid_list}")
     return "\n".join(lines) + "\n"
 
 

@@ -956,9 +956,7 @@ def _attempt_realign(
     # Reject malformed evidence: every entry must look like a git SHA, and the
     # list must be bounded (a self-consistent-hash but crafted payload could
     # otherwise crash _is_ancestor or blow up runtime).
-    if len(sess) > 1000 or not all(
-        isinstance(c, str) and _SHA_RE.fullmatch(c) for c in sess
-    ):
+    if len(sess) > 1000 or not all(isinstance(c, str) and _SHA_RE.fullmatch(c) for c in sess):
         return None
     mode = payload.get("mode", "normal")
     if mode == MODE_FORENSIC_RETRO:
@@ -1119,7 +1117,9 @@ def check_retro_gate(
                     return _handle_validation_failure(
                         project=project,
                         task=task,
-                        failure=_retry("nonce-invalid-format", "nonce fails ^[A-Za-z0-9_-]{1,128}$"),
+                        failure=_retry(
+                            "nonce-invalid-format", "nonce fails ^[A-Za-z0-9_-]{1,128}$"
+                        ),
                         payload=payload,
                         evidence_path=evidence_path,
                         session_id=sid,
@@ -1221,9 +1221,7 @@ def check_retro_gate(
                 )
 
             if not forensic:
-                _clear_attempt_on_success(
-                    project, task, payload.get("evidence_hash", ""), sid
-                )
+                _clear_attempt_on_success(project, task, payload.get("evidence_hash", ""), sid)
             else:
                 _audit_append(
                     project,

@@ -39,7 +39,6 @@ from handoff_fanout.atomic import (
     write_with_fsync,
 )
 
-
 # ─── atomic_create / write_with_fsync / atomic_replace (unchanged) ──────────
 
 
@@ -167,9 +166,11 @@ def test_acquire_dir_lock_contention_fails_after_retries(tmp_path: Path) -> None
     ready = tmp_path / "busy.ready"
     proc = _spawn_holder(lock, ready)
     try:
-        with pytest.raises(LockAcquisitionError):
-            with acquire_dir_lock(lock, retries=2, wait_seconds=0.05):
-                pass
+        with (
+            pytest.raises(LockAcquisitionError),
+            acquire_dir_lock(lock, retries=2, wait_seconds=0.05),
+        ):
+            pass
     finally:
         proc.kill()
         proc.wait()
@@ -187,9 +188,11 @@ def test_alive_holder_is_never_force_broken(tmp_path: Path) -> None:
     proc = _spawn_holder(lock, ready)
     try:
         # Even with several retries, an alive holder is not broken.
-        with pytest.raises(LockAcquisitionError):
-            with acquire_dir_lock(lock, retries=3, wait_seconds=0.05):
-                pass
+        with (
+            pytest.raises(LockAcquisitionError),
+            acquire_dir_lock(lock, retries=3, wait_seconds=0.05),
+        ):
+            pass
         assert proc.poll() is None, "holder must still be alive (not killed/broken)"
     finally:
         proc.kill()
@@ -275,9 +278,8 @@ def test_migration_old_lockdir_fails_closed(tmp_path: Path) -> None:
     lock = tmp_path / "legacy.lock"
     lock.mkdir()
     (lock / "pid").write_text("123\n")  # old marker file inside the dir
-    with pytest.raises(LockMigrationError):
-        with acquire_dir_lock(lock, retries=1, wait_seconds=0.0):
-            pass
+    with pytest.raises(LockMigrationError), acquire_dir_lock(lock, retries=1, wait_seconds=0.0):
+        pass
     # The old directory is left untouched for the operator to remove.
     assert lock.is_dir()
     assert (lock / "pid").exists()
@@ -298,9 +300,8 @@ def test_hard_errno_propagates_not_retried(tmp_path: Path, monkeypatch) -> None:
         raise OSError(errno.ENOLCK, "no locks available")
 
     monkeypatch.setattr(atomic.fcntl, "flock", boom)
-    with pytest.raises(OSError) as exc:
-        with acquire_dir_lock(lock, retries=3, wait_seconds=0.0):
-            pass
+    with pytest.raises(OSError) as exc, acquire_dir_lock(lock, retries=3, wait_seconds=0.0):
+        pass
     assert exc.value.errno == errno.ENOLCK
 
 
@@ -315,9 +316,11 @@ def test_would_block_errno_retries_then_raises(tmp_path: Path, monkeypatch) -> N
         raise OSError(errno.EWOULDBLOCK, "would block")
 
     monkeypatch.setattr(atomic.fcntl, "flock", busy)
-    with pytest.raises(LockAcquisitionError):
-        with acquire_dir_lock(lock, retries=3, wait_seconds=0.0):
-            pass
+    with (
+        pytest.raises(LockAcquisitionError),
+        acquire_dir_lock(lock, retries=3, wait_seconds=0.0),
+    ):
+        pass
     assert calls["n"] == 3, "should retry the full count before giving up"
 
 
@@ -329,9 +332,11 @@ def test_failed_acquire_leaves_no_registry_entry(tmp_path: Path, monkeypatch) ->
         raise OSError(errno.EWOULDBLOCK, "would block")
 
     monkeypatch.setattr(atomic.fcntl, "flock", busy)
-    with pytest.raises(LockAcquisitionError):
-        with acquire_dir_lock(lock, retries=1, wait_seconds=0.0):
-            pass
+    with (
+        pytest.raises(LockAcquisitionError),
+        acquire_dir_lock(lock, retries=1, wait_seconds=0.0),
+    ):
+        pass
     assert os.path.realpath(str(lock)) not in _LOCK_REGISTRY
 
 

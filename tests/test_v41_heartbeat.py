@@ -27,10 +27,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 from handoff_fanout import templates, watchdog
-
 
 # ─── A: build_handoff_md heartbeat injection ─────────────────────────────────
 
@@ -83,8 +80,10 @@ def test_build_handoff_md_contains_timeout_caveat():
     assert "§第一步.5" in md
     assert "timeout 300 codex exec" in md
     # placed between the heartbeat step and baseline — proactive, before work
-    assert md.index("第一步: 启动 heartbeat") < md.index("§第一步.5") < md.index(
-        "第二步: Baseline 验证"
+    assert (
+        md.index("第一步: 启动 heartbeat")
+        < md.index("§第一步.5")
+        < md.index("第二步: Baseline 验证")
     )
 
 
@@ -110,8 +109,10 @@ def test_build_sub_task_handoff_md_contains_timeout_caveat():
     md = _render_sub_task()
     assert "§第二步.5" in md
     assert "timeout 300 <cmd>" in md
-    assert md.index("第二步: 启动 heartbeat") < md.index("§第二步.5") < md.index(
-        "第三步: Baseline 验证"
+    assert (
+        md.index("第二步: 启动 heartbeat")
+        < md.index("§第二步.5")
+        < md.index("第三步: Baseline 验证")
     )
 
 
@@ -255,9 +256,7 @@ class _FakePgrep:
             head = str(argv[0])
             if head == "pgrep" or head.endswith("/pgrep"):
                 self.calls.append(list(argv))
-                return SimpleNamespace(
-                    stdout=self.stdout, stderr="", returncode=self.returncode
-                )
+                return SimpleNamespace(stdout=self.stdout, stderr="", returncode=self.returncode)
         return _REAL_SUBPROCESS_RUN(argv, *args, **kwargs)
 
 
@@ -375,9 +374,7 @@ def test_mode6_enforce_kills_matching_pids(isolated_handoff_home, monkeypatch):
     _patch_time_and_kill(monkeypatch, fake_kill)
 
     assert watchdog.scan_single_task_heartbeats() == 1
-    assert fake_pgrep.calls == [
-        ["pgrep", "-fa", _expected_pgrep_pattern(queue, "task-kill")]
-    ]
+    assert fake_pgrep.calls == [["pgrep", "-fa", _expected_pgrep_pattern(queue, "task-kill")]]
     term_pids = [p for p, s in fake_kill.signals if s == signal.SIGTERM]
     assert sorted(term_pids) == [12345, 12346]
     body = (queue / "task-kill.529-suspected").read_text()
@@ -386,9 +383,7 @@ def test_mode6_enforce_kills_matching_pids(isolated_handoff_home, monkeypatch):
     assert "SIGKILL escalation" in body
 
 
-def test_mode6_enforce_escalates_to_sigkill_when_term_ignored(
-    isolated_handoff_home, monkeypatch
-):
+def test_mode6_enforce_escalates_to_sigkill_when_term_ignored(isolated_handoff_home, monkeypatch):
     """Stubborn PID: SIGTERM → grace expires → SIGKILL → verify → killed."""
     queue = _setup_stale_task(isolated_handoff_home, "task-stubborn")
     fake_pgrep = _FakePgrep(_heartbeat_cmdline(queue, "task-stubborn", 9999))
@@ -425,9 +420,7 @@ def test_mode6_enforce_records_still_alive_when_sigkill_does_not_take(
     assert signal.SIGKILL in sent
 
 
-def test_mode6_enforce_term_alone_when_process_exits_mid_grace(
-    isolated_handoff_home, monkeypatch
-):
+def test_mode6_enforce_term_alone_when_process_exits_mid_grace(isolated_handoff_home, monkeypatch):
     """SIGTERM lands, process exits on the 3rd alive-probe → no SIGKILL."""
     queue = _setup_stale_task(isolated_handoff_home, "task-graceful")
     fake_pgrep = _FakePgrep(_heartbeat_cmdline(queue, "task-graceful", 7777))
@@ -481,9 +474,7 @@ def test_mode6_enforce_skips_self_and_pytest(isolated_handoff_home, monkeypatch)
     fake_pgrep = _FakePgrep(
         f"{my_pid} python -m handoff_fanout.watchdog\n"
         f"88888 pytest -k task-self\n"
-        f"99999 /usr/local/bin/pytest -k task-self\n"
-        + hb_cmd
-        + f"54321 pgrep -fa task-self\n",
+        f"99999 /usr/local/bin/pytest -k task-self\n" + hb_cmd + "54321 pgrep -fa task-self\n",
     )
     monkeypatch.setattr(watchdog.subprocess, "run", fake_pgrep)
     fake_kill = _FakeKill()
@@ -501,8 +492,7 @@ def test_mode6_enforce_skips_python_dash_m_pytest(isolated_handoff_home, monkeyp
     fake_pgrep = _FakePgrep(
         "20001 python -m pytest tests/test_v41_heartbeat.py -k task-modpy\n"
         "20002 /opt/homebrew/bin/python3 -m pytest -k task-modpy\n"
-        "20003 python3.13 -m pytest\n"
-        + hb_cmd,
+        "20003 python3.13 -m pytest\n" + hb_cmd,
     )
     monkeypatch.setattr(watchdog.subprocess, "run", fake_pgrep)
     fake_kill = _FakeKill()
@@ -520,8 +510,7 @@ def test_mode6_enforce_skips_uv_run_pytest(isolated_handoff_home, monkeypatch):
     fake_pgrep = _FakePgrep(
         "21001 uv run pytest -k task-uv\n"
         "21002 uv run --frozen pytest -k task-uv\n"
-        "21003 uvx pytest -k task-uv\n"
-        + hb_cmd,
+        "21003 uvx pytest -k task-uv\n" + hb_cmd,
     )
     monkeypatch.setattr(watchdog.subprocess, "run", fake_pgrep)
     fake_kill = _FakeKill()
@@ -552,9 +541,7 @@ def test_mode6_enforce_survives_pgrep_missing(isolated_handoff_home, monkeypatch
     assert real_signals == []
 
 
-def test_mode6_enforce_treats_pgrep_rc_gt_1_as_unavailable(
-    isolated_handoff_home, monkeypatch
-):
+def test_mode6_enforce_treats_pgrep_rc_gt_1_as_unavailable(isolated_handoff_home, monkeypatch):
     """pgrep rc=2 (syntax) / rc=3 (fatal) → unavailable, don't guess."""
     queue = _setup_stale_task(isolated_handoff_home, "task-rc2")
     fake_pgrep = _FakePgrep("some garbage\n", returncode=2)

@@ -41,15 +41,15 @@ def _write_stub(path: Path, sink: Path, *, exit_code: int = 0) -> None:
     """Create a stub command that appends its argv to ``sink``."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        "#!/bin/bash\n"
-        f'printf "%s\\n" "$*" >> "{sink}"\n'
-        f"exit {exit_code}\n",
+        f'#!/bin/bash\nprintf "%s\\n" "$*" >> "{sink}"\nexit {exit_code}\n',
         encoding="utf-8",
     )
     path.chmod(0o755)
 
 
-def _make_evidence(home: Path, task: str = TASK, project: str = PROJECT, *, nonce: str | None = None) -> Path:
+def _make_evidence(
+    home: Path, task: str = TASK, project: str = PROJECT, *, nonce: str | None = None
+) -> Path:
     """Generate a valid retro evidence file via the real precheck builder."""
     payload = handoff_precheck.build_evidence(
         task_id=task,
@@ -177,7 +177,9 @@ def test_A01_full_old_ready_triggers_autoclose(home, tmp_path, stubbed_env):
 
     done = home / PROJECT / "ack" / f"{TASK}.autoclose_done"
     failed = home / PROJECT / "ack" / f"{TASK}.autoclose_failed.txt"
-    assert done.exists(), f"expected autoclose_done, got dir: {list((home/PROJECT/'ack').iterdir())}"
+    assert done.exists(), (
+        f"expected autoclose_done, got dir: {list((home / PROJECT / 'ack').iterdir())}"
+    )
     assert not failed.exists()
     body = done.read_text()
     assert TASK in body
@@ -260,10 +262,7 @@ def test_A07_per_task_lock_serializes_two_runs(home, tmp_path, stubbed_env):
     # Slow down the `open` stub a touch so race chance is real.
     open_stub = Path(stubbed_env["HANDOFF_OPEN_CMD"])
     open_stub.write_text(
-        "#!/bin/bash\n"
-        'printf "%s\\n" "$*" >> "$_OPEN_SINK"\n'
-        "sleep 0.5\n"
-        "exit 0\n",
+        '#!/bin/bash\nprintf "%s\\n" "$*" >> "$_OPEN_SINK"\nsleep 0.5\nexit 0\n',
     )
     open_stub.chmod(0o755)
 

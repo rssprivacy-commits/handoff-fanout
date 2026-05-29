@@ -24,17 +24,13 @@ This file exercises the helper directly and the integration through
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
-import sys
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from handoff_fanout import dump, handoff_precheck
-
 
 # ─── C: unit — _maybe_pbcopy env guards ─────────────────────────────────────
 
@@ -131,7 +127,9 @@ def test_maybe_pbcopy_skips_when_pytest_env_empty_string(monkeypatch):
     """
 
     def fake_popen(argv, **kwargs):
-        raise AssertionError(f"pbcopy invoked despite PYTEST_CURRENT_TEST set (empty): argv={argv!r}")
+        raise AssertionError(
+            f"pbcopy invoked despite PYTEST_CURRENT_TEST set (empty): argv={argv!r}"
+        )
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     monkeypatch.setenv("PYTEST_CURRENT_TEST", "")

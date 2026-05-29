@@ -271,7 +271,9 @@ def session_commits(workspace: Path) -> tuple[list[str], str]:
         return out.split(), "upstream"
     # Either everything is pushed, or there is no upstream. Distinguish by
     # probing for an upstream ref; absent → conservative fallback.
-    has_upstream = _git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], workspace)
+    has_upstream = _git(
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], workspace
+    )
     if has_upstream:
         return [], "upstream"  # clean: all local work already pushed
     fallback = _git(["rev-list", "--max-count=5", "HEAD"], workspace)
@@ -455,9 +457,7 @@ def _load_phase_file(path: Path | None) -> dict:
 def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="handoff-precheck",
-        description=(
-            "v5.4 retro-evidence precheck: emit retro.evidence.json for the dump gate."
-        ),
+        description=("v5.4 retro-evidence precheck: emit retro.evidence.json for the dump gate."),
     )
     ap.add_argument("--task", required=True, help="kebab-case task ID")
     ap.add_argument("--project", default=None, help="project slug; defaults to basename(workspace)")
@@ -516,15 +516,16 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"ERR-FATAL invalid-project-slug: {project!r}\n")
         return 1
 
-    file_overrides = _load_phase_file(Path(args.phase_status_file) if args.phase_status_file else None)
+    file_overrides = _load_phase_file(
+        Path(args.phase_status_file) if args.phase_status_file else None
+    )
     p0 = dict(file_overrides.get("phase0", {}))
     p1 = dict(file_overrides.get("phase1", {}))
     p0.update(_parse_phase_kv(args.phase0_status))
     p1.update(_parse_phase_kv(args.phase1_status))
 
-    reason_err = (
-        check_reason_required(p0, PHASE0_KEYS, "phase0")
-        or check_reason_required(p1, PHASE1_KEYS, "phase1")
+    reason_err = check_reason_required(p0, PHASE0_KEYS, "phase0") or check_reason_required(
+        p1, PHASE1_KEYS, "phase1"
     )
     if reason_err:
         sys.stderr.write(reason_err + "\n")

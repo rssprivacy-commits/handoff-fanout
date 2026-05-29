@@ -48,10 +48,7 @@ def _iter_queue_dirs(root: Path, project: str | None):
 
 def _terminal_task_ids(queue_dir: Path) -> set[str]:
     done = {f.stem for f in queue_dir.glob("*.done")}
-    blocked = {
-        f.name[: -len(_BLOCKED_SUFFIX)]
-        for f in queue_dir.glob(f"*{_BLOCKED_SUFFIX}")
-    }
+    blocked = {f.name[: -len(_BLOCKED_SUFFIX)] for f in queue_dir.glob(f"*{_BLOCKED_SUFFIX}")}
     return done | blocked
 
 

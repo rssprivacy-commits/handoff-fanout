@@ -165,9 +165,12 @@ def test_safe_commit_cjk_filename_passes_segment5(gitrepo):
     _safe_commit(gitrepo, "add cjk doc", [fname], expect_rc=0)
 
     show = subprocess.run(
-        ["git", "-c", "core.quotepath=false", "show", "--name-only",
-         "--pretty=format:", "HEAD"],
-        cwd=repo, env=gitrepo["env"], capture_output=True, text=True, check=True,
+        ["git", "-c", "core.quotepath=false", "show", "--name-only", "--pretty=format:", "HEAD"],
+        cwd=repo,
+        env=gitrepo["env"],
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout
     assert fname in show
 
