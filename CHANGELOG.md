@@ -339,7 +339,7 @@ CI matrix, an idempotent installer, and a 30-second demo GIF.
 - **README badges + demo embed** — top-of-page GIF in both
   [README.md](README.md) and [README.zh.md](README.zh.md).
 - **ERP-side thin-shim migration** (downstream consumer) —
-  `dharmaxis-group/erp-system@54ab453` replaces 4 hand-rolled handoff
+  the consumer replaces 4 hand-rolled handoff
   scripts (1292 + 388 + 383 + 225 = 2288 lines) with ~25-line shims that
   import `handoff_fanout`. ERP-specific behaviour (`V3.6` redlines,
   `主人立法`, `docker compose alembic current` baseline hook, roadmap
