@@ -14,10 +14,14 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import fcntl
 import os
+import socket
 import sys
+import threading
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -104,7 +108,38 @@ def _fsync_dir(path: Path) -> None:
 
 
 class LockAcquisitionError(RuntimeError):
-    """Raised when ``acquire_dir_lock`` exhausts its retries."""
+    """Raised when ``acquire_dir_lock`` exhausts its retries against a live holder."""
+
+
+class LockMigrationError(LockAcquisitionError):
+    """Raised when an old mkdir-era ``*.lockdir`` directory blocks the new flock file.
+
+    Fail closed: the operator must remove the legacy directory manually. Auto
+    ``rmdir`` would reintroduce the very acquire/clear TOCTOU that the flock
+    migration removes, so it is intentionally not done. Subclasses
+    ``LockAcquisitionError`` so existing ``except LockAcquisitionError``
+    handlers still catch it.
+    """
+
+
+@dataclass
+class _LockEntry:
+    fd: int
+    depth: int
+
+
+# Process-wide registry: ``realpath(lock file) -> _LockEntry``. ``flock`` is
+# keyed by the open file description, so a second ``os.open()`` + ``LOCK_EX`` on
+# the SAME path within this process would block against itself (EWOULDBLOCK).
+# The registry makes re-entrant acquisition reuse the already-held fd via depth
+# counting instead of self-deadlocking. (R-flock P0 #1)
+_LOCK_REGISTRY: dict[str, _LockEntry] = {}
+_REGISTRY_LOCK = threading.Lock()
+
+# errno values meaning "another holder has the lock; retrying may help".
+# Everything else (ENOENT/EISDIR/ENOLCK/ESTALE/...) is a hard error that must
+# propagate immediately rather than be mistaken for contention. (R-flock P1)
+_RETRYABLE_ERRNOS = frozenset({errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK})
 
 
 @contextlib.contextmanager
@@ -115,126 +150,153 @@ def acquire_dir_lock(
     retries: int = 5,
     wait_seconds: float = 10.0,
 ) -> Iterator[Path]:
-    """Acquire a cross-process directory lock backed by ``mkdir()`` atomicity.
+    """Acquire a cross-process exclusive lock backed by ``fcntl.flock``.
 
-    A stale lock (mtime older than ``stale_seconds``) is force-cleared once
-    before retrying — this recovers from crashed lock holders without needing
-    an external sweeper.
+    The kernel releases the lock automatically when the holding process dies
+    or its fd closes, so there is **no staleness heuristic** (``stale_seconds``
+    is accepted only for call-site compatibility and ignored) and **no
+    owner-nonce fencing** — the kernel is the fencing authority. This roots out
+    the acquire/stale-clear TOCTOU that the previous ``mkdir`` lock had.
 
-    The lock directory contains a ``pid`` file naming the holder, which is
-    useful when diagnosing deadlocks.
+    Re-entrant acquisition of the same path within one process reuses the held
+    fd (depth-counted) rather than self-blocking. The depth counter assumes
+    strict LIFO nesting within a single thread — which every consumer satisfies
+    (they are single-threaded CLI ``with``-blocks). Concurrent acquisition of
+    the *same* path from multiple threads is not supported: a second thread
+    would either be mis-counted as re-entrant or self-block on ``flock``; the
+    consumers never do this. The lock fd is ``O_CLOEXEC`` + non-inheritable so
+    it never leaks into subprocesses (e.g. the ``git`` calls dump makes while
+    holding the lock).
 
-    Raises ``LockAcquisitionError`` after ``retries`` failed attempts.
+    Trade-off (R-flock P1): an alive-but-hung holder is **never** force-broken
+    (breaking it would reintroduce split-brain). flock root-fixes *crashed*
+    holders only; alive-hang recovery belongs to the watchdog / operation
+    timeouts, not here.
+
+    Raises ``LockMigrationError`` if a legacy mkdir lock directory occupies the
+    path, or ``LockAcquisitionError`` after ``retries`` failed attempts against
+    a live holder.
     """
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    del stale_seconds  # flock needs no staleness heuristic; kept for API compat
+    rp = os.path.realpath(str(lock_path))
 
-    if lock_path.exists():
-        age = time.time() - lock_path.stat().st_mtime
-        if age > stale_seconds:
-            # Capture the stale holder's owner, then re-verify staleness +
-            # ownership immediately before clearing. This stops a second
-            # reclaimer (which observed the SAME stale lock) from deleting a
-            # fresh lock that a first reclaimer just acquired: the owner nonce
-            # will have changed, so we skip the clear. (I6 split-brain narrowing)
-            owner_before = _read_owner(lock_path)
-            with contextlib.suppress(FileNotFoundError, OSError):
-                still_stale = (time.time() - lock_path.stat().st_mtime) > stale_seconds
-                if still_stale and _read_owner(lock_path) == owner_before:
-                    print(
-                        f"handoff-safe-commit: 锁陈旧 stale lock at {lock_path} "
-                        f"(age={age:.0f}s > {stale_seconds:.0f}s) — force clearing",
-                        file=sys.stderr,
-                    )
-                    _force_clear_lock(lock_path)
-
-    for attempt in range(retries):
-        try:
-            lock_path.mkdir(parents=False, exist_ok=False)
-        except FileExistsError:
-            if attempt < retries - 1:
-                time.sleep(wait_seconds)
-            continue
-        # Success. Stamp a fencing token (owner nonce) unique to THIS
-        # acquisition so the release path can prove ownership before deleting
-        # the dir — without it, a holder whose stale lock was reclaimed by a
-        # sibling would delete the sibling's fresh lock on context exit (I6
-        # split-brain).
-        my_nonce = _new_owner_nonce()
-        try:
-            (lock_path / "owner").write_text(my_nonce + "\n")
-        except OSError as e:
-            # Without a readable owner token the release path can't prove
-            # ownership, so it would fail-closed and leak the lock. Roll the
-            # acquisition back instead of holding an unidentifiable lock.
-            _force_clear_lock(lock_path)
-            raise LockAcquisitionError(
-                f"acquired {lock_path} but could not stamp owner token: {e}"
-            ) from e
-        with contextlib.suppress(OSError):
-            (lock_path / "pid").write_text(f"{os.getpid()}\n")
+    # Re-entrant fast path: this process already holds the lock → reuse the fd.
+    with _REGISTRY_LOCK:
+        entry = _LOCK_REGISTRY.get(rp)
+        reentrant = entry is not None
+        if reentrant:
+            entry.depth += 1
+    if reentrant:
         try:
             yield lock_path
         finally:
-            _release_owned_lock(lock_path, my_nonce)
+            with _REGISTRY_LOCK:
+                e = _LOCK_REGISTRY.get(rp)
+                if e is not None:
+                    e.depth -= 1
         return
 
-    raise LockAcquisitionError(
-        f"could not acquire lock at {lock_path} after {retries} attempts "
-        f"(holder pid: {_read_pid(lock_path)})"
-    )
-
-
-def _new_owner_nonce() -> str:
-    """Per-acquisition fencing token: pid + monotonic ns + random suffix."""
-    return f"{os.getpid()}-{time.monotonic_ns()}-{os.urandom(6).hex()}"
-
-
-def _read_owner(lock_path: Path) -> str | None:
+    fd = _flock_acquire(lock_path, retries=retries, wait_seconds=wait_seconds)
+    with _REGISTRY_LOCK:
+        _LOCK_REGISTRY[rp] = _LockEntry(fd=fd, depth=1)
     try:
-        return (lock_path / "owner").read_text().strip()
-    except OSError:
-        return None
+        yield lock_path
+    finally:
+        with _REGISTRY_LOCK:
+            e = _LOCK_REGISTRY.get(rp)
+            release = e is not None and e.depth <= 1
+            if e is not None:
+                if release:
+                    del _LOCK_REGISTRY[rp]
+                else:
+                    e.depth -= 1
+        if release:
+            _release_flock(fd)
 
 
-def _release_owned_lock(lock_path: Path, my_nonce: str) -> None:
-    """Release a lock we acquired — only if we still own it.
+def _flock_acquire(lock_path: Path, *, retries: int, wait_seconds: float) -> int:
+    """Open the anchor file and take an exclusive ``flock``; return the held fd.
 
-    If the on-disk ``owner`` nonce no longer matches ours, our lock was
-    stale-cleared and reclaimed by another holder; deleting it now would
-    destroy *their* lock, so we leave it untouched (I6 fix). A missing owner
-    file is treated as ours (legacy / best-effort) so old callers still clean
-    up.
+    On any failure path the fd is closed (no leak). Caller owns the returned fd
+    and must release it via :func:`_release_flock`.
     """
-    owner = _read_owner(lock_path)
-    if owner != my_nonce:
-        # Mismatch OR missing owner → we can't prove this lock is still ours
-        # (stale-cleared + reclaimed by a sibling, or owner file lost). Deleting
-        # it could destroy another holder's lock, so leave it. A genuinely
-        # orphaned lock is later reclaimed via the stale-age path. (codex P0-1)
-        return
-    _force_clear_lock(lock_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Migration fail-closed: a legacy mkdir lock dir at this path would make
+    # ``os.open`` raise EISDIR and silently break mutual exclusion. Refuse
+    # rather than auto-rmdir (which brings back the TOCTOU we removed).
+    if lock_path.is_dir():
+        raise LockMigrationError(
+            f"refusing to lock {lock_path}: a legacy mkdir lock directory occupies "
+            f"this path. Remove it manually once no holder is active, then retry "
+            f"(auto-removal is intentionally not done to avoid reintroducing TOCTOU)."
+        )
+
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(str(lock_path), flags, 0o644)
+    os.set_inheritable(fd, False)  # belt-and-suspenders over O_CLOEXEC
+    try:
+        for attempt in range(retries):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as e:
+                if e.errno in _RETRYABLE_ERRNOS:
+                    if attempt < retries - 1:
+                        time.sleep(wait_seconds)
+                        continue
+                    raise LockAcquisitionError(
+                        f"could not acquire lock at {lock_path} after {retries} "
+                        f"attempts (holder: {_read_holder(lock_path)})"
+                    ) from e
+                raise  # hard errno (ENOLCK/EISDIR/ESTALE/...) — propagate as-is
+            else:
+                # Locked. Stamp diagnostics AFTER the flock succeeds; the
+                # content is for humans only — the kernel guarantees exclusion.
+                _stamp_holder(fd)
+                return fd
+        # retries < 1 — guard against an fd leak.
+        raise LockAcquisitionError(f"could not acquire lock at {lock_path}")
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        raise
 
 
-def _force_clear_lock(lock_path: Path) -> None:
-    """Unconditionally remove a lock dir + its marker files.
+def _release_flock(fd: int) -> None:
+    """Release the lock: ``LOCK_UN`` then ``close`` (close alone also releases).
 
-    Used for releasing our own lock and for reclaiming a stale foreign lock.
-    Removes ``owner`` / ``pid`` first so the final ``rmdir`` succeeds.
+    The anchor file is intentionally **not** unlinked — it is reused, and
+    unlink/create would reintroduce a creation race. Its content (the last
+    holder's diagnostics) is left in place. Errors are suppressed so a release
+    failure never shadows the critical section's original exception. (P2)
     """
-    for marker in ("owner", "pid"):
-        with contextlib.suppress(FileNotFoundError, OSError):
-            (lock_path / marker).unlink()
+    with contextlib.suppress(OSError):
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    with contextlib.suppress(OSError):
+        os.close(fd)
+
+
+def _stamp_holder(fd: int) -> None:
+    """Best-effort diagnostics written into the locked anchor file.
+
+    For human deadlock diagnosis only — never read back for correctness.
+    Written only after the flock is held.
+    """
     try:
-        lock_path.rmdir()
-    except FileNotFoundError:
-        pass
+        info = (
+            f"pid={os.getpid()} host={socket.gethostname()} "
+            f"start={time.time():.0f} cmd={' '.join(sys.argv)}\n"
+        )
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, info.encode("utf-8", "replace"))
+        os.fsync(fd)
     except OSError:
-        # Lock dir non-empty (unexpected leftover files) — best effort.
         pass
 
 
-def _read_pid(lock_path: Path) -> str:
+def _read_holder(lock_path: Path) -> str:
     try:
-        return (lock_path / "pid").read_text().strip()
+        return lock_path.read_text(errors="replace").strip() or "?"
     except OSError:
         return "?"

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Lock primitive root-fixed: `acquire_dir_lock` now uses `fcntl.flock`**
+  instead of `mkdir` + stale-mtime reclaim (v6 concurrency design §14 /
+  R-flock audit). The kernel releases the lock automatically when the holder
+  dies or its fd closes, removing the acquire/stale-clear TOCTOU class
+  entirely — no more `stale_seconds` heuristic, no owner-nonce fencing
+  (the kernel is the fencing authority). Net code reduction.
+  - **API-compatible**: all 5 consumers (safe-commit, precheck, retro-gate ×3)
+    are unchanged; `stale_seconds=` is still accepted but ignored.
+  - **Re-entrant safe**: a process-wide registry (`realpath → {fd, depth}`)
+    makes same-path nested acquisition reuse the held fd instead of
+    self-deadlocking on `flock` (R-flock P0 #1).
+  - **No fd leak into subprocesses**: the lock fd is `O_CLOEXEC` +
+    non-inheritable, so the `git` calls dump makes while holding the lock can
+    never inherit it (R-flock P0 #2).
+  - **Honest trade-off**: an *alive-but-hung* holder is never force-broken
+    (breaking would reintroduce split-brain); flock root-fixes *crashed*
+    holders only. Alive-hang recovery stays with the watchdog / op timeouts.
+  - **Migration is fail-closed**: a leftover mkdir-era `*.lockdir` directory
+    at a lock path raises `LockMigrationError` (subclass of
+    `LockAcquisitionError`) rather than being auto-removed — consumers must
+    switch versions together and clear any stale legacy dirs manually
+    (R-flock P1). **Not yet released**; a coordinated version bump + consumer
+    re-pin is required before rollout.
+
 ## [1.5.1] — 2026-05-29
 
 ### Fixed

@@ -8,8 +8,8 @@ otherwise the same, covering:
   1. Two serial commits succeed (functional baseline).
   2. A pre-commit hook that auto-adds an extra file is rejected
      (segment-5 check inside the hook).
-  3. A stale lock dir (>5 min mtime) is force-cleared and the commit
-     proceeds (the atomic helper now logs ``锁陈旧`` on stderr).
+  3. (flock era) A crashed lock holder is auto-released by the kernel so
+     the commit proceeds (3a); a legacy mkdir lock dir fails closed (3b).
   4. Pre-existing staged paths in the index are tolerated; ``--only``
      keeps them out of the actual commit.
   5. ``HANDOFF_SAFE_COMMIT_BYPASS=1`` is a no-op on the happy path.
@@ -23,6 +23,7 @@ depend on any project-level pre-commit infrastructure.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -194,27 +195,66 @@ git add leaked.txt
     assert len(log) == 1  # init only
 
 
-# ─── 3: stale lock auto-cleared ─────────────────────────────────────────────
+# ─── 3a: crashed holder auto-released by the kernel (flock root-fix) ─────────
+
+_HOLDER_SRC = (
+    "import fcntl, os, sys, time;"
+    "fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o644);"
+    "fcntl.flock(fd, fcntl.LOCK_EX);"
+    "open(sys.argv[2], 'w').close();"
+    "time.sleep(60)"
+)
 
 
-def test_safe_commit_clears_stale_lock_and_proceeds(gitrepo):
-    """A lock dir whose mtime is older than the stale window should be reclaimed."""
+def test_safe_commit_proceeds_after_crashed_lock_holder(gitrepo):
+    """flock root-fix (v6 §14.2): a holder that died releases its lock via the
+    kernel, so the next safe-commit acquires immediately — no stale_seconds
+    heuristic, no force-clear, no ``锁陈旧`` log."""
+    lock = gitrepo["lock"]
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    ready = lock.parent / "holder.ready"
+    proc = subprocess.Popen([sys.executable, "-c", _HOLDER_SRC, str(lock), str(ready)])
+    try:
+        deadline = time.time() + 10
+        while not ready.exists() and time.time() < deadline:
+            time.sleep(0.02)
+        assert ready.exists(), "holder subprocess never acquired the flock"
+        proc.send_signal(signal.SIGKILL)
+        proc.wait()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+    repo = gitrepo["repo"]
+    (repo / "after_crash.txt").write_text("ok\n")
+    result = _safe_commit(gitrepo, "after crashed holder", ["after_crash.txt"])
+    assert "锁陈旧" not in result.stderr, "flock has no stale-clear path"
+
+    log = _git(gitrepo, "log", "--oneline").strip().splitlines()
+    assert len(log) == 2
+    assert "after crashed holder" in log[0]
+
+
+# ─── 3b: legacy mkdir lock dir → migration fail-closed ──────────────────────
+
+
+def test_safe_commit_fails_closed_on_legacy_lock_dir(gitrepo):
+    """A leftover mkdir-era lock DIRECTORY must make safe-commit fail closed
+    (manual cleanup) rather than be silently reclaimed (R-flock P1 migration)."""
     lock = gitrepo["lock"]
     lock.parent.mkdir(parents=True, exist_ok=True)
     lock.mkdir()
     (lock / "pid").write_text("99999\n")
-    stale_time = time.time() - 360  # 6 min
-    os.utime(lock / "pid", (stale_time, stale_time))
-    os.utime(lock, (stale_time, stale_time))
 
     repo = gitrepo["repo"]
-    (repo / "after_stale.txt").write_text("ok\n")
-    result = _safe_commit(gitrepo, "after stale lock", ["after_stale.txt"])
-    assert "锁陈旧" in result.stderr, f"expected stale-clear stderr: {result.stderr!r}"
+    (repo / "legacy.txt").write_text("ok\n")
+    result = _safe_commit(gitrepo, "should not commit", ["legacy.txt"], expect_rc=1)
+    assert "legacy mkdir lock directory" in result.stderr
 
     log = _git(gitrepo, "log", "--oneline").strip().splitlines()
-    assert len(log) == 2
-    assert "after stale lock" in log[0]
+    assert len(log) == 1, "nothing should be committed when the lock fails closed"
+    assert lock.is_dir(), "legacy lock dir must be left for the operator to remove"
 
 
 # ─── 4: pre-existing staged file is tolerated, --only contains the commit ───
