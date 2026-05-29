@@ -109,8 +109,41 @@ write_ack() {
 # 返回 0 = frontmost 是 Code (可按 Enter), 非 0 = 别的 app (abort)
 is_frontmost_code() {
     local front
-    front=$(/usr/bin/osascript -e 'tell application "System Events" to name of first application process whose frontmost is true' 2>/dev/null)
+    front=$("$HANDOFF_OSASCRIPT_CMD" -e 'tell application "System Events" to name of first application process whose frontmost is true' 2>/dev/null)
     [ "$front" = "Code" ]
+}
+
+# Accessibility (UI-scripting) preflight. `keystroke` requires the process that
+# ultimately drives System Events (launchd's osascript binary) to hold the
+# Accessibility permission. Probe it NON-destructively via `UI elements enabled`
+# — a pure query that sends no keys — routed through HANDOFF_OSASCRIPT_CMD so
+# tests can stub it. Returns 0 = trusted.
+accessibility_trusted() {
+    local r
+    r=$("$HANDOFF_OSASCRIPT_CMD" -e 'tell application "System Events" to return (UI elements enabled)' 2>/dev/null)
+    [ "$r" = "true" ]
+}
+
+# Missing Accessibility used to surface only as a per-task WARN buried in the
+# log, so auto-submit silently degraded to "tab opened, Enter never pressed".
+# Raise ONE actionable notification instead — at most once per run, and once per
+# 6h across runs (marker mtime) so a persistently-unfixed grant doesn't nag on
+# every launchd tick. `display notification` itself needs no Accessibility, so
+# it still fires when keystroke can't.
+ACCESSIBILITY_WARNED=0
+warn_accessibility_once() {
+    [ "$ACCESSIBILITY_WARNED" = "1" ] && return 0
+    ACCESSIBILITY_WARNED=1
+    local marker="$HANDOFF_ROOT/.accessibility-warned"
+    if [ -f "$marker" ]; then
+        local mt now
+        mt=$(/usr/bin/stat -f %m "$marker" 2>/dev/null || echo 0)
+        now=$(/bin/date +%s)
+        [ "$((now - mt))" -lt 21600 ] && return 0
+    fi
+    : > "$marker" 2>/dev/null || true
+    log "ACCESSIBILITY-MISSING: 自动接续无法按 Enter (缺辅助功能权限). 新 tab 仍会打开但需手动按一次 Enter. 修复: System Settings → 隐私与安全性 → 辅助功能, 勾选运行 launchd 的 osascript/Terminal."
+    "$HANDOFF_OSASCRIPT_CMD" -e 'display notification "自动接续无法按 Enter：缺辅助功能权限。tab 已打开，请手动按 Enter，并到 系统设置 → 隐私与安全性 → 辅助功能 授权。" with title "Handoff ⚠️ 辅助功能权限" sound name "Basso"' 2>>"$LOG" || true
 }
 
 # 遍历所有项目子目录 — main spawn loop (gated by HANDOFF_SKIP_SPAWN).
@@ -173,7 +206,7 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
         fi
 
         # Step 2: open URI in the activated workspace
-        if /usr/bin/open "$URI"; then
+        if "$HANDOFF_OPEN_CMD" "$URI"; then
             log "SUCCESS: spawned Claude tab in project=$PROJECT task=$TASK (archived: $TASK-$TS.txt)"
             write_ack "$PROJ_DIR" "$TASK" "spawned" "open URI success @ $TS"
             SPAWNED=$((SPAWNED + 1))
@@ -182,16 +215,25 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
             # 等 sleep 1.5 后必须验证 frontmost app 是 Code 才按 Enter
             # 否则可能按到 finder / 别 app, 触发不可预期行为 (写入文件名 / 触发快捷键等)
             sleep 1.5  # 等 Claude Code 渲染输入栏 + prompt 粘贴完成
-            if is_frontmost_code; then
-                if /usr/bin/osascript -e 'tell application "System Events" to tell process "Code" to keystroke return' 2>>"$LOG"; then
+            if ! accessibility_trusted; then
+                # Skip the doomed keystroke entirely — it would just log a WARN
+                # and leave the tab un-submitted. Surface it loudly instead.
+                warn_accessibility_once
+                log "ABORT-SUBMIT: Accessibility 权限缺失 — Enter 未按 (tab 已开, 需手动按一次). project=$PROJECT task=$TASK"
+                write_ack "$PROJ_DIR" "$TASK" "failed" "accessibility-missing: 需手动按 Enter (System Settings → 辅助功能)"
+            elif is_frontmost_code; then
+                if "$HANDOFF_OSASCRIPT_CMD" -e 'tell application "System Events" to tell process "Code" to keystroke return' 2>>"$LOG"; then
                     log "AUTO-SUBMIT: pressed Enter for project=$PROJECT task=$TASK"
                     write_ack "$PROJ_DIR" "$TASK" "submitted" "osascript Enter success"
                 else
-                    log "WARN: osascript keystroke failed (Accessibility 权限缺失?) project=$PROJECT task=$TASK"
-                    write_ack "$PROJ_DIR" "$TASK" "failed" "osascript keystroke failed (Accessibility?)"
+                    # Preflight said trusted but keystroke still failed — transient,
+                    # or permission revoked mid-run. Treat as accessibility-class.
+                    warn_accessibility_once
+                    log "WARN: osascript keystroke failed despite accessibility preflight OK (transient / 权限 mid-run 撤销?) project=$PROJECT task=$TASK"
+                    write_ack "$PROJ_DIR" "$TASK" "failed" "osascript keystroke failed post-preflight"
                 fi
             else
-                front_app=$(/usr/bin/osascript -e 'tell application "System Events" to name of first application process whose frontmost is true' 2>/dev/null)
+                front_app=$("$HANDOFF_OSASCRIPT_CMD" -e 'tell application "System Events" to name of first application process whose frontmost is true' 2>/dev/null)
                 log "ABORT-SUBMIT: frontmost is '$front_app' (not Code) — Enter 未按, 主人需手动按一次 Enter"
                 write_ack "$PROJ_DIR" "$TASK" "failed" "frontmost was '$front_app' not Code, abort osascript Enter"
             fi
