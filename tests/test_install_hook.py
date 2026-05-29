@@ -92,6 +92,44 @@ def test_hook_ignores_empty_entries_in_expected_list(repo: Path) -> None:
     assert r.returncode == 0, r.stderr
 
 
+def test_hook_accepts_file_path_form(repo: Path, tmp_path: Path) -> None:
+    """HANDOFF_EXPECTED_FILES may be an ABSOLUTE path to a newline-list file —
+    the form ``handoff safe-commit`` actually exports. The hook must read the
+    file, not treat the path string itself as a ':'-list (the bug that made
+    every wrapper commit on a fresh install fail)."""
+    _stage(repo, "a.py")
+    expfile = tmp_path / "expected.txt"
+    expfile.write_text("a.py\nb.py\n", encoding="utf-8")
+    r = _run_hook(repo, expected=str(expfile))
+    assert r.returncode == 0, r.stderr
+
+
+def test_hook_blocks_extra_with_file_path_form(repo: Path, tmp_path: Path) -> None:
+    _stage(repo, "a.py")
+    _stage(repo, "rogue.py")
+    expfile = tmp_path / "expected.txt"
+    expfile.write_text("a.py\n", encoding="utf-8")
+    r = _run_hook(repo, expected=str(expfile))
+    assert r.returncode != 0
+    assert "rogue.py" in r.stderr
+
+
+def test_hook_accepts_cjk_filename_file_form(repo: Path, tmp_path: Path) -> None:
+    """CJK-named file must not trip the core.quotepath false-positive (file form)."""
+    _stage(repo, "部署任务栈.md")
+    expfile = tmp_path / "expected.txt"
+    expfile.write_text("部署任务栈.md\n", encoding="utf-8")
+    r = _run_hook(repo, expected=str(expfile))
+    assert r.returncode == 0, r.stderr
+
+
+def test_hook_accepts_cjk_filename_colon_form(repo: Path) -> None:
+    """CJK also works via the inline ':'-list form."""
+    _stage(repo, "部署任务栈.md")
+    r = _run_hook(repo, expected="部署任务栈.md")
+    assert r.returncode == 0, r.stderr
+
+
 def test_hook_is_executable() -> None:
     """install.sh chmods it; verify the file itself ships executable."""
     assert HOOK.exists(), f"hook script missing: {HOOK}"

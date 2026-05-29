@@ -2,15 +2,18 @@
 # handoff-fanout — Layer 2 pre-commit hook
 #
 # Verifies that the staged file set is a subset of $HANDOFF_EXPECTED_FILES
-# (a colon-separated list set by `handoff safe-commit`). Manual commits with
-# no env var set are passed through unchanged.
+# (set by `handoff safe-commit`). The value is either a path to a file with one
+# expected path per line (the form the wrapper actually exports) OR a literal
+# ':'-separated list (the inline form). Manual commits with no env var set are
+# passed through unchanged.
 #
 # This hook is the server-side guarantee that an absolute-path `/usr/bin/git
 # commit` (which bypasses Layer 1's PATH-injected wrapper) still cannot sweep
 # in another tab's `git add`.
 #
-# Intentionally POSIX-portable (awk + grep, no associative arrays) so it
-# works under macOS's stock bash 3.2 as well as bash 4+/zsh/dash.
+# Uses bash process substitution (the shebang guarantees bash, incl. macOS's
+# stock bash 3.2) + grep; avoids associative arrays and the `awk -v` embedded-
+# newline pitfall in macOS's stock awk.
 
 set -eu
 
@@ -18,15 +21,41 @@ if [ -z "${HANDOFF_EXPECTED_FILES:-}" ]; then
     exit 0
 fi
 
-STAGED=$(git diff --cached --name-only)
+# HANDOFF_EXPECTED_FILES is either (a) a path to a file with one expected
+# workspace-relative path per line — the form `handoff safe-commit` actually
+# exports (an ABSOLUTE temp path; robust for many files / spaces / colons), or
+# (b) a literal ':'-separated list of workspace-relative paths (the inline
+# form). Disambiguate on the leading '/': only an absolute path that resolves
+# to a real file is read as a list file; everything else is the ':' form. This
+# avoids mistaking a single relative entry that happens to name an existing
+# file (e.g. "a.py") for a list file. Normalize to newline-separated so the
+# subset check below is identical for either form.
+case "$HANDOFF_EXPECTED_FILES" in
+    /*) if [ -f "$HANDOFF_EXPECTED_FILES" ]; then
+            EXPECTED_LIST=$(cat "$HANDOFF_EXPECTED_FILES")
+        else
+            EXPECTED_LIST=$(printf '%s' "$HANDOFF_EXPECTED_FILES" | tr ':' '\n')
+        fi ;;
+    *)  EXPECTED_LIST=$(printf '%s' "$HANDOFF_EXPECTED_FILES" | tr ':' '\n') ;;
+esac
 
-EXTRA=$(printf '%s\n' "$STAGED" | awk -v expected="$HANDOFF_EXPECTED_FILES" '
-    BEGIN {
-        n = split(expected, parts, ":")
-        for (i = 1; i <= n; i++) if (parts[i] != "") set[parts[i]] = 1
-    }
-    NF { if (!($0 in set)) print }
-')
+# core.quotepath=false: keep CJK/non-ASCII paths verbatim UTF-8 rather than
+# git's octal-escaped default, so they match the UTF-8 expected list (otherwise
+# every Chinese-named file trips a spurious hijack rejection).
+STAGED=$(git -c core.quotepath=false diff --cached --name-only)
+
+# Nothing staged → vacuously a subset.
+if [ -z "$STAGED" ]; then
+    exit 0
+fi
+
+# extra := staged lines not present (whole-line, literal) in the expected set.
+# grep reads the expected lines (empties stripped) from a process substitution;
+# -F literal, -x whole-line, -v invert. Newline-safe (unlike `awk -v`, whose
+# macOS build rejects embedded newlines) and byte-exact for CJK paths.
+EXTRA=$(printf '%s\n' "$STAGED" \
+    | grep -vxF -f <(printf '%s\n' "$EXPECTED_LIST" | grep -v '^$') \
+    || true)
 
 if [ -n "$EXTRA" ]; then
     cat >&2 <<EOF

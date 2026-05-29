@@ -56,13 +56,20 @@ A `git commit` that picks up files outside of an explicit expected set. The clas
 
 ### How
 
-The hook reads `HANDOFF_EXPECTED_FILES` from the environment (a `:`-separated list of workspace-relative paths). It computes:
+The hook reads `HANDOFF_EXPECTED_FILES` from the environment. The value takes **either** form:
+
+- **Absolute file path** — one expected workspace-relative path per line. This is what the `safe-commit` wrapper actually exports (it writes a temp file), robust for many files / spaces / `:` in names.
+- **`:`-separated list** — of workspace-relative paths (the inline form).
+
+The hook disambiguates on the leading `/`: an absolute path that resolves to a real file is read as a list file; everything else is parsed as the `:` form (so a single relative entry like `a.py` that also happens to name an existing file is never mistaken for a list file). It then computes:
 
 ```
-staged   := git diff --cached --name-only
-expected := split HANDOFF_EXPECTED_FILES on ":"
+staged   := git -c core.quotepath=false diff --cached --name-only
+expected := lines(file)  if abs-path-file  else  split(value, ":")
 extra    := staged − expected
 ```
+
+`core.quotepath=false` keeps CJK / non-ASCII paths verbatim UTF-8; git's octal-escaped default would never match the UTF-8 expected list and would reject every Chinese-named file.
 
 If `extra` is non-empty, the hook prints a diagnostic and exits non-zero, blocking the commit. The `handoff safe-commit` wrapper (Layer 3) is the canonical setter of `HANDOFF_EXPECTED_FILES`; manual `git commit` invocations from a sane shell will simply pass through (no env var = no check).
 
@@ -90,7 +97,7 @@ The race between `git add` and `git commit` that allows Tab B to sweep in Tab A'
 `safe-commit FILES... -- -m "msg"` does, in order:
 
 1. **Acquire a flock** on `$HANDOFF_HOME/git-commit.lock`. Cross-process exclusive lock. If another process holds it, retry up to 5 times with stale-lock recovery (5 min ttl).
-2. **Set `HANDOFF_EXPECTED_FILES=FILES`** in the child env. This is the contract Layer 2 verifies.
+2. **Write FILES (one per line) to a temp file and set `HANDOFF_EXPECTED_FILES=<that abs path>`** in the child env. This is the contract Layer 2 verifies (file-path form).
 3. **`git add -- FILES`** — only the explicitly named paths, never `-A`.
 4. **`git commit --only FILES -m "msg"`** — `--only` is git's belt to Layer 2's braces. Even without the hook, only the named files are committed.
 5. **Verify `git diff --cached --name-only` ⊆ FILES** after the commit (post-condition). If anything else is in the new commit, abort and write a forensic file under `$HANDOFF_HOME/<project>/incidents/`.
