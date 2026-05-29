@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] — 2026-05-30
+
+v6 concurrency release: the cross-process lock primitive is root-fixed onto
+`fcntl.flock`, plus retro-freshness re-alignment for concurrent sessions.
+MINOR bump — the public API and all 5 consumers are unchanged; the only
+runtime caveat is the fail-closed legacy-lockdir migration (see below), which
+requires consumers to re-pin to `>=1.6.0` and clear any stale legacy lock
+directories as part of rollout.
+
+### Added
+
+- **`dump` auto-re-aligns evidence when a concurrent session moves HEAD**
+  (v6 Phase 1-B) — when the retro freshness check fails *only* because a
+  sibling tab advanced HEAD, `dump` rebuilds the evidence against the new
+  HEAD in-process (CAS + bounded jittered retry, no attempt-counter bump)
+  instead of failing the gate, provided the working tree is clean and this
+  session's commits remain ancestors of the new HEAD (a real fast-forward,
+  not an ABA). The whole sequence runs inside the already-held `dump.lock`.
+  Same-HEAD / dirty-tree / non-fast-forward cases still fail-closed.
+
 ### Changed
 
 - **Lock primitive root-fixed: `acquire_dir_lock` now uses `fcntl.flock`**
@@ -30,8 +50,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     at a lock path raises `LockMigrationError` (subclass of
     `LockAcquisitionError`) rather than being auto-removed — consumers must
     switch versions together and clear any stale legacy dirs manually
-    (R-flock P1). **Not yet released**; a coordinated version bump + consumer
-    re-pin is required before rollout.
+    (R-flock P1). Rollout therefore requires re-pinning consumers to
+    `>=1.6.0` and confirming no leftover `*.lockdir` directories remain.
+- **Evidence files are overwritten atomically** (v6 Phase 0) —
+  `atomic_replace()` (write tmp with `O_EXCL` + short-write loop, then
+  `os.replace` + fsync) replaces the previous truncate-then-write path, so a
+  hash-checked evidence file can never be observed half-written by a
+  concurrent reader.
+
+### Fixed
+
+- **No more spurious head-stale rejection after slow post-commit work**
+  (v6 Phase 1-A) — when HEAD matches, freshness is now judged by evidence
+  *drift* (snapshot age ≤ 1800s) rather than the `commit_fresh` heuristic
+  (last-commit age ≤ 5 min). This fixes the zero-concurrency false positive
+  where doing memory / audit work *after* the commit pushed `last_commit_age`
+  past 5 min and got the session's own fresh evidence wrongly rejected as
+  head-stale. Future-dated precheck timestamps (negative drift, clock skew /
+  tampering) are now rejected rather than sailing through every drift check.
 
 ## [1.5.1] — 2026-05-29
 
