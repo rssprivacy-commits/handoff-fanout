@@ -95,8 +95,11 @@ if [[ $UNINSTALL -eq 1 ]]; then
     fi
     CODE_BIN="$(command -v code || true)"
     if [[ -n "$CODE_BIN" ]] && "$CODE_BIN" --list-extensions 2>/dev/null | grep -qx "dharmaxis.handoff-helper"; then
-        "$CODE_BIN" --uninstall-extension dharmaxis.handoff-helper >/dev/null 2>&1 || true
-        echo "  ✓ uninstalled handoff-helper VS Code extension"
+        if "$CODE_BIN" --uninstall-extension dharmaxis.handoff-helper >/dev/null 2>&1; then
+            echo "  ✓ uninstalled handoff-helper VS Code extension"
+        else
+            echo "  ⚠ failed to uninstall handoff-helper extension — remove manually via 'code --uninstall-extension dharmaxis.handoff-helper'"
+        fi
     fi
     echo "  (keeping $HANDOFF_HOME and config.json — remove manually if desired)"
     echo "✅ uninstall complete"
@@ -191,13 +194,12 @@ if [[ $INSTALL_EXTENSION -eq 1 ]]; then
             echo "⊘ extension skipped (npm not on PATH — needed to build the .vsix)"
         else
             echo "→ building handoff-helper.vsix (v$EXT_VERSION)"
-            (
-                cd "$EXT_DIR"
-                [[ -d node_modules ]] || npm install --silent
-                npm run package --silent
-            )
             VSIX="$EXT_DIR/handoff-helper.vsix"
-            if [[ -f "$VSIX" ]] && "$CODE_BIN" --install-extension "$VSIX" --force >/dev/null 2>&1; then
+            # Guard the build in an `if` so a failure under `set -e` falls through
+            # to the warning instead of aborting the whole installer.
+            if ( cd "$EXT_DIR" && { [[ -d node_modules ]] || npm install --silent; } && npm run package --silent ) \
+                && [[ -f "$VSIX" ]] \
+                && "$CODE_BIN" --install-extension "$VSIX" --force >/dev/null 2>&1; then
                 echo "✓ installed handoff-helper extension (v$EXT_VERSION)"
                 echo "  (autoclose stays OFF until you opt in — see config.json autoclose note)"
             else
