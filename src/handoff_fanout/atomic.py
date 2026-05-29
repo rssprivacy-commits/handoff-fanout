@@ -56,6 +56,40 @@ def write_with_fsync(path: Path, content: str) -> None:
     _fsync_dir(path.parent)
 
 
+def atomic_replace(path: Path, content: str) -> None:
+    """Atomically replace ``path``'s contents with ``content``.
+
+    Unlike :func:`write_with_fsync` (which uses ``O_TRUNC`` in place and
+    therefore exposes a window where a concurrent reader sees a truncated /
+    partial file), this writes to a same-directory temp file, fsyncs it, then
+    ``os.replace``s it over the target — a reader always observes either the
+    full old content or the full new content, never a partial state. Required
+    wherever a hash-verified artifact (e.g. retro evidence) is overwritten
+    while other tabs may be reading it.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.tmp.{os.getpid()}.{time.monotonic_ns()}"
+    data = content.encode("utf-8")
+    try:
+        # O_EXCL: the temp name embeds pid+monotonic_ns so it is unique; EXCL
+        # turns any collision into a hard error rather than a silent overwrite.
+        fd = os.open(str(tmp), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        try:
+            mv = memoryview(data)
+            while mv:
+                written = os.write(fd, mv)  # handle short writes
+                mv = mv[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    _fsync_dir(path.parent)
+
+
 def _fsync_dir(path: Path) -> None:
     dir_fd = os.open(str(path), os.O_RDONLY)
     try:
@@ -97,12 +131,21 @@ def acquire_dir_lock(
     if lock_path.exists():
         age = time.time() - lock_path.stat().st_mtime
         if age > stale_seconds:
-            print(
-                f"handoff-safe-commit: 锁陈旧 stale lock at {lock_path} "
-                f"(age={age:.0f}s > {stale_seconds:.0f}s) — force clearing",
-                file=sys.stderr,
-            )
-            _force_clear_lock(lock_path)
+            # Capture the stale holder's owner, then re-verify staleness +
+            # ownership immediately before clearing. This stops a second
+            # reclaimer (which observed the SAME stale lock) from deleting a
+            # fresh lock that a first reclaimer just acquired: the owner nonce
+            # will have changed, so we skip the clear. (I6 split-brain narrowing)
+            owner_before = _read_owner(lock_path)
+            with contextlib.suppress(FileNotFoundError, OSError):
+                still_stale = (time.time() - lock_path.stat().st_mtime) > stale_seconds
+                if still_stale and _read_owner(lock_path) == owner_before:
+                    print(
+                        f"handoff-safe-commit: 锁陈旧 stale lock at {lock_path} "
+                        f"(age={age:.0f}s > {stale_seconds:.0f}s) — force clearing",
+                        file=sys.stderr,
+                    )
+                    _force_clear_lock(lock_path)
 
     for attempt in range(retries):
         try:
@@ -111,16 +154,28 @@ def acquire_dir_lock(
             if attempt < retries - 1:
                 time.sleep(wait_seconds)
             continue
-        # Success.
-        pid_file = lock_path / "pid"
-        # If we can't write the pid file something is wrong, but we still
-        # hold the lock — proceed and let the caller surface the error.
+        # Success. Stamp a fencing token (owner nonce) unique to THIS
+        # acquisition so the release path can prove ownership before deleting
+        # the dir — without it, a holder whose stale lock was reclaimed by a
+        # sibling would delete the sibling's fresh lock on context exit (I6
+        # split-brain).
+        my_nonce = _new_owner_nonce()
+        try:
+            (lock_path / "owner").write_text(my_nonce + "\n")
+        except OSError as e:
+            # Without a readable owner token the release path can't prove
+            # ownership, so it would fail-closed and leak the lock. Roll the
+            # acquisition back instead of holding an unidentifiable lock.
+            _force_clear_lock(lock_path)
+            raise LockAcquisitionError(
+                f"acquired {lock_path} but could not stamp owner token: {e}"
+            ) from e
         with contextlib.suppress(OSError):
-            pid_file.write_text(f"{os.getpid()}\n")
+            (lock_path / "pid").write_text(f"{os.getpid()}\n")
         try:
             yield lock_path
         finally:
-            _force_clear_lock(lock_path)
+            _release_owned_lock(lock_path, my_nonce)
         return
 
     raise LockAcquisitionError(
@@ -129,11 +184,46 @@ def acquire_dir_lock(
     )
 
 
+def _new_owner_nonce() -> str:
+    """Per-acquisition fencing token: pid + monotonic ns + random suffix."""
+    return f"{os.getpid()}-{time.monotonic_ns()}-{os.urandom(6).hex()}"
+
+
+def _read_owner(lock_path: Path) -> str | None:
+    try:
+        return (lock_path / "owner").read_text().strip()
+    except OSError:
+        return None
+
+
+def _release_owned_lock(lock_path: Path, my_nonce: str) -> None:
+    """Release a lock we acquired — only if we still own it.
+
+    If the on-disk ``owner`` nonce no longer matches ours, our lock was
+    stale-cleared and reclaimed by another holder; deleting it now would
+    destroy *their* lock, so we leave it untouched (I6 fix). A missing owner
+    file is treated as ours (legacy / best-effort) so old callers still clean
+    up.
+    """
+    owner = _read_owner(lock_path)
+    if owner != my_nonce:
+        # Mismatch OR missing owner → we can't prove this lock is still ours
+        # (stale-cleared + reclaimed by a sibling, or owner file lost). Deleting
+        # it could destroy another holder's lock, so leave it. A genuinely
+        # orphaned lock is later reclaimed via the stale-age path. (codex P0-1)
+        return
+    _force_clear_lock(lock_path)
+
+
 def _force_clear_lock(lock_path: Path) -> None:
-    pid_file = lock_path / "pid"
-    if pid_file.exists():
-        with contextlib.suppress(FileNotFoundError):
-            pid_file.unlink()
+    """Unconditionally remove a lock dir + its marker files.
+
+    Used for releasing our own lock and for reclaiming a stale foreign lock.
+    Removes ``owner`` / ``pid`` first so the final ``rmdir`` succeeds.
+    """
+    for marker in ("owner", "pid"):
+        with contextlib.suppress(FileNotFoundError, OSError):
+            (lock_path / marker).unlink()
     try:
         lock_path.rmdir()
     except FileNotFoundError:

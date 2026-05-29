@@ -245,6 +245,10 @@ def test_R06_head_stale_with_block_action_returns_blocked(handoff_home, workspac
     subprocess.run(["git", "commit", "-q", "-m", "two"], cwd=workspace, check=True)
     payload["evidence_hash"] = handoff_precheck.compute_evidence_hash(payload)
     ev = _write_evidence(handoff_home, payload)
+    # Leave the tree dirty so 1-B re-align refuses (retro claims may be
+    # incomplete) — this keeps the test exercising the block path rather than
+    # the legitimate sibling-move re-align (covered by R16).
+    (workspace / "wip.txt").write_text("uncommitted")
     # Configure block action
     cfg_path = handoff_home / PROJECT / "handoff.config.json"
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
@@ -256,6 +260,112 @@ def test_R06_head_stale_with_block_action_returns_blocked(handoff_home, workspac
     blocked = handoff_home / PROJECT / "queue" / f"{TASK}.BLOCKED.md"
     assert blocked.exists()
     assert "head-stale-fatal" in blocked.read_text()
+
+
+def test_R06b_head_matches_but_old_commit_passes(handoff_home, workspace):
+    """1-A (F1-A silent-aging fix): HEAD unchanged since precheck but the last
+    commit is >300s old — the session committed, then spent time on memory /
+    codex audit before dump. Evidence is fully fresh (head matches, drift ~0);
+    the old `commit_fresh` gate wrongly rejected this as head-stale-resubmit.
+    Must now pass."""
+    old = (datetime.now(UTC) - timedelta(seconds=600)).isoformat(timespec="seconds")
+    (workspace / "c.txt").write_text("x")
+    subprocess.run(["git", "add", "c.txt"], cwd=workspace, check=True)
+    env = {**os.environ, "GIT_COMMITTER_DATE": old, "GIT_AUTHOR_DATE": old}
+    subprocess.run(["git", "commit", "-q", "-m", "old"], cwd=workspace, check=True, env=env)
+    # precheck now: head_at_precheck == current HEAD, timestamp == now (drift ~0)
+    payload = _make_payload(workspace)
+    ev = _write_evidence(handoff_home, payload)
+    code, err = _run_dump(workspace=workspace, retro_evidence=ev)
+    assert code == 0, f"head-matches + fresh drift must pass despite old commit; got: {err}"
+
+
+def test_R16_sibling_moved_head_triggers_realign(handoff_home, workspace):
+    """1-B: precheck snapshots HEAD=H0; a sibling tab commits, moving HEAD to
+    H1; drift exceeds tolerance so plain freshness fails. But the working tree
+    is clean and this session's own commits are still ancestors of H1, so dump
+    auto-re-aligns the evidence to H1 and passes — WITHOUT bumping attempt_n."""
+    payload = _make_payload(workspace)
+    h0 = payload["head_at_precheck"]
+    assert payload.get("session_commits"), "precheck must snapshot session_commits"
+    # Age the precheck timestamp past the drift tolerance (so the drift-tolerant
+    # branch can't rescue it — only re-align can).
+    payload["head_at_precheck_timestamp"] = (
+        datetime.now(UTC) - timedelta(seconds=120)
+    ).isoformat(timespec="seconds")
+    payload["evidence_hash"] = handoff_precheck.compute_evidence_hash(payload)
+    ev = _write_evidence(handoff_home, payload)
+    # Sibling tab commits → HEAD moves; working tree clean afterwards.
+    (workspace / "sibling.txt").write_text("x")
+    subprocess.run(["git", "add", "sibling.txt"], cwd=workspace, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "sibling work"], cwd=workspace, check=True)
+    h1 = handoff_precheck._git(["rev-parse", "HEAD"], workspace)
+    assert h0 != h1
+
+    code, err = _run_dump(workspace=workspace, retro_evidence=ev)
+    assert code == 0, f"re-align should pass; got: {err}"
+    # attempt_n must NOT be bumped — re-align is a machine correction, not a fix.
+    counter = handoff_home / PROJECT / "ack" / f"{TASK}.retro.attempt_n.txt"
+    assert (not counter.exists()) or counter.read_text().strip() in ("", "0")
+    # Evidence file rewritten to the current HEAD, hash still self-consistent.
+    new_payload = json.loads(ev.read_text())
+    assert new_payload["head_at_precheck"] == h1
+    assert new_payload["evidence_hash"] == handoff_precheck.compute_evidence_hash(new_payload)
+
+
+def test_R17_dirty_tree_does_not_realign(handoff_home, workspace):
+    """1-B safety: if the working tree is dirty (session work not fully
+    committed), re-align is refused — retro claims may be incomplete — and the
+    dump falls back to the normal retry path (attempt_n bumped)."""
+    payload = _make_payload(workspace)
+    payload["head_at_precheck_timestamp"] = (
+        datetime.now(UTC) - timedelta(seconds=120)
+    ).isoformat(timespec="seconds")
+    payload["evidence_hash"] = handoff_precheck.compute_evidence_hash(payload)
+    ev = _write_evidence(handoff_home, payload)
+    # Sibling commit moves HEAD ...
+    (workspace / "sibling.txt").write_text("x")
+    subprocess.run(["git", "add", "sibling.txt"], cwd=workspace, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "sibling"], cwd=workspace, check=True)
+    # ... and leave an uncommitted change in the tree (dirty).
+    (workspace / "uncommitted.txt").write_text("wip")
+
+    code, err = _run_dump(workspace=workspace, retro_evidence=ev)
+    assert code == 4, f"dirty tree must fall through to retry; got {code}: {err}"
+    assert "head-stale-resubmit" in err
+    counter = handoff_home / PROJECT / "ack" / f"{TASK}.retro.attempt_n.txt"
+    assert counter.read_text().strip() == "1"
+
+
+def test_R18_realign_refuses_when_head_unchanged(handoff_home, workspace):
+    """1-B safety (codex P0-2): evidence is stale by drift (> evidence_max_age)
+    but HEAD never moved — no sibling activity. Re-align must NOT silently
+    refresh it to the same HEAD (that would bypass evidence_max_age and revive
+    arbitrarily old evidence / mask an ABA). Falls through to retry."""
+    payload = _make_payload(workspace)
+    payload["head_at_precheck_timestamp"] = (
+        datetime.now(UTC) - timedelta(hours=2)
+    ).isoformat(timespec="seconds")
+    payload["evidence_hash"] = handoff_precheck.compute_evidence_hash(payload)
+    ev = _write_evidence(handoff_home, payload)
+    # NO sibling commit — HEAD stays == head_at_precheck.
+    code, err = _run_dump(workspace=workspace, retro_evidence=ev)
+    assert code == 4, f"same-HEAD stale must not re-align; got {code}: {err}"
+    assert "head-stale" in err
+
+
+def test_R19_future_precheck_timestamp_rejected(handoff_home, workspace):
+    """codex P1-4: a precheck timestamp in the future yields negative drift,
+    which `drift <= evidence_max_age` would wrongly accept. Reject it."""
+    payload = _make_payload(workspace)
+    payload["head_at_precheck_timestamp"] = (
+        datetime.now(UTC) + timedelta(minutes=5)
+    ).isoformat(timespec="seconds")
+    payload["evidence_hash"] = handoff_precheck.compute_evidence_hash(payload)
+    ev = _write_evidence(handoff_home, payload)
+    code, err = _run_dump(workspace=workspace, retro_evidence=ev)
+    assert code == 4, f"future timestamp must be rejected; got {code}: {err}"
+    assert "future" in err
 
 
 def test_R07_forensic_retro_passes_without_strict_checks(handoff_home, workspace):

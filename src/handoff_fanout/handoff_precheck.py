@@ -211,6 +211,30 @@ def _last_commit_age_sec(workspace: Path) -> int:
     return int((datetime.now(ts.tzinfo) - ts).total_seconds())
 
 
+def session_commits(workspace: Path) -> tuple[list[str], str]:
+    """Snapshot the commit SHAs this session is responsible for.
+
+    Returns ``(commits, source)``. Preferred source is everything ahead of the
+    upstream (``@{upstream}..HEAD``) — the local commits not yet on origin,
+    i.e. this session's unpushed work. When no upstream is configured we fall
+    back to the last few commits (``--max-count=5``) and flag the source so the
+    re-align consumer can treat it more conservatively.
+
+    Deterministic ``list[str]`` (newest-first, git's natural order) — never a
+    set — so it serializes stably into the evidence hash.
+    """
+    out = _git(["rev-list", "@{upstream}..HEAD"], workspace)
+    if out:
+        return out.split(), "upstream"
+    # Either everything is pushed, or there is no upstream. Distinguish by
+    # probing for an upstream ref; absent → conservative fallback.
+    has_upstream = _git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], workspace)
+    if has_upstream:
+        return [], "upstream"  # clean: all local work already pushed
+    fallback = _git(["rev-list", "--max-count=5", "HEAD"], workspace)
+    return (fallback.split() if fallback else []), "fallback"
+
+
 # ─── phase status assembly ──────────────────────────────────────────────────
 
 
@@ -264,6 +288,7 @@ def build_evidence(
 
     sid, sid_kind = resolve_session_id()
     head = _git(["rev-parse", "HEAD"], workspace) or "(unknown)"
+    sess_commits, sess_source = session_commits(workspace)
 
     payload: dict = {
         "schema_version": EVIDENCE_SCHEMA_VERSION,
@@ -275,6 +300,11 @@ def build_evidence(
         "head_at_precheck": head,
         "head_at_precheck_timestamp": _iso_now(),
         "last_commit_age_sec": _last_commit_age_sec(workspace),
+        # 1-B: the commit set this session owns, snapshotted at precheck. The
+        # dump-side re-align uses it to prove HEAD only moved because of sibling
+        # tabs (these commits still ancestors) before re-aligning evidence.
+        "session_commits": sess_commits,
+        "session_commits_source": sess_source,
         "session_id": sid,
         "session_id_kind": sid_kind,
         "phase0": merge_phase_status(_empty_phase(PHASE0_KEYS), phase0, PHASE0_KEYS),

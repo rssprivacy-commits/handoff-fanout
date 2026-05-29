@@ -42,8 +42,14 @@ from handoff_fanout.handoff_precheck import (
     PHASE1_KEYS,
     PHASE_STATUS_VALID,
     STATUS_REQUIRING_REASON,
+    build_evidence,
     compute_evidence_hash,
 )
+
+# 1-B: stale-class subcodes that an in-process re-align can rescue (the HEAD
+# moved due to a sibling commit while this session's own work is intact).
+REALIGNABLE_SUBCODES = frozenset({"head-stale-resubmit", "head-stale-fatal"})
+REALIGN_MAX_TRIES = 3
 
 # ─── exit codes (§7.1) ──────────────────────────────────────────────────────
 
@@ -66,6 +72,11 @@ PREFIX_BYPASS = "ERR-BYPASS"
 DEFAULT_HEAD_FRESHNESS = {
     "last_commit_max_age_sec": 300,
     "head_at_precheck_drift_tolerance_sec": 30,
+    # 1-A: when HEAD still matches the evidence snapshot, evidence freshness is
+    # bounded by how old the snapshot is (drift), NOT by how long ago the last
+    # commit landed. A session legitimately commits then spends minutes on
+    # memory/codex audit before dump; that must not make valid evidence "stale".
+    "evidence_max_age_sec": 1800,
     "head_stale_action": "retry",  # retry | block | warn-ok
 }
 HEAD_STALE_ACTIONS = {"retry", "block", "warn-ok"}
@@ -523,6 +534,7 @@ def _check_head_freshness(
 
     max_age = int(cfg["head_freshness"]["last_commit_max_age_sec"])
     drift_tolerance = int(cfg["head_freshness"]["head_at_precheck_drift_tolerance_sec"])
+    evidence_max_age = int(cfg["head_freshness"].get("evidence_max_age_sec", 1800))
     action = cfg["head_freshness"]["head_stale_action"]
 
     warnings: list[str] = []
@@ -534,11 +546,26 @@ def _check_head_freshness(
             "head-timestamp-invalid",
             "head_at_precheck_timestamp missing or unparseable",
         ), warnings
+    if drift < 0:
+        # Future precheck timestamp (clock skew / tampering). A negative drift
+        # would otherwise sail through every `drift <= ...` comparison below.
+        return _retry(
+            "head-timestamp-future",
+            f"head_at_precheck_timestamp is {abs(drift)}s in the future",
+        ), warnings
 
     head_matches = head_now == head_evidence
-    commit_fresh = 0 <= last_age <= max_age
 
-    if head_matches and commit_fresh:
+    # 1-A: HEAD unchanged since precheck ⟹ no commit moved it ⟹ the evidence
+    # reflects the current repo state. Gate on the evidence snapshot age
+    # (drift) rather than last-commit recency, so a session that committed then
+    # spent >max_age on memory/audit is not falsely flagged stale.
+    if head_matches and drift <= evidence_max_age:
+        if last_age > max_age:
+            warnings.append(
+                f"head-matches-old-commit-ok: {_iso_now()} "
+                f"last_commit_age={last_age}s drift={drift}s head={head_now}"
+            )
         return None, warnings
 
     if (not head_matches) and drift <= drift_tolerance:
@@ -849,6 +876,148 @@ def _handle_validation_failure(
         return _locked(e.subcode, "another tab is updating attempt counter")
 
 
+# ─── 1-B: dump-time re-align ─────────────────────────────────────────────────
+
+
+_SHA_RE = re.compile(r"[0-9a-f]{7,40}")
+
+
+def _git_strict(args: list[str], workspace: Path) -> tuple[int, str]:
+    """Like ``_git`` but returns ``(returncode, stdout)`` so callers can tell a
+    genuinely-empty result (rc 0) from a git failure (rc != 0). Returns
+    ``(-1, "")`` if git couldn't even be spawned."""
+    try:
+        r = subprocess.run(
+            ["git", *args],
+            cwd=str(workspace),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        return r.returncode, (r.stdout or "").strip()
+    except (subprocess.SubprocessError, OSError):
+        return -1, ""
+
+
+def _is_ancestor(ancestor: str, descendant: str, workspace: Path) -> bool:
+    try:
+        r = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+            cwd=str(workspace),
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        return r.returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def _phase_overrides(payload: dict, section: str) -> dict | None:
+    val = payload.get(section)
+    return val if isinstance(val, dict) else None
+
+
+def _attempt_realign(
+    payload: dict,
+    evidence_path: Path,
+    workspace: Path,
+    project: str,
+    task: str,
+) -> dict | None:
+    """Re-bind stale evidence to the current HEAD when it only drifted because
+    a sibling tab committed (1-B). Returns the rewritten payload on success, or
+    ``None`` to fall through to the normal retry/attempt path.
+
+    Safe only when ALL hold (fail-closed otherwise):
+      * the evidence carries a ``session_commits`` snapshot (else we can't prove
+        whose commits moved HEAD);
+      * ``git rev-parse HEAD`` works (git healthy);
+      * the working tree is clean (this session's work is fully committed, so
+        the phase0/phase1 retro claims still hold);
+      * every snapshotted session commit is still an ancestor of the new HEAD
+        (HEAD moved *only* via siblings — our work was neither rewritten nor
+        dropped; this also rejects the ABA reset-to-old-SHA case).
+
+    The whole sequence runs inside the gate's already-held dump.lock; a CAS on
+    HEAD before/after the in-process rebuild guards the residual window where a
+    sibling commits mid-rebuild (bounded retry with jitter, never bumping
+    attempt_n — machine correction, not an AI fix).
+    """
+    sess = payload.get("session_commits")
+    if not isinstance(sess, list) or not sess:
+        return None
+    # Reject malformed evidence: every entry must look like a git SHA, and the
+    # list must be bounded (a self-consistent-hash but crafted payload could
+    # otherwise crash _is_ancestor or blow up runtime).
+    if len(sess) > 1000 or not all(
+        isinstance(c, str) and _SHA_RE.fullmatch(c) for c in sess
+    ):
+        return None
+    mode = payload.get("mode", "normal")
+    if mode == MODE_FORENSIC_RETRO:
+        return None  # forensic skips strict checks entirely; nothing to re-align
+
+    old_head = payload.get("head_at_precheck", "")
+    if not isinstance(old_head, str) or not _SHA_RE.fullmatch(old_head):
+        return None
+
+    for i in range(REALIGN_MAX_TRIES):
+        head_now = _git(["rev-parse", "HEAD"], workspace)
+        if not head_now:
+            return None  # git broken → fail closed
+        # Re-align only rescues a *genuine sibling move*: HEAD must have actually
+        # advanced past the precheck HEAD. Same-HEAD staleness (drift-only) must
+        # NOT be refreshed — that would revive arbitrarily old evidence and mask
+        # an ABA reset-to-old-SHA. (codex P0-2)
+        if head_now == old_head:
+            return None
+        if not _is_ancestor(old_head, head_now, workspace):
+            return None  # old HEAD not an ancestor → history rewritten / ABA
+        # Working tree must be clean — strict, fail-closed on any git error
+        # (a plain "" from a failed `git status` must not read as clean). (P1-3)
+        rc, status_out = _git_strict(["status", "--porcelain"], workspace)
+        if rc != 0 or status_out != "":
+            return None
+        if not all(_is_ancestor(c, head_now, workspace) for c in sess):
+            return None  # our commits not all ancestors → not a pure sibling move
+        new_payload = build_evidence(
+            task_id=task,
+            project=payload.get("project", project),
+            workspace=workspace,
+            mode=mode,
+            nonce=payload.get("nonce"),
+            phase0=_phase_overrides(payload, "phase0"),
+            phase1=_phase_overrides(payload, "phase1"),
+        )
+        # The owned commit set is fixed at precheck — preserve the snapshot
+        # rather than re-deriving it (a sibling push could otherwise shrink it).
+        new_payload["session_commits"] = list(sess)
+        new_payload["session_commits_source"] = payload.get("session_commits_source", "")
+        # Preserve the original session identity — re-align is a freshness
+        # refresh, not a new session. (P1-5)
+        for k in ("session_id", "session_id_kind"):
+            if k in payload:
+                new_payload[k] = payload[k]
+        # The in-process builder must have observed the same HEAD we validated;
+        # if not (e.g. its rev-parse failed → "(unknown)"), abort this attempt.
+        if new_payload.get("head_at_precheck") != head_now:
+            time.sleep(0.2 + 0.1 * i)
+            continue
+        new_payload["evidence_hash"] = compute_evidence_hash(new_payload)
+        head_after = _git(["rev-parse", "HEAD"], workspace)
+        if head_after != head_now:
+            time.sleep(0.2 + 0.1 * i)  # CAS fail: sibling committed mid-rebuild
+            continue
+        atomic.atomic_replace(
+            evidence_path,
+            json.dumps(new_payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        )
+        return new_payload
+    return None
+
+
 # ─── public entry point ─────────────────────────────────────────────────────
 
 
@@ -989,15 +1158,45 @@ def check_retro_gate(
                 for w in warnings:
                     _append_warning(project, task, w)
                 if head_err is not None:
-                    return _handle_validation_failure(
-                        project=project,
-                        task=task,
-                        failure=head_err,
-                        payload=payload,
-                        evidence_path=evidence_path,
-                        session_id=sid,
-                        head=payload.get("head_at_precheck", ""),
-                    )
+                    # 1-B: a stale-class failure may be a pure sibling HEAD move.
+                    # Try an in-process re-align (inside this held dump.lock,
+                    # CAS-guarded) BEFORE counting it against attempt_n.
+                    realigned = None
+                    if head_err.subcode in REALIGNABLE_SUBCODES and evidence_path is not None:
+                        realigned = _attempt_realign(
+                            payload, evidence_path, workspace, project, task
+                        )
+                    if realigned is not None:
+                        head_err2, warnings2 = _check_head_freshness(
+                            realigned, workspace, config, project, task
+                        )
+                        for w in warnings2:
+                            _append_warning(project, task, w)
+                        if head_err2 is None:
+                            _audit_append(
+                                project,
+                                task,
+                                {
+                                    "event": "head-realigned",
+                                    "old_head": payload.get("head_at_precheck", ""),
+                                    "new_head": realigned.get("head_at_precheck", ""),
+                                    "tab_session_id": sid,
+                                },
+                            )
+                            payload = realigned  # success path uses realigned hash
+                            head_err = None
+                        else:
+                            head_err = head_err2
+                    if head_err is not None:
+                        return _handle_validation_failure(
+                            project=project,
+                            task=task,
+                            failure=head_err,
+                            payload=payload,
+                            evidence_path=evidence_path,
+                            session_id=sid,
+                            head=payload.get("head_at_precheck", ""),
+                        )
             else:
                 _audit_append(
                     project,
