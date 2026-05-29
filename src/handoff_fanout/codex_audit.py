@@ -31,7 +31,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from handoff_fanout import atomic
@@ -129,6 +129,131 @@ def dispositions_path(project: str, task: str) -> Path:
 def _relative_to_project(project: str, path: Path) -> str:
     """Canonical POSIX path relative to ``$HANDOFF_HOME/<project>/`` (no abs leak)."""
     return path.relative_to(_project_home(project)).as_posix()
+
+
+# ─── owner_ack_token (Component A) — design §2 ──────────────────────────────
+# TRUST MODEL (owner ruling #1, NOT cryptography): an AI running with the
+# owner's identity can write any file and therefore fabricate a self-consistent
+# token. This binding checksum defends against (a) reusing one finding's
+# approval on a DIFFERENT finding (finding_hash binding), (b) an approval that
+# never expires (7-day TTL), and (c) a trace-less approval (audit jsonl trail +
+# the AskUserQuestion button's friction). It does NOT defend against a malicious
+# forger; that needs an owner-held key (deferred, see design §6).
+
+
+def _finding_hash_short(finding_hash: str) -> str:
+    """The 16 hex chars after ``sha256:`` — the ack artifact filename slug.
+
+    Raising on a non-canonical hash keeps a malformed value from producing a
+    surprising filename (e.g. one containing ``/`` or ``..``).
+    """
+    if not isinstance(finding_hash, str) or not _SHA256_REF_RE.match(finding_hash):
+        raise ValueError(f"finding_hash must be sha256:<64 hex>; got {finding_hash!r}")
+    return finding_hash[len("sha256:") : len("sha256:") + 16]
+
+
+def compute_owner_ack_token(task: str, finding_hash: str, nonce: str, approved_at: str) -> str:
+    """Binding checksum = ``sha256(task | finding_hash | nonce | approved_at)``.
+
+    NOT a secret (see the trust-model note above): it pins an approval to one
+    (task, finding, nonce, approval-instant) tuple so it can't be silently
+    re-pointed at another finding. Newline-joined canonical form.
+    """
+    canonical = f"{task}\n{finding_hash}\n{nonce}\n{approved_at}"
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def owner_ack_path(project: str, task: str, finding_hash: str) -> Path:
+    """``$HANDOFF_HOME/<project>/ack/<task>.owner_ack.<short>.json``."""
+    _validate_ids(project, task)
+    short = _finding_hash_short(finding_hash)
+    return _config.home_dir() / project / "ack" / f"{task}.owner_ack.{short}.json"
+
+
+def _audit_trail_path(project: str, task: str) -> Path:
+    """The closing-audit jsonl the Phase C overdue scanner also appends to
+    (``ack/<task>.audit.retry_audit.jsonl``)."""
+    _validate_ids(project, task)
+    return _config.home_dir() / project / "ack" / f"{task}.audit.retry_audit.jsonl"
+
+
+def _append_audit_trail(project: str, task: str, event: dict) -> None:
+    """Append one JSON line to the task's audit trail (best-effort, fsync'd)."""
+    path = _audit_trail_path(project, task)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(line)
+        fh.flush()
+
+
+def _add_days_iso(iso: str, days: int) -> str:
+    """Return ``iso`` shifted by ``days``, normalized to an offset-aware ISO-8601."""
+    dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return (dt + timedelta(days=days)).isoformat()
+
+
+def write_owner_ack(
+    project: str,
+    task: str,
+    finding_hash: str,
+    finding_title: str,
+    nonce: str,
+    approved_at: str,
+    reason: str,
+) -> dict:
+    """Write the owner-ack artifact (after the owner clicks the AskUserQuestion
+    button) and append an ``owner-ack-written`` trail line. Returns the artifact.
+
+    ``expires_at`` = ``approved_at`` + :data:`OWNER_ACK_TTL_DAYS` (owner ruling #4).
+    NOT cryptographic — see the module trust-model note.
+    """
+    _validate_ids(project, task)
+    token = compute_owner_ack_token(task, finding_hash, nonce, approved_at)
+    expires_at = _add_days_iso(approved_at, OWNER_ACK_TTL_DAYS)
+    artifact = {
+        "schema_version": OWNER_ACK_SCHEMA_VERSION,
+        "kind": "owner_ack",
+        "task": task,
+        "finding_hash": finding_hash,
+        "finding_title": finding_title,
+        "nonce": nonce,
+        "approved_at": approved_at,
+        "expires_at": expires_at,
+        "reason": reason,
+        "owner_ack_token": token,
+    }
+    path = owner_ack_path(project, task, finding_hash)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic.atomic_replace(path, json.dumps(artifact, ensure_ascii=False, sort_keys=True) + "\n")
+    _append_audit_trail(
+        project,
+        task,
+        {
+            "event": "owner-ack-written",
+            "finding_hash": finding_hash,
+            "nonce": nonce,
+            "approved_at": approved_at,
+            "expires_at": expires_at,
+        },
+    )
+    return artifact
+
+
+def load_owner_ack(project: str, task: str, finding_hash: str) -> dict | None:
+    """Read the on-disk owner-ack artifact; ``None`` if missing / unreadable /
+    not a JSON object."""
+    try:
+        path = owner_ack_path(project, task, finding_hash)
+    except ValueError:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 # ─── findings hashing (sidecar manifest — R2-P0-3) ──────────────────────────
@@ -555,6 +680,18 @@ _EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 # "gate 校验次数 ≥ 阈值"). The Phase A builder requires the list be non-empty;
 # the gate re-checks the count so hand-crafted evidence can't shrink it to 0.
 BYPASS_MIN_FAILURES = 1
+
+# Owner-ack / bypass-producer constants (Phase D pre-req; design §2.2 / §3.1).
+OWNER_ACK_TTL_DAYS = 7  # owner_override exemption validity (owner ruling #4)
+BYPASS_FOLLOW_UP_DEADLINE_DAYS = 1  # short debt; next session should re-audit
+# The producer's honest threshold: how many machine-proven codex failures define
+# "codex unavailable" before write_bypass_override will emit the sidecar. This is
+# DISTINCT from BYPASS_MIN_FAILURES (the gate's loose floor) — the producer is
+# stricter so the honest path can't manufacture a bypass off a single hiccup.
+MIN_CODEX_FAILURES = 3
+OWNER_ACK_SCHEMA_VERSION = "1.0"
+BYPASS_OVERRIDE_SCHEMA_VERSION = "1.0"
+SUPPORTED_OWNER_ACK_SCHEMA_VERSIONS = ("1.0",)
 
 # docs_only legitimacy (spec §2.2): only these suffixes may be "docs", and
 # CLAUDE.md / AGENTS.md / GEMINI.md / anything under prompts/ are force-full
