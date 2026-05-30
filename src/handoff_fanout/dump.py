@@ -450,11 +450,11 @@ def write_active_dump(
         if old_ready_path is None:
             # The gate passed with an evidence file, yet old_ready couldn't be
             # written (evidence vanished / unreadable between the gate and here).
-            # Don't fail the already-published dump, but make it loud: autoclose
-            # silently won't fire without this artifact.
+            # Don't fail the already-published dump, but make it loud: without
+            # this artifact the §0 new-session audit can't verify this session.
             print(
                 "[dump] ⚠️  retro evidence supplied but old_ready was NOT written "
-                "(evidence vanished/unreadable); autoclose will not trigger for "
+                "(evidence vanished/unreadable); §0 new-session audit can't verify "
                 f"{project}/{task}"
             )
 
@@ -475,10 +475,14 @@ def _write_old_ready(
     """Write ``ack/<task>.old_ready`` per spec §7.6.
 
     Only invoked when the retro gate ran with an evidence file and passed. The
-    artifact tells the v4 autoclose watcher that this session is closed and
-    references the on-disk evidence so the watcher can verify integrity before
-    closing the old tab. Returns the written path (or ``None`` if the evidence
-    file vanished between the gate check and this call).
+    artifact is **audit metadata** read by the §0 new-session predecessor audit
+    and the Phase C/D codex-audit gate (it carries ``retro_evidence_hash`` +
+    ``codex_audit_hash`` / ``codex_audit_mode`` / ``next_session_forced_task``),
+    so a new session can verify the prior session actually closed + audited.
+    (Historically it also drove the v4 tab-autoclose watcher, now removed — the
+    artifact stays because the audit/retro-mandate chain depends on it.) Returns
+    the written path (or ``None`` if the evidence file vanished between the gate
+    check and this call).
     """
     if not evidence_path.exists():
         return None

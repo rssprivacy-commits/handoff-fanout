@@ -1,7 +1,6 @@
 {
   "_comment": "handoff-fanout config (referenced from $HANDOFF_HOME/config.json). Drop unused keys; all fields are optional with safe defaults.",
 
-  "_autoclose_comment": "Tab autoclose (handoff-helper VS Code extension) is OFF by default and is NOT toggled here — config.json is read by the python dump/build, while autoclose runs in the bash launchd watcher (install/auto-continue.sh). To opt in, set env HANDOFF_AUTOCLOSE_ENABLED=1, or touch $HANDOFF_HOME/autoclose.enabled (all projects) / $HANDOFF_HOME/<project>/autoclose.enabled (one project). The watcher then opens vscode://dharmaxis.handoff-helper/autoclose?task_id=..&nonce=..&project=.. — install the extension via install/install.sh (or `cd extension && npm run package && code --install-extension handoff-helper.vsix`).",
 
   "inject_blocks": [
     "## Project red lines (example)\n- never edit src/legacy/ without an ADR\n- treasury operations must go through journal_service.post_entry()"

@@ -31,19 +31,34 @@ LOG="$HANDOFF_ROOT/auto-continue.log"
 HANDOFF_OPEN_CMD="${HANDOFF_OPEN_CMD:-/usr/bin/open}"
 HANDOFF_OSASCRIPT_CMD="${HANDOFF_OSASCRIPT_CMD:-/usr/bin/osascript}"
 HANDOFF_SHA256_CMD="${HANDOFF_SHA256_CMD:-/usr/bin/shasum}"
-# tests set HANDOFF_SKIP_SPAWN=1 to exercise the new autoclose / overdue
-# segments without depending on a live VS Code instance.
+# tests set HANDOFF_SKIP_SPAWN=1 to exercise the overdue-scanner segment
+# without depending on a live VS Code instance.
 HANDOFF_SKIP_SPAWN="${HANDOFF_SKIP_SPAWN:-0}"
 # tests set HANDOFF_VSCODE_CHECK=0 to skip the `pgrep "Visual Studio Code"`
 # global guard (no-op in CI / headless contexts).
 HANDOFF_VSCODE_CHECK="${HANDOFF_VSCODE_CHECK:-1}"
-# autoclose feature gate: default OFF, opt-in via this env or via the
-# autoclose.enabled sentinel files documented in v4 改进 #6.
-HANDOFF_AUTOCLOSE_ENABLED="${HANDOFF_AUTOCLOSE_ENABLED:-0}"
 # python3 is a hard dependency of this system (the dump/precheck CLIs are a
 # Python package); the overdue scanner uses it for timezone-correct ISO-8601
 # comparison. Overridable so tests can point at a specific interpreter.
 HANDOFF_PYTHON_CMD="${HANDOFF_PYTHON_CMD:-python3}"
+
+# ── unlock-pivot (lock-screen → auto-unlock → visible GUI; design §4 / codex R1) ──
+# The GUI submit (code -r / open / osascript Enter) needs an UNLOCKED screen —
+# synthetic keystrokes are forbidden against the macOS lock screen. When locked +
+# the project opted in, auto-unlock first (MindPersist's CGEvent password
+# injection CLI), then run the visible GUI path so the owner can still audit the
+# tab. Locked + not-opted-in / unlock-failed / unknown ⇒ defer (keep .uri, notify,
+# resume on unlock) — never a silent dead-stall, never a blind-box. Default OFF.
+HANDOFF_UNLOCK_ENABLED="${HANDOFF_UNLOCK_ENABLED:-0}"   # per-project opt-in (P0-1)
+HANDOFF_LOCK_CHECK_CMD="${HANDOFF_LOCK_CHECK_CMD:-}"    # tests stub: prints locked|unlocked|*
+HANDOFF_IOREG_CMD="${HANDOFF_IOREG_CMD:-/usr/sbin/ioreg}"
+HANDOFF_UNLOCK_CMD="${HANDOFF_UNLOCK_CMD:-}"            # e.g. "<mp>/.venv/bin/python -m src.agent.unlock_cli --unlock"
+HANDOFF_RELOCK_CMD="${HANDOFF_RELOCK_CMD:-}"            # e.g. "<mp>/.venv/bin/python -m src.agent.unlock_cli --lock"
+HANDOFF_UNLOCK_TIMEOUT="${HANDOFF_UNLOCK_TIMEOUT:-90}"  # wall-clock cap for the unlock CLI (P1-5)
+HANDOFF_RELOCK_TIMEOUT="${HANDOFF_RELOCK_TIMEOUT:-20}"
+HANDOFF_CAFFEINATE_CMD="${HANDOFF_CAFFEINATE_CMD:-caffeinate -d -i}"  # held across unlock→submit (P1-6); empty disables
+HANDOFF_UNLOCK_FAIL_THRESHOLD="${HANDOFF_UNLOCK_FAIL_THRESHOLD:-2}"   # consecutive fails → manual-only (P0-3 / B3)
+HANDOFF_UNLOCK_COOLDOWN="${HANDOFF_UNLOCK_COOLDOWN:-1800}"            # seconds to wait after threshold reached
 
 CODE_BIN="${HANDOFF_CODE_BIN:-/usr/local/bin/code}"
 [ ! -x "$CODE_BIN" ] && CODE_BIN="/opt/homebrew/bin/code"
@@ -94,8 +109,8 @@ if [ "$HANDOFF_VSCODE_CHECK" = "1" ]; then
 fi
 
 # 全局 Guard 5: code CLI 必须可用 (workspace routing 核心)
-# Skip the strict check when only running autoclose / overdue segments since
-# those do not touch `code -r`.
+# Skip the strict check when only running the overdue segment since it does
+# not touch `code -r`.
 if [ "$HANDOFF_SKIP_SPAWN" != "1" ]; then
     if [ -z "$CODE_BIN" ] || [ ! -x "$CODE_BIN" ]; then
         log "FATAL: code CLI not found (workspace routing unavailable)"
@@ -104,8 +119,8 @@ if [ "$HANDOFF_SKIP_SPAWN" != "1" ]; then
 fi
 
 SPAWNED=0
-AUTOCLOSED=0
 OVERDUE_MARKED=0
+DEFERRED=0
 shopt -s nullglob
 
 # 2026-05-28 codex audit blind-spot #4 修复:
@@ -160,6 +175,158 @@ warn_accessibility_once() {
     "$HANDOFF_OSASCRIPT_CMD" -e 'display notification "自动接续无法按 Enter：缺辅助功能权限。tab 已打开，请手动按 Enter，并到 系统设置 → 隐私与安全性 → 辅助功能 授权。" with title "Handoff ⚠️ 辅助功能权限" sound name "Basso"' 2>>"$LOG" || true
 }
 
+# ─── unlock-pivot helpers (lock-aware GUI gating; defined before the loop) ───
+
+# Lock probe. exit 0=locked / 1=unlocked / 2=UNKNOWN (ioreg failed/empty).
+# EMPIRICAL: unlocked macs have CGSSessionScreenIsLocked ABSENT (no `= No`); only
+# `= Yes` = locked. key-absent ⇒ UNLOCKED — mapping it to UNKNOWN would defer
+# every unlocked machine (100% stall). Only a genuine ioreg failure is UNKNOWN.
+screen_is_locked() {
+    if [ -n "$HANDOFF_LOCK_CHECK_CMD" ]; then
+        case "$("$HANDOFF_LOCK_CHECK_CMD" 2>/dev/null)" in
+            locked) return 0 ;; unlocked) return 1 ;; *) return 2 ;;
+        esac
+    fi
+    local out
+    out=$("$HANDOFF_IOREG_CMD" -n Root -d1 2>/dev/null) || return 2
+    [ -z "$out" ] && return 2
+    printf '%s' "$out" | /usr/bin/grep -q '"CGSSessionScreenIsLocked" = Yes' && return 0
+    return 1
+}
+
+# Per-project unlock opt-in (default OFF; NO global default-on — P0-1).
+unlock_enabled_for_project() {
+    local proj_dir="$1"
+    [ "$HANDOFF_UNLOCK_ENABLED" = "1" ] && return 0
+    [ -f "$HANDOFF_ROOT/unlock.enabled" ] && return 0
+    [ -f "$proj_dir/unlock.enabled" ] && return 0
+    return 1
+}
+
+# Portable epoch mtime (BSD/macOS vs GNU).
+_u_mtime() { case "$(uname)" in Darwin) /usr/bin/stat -f %m "$1" 2>/dev/null ;; *) stat -c %Y "$1" 2>/dev/null ;; esac; }
+
+# Run a command with a wall-clock timeout (macOS lacks /usr/bin/timeout): bg +
+# poll + kill. Returns the command's exit code, or 124 on timeout (P1-5).
+run_with_timeout() {
+    local secs="$1"; shift
+    [ "$#" -eq 0 ] && return 2
+    "$@" &
+    local pid=$! waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$waited" -ge "$secs" ]; then
+            kill -TERM "$pid" 2>/dev/null; sleep 1; kill -KILL "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null; return 124
+        fi
+        sleep 1; waited=$((waited + 1))
+    done
+    wait "$pid"; return $?
+}
+
+# Durable defer marker (design §3.1): keep the .uri, record why/since/ticks so the
+# 状态 shortcut + watchdog surface "N tasks waiting for unlock". Removed when the
+# .uri is finally consumed. Self-contained.
+defer_uri() {
+    local proj_dir="$1" queue="$2" task="$3" reason="$4"
+    local marker="$queue/$task.deferred"
+    local now; now=$(/bin/date +%s)
+    local first="$now" ticks=1
+    if [ -f "$marker" ]; then
+        local pf pt
+        pf=$(sed -n 's/^first_epoch=//p' "$marker" 2>/dev/null | head -1)
+        pt=$(sed -n 's/^ticks=//p' "$marker" 2>/dev/null | head -1)
+        case "$pf" in ''|*[!0-9]*) pf="$now" ;; esac
+        case "$pt" in ''|*[!0-9]*) pt=0 ;; esac
+        first="$pf"; ticks=$((pt + 1))
+    fi
+    printf 'task=%s\nreason=%s\nfirst_epoch=%s\nlast_epoch=%s\nticks=%s\n' \
+        "$task" "$reason" "$first" "$now" "$ticks" > "$marker"
+    local nfile="$proj_dir/.deferred-notified"
+    local do_notify=1
+    if [ -f "$nfile" ]; then
+        local mt; mt=$(_u_mtime "$nfile")
+        [ -n "$mt" ] && [ "$((now - mt))" -lt 21600 ] && do_notify=0
+    fi
+    if [ "$do_notify" = "1" ]; then
+        : > "$nfile" 2>/dev/null || true
+        "$HANDOFF_OSASCRIPT_CMD" -e 'display notification "锁屏待接续 — 解锁或为该项目开启 unlock" with title "Handoff"' 2>>"$LOG" || true
+    fi
+    log "DEFER: project=$(basename "$proj_dir") task=$task reason=$reason ticks=$ticks"
+    DEFERRED=$((DEFERRED + 1))
+}
+
+# Unlock-failure cooldown (P0-3): a wrong/expired Keychain password must NOT be
+# retried every 60s tick (macOS account lockout). Count consecutive failures;
+# once >= threshold set a long next_retry so auto-unlock pauses until the owner
+# clears the marker / fixes Keychain.
+_unlock_cd_marker() { echo "$1/.unlock-cooldown"; }
+unlock_in_cooldown() {
+    local m; m=$(_unlock_cd_marker "$1"); [ -f "$m" ] || return 1
+    local nr; nr=$(sed -n 's/^next_retry_epoch=//p' "$m" 2>/dev/null | head -1)
+    case "$nr" in ''|*[!0-9]*) return 1 ;; esac
+    local now; now=$(/bin/date +%s)
+    [ "$now" -lt "$nr" ]
+}
+unlock_fail_bump() {
+    local proj_dir="$1" rc="$2"; local m; m=$(_unlock_cd_marker "$proj_dir")
+    local now; now=$(/bin/date +%s); local cnt=0
+    [ -f "$m" ] && cnt=$(sed -n 's/^count=//p' "$m" 2>/dev/null | head -1)
+    case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
+    cnt=$((cnt + 1))
+    local nr=$now
+    if [ "$cnt" -ge "$HANDOFF_UNLOCK_FAIL_THRESHOLD" ]; then
+        nr=$((now + HANDOFF_UNLOCK_COOLDOWN))
+        "$HANDOFF_OSASCRIPT_CMD" -e "display notification \"自动解锁连续失败 $cnt 次，已暂停自动解锁（密码错/Keychain 过期?），请人工处理\" with title \"Handoff ⚠️ 解锁\" sound name \"Basso\"" 2>>"$LOG" || true
+        log "UNLOCK-COOLDOWN: project=$(basename "$proj_dir") count=$cnt rc=$rc — pause auto-unlock until $nr"
+    fi
+    printf 'count=%s\nlast_epoch=%s\nnext_retry_epoch=%s\nlast_rc=%s\n' "$cnt" "$now" "$nr" "$rc" > "$m"
+}
+unlock_fail_reset() { rm -f "$(_unlock_cd_marker "$1")" 2>/dev/null || true; }
+
+# Global unlock mutex (P0-2): one unlock at a time across concurrent launchd ticks
+# so a 2nd tick never injects the password into an already-unlocked / wrong window.
+GLOBAL_UNLOCK_LOCK="$HANDOFF_ROOT/.unlock.lock"
+acquire_unlock_lock() {
+    if [ -d "$GLOBAL_UNLOCK_LOCK" ]; then
+        local pid; pid=$(cat "$GLOBAL_UNLOCK_LOCK/pid" 2>/dev/null)
+        case "$pid" in ''|*[!0-9]*) pid="" ;; esac
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then return 1; fi
+        local mt; mt=$(_u_mtime "$GLOBAL_UNLOCK_LOCK"); local now; now=$(/bin/date +%s)
+        if [ -n "$mt" ] && [ "$((now - mt))" -le 180 ]; then return 1; fi
+        rm -f "$GLOBAL_UNLOCK_LOCK/pid" 2>/dev/null; rmdir "$GLOBAL_UNLOCK_LOCK" 2>/dev/null
+    fi
+    mkdir "$GLOBAL_UNLOCK_LOCK" 2>/dev/null || return 1
+    echo "$$" > "$GLOBAL_UNLOCK_LOCK/pid" 2>/dev/null || true
+    return 0
+}
+release_unlock_lock() {
+    rm -f "$GLOBAL_UNLOCK_LOCK/pid" 2>/dev/null || true
+    rmdir "$GLOBAL_UNLOCK_LOCK" 2>/dev/null || true
+}
+
+# Re-lock after a run we unlocked (P1-5): verify it actually re-locked; loud
+# notification on failure (never leave the Mac silently unlocked unattended).
+do_relock() {
+    [ -z "$HANDOFF_RELOCK_CMD" ] && return 0
+    run_with_timeout "$HANDOFF_RELOCK_TIMEOUT" $HANDOFF_RELOCK_CMD >>"$LOG" 2>&1
+    sleep 1
+    if ! screen_is_locked; then
+        "$HANDOFF_OSASCRIPT_CMD" -e 'display notification "自动接续后重新锁屏失败 — 屏幕可能仍解锁，请人工锁屏" with title "Handoff ⚠️ 重锁失败" sound name "Basso"' 2>>"$LOG" || true
+        log "RELOCK-FAIL: screen not re-locked (HANDOFF_RELOCK_CMD)"
+    fi
+}
+
+# Per-iteration cleanup: stop the held caffeinate + re-lock if WE unlocked. Must
+# run before every `continue` AFTER the unlock gating, and at iteration end.
+CAFF_PID=""
+UNLOCKED_BY_US=0
+_post_iter_cleanup() {
+    [ -n "$CAFF_PID" ] && kill "$CAFF_PID" 2>/dev/null
+    CAFF_PID=""
+    [ "$UNLOCKED_BY_US" = "1" ] && do_relock
+    UNLOCKED_BY_US=0
+}
+
 # 遍历所有项目子目录 — main spawn loop (gated by HANDOFF_SKIP_SPAWN).
 if [ "$HANDOFF_SKIP_SPAWN" = "1" ]; then
     log "SKIP-SPAWN: HANDOFF_SKIP_SPAWN=1 — skipping main spawn loop (test mode)"
@@ -201,13 +368,57 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
             continue
         fi
 
+        # ── unlock-pivot gating (design §4): the GUI path needs an unlocked screen ──
+        CAFF_PID=""
+        UNLOCKED_BY_US=0
+        screen_is_locked; _LRC=$?
+        if [ "$_LRC" = "2" ]; then
+            # UNKNOWN lock state ⇒ fail-closed: never GUI-submit blind.
+            defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "lock-unknown"; continue
+        fi
+        if [ "$_LRC" = "0" ]; then
+            # Locked → must auto-unlock first (UI keystrokes are forbidden locked).
+            if ! unlock_enabled_for_project "$PROJ_DIR"; then
+                defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "locked-unlock-not-enabled"; continue
+            fi
+            if unlock_in_cooldown "$PROJ_DIR"; then
+                defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "unlock-cooldown"; continue
+            fi
+            if [ -z "$HANDOFF_UNLOCK_CMD" ]; then
+                defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "unlock-cmd-unset"; continue
+            fi
+            if ! acquire_unlock_lock; then
+                defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "unlock-busy"; continue
+            fi
+            # Hold caffeinate across unlock→submit (P1-6: keep system awake so it
+            # can't re-lock mid-window). Empty HANDOFF_CAFFEINATE_CMD disables.
+            if [ -n "$HANDOFF_CAFFEINATE_CMD" ]; then $HANDOFF_CAFFEINATE_CMD >/dev/null 2>&1 & CAFF_PID=$!; fi
+            # Re-probe under the mutex (P0-2): another tick may have unlocked already.
+            if screen_is_locked; then
+                run_with_timeout "$HANDOFF_UNLOCK_TIMEOUT" $HANDOFF_UNLOCK_CMD >>"$LOG" 2>&1; _URC=$?
+                if screen_is_locked; then
+                    unlock_fail_bump "$PROJ_DIR" "$_URC"
+                    [ -n "$CAFF_PID" ] && kill "$CAFF_PID" 2>/dev/null; CAFF_PID=""
+                    release_unlock_lock
+                    defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "unlock-failed-rc$_URC"; continue
+                fi
+                unlock_fail_reset "$PROJ_DIR"
+                UNLOCKED_BY_US=1
+                log "UNLOCK-OK: project=$PROJECT task=$TASK (rc=$_URC)"
+            fi
+            release_unlock_lock
+        fi
+
         # Atomic claim
         TS=$(date +%s%N)
         LAUNCHED_FILE="$LAUNCHED/$TASK-$TS.txt"
         if ! mv "$URI_FILE" "$LAUNCHED_FILE" 2>/dev/null; then
             log "SKIP: race lost for project=$PROJECT task=$TASK"
+            _post_iter_cleanup
             continue
         fi
+        # Consuming the .uri clears any prior defer marker for this task.
+        rm -f "$QUEUE/$TASK.deferred" 2>/dev/null
 
         log "TRIGGER: project=$PROJECT task=$TASK workspace=$WORKSPACE"
 
@@ -229,7 +440,14 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
             # 等 sleep 1.5 后必须验证 frontmost app 是 Code 才按 Enter
             # 否则可能按到 finder / 别 app, 触发不可预期行为 (写入文件名 / 触发快捷键等)
             sleep 1.5  # 等 Claude Code 渲染输入栏 + prompt 粘贴完成
-            if ! accessibility_trusted; then
+            if screen_is_locked; then
+                # P1-6: screen re-locked during the unlock→submit window — a synthetic
+                # Enter against the lock screen is forbidden + dangerous. Abort the
+                # submit; the tab is open but unsubmitted (visible park, owner finishes
+                # on unlock). caffeinate should normally prevent this.
+                log "ABORT-SUBMIT: screen re-locked before Enter — 未按 (tab 已开). project=$PROJECT task=$TASK"
+                write_ack "$PROJ_DIR" "$TASK" "failed" "screen re-locked before submit Enter"
+            elif ! accessibility_trusted; then
                 # Skip the doomed keystroke entirely — it would just log a WARN
                 # and leave the tab un-submitted. Surface it loudly instead.
                 warn_accessibility_once
@@ -257,15 +475,18 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
             write_ack "$PROJ_DIR" "$TASK" "failed" "open URI failed, restored to queue"
             mv "$LAUNCHED_FILE" "$URI_FILE"
         fi
+
+        # post-iteration: stop the held caffeinate + re-lock if WE unlocked.
+        _post_iter_cleanup
     done
 done
 
-if [ $SPAWNED -gt 0 ]; then
-    log "DONE: spawned $SPAWNED task(s) this run (across all projects)"
+if [ $SPAWNED -gt 0 ] || [ $DEFERRED -gt 0 ]; then
+    log "DONE: spawned $SPAWNED deferred $DEFERRED task(s) this run (across all projects)"
 fi
 
 
-# ─── helpers shared by autoclose + overdue scanner ──────────────────────────
+# ─── helpers for the follow-up overdue scanner ──────────────────────────────
 # v5.4 Phase 4d D-4. Designed to be idempotent: missing inputs short-circuit
 # instead of erroring out so a partially provisioned project never blocks the
 # rest of the loop.
@@ -273,17 +494,6 @@ fi
 now_iso_utc() {
     # ISO-8601 to-the-second UTC — matches `datetime.now(UTC).isoformat(timespec="seconds")`
     /bin/date -u +"%Y-%m-%dT%H:%M:%S+00:00"
-}
-
-mtime_sec() {
-    # Epoch mtime, portable across BSD/macOS (`stat -f %m`) and GNU/Linux
-    # (`stat -c %Y`). Production autoclose only runs on macOS, but the test
-    # suite exercises this on Linux CI — a BSD-only form there returns empty,
-    # which made clean_stale_lock silently skip recycling (A08 red on ubuntu).
-    case "$(uname)" in
-        Darwin) /usr/bin/stat -f %m "$1" 2>/dev/null ;;
-        *) stat -c %Y "$1" 2>/dev/null ;;
-    esac
 }
 
 # Timezone-correct "is now (UTC) strictly past <deadline>?" — exit 0 = overdue.
@@ -306,44 +516,6 @@ if dt.tzinfo is None:
     dt = dt.replace(tzinfo=timezone.utc)
 sys.exit(0 if datetime.now(timezone.utc) > dt else 1)
 PY
-}
-
-# Release a per-task lock dir created by mkdir + a `pid` ownership file.
-release_lock() {
-    rm -f "$1/pid" 2>/dev/null || true
-    rmdir "$1" 2>/dev/null || true
-}
-
-# stale lock cleanup: recycle only when the recorded owner pid is gone AND the
-# dir is older than ttl seconds. Checking pid liveness first (P1) stops a slow
-# but still-running holder from having its lock stolen on the TTL alone.
-clean_stale_lock() {
-    local lock="$1"; local ttl="$2"
-    [ -d "$lock" ] || return 0
-    local pid=""
-    [ -f "$lock/pid" ] && pid=$(cat "$lock/pid" 2>/dev/null)
-    case "$pid" in ''|*[!0-9]*) pid="" ;; esac  # ignore empty/garbage pid file
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        return 0  # owner alive — never recycle regardless of age
-    fi
-    local mt; mt=$(mtime_sec "$lock") || return 0
-    [ -z "$mt" ] && return 0
-    local now; now=$(/bin/date +%s)
-    if [ "$((now - mt))" -gt "$ttl" ]; then
-        release_lock "$lock"
-    fi
-}
-
-# sha256 of a file using whichever helper the host provides.
-sha256_file() {
-    local f="$1"
-    if [ -x "$HANDOFF_SHA256_CMD" ] && [ "$(basename "$HANDOFF_SHA256_CMD")" = "shasum" ]; then
-        "$HANDOFF_SHA256_CMD" -a 256 "$f" 2>/dev/null | awk '{print $1}'
-    elif command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$f" 2>/dev/null | awk '{print $1}'
-    else
-        /usr/bin/shasum -a 256 "$f" 2>/dev/null | awk '{print $1}'
-    fi
 }
 
 # very small JSON value extractor: looks for "<key>"\s*:\s*"<value>" or numeric.
@@ -532,153 +704,6 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
     scan_overdue_overrides "$PROJ_DIR"
 done
 
-
-# ─── v5.4 Phase 4d D-4 — autoclose old tab via helper extension URI ─────────
-# Opt-in: a session-wide env var, or a sentinel file at the global or
-# project level. The watcher only triggers when a fresh new tab has been
-# submitted AND the matching ack/<task>.old_ready evidence is present.
-
-autoclose_enabled_for_project() {
-    local proj_dir="$1"
-    [ "$HANDOFF_AUTOCLOSE_ENABLED" = "1" ] && return 0
-    [ -f "$HANDOFF_ROOT/autoclose.enabled" ] && return 0
-    [ -f "$proj_dir/autoclose.enabled" ] && return 0
-    return 1
-}
-
-# Watcher-readable allow-list. MUST track dump.py OLD_READY_SCHEMA_VERSION
-# (= handoff_precheck.EVIDENCE_SCHEMA_VERSION). Keep prior versions here so an
-# old_ready written by an earlier build still autocloses (P1: backward compat).
-# An unknown version fails closed (writes autoclose_failed.txt, logged — never
-# closes a tab on a schema it can't verify).
-KNOWN_SCHEMA_VERSIONS="5.5.0 v5.4.1 v5.4.0"
-
-# Validate old_ready then trigger the helper URI. All failure paths leave a
-# `<task>.autoclose_failed.txt` next to the ack files so the watcher won't
-# loop on the same task forever.
-try_autoclose() {
-    local proj_dir="$1"; local task="$2"
-    local project; project=$(basename "$proj_dir")
-    local ack="$proj_dir/ack"
-    local queue="$proj_dir/queue"
-    local locks="$proj_dir/locks"
-    local old_ready="$ack/$task.old_ready"
-    local done_marker="$ack/$task.autoclose_done"
-    local failed_marker="$ack/$task.autoclose_failed.txt"
-
-    [ -f "$done_marker" ] && return 0
-    [ -f "$failed_marker" ] && return 0
-    [ -f "$queue/$task.BLOCKED.md" ] && {
-        log "AUTOCLOSE-SKIP: project=$project task=$task — BLOCKED.md present"
-        return 0
-    }
-    [ -f "$queue/$task.done" ] && return 0
-    [ -f "$old_ready" ] || return 0
-
-    # Cheap schema_version whitelist (§7.6 R2 T-B.1).
-    local schema; schema=$(json_get "$old_ready" "schema_version")
-    if ! printf '%s\n' "$KNOWN_SCHEMA_VERSIONS" | tr ' ' '\n' | grep -Fxq "$schema"; then
-        printf 'task_id: %s\nreason: schema_version_unknown\nschema_version: %s\ntime: %s\n' \
-            "$task" "$schema" "$(now_iso_utc)" > "$failed_marker"
-        log "AUTOCLOSE-FAIL: project=$project task=$task reason=schema_version_unknown ($schema)"
-        return 0
-    fi
-
-    # Resolve evidence file: absolute path is the fast path; fall back to the
-    # relative path rooted at $proj_dir (§7.6 移植性) when the absolute path
-    # is gone (different machine / container).
-    local rel_path abs_path declared_hash evidence_file
-    declared_hash=$(json_get "$old_ready" "retro_evidence_hash")
-    rel_path=$(json_get "$old_ready" "retro_evidence_path")
-    abs_path=$(json_get "$old_ready" "retro_evidence_path_absolute")
-
-    if [ -n "$abs_path" ] && [ -f "$abs_path" ]; then
-        evidence_file="$abs_path"
-    elif [ -n "$rel_path" ] && [ -f "$proj_dir/$rel_path" ]; then
-        evidence_file="$proj_dir/$rel_path"
-    else
-        printf 'task_id: %s\nreason: missing_retro_evidence\nrel_path: %s\nabs_path: %s\ntime: %s\n' \
-            "$task" "$rel_path" "$abs_path" "$(now_iso_utc)" > "$failed_marker"
-        log "AUTOCLOSE-FAIL: project=$project task=$task reason=missing_retro_evidence"
-        return 0
-    fi
-
-    local actual_hash; actual_hash=$(sha256_file "$evidence_file")
-    if [ -z "$actual_hash" ] || [ "$actual_hash" != "$declared_hash" ]; then
-        printf 'task_id: %s\nreason: retro_evidence_invalid\ndeclared: %s\nactual: %s\ntime: %s\n' \
-            "$task" "$declared_hash" "$actual_hash" "$(now_iso_utc)" > "$failed_marker"
-        log "AUTOCLOSE-FAIL: project=$project task=$task reason=retro_evidence_invalid"
-        return 0
-    fi
-
-    local nonce; nonce=$(json_get "$old_ready" "nonce")
-
-    # P0: task / project / nonce are interpolated unescaped into the helper URI
-    # query below. task & project are kebab-constrained upstream (dump-time
-    # validate_task_id / validate_project_slug + the .submitted filename), but
-    # nonce is operator-supplied — reject any value that could inject extra
-    # query params (& # = / space …) so the helper can never be steered onto the
-    # wrong tab and close an unrelated session.
-    case "$task$project" in
-        *[!a-z0-9-]*)
-            printf 'task_id: %s\nreason: unsafe_uri_param\nfield: task_or_project\ntime: %s\n' \
-                "$task" "$(now_iso_utc)" > "$failed_marker"
-            log "AUTOCLOSE-FAIL: project=$project task=$task reason=unsafe_uri_param(task/project)"
-            return 0 ;;
-    esac
-    case "$nonce" in
-        *[!A-Za-z0-9._-]*)
-            printf 'task_id: %s\nreason: unsafe_uri_param\nfield: nonce\nnonce: %s\ntime: %s\n' \
-                "$task" "$nonce" "$(now_iso_utc)" > "$failed_marker"
-            log "AUTOCLOSE-FAIL: project=$project task=$task reason=unsafe_uri_param(nonce)"
-            return 0 ;;
-    esac
-
-    # Per-task lock (§7.3 — locks/<task>.autoclose.lock, 5min stale TTL).
-    mkdir -p "$locks"
-    local lock="$locks/$task.autoclose.lock"
-    clean_stale_lock "$lock" 300
-    if ! mkdir "$lock" 2>/dev/null; then
-        log "AUTOCLOSE-SKIP: project=$project task=$task — lock held"
-        return 0
-    fi
-    echo "$$" > "$lock/pid" 2>/dev/null \
-        || log "AUTOCLOSE-WARN: project=$project task=$task — pid file unwritable (stale-lock detection degraded to TTL)"
-    trap 'release_lock "$lock"' RETURN
-    # Re-check sentinels after acquiring the lock (TOCTOU defence per v4 #4).
-    if [ -f "$done_marker" ] || [ -f "$failed_marker" ]; then
-        release_lock "$lock"
-        trap - RETURN
-        return 0
-    fi
-
-    local uri="vscode://dharmaxis.handoff-helper/autoclose?task_id=${task}&nonce=${nonce}&project=${project}"
-    if "$HANDOFF_OPEN_CMD" "$uri" 2>>"$LOG"; then
-        printf 'task_id: %s\nnonce: %s\nuri: %s\ntime: %s\n' \
-            "$task" "$nonce" "$uri" "$(now_iso_utc)" > "$done_marker"
-        log "AUTOCLOSE: project=$project task=$task uri=$uri"
-        AUTOCLOSED=$((AUTOCLOSED + 1))
-    else
-        printf 'task_id: %s\nnonce: %s\nreason: open_uri_failed\ntime: %s\n' \
-            "$task" "$nonce" "$(now_iso_utc)" > "$failed_marker"
-        log "AUTOCLOSE-FAIL: project=$project task=$task reason=open_uri_failed"
-    fi
-    release_lock "$lock"
-    trap - RETURN
-}
-
-for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
-    [ -d "$PROJ_DIR" ] || continue
-    autoclose_enabled_for_project "$PROJ_DIR" || continue
-    ACK_DIR="$PROJ_DIR/ack"
-    [ -d "$ACK_DIR" ] || continue
-    for SUBMITTED in "$ACK_DIR"/*.submitted; do
-        [ -f "$SUBMITTED" ] || continue
-        TASK=$(basename "$SUBMITTED" .submitted)
-        try_autoclose "$PROJ_DIR" "$TASK"
-    done
-done
-
-if [ $AUTOCLOSED -gt 0 ] || [ $OVERDUE_MARKED -gt 0 ]; then
-    log "DONE: autoclose=$AUTOCLOSED overdue_marked=$OVERDUE_MARKED this run"
+if [ $OVERDUE_MARKED -gt 0 ]; then
+    log "DONE: overdue_marked=$OVERDUE_MARKED this run"
 fi
