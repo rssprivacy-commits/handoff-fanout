@@ -27,6 +27,10 @@
 #   --uninstall       reverse everything this script installs
 #   --sync-launcher   push canonical auto-continue.sh → ~/.local/bin + record sha
 #                     (keeps the com.dharmaxis.auto-continue runtime copy canonical)
+#   --headless        install + load the lock-screen headless runner launchd job
+#                     (com.dharmaxis.handoff-headless). DEFAULT OFF / opt-in only —
+#                     the feature still stays OFF per-project until you set a
+#                     headless.enabled sentinel AND the §2.2 on-box spike passes.
 #   -h | --help       show this message
 
 set -euo pipefail
@@ -39,6 +43,7 @@ INSTALL_CONFIG=1
 INSTALL_EXTENSION=1
 UNINSTALL=0
 DO_SYNC_LAUNCHER=0
+INSTALL_HEADLESS=0
 REPO_URL="https://github.com/rssprivacy-commits/handoff-fanout.git"
 
 usage() {
@@ -54,6 +59,7 @@ while [[ $# -gt 0 ]]; do
         --no-extension) INSTALL_EXTENSION=0; shift ;;
         --uninstall)   UNINSTALL=1; shift ;;
         --sync-launcher) DO_SYNC_LAUNCHER=1; shift ;;
+        --headless)    INSTALL_HEADLESS=1; shift ;;
         -h|--help)     usage; exit 0 ;;
         *)             echo "Unknown arg: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -112,6 +118,12 @@ if [[ $UNINSTALL -eq 1 ]]; then
             launchctl unload "$PLIST" 2>/dev/null || true
             rm -f "$PLIST"
             echo "  ✓ removed launchd agent"
+        fi
+        HEADLESS_PLIST="$HOME/Library/LaunchAgents/com.dharmaxis.handoff-headless.plist"
+        if [[ -f "$HEADLESS_PLIST" ]]; then
+            launchctl unload "$HEADLESS_PLIST" 2>/dev/null || true
+            rm -f "$HEADLESS_PLIST"
+            echo "  ✓ removed headless runner launchd agent"
         fi
     fi
     if git rev-parse --git-dir >/dev/null 2>&1; then
@@ -203,6 +215,67 @@ if [[ $INSTALL_LAUNCHD -eq 1 && "$(uname)" == "Darwin" ]]; then
     fi
 elif [[ $INSTALL_LAUNCHD -eq 1 ]]; then
     echo "⊘ launchd skipped (not macOS)"
+fi
+
+# ─── 4b. headless runner launchd agent (opt-in, macOS only) ─────────────────
+# DEFAULT OFF — only when --headless is passed. Installing this job does NOT
+# enable headless: it stays idle until a project opts in (headless.enabled) AND
+# the §2.2 on-box spike passes. The job's QueueDirectories must list each
+# project's headless-req/ dir, so we enumerate existing projects + create the
+# dirs. (A project added later needs a re-run — the documented per-project
+# deployment model.)
+if [[ $INSTALL_HEADLESS -eq 1 && "$(uname)" == "Darwin" ]]; then
+    HANDOFF_BIN="$(command -v handoff || true)"
+    if [[ -z "$HANDOFF_BIN" ]]; then
+        echo "⚠ no \`handoff\` on PATH — install with \`pip install handoff-fanout\` first; skipping headless launchd"
+    else
+        AGENT_DIR="$HOME/Library/LaunchAgents"
+        mkdir -p "$AGENT_DIR"
+        HEADLESS_PLIST="$AGENT_DIR/com.dharmaxis.handoff-headless.plist"
+        # Enumerate project dirs (a project dir is any $HANDOFF_HOME/<name>/ that
+        # has a queue/ subdir), create its headless-req/, build QueueDirectories.
+        QUEUE_DIRS_XML=""
+        for proj_queue in "$HANDOFF_HOME"/*/queue; do
+            [[ -d "$proj_queue" ]] || continue
+            proj_dir="$(dirname "$proj_queue")"
+            mkdir -p "$proj_dir/headless-req"
+            QUEUE_DIRS_XML+="        <string>$proj_dir/headless-req</string>"$'\n'
+        done
+        if [[ -z "$QUEUE_DIRS_XML" ]]; then
+            echo "⚠ no projects with a queue/ found under $HANDOFF_HOME — headless plist would have an empty QueueDirectories; skipping load until a project exists"
+        else
+            # Substitute @@HANDOFF_BIN@@/@@HANDOFF_HOME@@ then splice the
+            # QueueDirectories block (multi-line ⇒ done with awk, not sed s///).
+            sed \
+                -e "s|@@HANDOFF_BIN@@|$HANDOFF_BIN|g" \
+                -e "s|@@HANDOFF_HOME@@|$HANDOFF_HOME|g" \
+                "$ASSET_DIR/launchd/com.dharmaxis.handoff-headless.plist" \
+            | awk -v repl="$QUEUE_DIRS_XML" '
+                /@@QUEUE_DIRECTORIES@@/ { printf "%s", repl; next }
+                { print }
+              ' > "$HEADLESS_PLIST.tmp"
+            # Env-drift defence (§3.2): the generated plist MUST carry both
+            # mandate flags so the headless dump is gated like the GUI path.
+            if ! grep -q "HANDOFF_AUDIT_MANDATE" "$HEADLESS_PLIST.tmp" \
+               || ! grep -q "HANDOFF_RETRO_MANDATE" "$HEADLESS_PLIST.tmp"; then
+                rm -f "$HEADLESS_PLIST.tmp"
+                echo "❌ headless plist missing a mandate env — refusing to install" >&2
+                exit 1
+            fi
+            if [[ -f "$HEADLESS_PLIST" ]] && cmp -s "$HEADLESS_PLIST.tmp" "$HEADLESS_PLIST"; then
+                rm -f "$HEADLESS_PLIST.tmp"
+                echo "✓ headless launchd plist unchanged"
+            else
+                mv "$HEADLESS_PLIST.tmp" "$HEADLESS_PLIST"
+                launchctl unload "$HEADLESS_PLIST" 2>/dev/null || true
+                launchctl load -w "$HEADLESS_PLIST"
+                echo "✓ loaded headless launchd agent → $HEADLESS_PLIST"
+                echo "  (headless stays OFF until a project sets headless.enabled AND the §2.2 spike passes)"
+            fi
+        fi
+    fi
+elif [[ $INSTALL_HEADLESS -eq 1 ]]; then
+    echo "⊘ headless launchd skipped (not macOS)"
 fi
 
 # ─── 5. handoff-helper VS Code extension (tab autoclose) ────────────────────

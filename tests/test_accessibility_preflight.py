@@ -68,10 +68,18 @@ def _setup(home: Path, tmp_path: Path, *, ui_enabled: str, keystroke_exit: int =
     _recording_stub(code_stub, tmp_path / "code.log")
     _osascript_stub(osa_stub, osa_sink, ui_enabled=ui_enabled, keystroke_exit=keystroke_exit)
 
+    # The auto-submit/accessibility path is the UNLOCKED GUI path by
+    # definition; pin the lock probe so routing is deterministic on any host
+    # (incl. Linux CI where ioreg is absent and would read UNKNOWN -> defer).
+    lock_stub = stub_dir / "lockprobe"
+    lock_stub.write_text("#!/bin/bash\necho unlocked\n", encoding="utf-8")
+    lock_stub.chmod(0o755)
     env = dict(os.environ)
     env.update(
         {
             "HANDOFF_ROOT": str(home),
+            "HANDOFF_LOCK_CHECK_CMD": str(lock_stub),
+            "HANDOFF_HEADLESS_SWEEP": "0",
             "HANDOFF_OPEN_CMD": str(open_stub),
             "HANDOFF_CODE_BIN": str(code_stub),
             "HANDOFF_OSASCRIPT_CMD": str(osa_stub),

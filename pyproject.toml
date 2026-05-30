@@ -63,6 +63,7 @@ handoff-heartbeat = "handoff_fanout.heartbeat:main"
 handoff-safe-commit = "handoff_fanout.safe_commit:main"
 handoff-precheck = "handoff_fanout.handoff_precheck:main"
 handoff-prune = "handoff_fanout.prune:main"
+handoff-headless-run = "handoff_fanout.headless_runner:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/handoff_fanout"]

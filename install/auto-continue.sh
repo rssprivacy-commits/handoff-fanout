@@ -45,6 +45,24 @@ HANDOFF_AUTOCLOSE_ENABLED="${HANDOFF_AUTOCLOSE_ENABLED:-0}"
 # comparison. Overridable so tests can point at a specific interpreter.
 HANDOFF_PYTHON_CMD="${HANDOFF_PYTHON_CMD:-python3}"
 
+# ── headless fallback (lock-screen / display-off resilience) ────────────────
+# When the display sleeps the Mac locks (screenLock=immediate) and the GUI
+# osascript-Enter submit silently fails (design spec §1). Locked + per-project
+# opt-in ⇒ route the next session to the launchd-owned headless runner instead
+# of the (doomed) GUI tab. Default OFF; opt in via HANDOFF_HEADLESS_ENABLED=1 or
+# a headless.enabled sentinel (global or per-project), mirroring autoclose.
+HANDOFF_HEADLESS_ENABLED="${HANDOFF_HEADLESS_ENABLED:-0}"
+# Lock probe override (tests stub it). Stub prints locked|unlocked|<other>.
+HANDOFF_LOCK_CHECK_CMD="${HANDOFF_LOCK_CHECK_CMD:-}"
+# ioreg command override (tests stub it to inject sample ioreg output so the
+# key-presence parsing in screen_is_locked is exercised without a real macOS).
+HANDOFF_IOREG_CMD="${HANDOFF_IOREG_CMD:-/usr/sbin/ioreg}"
+# Path to the `handoff` console script, for the launcher-start supervisor sweep
+# (handoff headless-run --sweep-only). Best-effort: a missing CLI never breaks
+# the GUI loop. Tests set HANDOFF_HEADLESS_SWEEP=0 to skip it entirely.
+HANDOFF_CLI="${HANDOFF_CLI:-handoff}"
+HANDOFF_HEADLESS_SWEEP="${HANDOFF_HEADLESS_SWEEP:-1}"
+
 CODE_BIN="${HANDOFF_CODE_BIN:-/usr/local/bin/code}"
 [ ! -x "$CODE_BIN" ] && CODE_BIN="/opt/homebrew/bin/code"
 # fallback: which code
@@ -53,6 +71,47 @@ CODE_BIN="${HANDOFF_CODE_BIN:-/usr/local/bin/code}"
 log() {
     mkdir -p "$HANDOFF_ROOT" 2>/dev/null
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"
+}
+
+# Lock probe. exit 0 = locked, 1 = unlocked, 2 = UNKNOWN (ioreg itself failed).
+#
+# EMPIRICAL key semantics (verified on macOS, design spec §3 precondition 1, and
+# re-verified at impl time): `CGSSessionScreenIsLocked = Yes` is present ONLY when
+# the screen is LOCKED; when UNLOCKED the key is ABSENT (there is no `= No` line in
+# practice). So:
+#   - ioreg command failed / empty output      -> UNKNOWN (2) -> caller fails CLOSED
+#   - "...Locked = Yes" present                 -> LOCKED (0)
+#   - "...Locked = No" present (rare/never)     -> UNLOCKED (1)
+#   - ioreg succeeded, key absent               -> UNLOCKED (1)  <- the normal case
+#
+# ⚠ An earlier draft (faithful to the spec's sample code) mapped key-absent ->
+# UNKNOWN, which would have deferred EVERY task on a normal unlocked machine (100%
+# relay stall). key-absent = unlocked is the correct, relay-preserving mapping and
+# is safe under both possible unlocked encodings. Only a genuine ioreg execution
+# failure is UNKNOWN. The §2.2 spike still validates this probe from the launchd
+# context on the live OS before headless is enabled.
+screen_is_locked() {
+    if [ -n "$HANDOFF_LOCK_CHECK_CMD" ]; then
+        case "$("$HANDOFF_LOCK_CHECK_CMD" 2>/dev/null)" in
+            locked) return 0 ;;
+            unlocked) return 1 ;;
+            *) return 2 ;;
+        esac
+    fi
+    local out
+    out=$("$HANDOFF_IOREG_CMD" -n Root -d1 2>/dev/null) || return 2
+    [ -z "$out" ] && return 2
+    printf '%s' "$out" | /usr/bin/grep -q '"CGSSessionScreenIsLocked" = Yes' && return 0
+    return 1
+}
+
+# Per-project headless opt-in (default OFF), mirroring autoclose_enabled_for_project.
+headless_enabled_for_project() {
+    local proj_dir="$1"
+    [ "$HANDOFF_HEADLESS_ENABLED" = "1" ] && return 0
+    [ -f "$HANDOFF_ROOT/headless.enabled" ] && return 0
+    [ -f "$proj_dir/headless.enabled" ] && return 0
+    return 1
 }
 
 # Drift guard (Phase D / Task 2): warn — never abort — when this DEPLOYED copy
@@ -85,18 +144,43 @@ if [ -f "$HANDOFF_ROOT/done" ]; then
     exit 0
 fi
 
-# 全局 Guard 4: VS Code 必须运行 (tests skip via HANDOFF_VSCODE_CHECK=0)
-if [ "$HANDOFF_VSCODE_CHECK" = "1" ]; then
+# Compute lock state ONCE (machine-global at this tick). Drives both the GUI-
+# guard conditionalization below and the per-.uri routing in the spawn loop.
+screen_is_locked; _lrc=$?
+case "$_lrc" in
+    0) LOCK_STATE=locked ;;
+    1) LOCK_STATE=unlocked ;;
+    *) LOCK_STATE=unknown ;;
+esac
+
+# Launcher-start supervisor sweep (design spec §3.4-2): reconcile any headless
+# child orphaned by a SIGKILLed runner + SIGTERM/SIGKILL any live headless child
+# whose chain is now halted (so 暂停/永久停 actually stop overnight agents even
+# when the running runner can't). Best-effort — a missing `handoff` CLI must
+# never break the GUI loop. Pay the python startup cost ONLY when a headless
+# pidfile actually exists (free no-op otherwise). Skipped in test mode.
+if [ "$HANDOFF_SKIP_SPAWN" != "1" ] && [ "$HANDOFF_HEADLESS_SWEEP" = "1" ]; then
+    if compgen -G "$HANDOFF_ROOT"/*/headless/*.pid >/dev/null 2>&1; then
+        HANDOFF_HEADLESS_ROOT="$HANDOFF_ROOT" "$HANDOFF_CLI" headless-run --sweep-only >>"$LOG" 2>&1 \
+            || log "WARN: headless sweep-only failed (CLI missing / non-fatal)"
+    fi
+fi
+
+# 全局 Guard 4: VS Code 必须运行 (tests skip via HANDOFF_VSCODE_CHECK=0).
+# GUI-path-only (P0 #5): when LOCKED, the GUI submit is doomed regardless
+# (osascript can't punch through the lock) — do NOT exit; fall through to the
+# per-.uri headless/defer routing. Only the unlocked GUI path needs VS Code.
+if [ "$HANDOFF_VSCODE_CHECK" = "1" ] && [ "$LOCK_STATE" = "unlocked" ]; then
     if ! pgrep -f "Visual Studio Code.app" > /dev/null 2>&1; then
-        log "SKIP: VS Code not running"
+        log "SKIP: VS Code not running (unlocked GUI path)"
         exit 0
     fi
 fi
 
-# 全局 Guard 5: code CLI 必须可用 (workspace routing 核心)
-# Skip the strict check when only running autoclose / overdue segments since
-# those do not touch `code -r`.
-if [ "$HANDOFF_SKIP_SPAWN" != "1" ]; then
+# 全局 Guard 5: code CLI 必须可用 (workspace routing 核心).
+# Only the unlocked GUI path uses `code -r`; skip when not spawning
+# (autoclose/overdue only) OR when locked (headless/defer needs no `code`).
+if [ "$HANDOFF_SKIP_SPAWN" != "1" ] && [ "$LOCK_STATE" = "unlocked" ]; then
     if [ -z "$CODE_BIN" ] || [ ! -x "$CODE_BIN" ]; then
         log "FATAL: code CLI not found (workspace routing unavailable)"
         exit 1
@@ -116,6 +200,68 @@ write_ack() {
     local ack_dir="$proj_dir/ack"
     mkdir -p "$ack_dir" 2>/dev/null
     printf '%s\n%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$detail" > "$ack_dir/$task.$state"
+}
+
+# Portable epoch-mtime (BSD/macOS `stat -f %m` vs GNU `stat -c %Y`). Defined here
+# (early) so the spawn-loop defer path can use it; the autoclose block has its
+# own mtime_sec defined later — keep both in sync.
+_mtime_epoch() {
+    case "$(uname)" in
+        Darwin) /usr/bin/stat -f %m "$1" 2>/dev/null ;;
+        *) stat -c %Y "$1" 2>/dev/null ;;
+    esac
+}
+
+# ── headless fallback: defer + dispatch (design spec §3.1 / §3.2) ───────────
+
+# Durable defer marker (§3.1 R2 P1). When locked + NOT opted-in (or lock state
+# UNKNOWN ⇒ fail-closed), the .uri is LEFT in the queue and a KV marker records
+# why + since-when + tick-count so "N tasks paused waiting for unlock" is visible
+# to the 状态/status shortcut and the watchdog — not just an ephemeral toast.
+# The marker is removed when the .uri is finally consumed (unlock→GUI, or owner
+# enables headless). Self-contained (no dependency on later-defined helpers).
+defer_uri() {
+    local proj_dir="$1" queue="$2" task="$3" reason="$4"
+    local marker="$queue/$task.deferred"
+    local now; now=$(/bin/date +%s)
+    local first="$now" ticks=1
+    if [ -f "$marker" ]; then
+        local pf pt
+        pf=$(sed -n 's/^first_epoch=//p' "$marker" 2>/dev/null | head -1)
+        pt=$(sed -n 's/^ticks=//p' "$marker" 2>/dev/null | head -1)
+        case "$pf" in ''|*[!0-9]*) pf="$now" ;; esac
+        case "$pt" in ''|*[!0-9]*) pt=0 ;; esac
+        first="$pf"; ticks=$((pt + 1))
+    fi
+    printf 'task=%s\nreason=%s\nfirst_epoch=%s\nlast_epoch=%s\nticks=%s\n' \
+        "$task" "$reason" "$first" "$now" "$ticks" > "$marker"
+    # Notify at most once per 6h (throttle by a per-project marker mtime) so a
+    # long lock doesn't toast on every 60s launchd tick.
+    local nfile="$proj_dir/.deferred-notified"
+    local do_notify=1
+    if [ -f "$nfile" ]; then
+        local mt; mt=$(_mtime_epoch "$nfile")
+        [ -n "$mt" ] && [ "$((now - mt))" -lt 21600 ] && do_notify=0
+    fi
+    if [ "$do_notify" = "1" ]; then
+        : > "$nfile" 2>/dev/null || true
+        "$HANDOFF_OSASCRIPT_CMD" -e 'display notification "锁屏待接续 — 解锁或为该项目开启 headless" with title "Handoff"' 2>>"$LOG" || true
+    fi
+    log "DEFER: project=$(basename "$proj_dir") task=$task reason=$reason ticks=$ticks"
+}
+
+# Hand a claimed (locked + opted-in) .uri to the launchd-owned headless runner by
+# writing <project>/headless-req/<task>.req (atomic temp+rename). The runner's
+# QueueDirectories fires on the new file; it reads the prompt from queue/<task>.md
+# and the workspace from this .req. auto-continue.sh does NOT run claude itself.
+dispatch_headless() {
+    local proj_dir="$1" task="$2" workspace="$3"
+    local reqdir="$proj_dir/headless-req"
+    mkdir -p "$reqdir" 2>/dev/null
+    local req="$reqdir/$task.req"
+    local tmp="$reqdir/.$task.req.tmp.$$"
+    printf 'WORKSPACE=%s\ntask=%s\n' "$workspace" "$task" > "$tmp" \
+        && mv -f "$tmp" "$req"
 }
 
 # 2026-05-28 codex audit blind-spot #4 修复:
@@ -201,11 +347,40 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
             continue
         fi
 
-        # Atomic claim
+        # ── routing (design spec §3.1): lock state × per-project headless opt-in ──
+        ROUTE=gui
+        if [ "$LOCK_STATE" = "locked" ]; then
+            if headless_enabled_for_project "$PROJ_DIR"; then ROUTE=headless; else ROUTE=defer; fi
+        elif [ "$LOCK_STATE" = "unknown" ]; then
+            ROUTE=defer   # fail-closed: never GUI-submit blind into an unknown lock state
+        fi
+
+        if [ "$ROUTE" = "defer" ]; then
+            if [ "$LOCK_STATE" = "unknown" ]; then
+                defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "lock-unknown"
+            else
+                defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "locked-not-opted-in"
+            fi
+            continue   # leave the .uri in queue for unlock / opt-in (no dead tab)
+        fi
+
+        # Atomic claim (shared by GUI + headless): .uri → launched/
         TS=$(date +%s%N)
         LAUNCHED_FILE="$LAUNCHED/$TASK-$TS.txt"
         if ! mv "$URI_FILE" "$LAUNCHED_FILE" 2>/dev/null; then
             log "SKIP: race lost for project=$PROJECT task=$TASK"
+            continue
+        fi
+        # Consuming the .uri clears any prior defer marker for this task.
+        rm -f "$QUEUE/$TASK.deferred" 2>/dev/null
+
+        if [ "$ROUTE" = "headless" ]; then
+            # Locked + opted-in: hand to the launchd-owned headless runner. The
+            # prompt md (queue/$TASK.md) stays put for the runner to read.
+            dispatch_headless "$PROJ_DIR" "$TASK" "$WORKSPACE"
+            log "HEADLESS-DISPATCH: project=$PROJECT task=$TASK workspace=$WORKSPACE (locked + opted-in)"
+            write_ack "$PROJ_DIR" "$TASK" "headless-dispatched" "wrote headless-req/$TASK.req @ $TS"
+            SPAWNED=$((SPAWNED + 1))
             continue
         fi
 

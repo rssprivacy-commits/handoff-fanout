@@ -54,6 +54,10 @@ def main(argv: list[str] | None = None) -> int:
         "audit-close",
         help="Single-process: assemble codex_audit block → write evidence → dump",
     )
+    sub.add_parser(
+        "headless-run",
+        help="Drain headless-req/ + run locked-screen sessions (launchd-owned; see design spec)",
+    )
 
     # We parse only the first arg, then delegate the rest to the subcommand's own argparse.
     args, rest = parser.parse_known_args(argv)
@@ -94,6 +98,10 @@ def main(argv: list[str] | None = None) -> int:
         from handoff_fanout import codex_audit
 
         return codex_audit.main_audit_close(rest)
+    if args.subcommand == "headless-run":
+        from handoff_fanout import headless_runner
+
+        return headless_runner.main(rest)
 
     parser.print_help(sys.stderr)
     return 2

@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  handoff-fanout — lock-screen / display-off resilient HEADLESS runner.
+
+  Owns the lifecycle of the locked-screen fallback session (design spec
+  docs/design-headless-fallback-display-off.md §3.2). When the display sleeps the
+  Mac locks (screenLock=immediate) and the GUI osascript-Enter submit silently
+  fails; auto-continue.sh then routes the next session here by dropping a
+  <project>/headless-req/<task>.req file. launchd re-launches this job while any
+  .req remains (QueueDirectories), and `handoff headless-run` drains them, running
+  each session headless under `caffeinate -i`.
+
+  This plist is a TEMPLATE. `install/install.sh` substitutes:
+    @@HANDOFF_BIN@@         → resolved path of the `handoff` console script
+    @@HANDOFF_HOME@@        → resolved HANDOFF_HOME (the dharmaxis deployment uses
+                              ~/.claude-handoff, the SAME tree auto-continue.sh
+                              writes headless-req/ into)
+    @@QUEUE_DIRECTORIES@@   → one <string> per project's headless-req/ dir
+
+  DEFAULT OFF: installing this job does NOT enable headless. Headless only runs
+  for a project that opts in (HANDOFF_HEADLESS_ENABLED=1 / a headless.enabled
+  sentinel) AND only while the screen is locked — and only after the §2.2
+  pre-enable on-box spike passes. Until then the .req files are simply never
+  written by auto-continue.sh, so this job stays idle.
+
+  Loaded with:  launchctl load -w ~/Library/LaunchAgents/com.dharmaxis.handoff-headless.plist
+  Logs:         @@HANDOFF_HOME@@/headless-runner.log + per-task <project>/headless/<task>.log
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dharmaxis.handoff-headless</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@@HANDOFF_BIN@@</string>
+        <string>headless-run</string>
+    </array>
+
+    <!-- ONE trigger key: QueueDirectories (NOT WatchPaths). launchd keeps
+         re-launching the job while any watched dir is non-empty, so a .req that
+         arrives mid-run is not lost (WatchPaths is edge-triggered + lossy). The
+         runner empties each dir by unlinking the .req it drains. -->
+    <key>QueueDirectories</key>
+    <array>
+@@QUEUE_DIRECTORIES@@
+    </array>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <!-- launchd's graceful-stop window MUST exceed the runner's 30s
+         SIGTERM→SIGKILL plan so the runner's SIGTERM handler can killpg the
+         child group before launchd SIGKILLs the runner (design spec §3.2). -->
+    <key>ExitTimeOut</key>
+    <integer>90</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>@@HANDOFF_HOME@@/headless-runner.log</string>
+    <key>StandardErrorPath</key>
+    <string>@@HANDOFF_HOME@@/headless-runner.log</string>
+
+    <!-- Each launchd job carries its OWN env (no cross-job inheritance). The
+         mandate flags MUST be set here too so the dump the headless `claude -p`
+         runs is gated identically to the GUI path. install.sh asserts both this
+         plist and com.dharmaxis.auto-continue.plist carry the same mandate
+         block (env-drift defence, design spec §3.2). -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HANDOFF_HOME</key>
+        <string>@@HANDOFF_HOME@@</string>
+        <key>HANDOFF_HEADLESS_ROOT</key>
+        <string>@@HANDOFF_HOME@@</string>
+        <key>HANDOFF_AUDIT_MANDATE</key>
+        <string>1</string>
+        <key>HANDOFF_RETRO_MANDATE</key>
+        <string>1</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
