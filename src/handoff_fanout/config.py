@@ -64,12 +64,16 @@ class Config:
     roadmap: RoadmapSpec = field(default_factory=RoadmapSpec)
     uri_template: str = DEFAULT_URI_TEMPLATE
     workspace_root: Path = field(default_factory=lambda: Path(DEFAULT_WORKSPACE_ROOT).expanduser())
-    # Opt-in codex-audit repo-identity allowlist (Phase D P1 hardening). Empty =
-    # unconfigured = no restriction (the cross-repo anchor's friction + single-
-    # user trust disclaimer still apply). When non-empty, the audit gate accepts
-    # a cross-repo ``code_repo`` ONLY if its realpath matches one of these
-    # (realpath-normalized) absolute paths — closing the wrong-repo selector.
+    # Opt-in codex-audit repo-identity allowlist (Phase D P1 hardening). When the
+    # ``audit_code_repos`` KEY is present, the audit gate accepts a cross-repo
+    # ``code_repo`` ONLY if its realpath matches one of these (realpath-normalized)
+    # absolute paths — closing the wrong-repo selector. ``audit_allowlist_configured``
+    # records key PRESENCE so a key present-but-empty (all entries mis-written /
+    # filtered) fails CLOSED instead of silently degrading to unrestricted. Key
+    # absent → unconfigured → no restriction (the cross-repo anchor's friction +
+    # single-user trust disclaimer still apply).
     audit_code_repos: list[str] = field(default_factory=list)
+    audit_allowlist_configured: bool = False
 
     def queue_dir(self, project: str) -> Path:
         return self.home / project / "queue"
@@ -137,4 +141,5 @@ def _from_dict(data: dict, home: Path) -> Config:
         audit_code_repos=[
             str(r) for r in (data.get("audit_code_repos", []) or []) if isinstance(r, str) and r
         ],
+        audit_allowlist_configured="audit_code_repos" in data,
     )

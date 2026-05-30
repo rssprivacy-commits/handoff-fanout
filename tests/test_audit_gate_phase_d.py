@@ -721,6 +721,58 @@ def test_code_repo_allowlist_resolves_symlink(handoff_home, tmp_path):
     assert outcome.ok, (outcome.klass, outcome.subcode, outcome.detail)
 
 
+def test_resolve_audit_ws_returns_resolved_path_not_symlink(handoff_home, tmp_path):
+    # codex P1-1 (TOCTOU): the gate must operate on the RESOLVED realpath, not the
+    # symlink it was handed, so a symlink can't be repointed between check and use.
+    code_repo = _init_git_repo(tmp_path / "code", marker="resolved-return")
+    link = tmp_path / "code-link"
+    link.symlink_to(code_repo)
+    block = {"code_repo": str(link)}
+    audit_ws, err = codex_audit._resolve_audit_ws(block, tmp_path / "ws")
+    assert err is None
+    assert audit_ws == code_repo.resolve()  # resolved, not the symlink path
+
+
+def test_allowlist_present_but_all_invalid_fails_closed(handoff_home, tmp_path):
+    # codex P1-2 (fail-open): an audit_code_repos KEY present but yielding no valid
+    # entries means the owner INTENDED a restriction but mis-wrote it → fail closed
+    # for cross-repo, not silently degrade to unrestricted.
+    workspace = _init_git_repo(tmp_path / "launcher")
+    code_repo = _init_git_repo(tmp_path / "code", marker="all-junk")
+    (handoff_home / "config.json").write_text(
+        json.dumps({"audit_code_repos": ["", 123, None]}), encoding="utf-8"
+    )
+    payload = _evidence_with_full_audit(
+        input_commit=_head(code_repo),
+        code_repo=str(code_repo),
+        project=PROJECT,
+        task="t-junklist",
+        workspace=workspace,
+    )
+    outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-junklist")
+    assert outcome.klass == "retry"
+    assert outcome.subcode == "codex-audit-code-repo-not-allowed"
+
+
+def test_allowlist_absent_key_stays_unrestricted(handoff_home, tmp_path):
+    # opt-in default: a config.json WITHOUT the audit_code_repos key (or no config
+    # at all) leaves cross-repo unrestricted (distinguishes absent from empty).
+    workspace = _init_git_repo(tmp_path / "launcher")
+    code_repo = _init_git_repo(tmp_path / "code", marker="absent-key")
+    (handoff_home / "config.json").write_text(
+        json.dumps({"workspace_root": "~/Projects"}), encoding="utf-8"
+    )
+    payload = _evidence_with_full_audit(
+        input_commit=_head(code_repo),
+        code_repo=str(code_repo),
+        project=PROJECT,
+        task="t-absentkey",
+        workspace=workspace,
+    )
+    outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-absentkey")
+    assert outcome.ok, (outcome.klass, outcome.subcode, outcome.detail)
+
+
 def test_cross_repo_missing_code_repo_head_is_retry(handoff_home, tmp_path):
     # codex R2/R4: a cross-repo block MUST carry code_repo_head; absent → retry.
     workspace = _init_git_repo(tmp_path / "launcher")

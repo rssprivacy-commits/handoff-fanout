@@ -923,30 +923,34 @@ def _resolve_audit_ws(block: dict, workspace: Path) -> tuple[Path | None, str | 
     candidate = Path(raw)
     if not candidate.is_absolute() or not candidate.is_dir():
         return None, "codex-audit-code-repo-invalid"
-    rc, _ = _audit_git(["rev-parse", "--git-dir"], candidate)
+    # Resolve to the canonical realpath ONCE and operate on / return THAT — a
+    # symlink that resolves to an allowed repo at check time can't be repointed
+    # before later git ops use audit_ws (codex P1-1 TOCTOU). All downstream git
+    # runs against the resolved path, not the caller-supplied alias.
+    try:
+        resolved = candidate.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None, "codex-audit-code-repo-invalid"
+    rc, _ = _audit_git(["rev-parse", "--git-dir"], resolved)
     if rc != 0:
         return None, "codex-audit-code-repo-invalid"
-    # Opt-in repo-identity allowlist (Phase D P1 hardening / codex R1+R3). When the
-    # owner has configured audit_code_repos, a cross-repo code_repo MUST be one of
-    # them (realpath-normalized on both sides, so a symlink alias can't evade or
-    # falsely-reject). Empty/unconfigured → no restriction (single-user friction +
-    # disclaimer above still apply). This converts the wrong-repo trust boundary
-    # from "documented" to "enforced" once the owner opts in.
-    allow = _config.load().audit_code_repos
-    if allow:
-        try:
-            resolved = candidate.resolve()
-        except OSError:
-            return None, "codex-audit-code-repo-invalid"
+    # Opt-in repo-identity allowlist (Phase D P1 hardening / codex R1+R3). Key
+    # PRESENCE = intent to restrict: when audit_code_repos is configured, a
+    # cross-repo code_repo MUST realpath-match a listed path. A configured-but-
+    # empty list (all entries mis-written / filtered to nothing) fails CLOSED, not
+    # silently degrades to unrestricted (codex P1-2 fail-open). Key absent →
+    # unconfigured → no restriction (single-user friction + disclaimer still apply).
+    cfg = _config.load()
+    if cfg.audit_allowlist_configured:
         allowed = set()
-        for a in allow:
+        for a in cfg.audit_code_repos:
             try:
                 allowed.add(Path(a).expanduser().resolve())
             except (OSError, RuntimeError, ValueError):
                 continue
         if resolved not in allowed:
             return None, "codex-audit-code-repo-not-allowed"
-    return candidate, None
+    return resolved, None
 
 
 # Field families that contribute to a finding's stable identity (codex R1-F5 /
