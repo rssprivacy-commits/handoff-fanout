@@ -55,6 +55,20 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"
 }
 
+# Drift guard (Phase D / Task 2): warn — never abort — when this DEPLOYED copy
+# has diverged from the canonical install/auto-continue.sh that `install.sh
+# --sync-launcher` last pushed. The mandate-on overdue-debt scanner lives only
+# in the canonical copy, so a stale runtime launcher silently never enforces it.
+# Non-fatal so a missing/older sha file can never break the接续 loop.
+_CANON_SHA_FILE="$HANDOFF_ROOT/.auto-continue.canonical.sha"
+if [ -f "$_CANON_SHA_FILE" ]; then
+    _self_sha="$("$HANDOFF_SHA256_CMD" "$0" 2>/dev/null | awk '{print $1}')"
+    _canon_sha="$(cat "$_CANON_SHA_FILE" 2>/dev/null)"
+    if [ -n "$_self_sha" ] && [ -n "$_canon_sha" ] && [ "$_self_sha" != "$_canon_sha" ]; then
+        log "⚠ auto-continue.sh drift: running $_self_sha != canonical $_canon_sha — run install.sh --sync-launcher"
+    fi
+fi
+
 # 全局 Guard 1: handoff root 存在
 if [ ! -d "$HANDOFF_ROOT" ]; then
     exit 0

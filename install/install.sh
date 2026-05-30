@@ -25,6 +25,8 @@
 #   --no-config       don't write $HANDOFF_HOME/config.json
 #   --no-extension    skip building/installing the handoff-helper VS Code extension
 #   --uninstall       reverse everything this script installs
+#   --sync-launcher   push canonical auto-continue.sh → ~/.local/bin + record sha
+#                     (keeps the com.dharmaxis.auto-continue runtime copy canonical)
 #   -h | --help       show this message
 
 set -euo pipefail
@@ -36,6 +38,7 @@ INSTALL_LAUNCHD=1
 INSTALL_CONFIG=1
 INSTALL_EXTENSION=1
 UNINSTALL=0
+DO_SYNC_LAUNCHER=0
 REPO_URL="https://github.com/rssprivacy-commits/handoff-fanout.git"
 
 usage() {
@@ -50,6 +53,7 @@ while [[ $# -gt 0 ]]; do
         --no-config)   INSTALL_CONFIG=0; shift ;;
         --no-extension) INSTALL_EXTENSION=0; shift ;;
         --uninstall)   UNINSTALL=1; shift ;;
+        --sync-launcher) DO_SYNC_LAUNCHER=1; shift ;;
         -h|--help)     usage; exit 0 ;;
         *)             echo "Unknown arg: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -72,6 +76,31 @@ if [[ ! -d "$ASSET_DIR/git-hooks" || ! -d "$ASSET_DIR/launchd" || ! -d "$ASSET_D
     echo "❌ asset dir layout looks wrong: $ASSET_DIR" >&2
     echo "   expected git-hooks/, launchd/, examples/ siblings" >&2
     exit 1
+fi
+
+# ─── --sync-launcher : push canonical auto-continue.sh to the runtime ────────
+# The dharmaxis auto-continue launcher (~/.local/bin/auto-continue.sh, run by
+# com.dharmaxis.auto-continue) is a deployed COPY of this repo's canonical
+# install/auto-continue.sh. There is no other sync path, so it drifts. This step
+# pushes the canonical copy to the runtime location, records its sha as the
+# canonical sha (read by the launcher's startup drift guard), and verifies the
+# byte-for-byte copy. Standalone (does not run during a normal install).
+if [[ $DO_SYNC_LAUNCHER -eq 1 ]]; then
+    SRC="$ASSET_DIR/auto-continue.sh"
+    DEST="$HOME/.local/bin/auto-continue.sh"
+    SHA_FILE="$HOME/.claude-handoff/.auto-continue.canonical.sha"
+    if [[ ! -f "$SRC" ]]; then
+        echo "❌ canonical launcher missing: $SRC" >&2; exit 1
+    fi
+    mkdir -p "$HOME/.local/bin" "$HOME/.claude-handoff"
+    cp "$SRC" "$DEST" && chmod +x "$DEST"
+    shasum "$SRC" | awk '{print $1}' > "$SHA_FILE"
+    if [[ "$(shasum "$DEST" | awk '{print $1}')" == "$(cat "$SHA_FILE")" ]]; then
+        echo "✓ launcher synced: $DEST == canonical ($(cat "$SHA_FILE"))"
+    else
+        echo "✗ launcher sync verify FAILED" >&2; exit 1
+    fi
+    exit 0
 fi
 
 # ─── uninstall path ─────────────────────────────────────────────────────────
