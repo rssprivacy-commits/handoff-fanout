@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **VS Code lock-screen auto-unlock path** (`install/auto-continue.sh`). When a
+  project opts in (`<project>/unlock.enabled`) and the screen is locked, the
+  launcher auto-unlocks (via `HANDOFF_UNLOCK_CMD`, e.g. MindPersist's CGEvent
+  password-injection CLI), runs the normal **visible** GUI spawn, then re-locks
+  (`HANDOFF_RELOCK_CMD`, derived from the unlock cmd if unset). This fixes the
+  unattended dead-stall (synthetic Enter is forbidden against a locked screen)
+  while keeping the auditable VS Code tab — no headless blind-box. Hardened:
+  per-project opt-in only (default OFF), a global `.unlock.lock` mutex held
+  across unlock→submit→relock, `caffeinate` + re-probe-before-Enter, a
+  wall-clock unlock timeout, an unlock-failure cooldown (config errors pause for
+  manual fix), and mandatory verified re-lock (halts further spawns if it fails).
+  Locked + not-opted-in / unlock-failed / unknown ⇒ durable `<task>.deferred`
+  marker (keep the `.uri`, notify, resume on unlock).
+- `dump.py`: single-task `.md`/`.uri` writes are now crash-/kill-atomic
+  (`atomic.atomic_replace`).
+
+### Removed
+- **Tab autoclose** (the v4 path-D feature + the `handoff-helper` VS Code
+  extension install). VS Code tabs are the human-audit record and must not
+  auto-close. `install.sh` now uninstalls the obsolete extension as a migration.
+  `ack/<task>.old_ready` + the follow-up overdue scanner are KEPT — they are
+  load-bearing for the §0 new-session audit and the retro / Phase C-D codex-audit
+  gates (not autoclose-specific).
+
 ## [1.8.0] — 2026-05-30
 
 Phase D P1 repo-identity hardening for the cross-repo audit anchor. Two opt-in
