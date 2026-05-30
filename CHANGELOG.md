@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0] — 2026-05-30
+
+Phase D P1 repo-identity hardening for the cross-repo audit anchor. Two opt-in
+owner-configured allowlists close the cross-repo "wrong-repo selector" left as a
+non-crypto, single-user disclaimer in 1.7.0. MINOR — new opt-in config keys; both
+absent → behavior byte-identical to 1.7.0 (the cross-repo anchor's HEAD binding +
+disclaimer still apply).
+
+### Added
+
+- **`audit_code_repos` (path allowlist)**: when configured, a cross-repo
+  `code_repo` must realpath-match a listed directory. Resolve-and-return the
+  canonical path (TOCTOU-safe); key present-but-empty fails CLOSED.
+- **`audit_code_repo_roots` (root-SHA lineage allowlist)**: stronger,
+  path-independent — binds a `code_repo` to its root-commit lineage. EVERY root
+  reachable from HEAD must be listed (subset, so a merge of unrelated history
+  carrying one allowed root is rejected). The identity is read from the TRUE
+  object graph: `--no-replace-objects` (refs/replace), `GIT_GRAFT_FILE=/dev/null`
+  (legacy grafts), `-c core.commitGraph=false` (cached parent lists), and shallow
+  repos are rejected outright (`rev-parse --is-shallow-repository`). Honest
+  scoping: a root SHA names a lineage family, not a unique repo (a fork sharing
+  the root shares the identity) — non-crypto friction, like `owner_ack`. Both
+  allowlists configured → BOTH must pass (never weakens). Key present-but-empty,
+  git error, and empty root set all fail CLOSED.
+
+### Fixed
+
+- `_audit_git` gains an optional `env` MERGED over `os.environ` (preserves
+  PATH/HOME) so identity checks can neutralize repo-controlled history knobs.
+
 ## [1.7.0] — 2026-05-30
 
 Codex audit gate release (Phase A→D). Introduces the full codex-audit evidence
