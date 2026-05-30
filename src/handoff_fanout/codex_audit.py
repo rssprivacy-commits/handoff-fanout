@@ -901,6 +901,19 @@ def _resolve_audit_ws(block: dict, workspace: Path) -> tuple[Path | None, str | 
     NOTE: the *retro* freshness check (retro_gate) stays bound to ``workspace`` —
     retro = "did the launching session close out" (workspace), audit = "was the
     code reviewed" (code repo). They are orthogonal and must not be conflated.
+
+    TRUST MODEL (codex R1/R3 / design §1, owner ruling #1 — SAME single-user model
+    as owner_ack_token): ``code_repo`` is *self-asserted* by the evidence. There is
+    no project→repo registry, so the gate proves "THIS named repo @ its HEAD was
+    audited", not "the canonical repo for this project was audited". A caller could
+    name a different clean repo whose HEAD matches the audited commit — but that
+    repo must actually *contain* that commit (git SHAs are content+history hashes),
+    so it is a copy of the audited code, and a fully malicious AI that fabricates
+    evidence already had broader forgery paths in this single-user model. The
+    available NON-crypto friction (caller declares + gate binds ``code_repo_head``
+    to the live HEAD; see evaluate_audit_gate) is enforced; a repo-identity
+    allowlist / root-SHA binding is the owner-gated mandate-on hardening (deferred,
+    like the owner-held-key owner_ack in design §6), NOT done here.
     """
     raw = block.get("code_repo")
     if raw is None:
@@ -1726,6 +1739,34 @@ def evaluate_audit_gate(
     head_now = head_out.strip()
     if rc != 0 or not head_now:
         return AuditGateOutcome("retry", "codex-audit-head-unknown", "git rev-parse HEAD failed")
+
+    # Cross-repo extra binding (codex R1/R2/R3/R4). Only when code_repo is declared:
+    if block.get("code_repo") is not None:
+        # (R1) docs_only_light_audit derives its diff base from the LAUNCHER's
+        # session_commits, which are unrelated to code_repo — so its "only docs
+        # changed" ruling would diff the wrong repo. Forbid it cross-repo; a real
+        # cross-repo doc change must go through a full audit.
+        if mode == _pc.AUDIT_MODE_DOCS_ONLY:
+            return AuditGateOutcome(
+                "retry",
+                "codex-audit-docs-only-cross-repo",
+                "docs_only_light_audit not allowed cross-repo: its diff base is the "
+                "launcher's session_commits, not code_repo's — use full_codex_audit",
+            )
+        # (R2/R4) the builder always stamps code_repo_head; require it and bind it
+        # to the LIVE code_repo HEAD so a stale / forged / omitted head can't ride
+        # along. This makes the recorded head meaningful and is the available
+        # non-crypto friction for the wrong-code_repo boundary documented in
+        # _resolve_audit_ws (a fully malicious AI is out of the single-user model).
+        declared_head = block.get("code_repo_head")
+        if not isinstance(declared_head, str) or not _commit_equals(
+            audit_ws, declared_head, head_now
+        ):
+            return AuditGateOutcome(
+                "retry",
+                "codex-audit-code-repo-head-mismatch",
+                f"code_repo_head {declared_head!r} != live code_repo HEAD {head_now}",
+            )
 
     # R3-2: the no-audit-needed modes (bypass / empty_diff) may not be used to
     # sidestep a REAL audit that already ran. If any full-audit run artifact is
