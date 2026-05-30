@@ -459,3 +459,258 @@ def test_templates_document_owner_override_and_bypass():
     assert "audit.override.json" in src
     # honest trust-model disclaimer must survive (no "crypto secure" over-claim)
     assert "非加密" in src or "not cryptograph" in src.lower()
+
+
+# ─── Phase D rollout — cross-repo evidence anchor ────────────────────────────
+# G0 must bind the AUDITED code repo's HEAD, not the launching workspace's HEAD.
+# A cross-repo handoff (code audited in repo X, dump launched from workspace Y)
+# would otherwise be false-rejected 100% of the time the moment mandate flips on,
+# because the gate computed head_now from the launching workspace.
+
+
+def _init_git_repo(path: Path, marker: str = "") -> Path:
+    """Create a one-commit git repo at ``path`` and return it (no chdir).
+
+    ``marker`` distinguishes the committed content so two repos created in the
+    same second get DIFFERENT HEAD SHAs (git commit hashes are deterministic over
+    tree+author+timestamp; identical content in the same second would collide).
+    """
+    path.mkdir(parents=True)
+    for cmd in (
+        ["git", "init", "--quiet", "--initial-branch=main"],
+        ["git", "config", "user.email", "t@t.test"],
+        ["git", "config", "user.name", "t"],
+        ["git", "config", "commit.gpgsign", "false"],
+    ):
+        subprocess.run(cmd, cwd=path, check=True)
+    (path / "README.md").write_text(f"test {path.name} {marker}\n")
+    subprocess.run(["git", "add", "README.md"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", f"init {path.name}"], cwd=path, check=True)
+    return path
+
+
+def _evidence_with_full_audit(*, input_commit, code_repo, project, task, workspace):
+    """A clean ``full_codex_audit`` evidence payload (one finding-free run).
+
+    ``code_repo`` (str abs path) is added to the block iff not None; absent →
+    same-repo evidence, byte-identical to today's (backward-compat).
+    """
+    rec = codex_audit.write_findings_artifact(
+        project,
+        task,
+        1,
+        {"run_index": 1, "input_commit": input_commit, "original_findings": []},
+        input_commit=input_commit,
+    )
+    block = {"audit_mode": "full_codex_audit", "audit_runs": [rec], "dispositions": []}
+    if code_repo is not None:
+        block["code_repo"] = code_repo
+    p0 = {k: {"status": "✅"} for k in handoff_precheck.PHASE0_KEYS}
+    p1 = {k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS}
+    return handoff_precheck.build_evidence(
+        task_id=task,
+        project=project,
+        workspace=workspace,
+        phase0=p0,
+        phase1=p1,
+        codex_audit=block,
+    )
+
+
+def test_cross_repo_anchor_binds_code_repo_head(handoff_home, tmp_path):
+    # workspace = launching repo (e.g. erp-system); code_repo = audited repo.
+    workspace = _init_git_repo(tmp_path / "launcher")
+    code_repo = _init_git_repo(tmp_path / "code")
+    code_head = _head(code_repo)
+    # sanity: the two repos have DIFFERENT heads, so binding the wrong one fails.
+    assert code_head != _head(workspace)
+
+    payload = _evidence_with_full_audit(
+        input_commit=code_head,
+        code_repo=str(code_repo),
+        project=PROJECT,
+        task="t-cross",
+        workspace=workspace,
+    )
+    outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-cross")
+    assert outcome.ok, (outcome.klass, outcome.subcode, outcome.detail)
+
+
+def test_same_repo_absent_code_repo_unchanged(handoff_home, tmp_path):
+    # Backward-compat: no code_repo → gate uses workspace exactly as before.
+    workspace = _init_git_repo(tmp_path / "ws")
+    head = _head(workspace)
+    payload = _evidence_with_full_audit(
+        input_commit=head,
+        code_repo=None,
+        project=PROJECT,
+        task="t-same",
+        workspace=workspace,
+    )
+    outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-same")
+    assert outcome.ok, (outcome.klass, outcome.subcode, outcome.detail)
+
+
+def test_invalid_code_repo_is_retry(handoff_home, tmp_path):
+    workspace = _init_git_repo(tmp_path / "ws")
+    payload = _evidence_with_full_audit(
+        input_commit=_head(workspace),
+        code_repo=str(tmp_path / "does-not-exist"),
+        project=PROJECT,
+        task="t-bad",
+        workspace=workspace,
+    )
+    outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-bad")
+    assert outcome.klass == "retry"
+    assert outcome.subcode == "codex-audit-code-repo-invalid"
+
+
+def test_non_string_code_repo_is_retry(handoff_home, tmp_path):
+    # A non-string truthy code_repo (e.g. a list) must fail closed, not crash.
+    workspace = _init_git_repo(tmp_path / "ws")
+    payload = _evidence_with_full_audit(
+        input_commit=_head(workspace),
+        code_repo=None,
+        project=PROJECT,
+        task="t-nonstr",
+        workspace=workspace,
+    )
+    payload["codex_audit"]["code_repo"] = ["/not/a/string"]
+    outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-nonstr")
+    assert outcome.klass == "retry"
+    assert outcome.subcode == "codex-audit-code-repo-invalid"
+
+
+def test_relative_code_repo_is_retry(handoff_home, tmp_path):
+    # A relative code_repo path must be rejected (the gate requires an abs path).
+    workspace = _init_git_repo(tmp_path / "ws")
+    payload = _evidence_with_full_audit(
+        input_commit=_head(workspace),
+        code_repo=None,
+        project=PROJECT,
+        task="t-rel",
+        workspace=workspace,
+    )
+    payload["codex_audit"]["code_repo"] = "relative/path"
+    outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-rel")
+    assert outcome.klass == "retry"
+    assert outcome.subcode == "codex-audit-code-repo-invalid"
+
+
+def test_code_repo_not_a_git_repo_is_retry(handoff_home, tmp_path):
+    # An existing abs dir that is NOT a git repo must fail closed (R1 hardening:
+    # a malicious code_repo can't point at an arbitrary clean directory).
+    workspace = _init_git_repo(tmp_path / "ws")
+    plain_dir = tmp_path / "plain"
+    plain_dir.mkdir()
+    payload = _evidence_with_full_audit(
+        input_commit=_head(workspace),
+        code_repo=str(plain_dir),
+        project=PROJECT,
+        task="t-nogit",
+        workspace=workspace,
+    )
+    outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-nogit")
+    assert outcome.klass == "retry"
+    assert outcome.subcode == "codex-audit-code-repo-invalid"
+
+
+def test_audit_run_code_repo_sources_input_commit(handoff_home, tmp_path, monkeypatch, capsys):
+    # audit-run --code-repo (no --input-commit) records the CODE repo's HEAD,
+    # not the launching workspace's, as the run's input_commit.
+    workspace = _ws(tmp_path, monkeypatch)  # chdir'd launcher
+    code_repo = _init_git_repo(tmp_path / "code", marker="audit-run")
+    code_head = _head(code_repo)
+    assert code_head != _head(workspace)
+
+    findings = {"run_index": 1, "original_findings": []}
+    ffile = tmp_path / "findings.json"
+    ffile.write_text(json.dumps(findings))
+    rc = codex_audit.main_audit_run(
+        [
+            "--task",
+            "t-crun",
+            "--project",
+            PROJECT_WS,
+            "--workspace",
+            str(workspace),
+            "--run-index",
+            "1",
+            "--findings-file",
+            str(ffile),
+            "--code-repo",
+            str(code_repo),
+        ]
+    )
+    assert rc == 0, rc
+    # the printed run record carries input_commit = the CODE repo HEAD.
+    record = json.loads(capsys.readouterr().out.strip())
+    assert record["input_commit"] == code_head
+
+
+def test_audit_close_code_repo_writes_cross_repo_evidence(handoff_home, tmp_path, monkeypatch):
+    # End-to-end: a cross-repo close stamps code_repo + code_repo_head into the
+    # evidence, and that evidence passes the gate against the LAUNCHER workspace.
+    workspace = _ws(tmp_path, monkeypatch)  # chdir'd launcher
+    code_repo = _init_git_repo(tmp_path / "code", marker="audit-close")
+    code_head = _head(code_repo)
+    assert code_head != _head(workspace)
+
+    rec = codex_audit.write_findings_artifact(
+        PROJECT_WS,
+        "t-cclose",
+        1,
+        {"run_index": 1, "input_commit": code_head, "original_findings": []},
+        input_commit=code_head,
+    )
+    argv = [
+        "--task",
+        "t-cclose",
+        "--project",
+        PROJECT_WS,
+        "--workspace",
+        str(workspace),
+        "--next",
+        "next brief",
+        "--audit-mode",
+        "full_codex_audit",
+        "--run-record",
+        json.dumps(rec),
+        "--code-repo",
+        str(code_repo),
+        "--status",
+        "active",
+    ]
+    for k in handoff_precheck.PHASE0_KEYS:
+        argv += ["--phase0-status", f"{k}=✅"]
+    for k in handoff_precheck.PHASE1_KEYS:
+        argv += ["--phase1-status", f"{k}=✅"]
+    rc = codex_audit.main_audit_close(argv)
+    assert rc == 0, rc
+
+    evidence = json.loads(
+        (handoff_precheck.precheck_dir(PROJECT_WS) / "t-cclose.retro.evidence.json").read_text()
+    )
+    assert evidence["codex_audit"]["code_repo"] == str(code_repo)
+    assert evidence["codex_audit"]["code_repo_head"] == code_head
+    # the written evidence passes the gate against the launcher workspace.
+    outcome = codex_audit.evaluate_audit_gate(evidence, workspace, PROJECT_WS, "t-cclose")
+    assert outcome.ok, (outcome.klass, outcome.subcode, outcome.detail)
+
+
+def test_build_block_records_code_repo_and_head(tmp_path):
+    # build_codex_audit_block stamps code_repo + code_repo_head when given a repo;
+    # emits NEITHER key when absent (same-repo evidence stays byte-identical).
+    code_repo = _init_git_repo(tmp_path / "code")
+    code_head = _head(code_repo)
+    rec = {"run_index": 1, "input_commit": code_head, "verdict": "pass"}
+
+    with_repo = codex_audit.build_codex_audit_block(
+        "full_codex_audit", audit_runs=[rec], code_repo=str(code_repo)
+    )
+    assert with_repo["code_repo"] == str(code_repo)
+    assert with_repo["code_repo_head"] == code_head
+
+    without = codex_audit.build_codex_audit_block("full_codex_audit", audit_runs=[rec])
+    assert "code_repo" not in without
+    assert "code_repo_head" not in without

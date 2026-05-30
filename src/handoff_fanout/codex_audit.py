@@ -509,6 +509,25 @@ def verify_findings_artifact(project: str, task: str, run_index: int) -> bool:
 # ─── codex_audit block builder (4 modes — spec §2.1 / §3.5) ─────────────────
 
 
+def _build_code_repo_keys(code_repo: str | None) -> dict:
+    """Validate ``code_repo`` and return ``{"code_repo": abs, "code_repo_head": sha}``
+    (or ``{}`` when absent). Mirrors the gate's ``_resolve_audit_ws`` admission so a
+    block the gate would reject can't be assembled: requires an existing, absolute
+    git repo whose HEAD resolves. Same-repo (None) → no keys (hash-stable)."""
+    if code_repo is None:
+        return {}
+    if not isinstance(code_repo, str) or not code_repo:
+        raise ValueError("code_repo must be a non-empty absolute path string")
+    candidate = Path(code_repo)
+    if not candidate.is_absolute() or not candidate.is_dir():
+        raise ValueError(f"code_repo must be an existing absolute directory: {code_repo!r}")
+    rc, head = _audit_git(["rev-parse", "HEAD"], candidate)
+    head = head.strip()
+    if rc != 0 or not head:
+        raise ValueError(f"code_repo is not a readable git repo: {code_repo!r}")
+    return {"code_repo": str(candidate), "code_repo_head": head}
+
+
 def build_codex_audit_block(
     audit_mode: str,
     *,
@@ -516,6 +535,7 @@ def build_codex_audit_block(
     dispositions: list[dict] | None = None,
     attestation: dict | None = None,
     bypass: dict | None = None,
+    code_repo: str | None = None,
 ) -> dict:
     """Assemble the mode-specific ``codex_audit`` block embedded in evidence.
 
@@ -523,9 +543,17 @@ def build_codex_audit_block(
     that the caller supplied the pieces that mode requires and shapes the block
     accordingly. It does NOT decide the mode (that is the gate's machine
     ruling via ``git diff`` in Phase B) — the caller passes the chosen mode.
+
+    ``code_repo`` (cross-repo anchor): when given, the audited code lives in a
+    repo distinct from the launching workspace; the block records its absolute
+    path + current HEAD so the gate (``_resolve_audit_ws``) binds G0 to the code
+    repo, not the launcher. Absent → no extra keys (same-repo evidence stays
+    byte-identical → schema/canonical hash stable).
     """
     if audit_mode not in _pc.AUDIT_MODES:
         raise ValueError(f"audit_mode must be one of {list(_pc.AUDIT_MODES)}; got {audit_mode!r}")
+
+    code_repo_keys = _build_code_repo_keys(code_repo)
 
     if audit_mode in (_pc.AUDIT_MODE_FULL, _pc.AUDIT_MODE_DOCS_ONLY):
         if not audit_runs:
@@ -534,6 +562,7 @@ def build_codex_audit_block(
             "audit_mode": audit_mode,
             "audit_runs": list(audit_runs),
             "dispositions": list(dispositions or []),
+            **code_repo_keys,
         }
 
     if audit_mode == _pc.AUDIT_MODE_EMPTY_DIFF:
@@ -545,6 +574,7 @@ def build_codex_audit_block(
         return {
             "audit_mode": audit_mode,
             "empty_diff_attestation": {k: attestation[k] for k in required},
+            **code_repo_keys,
         }
 
     # AUDIT_MODE_BYPASS
@@ -584,6 +614,7 @@ def build_codex_audit_block(
         "audit_mode": audit_mode,
         "codex_failure_attempts": list(attempts),
         "follow_up_audit_task_id": follow,
+        **code_repo_keys,
     }
     override_ref = bypass.get("override_ref")
     if override_ref is not None:
@@ -854,6 +885,35 @@ def _commit_equals(workspace: Path, a: str, b: str) -> bool:
     ra = _resolve_commit(workspace, a)
     rb = _resolve_commit(workspace, b)
     return ra is not None and ra == rb
+
+
+def _resolve_audit_ws(block: dict, workspace: Path) -> tuple[Path | None, str | None]:
+    """Pick the repo the gate runs git against.
+
+    ``code_repo`` (an *absolute* path to the audited repo) overrides
+    ``workspace`` for cross-repo handoff — code audited in repo X, dump launched
+    from workspace Y. Absent → ``workspace`` (same-repo, byte-identical behaviour
+    to before). Returns ``(audit_ws, error_subcode)``; on any malformed /
+    non-existent / non-git ``code_repo`` it fails closed with
+    ``codex-audit-code-repo-invalid`` so an attacker can't point the gate at an
+    arbitrary clean directory to fake a matching HEAD.
+
+    NOTE: the *retro* freshness check (retro_gate) stays bound to ``workspace`` —
+    retro = "did the launching session close out" (workspace), audit = "was the
+    code reviewed" (code repo). They are orthogonal and must not be conflated.
+    """
+    raw = block.get("code_repo")
+    if raw is None:
+        return workspace, None
+    if not isinstance(raw, str) or not raw:
+        return None, "codex-audit-code-repo-invalid"
+    candidate = Path(raw)
+    if not candidate.is_absolute() or not candidate.is_dir():
+        return None, "codex-audit-code-repo-invalid"
+    rc, _ = _audit_git(["rev-parse", "--git-dir"], candidate)
+    if rc != 0:
+        return None, "codex-audit-code-repo-invalid"
+    return candidate, None
 
 
 # Field families that contribute to a finding's stable identity (codex R1-F5 /
@@ -1655,7 +1715,14 @@ def evaluate_audit_gate(
             "retry", "codex-audit-required", f"unknown / missing audit_mode: {mode!r}"
         )
 
-    rc, head_out = _audit_git(["rev-parse", "HEAD"], workspace)
+    # Cross-repo anchor: resolve the repo the gate audits ONCE here, then use it
+    # for every git op below. ``code_repo`` (when present) is the audited repo;
+    # absent → the launching workspace (same-repo, unchanged).
+    audit_ws, ws_err = _resolve_audit_ws(block, workspace)
+    if ws_err is not None:
+        return AuditGateOutcome("retry", ws_err, f"code_repo invalid: {block.get('code_repo')!r}")
+
+    rc, head_out = _audit_git(["rev-parse", "HEAD"], audit_ws)
     head_now = head_out.strip()
     if rc != 0 or not head_now:
         return AuditGateOutcome("retry", "codex-audit-head-unknown", "git rev-parse HEAD failed")
@@ -1676,8 +1743,8 @@ def evaluate_audit_gate(
     if mode == _pc.AUDIT_MODE_BYPASS:
         return _gate_bypass(block)
     if mode == _pc.AUDIT_MODE_EMPTY_DIFF:
-        return _gate_empty_diff(block, workspace, head_now)
-    return _gate_full(block, payload, workspace, project, task, head_now, mode)
+        return _gate_empty_diff(block, audit_ws, head_now)
+    return _gate_full(block, payload, audit_ws, project, task, head_now, mode)
 
 
 # ─── CLI ────────────────────────────────────────────────────────────────────
@@ -1707,6 +1774,12 @@ def main_audit_run(argv: list[str] | None = None) -> int:
         "--input-commit",
         default=None,
         help="HEAD this run audited; defaults to the findings file's input_commit",
+    )
+    ap.add_argument(
+        "--code-repo",
+        default=None,
+        help="abs path to the AUDITED repo when it differs from the launching "
+        "workspace; --input-commit then defaults to its HEAD",
     )
     args = ap.parse_args(argv)
 
@@ -1739,7 +1812,19 @@ def main_audit_run(argv: list[str] | None = None) -> int:
         sys.stderr.write("ERR-FATAL findings-file-invalid: original_findings must be a list\n")
         return 1
 
-    input_commit = args.input_commit or findings.get("input_commit")
+    # Cross-repo: when --code-repo is given and --input-commit is not, the run
+    # audited the code repo's HEAD (not the launching workspace's). Resolve it
+    # here so the gate's G0 (last run audited current code-repo HEAD) lines up.
+    code_repo_head = None
+    if args.code_repo and not args.input_commit:
+        cr = Path(args.code_repo).resolve()
+        rc, out = _audit_git(["rev-parse", "HEAD"], cr)
+        out = out.strip()
+        if rc != 0 or not out:
+            sys.stderr.write(f"ERR-FATAL code-repo-head-unknown: {args.code_repo!r}\n")
+            return 1
+        code_repo_head = out
+    input_commit = args.input_commit or code_repo_head or findings.get("input_commit")
     if not input_commit:
         sys.stderr.write(
             "ERR-FATAL input-commit-missing: pass --input-commit or set it in findings\n"
@@ -1846,6 +1931,12 @@ def main_audit_close(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--attestation-file", default=None, help="empty_diff_attestation JSON file")
     ap.add_argument("--bypass-file", default=None, help="codex_unavailable_bypass JSON file")
+    ap.add_argument(
+        "--code-repo",
+        default=None,
+        help="abs path to the AUDITED repo when it differs from the launching "
+        "workspace (cross-repo handoff); binds G0 to its HEAD",
+    )
     ap.add_argument("--status", default="active", help="dump status (active|done|blocked)")
     ap.add_argument("--tests", default=None, help="forwarded to dump --tests")
     # retro evidence phase status (forwarded to precheck-style build)
@@ -1917,6 +2008,9 @@ def main_audit_close(argv: list[str] | None = None) -> int:
                         sys.stderr.write(f"ERR-FATAL run-record-invalid: {rec_err}\n")
                         return 1
             dispositions = load_dispositions(project, args.task)
+            # Resolve a relative --code-repo to abs so the gate's is_absolute()
+            # admission passes; absent → None (same-repo, unchanged).
+            code_repo_abs = str(Path(args.code_repo).resolve()) if args.code_repo else None
             try:
                 block = build_codex_audit_block(
                     args.audit_mode,
@@ -1924,6 +2018,7 @@ def main_audit_close(argv: list[str] | None = None) -> int:
                     dispositions=dispositions,
                     attestation=attestation,
                     bypass=bypass,
+                    code_repo=code_repo_abs,
                 )
             except ValueError as e:
                 sys.stderr.write(f"ERR-FATAL codex-audit-block-invalid: {e}\n")
