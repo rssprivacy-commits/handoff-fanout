@@ -391,7 +391,13 @@ def write_active_dump(
         handoff_home=cfg.home,
         handoff_md_path=md_path,
     )
-    md_path.write_text(handoff_content, encoding="utf-8")
+    # Crash-/kill-atomic single-task write (temp+os.replace). A supervisor kill
+    # mid-dump must never leave a partial .md the launcher then misreads. The
+    # atomic_replace temp name (`.{name}.tmp.<pid>.<ns>`) never matches the
+    # launcher's `*.uri`/`*.md` globs (so an early WatchPaths wake on the temp is
+    # a harmless no-op). NOT write_with_fsync (in-place O_TRUNC = durable but NOT
+    # crash-atomic-replace). See docs/design-unlock-pivot-and-autoclose-removal §3.7.
+    atomic.atomic_replace(md_path, handoff_content)
     print(f"[dump] wrote {md_path} ({len(handoff_content)} bytes)")
 
     if status == "done":
@@ -425,7 +431,8 @@ def write_active_dump(
     # active: write .uri sidecar + clipboard + notification
     uri = build_uri(cfg, project, task)
     uri_path = queue_dir / f"{task}.uri"
-    uri_path.write_text(f"WORKSPACE={workspace}\nURI={uri}\n", encoding="utf-8")
+    # §3.7 — atomic .uri write (see the .md note above).
+    atomic.atomic_replace(uri_path, f"WORKSPACE={workspace}\nURI={uri}\n")
     print(f"[dump] wrote {uri_path}")
 
     _maybe_pbcopy(handoff_content)

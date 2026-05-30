@@ -932,8 +932,11 @@ def test_code_repo_multi_root_requires_all_roots_listed(handoff_home, tmp_path):
     # only root_a listed → subset fails → reject.
     _write_audit_root_allowlist(handoff_home, [root_a])
     payload = _evidence_with_full_audit(
-        input_commit=head, code_repo=str(code_repo), project=PROJECT,
-        task="t-multiroot", workspace=workspace,
+        input_commit=head,
+        code_repo=str(code_repo),
+        project=PROJECT,
+        task="t-multiroot",
+        workspace=workspace,
     )
     out1 = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-multiroot")
     assert out1.klass == "retry"
@@ -980,8 +983,11 @@ def test_code_repo_graft_cannot_fake_root(handoff_home, tmp_path):
     # grafts honored → WITHOUT the defense the gate would see X (allowlisted) and PASS.
     _write_audit_root_allowlist(handoff_home, [root_x])  # only the decoy is listed
     payload = _evidence_with_full_audit(
-        input_commit=head, code_repo=str(code_repo), project=PROJECT,
-        task="t-graft", workspace=workspace,
+        input_commit=head,
+        code_repo=str(code_repo),
+        project=PROJECT,
+        task="t-graft",
+        workspace=workspace,
     )
     outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-graft")
     # WITH GIT_GRAFT_FILE=/dev/null the gate sees the TRUE root A (unlisted) → reject.
@@ -1004,7 +1010,9 @@ def test_code_repo_shallow_repo_rejected(handoff_home, tmp_path):
     # sanity: the clone really is shallow.
     is_shallow = subprocess.run(
         ["git", "rev-parse", "--is-shallow-repository"],
-        cwd=shallow, capture_output=True, text=True,
+        cwd=shallow,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
     assert is_shallow == "true"
     workspace = _init_git_repo(tmp_path / "launcher")
@@ -1012,12 +1020,17 @@ def test_code_repo_shallow_repo_rejected(handoff_home, tmp_path):
     # would pass; with it, the repo is rejected as shallow.
     boundary = subprocess.run(
         ["git", "rev-list", "--max-parents=0", "HEAD"],
-        cwd=shallow, capture_output=True, text=True,
+        cwd=shallow,
+        capture_output=True,
+        text=True,
     ).stdout.split()
     _write_audit_root_allowlist(handoff_home, boundary)
     payload = _evidence_with_full_audit(
-        input_commit=_head(shallow), code_repo=str(shallow), project=PROJECT,
-        task="t-shallow", workspace=workspace,
+        input_commit=_head(shallow),
+        code_repo=str(shallow),
+        project=PROJECT,
+        task="t-shallow",
+        workspace=workspace,
     )
     outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-shallow")
     assert outcome.klass == "retry"
