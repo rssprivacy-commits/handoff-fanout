@@ -1,10 +1,11 @@
-"""v5.4 Phase 4d / v4 path-D autoclose watcher tests.
+"""Follow-up overdue scanner (§7.9) + old_ready writer (D-3) tests.
 
-Implements ``v5.4-retro-mandate-draft.md §7.11 A-01 .. A-12`` plus follow-up
-overdue scanner cases (§7.9). Every test shells out to
+(The v4 tab-autoclose A-series was removed with the autoclose feature, 2026-05-31;
+``old_ready`` + the overdue scanner stay — load-bearing for the §0 new-session
+audit and the retro / Phase C-D codex-audit gates.) Every test shells out to
 ``install/auto-continue.sh`` with ``HANDOFF_SKIP_SPAWN=1`` and a tmpdir
-``HANDOFF_ROOT`` so the main launchd-driven spawn loop is bypassed and the
-only behaviour under test is the autoclose / overdue segments.
+``HANDOFF_ROOT`` so the main spawn loop is bypassed and the only behaviour under
+test is the overdue segment.
 
 External commands the script depends on (``open``, ``osascript``,
 ``shasum``, ``code``) are stubbed via shell scripts that simply record

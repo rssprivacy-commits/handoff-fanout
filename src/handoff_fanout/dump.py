@@ -525,8 +525,8 @@ def _write_old_ready(
         "retro_evidence_path_absolute": str(evidence_path.resolve()),
     }
 
-    # Phase C — surface the codex audit block so the next session (§0) and the
-    # autoclose watcher can verify it. ``codex_audit_hash`` lets them detect a
+    # Phase C — surface the codex audit block so the next session's §0 audit can
+    # verify it. ``codex_audit_hash`` lets it detect a
     # tampered block; ``next_session_forced_task`` is set ONLY for a bypass
     # (the next session owes the skipped audit, spec §1.3). Non-bypass modes
     # impose no forced task. Lazy import: codex_audit imports dump (in

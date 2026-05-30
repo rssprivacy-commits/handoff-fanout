@@ -52,7 +52,16 @@ def _seed(home: Path, ws: Path) -> None:
     (q / f"{TASK}.md").write_text("# prompt\n", encoding="utf-8")
 
 
-def _env(home: Path, tmp_path: Path, *, initial: str, opt_in: bool, unlock_ok: bool) -> dict:
+def _env(
+    home: Path,
+    tmp_path: Path,
+    *,
+    initial: str,
+    opt_in: bool,
+    unlock_ok: bool,
+    fail_rc: int = 1,
+    relock: bool = True,
+) -> dict:
     stub = tmp_path / "stubs"
     stub.mkdir(exist_ok=True)
     state = tmp_path / "lockstate"
@@ -61,16 +70,20 @@ def _env(home: Path, tmp_path: Path, *, initial: str, opt_in: bool, unlock_ok: b
     unlock_sink = tmp_path / "unlock.log"
     relock_sink = tmp_path / "relock.log"
 
+    # R2 P0-1: opt-in is the per-project sentinel ONLY (no global env in tests).
+    if opt_in:
+        (home / PROJECT / "unlock.enabled").write_text("", encoding="utf-8")
+
     # lock probe: prints current state file content
     _w(stub / "lockprobe", '#!/bin/bash\ncat "$_LOCKSTATE" 2>/dev/null || echo unlocked\n')
-    # unlock: success flips state→unlocked (records call); fail leaves it (exit 1)
+    # unlock: success flips state→unlocked (records call); fail leaves it (exit fail_rc)
     if unlock_ok:
         _w(
             stub / "unlock",
             '#!/bin/bash\nprintf u >> "$_UNLOCK_SINK"\necho unlocked > "$_LOCKSTATE"\nexit 0\n',
         )
     else:
-        _w(stub / "unlock", '#!/bin/bash\nprintf u >> "$_UNLOCK_SINK"\nexit 1\n')
+        _w(stub / "unlock", f'#!/bin/bash\nprintf u >> "$_UNLOCK_SINK"\nexit {fail_rc}\n')
     # relock: state→locked (records call)
     _w(
         stub / "relock",
@@ -95,11 +108,11 @@ def _env(home: Path, tmp_path: Path, *, initial: str, opt_in: bool, unlock_ok: b
             "HANDOFF_CODE_BIN": str(stub / "code"),
             "HANDOFF_LOCK_CHECK_CMD": str(stub / "lockprobe"),
             "HANDOFF_UNLOCK_CMD": str(stub / "unlock"),
-            "HANDOFF_RELOCK_CMD": str(stub / "relock"),
+            "HANDOFF_RELOCK_CMD": str(stub / "relock") if relock else "",
             "HANDOFF_CAFFEINATE_CMD": "",  # no caffeinate in tests
             "HANDOFF_SKIP_SPAWN": "0",
             "HANDOFF_VSCODE_CHECK": "0",
-            "HANDOFF_UNLOCK_ENABLED": "1" if opt_in else "0",
+            "HANDOFF_UNLOCK_ENABLED": "0",  # opt-in via per-project sentinel only
             "_LOCKSTATE": str(state),
             "_UNLOCK_SINK": str(unlock_sink),
             "_RELOCK_SINK": str(relock_sink),
@@ -182,6 +195,40 @@ def test_unknown_lock_state_fails_closed_to_defer(home, tmp_path):
     marker = home / PROJECT / "queue" / f"{TASK}.deferred"
     assert marker.exists() and "lock-unknown" in marker.read_text()
     assert (home / PROJECT / "queue" / f"{TASK}.uri").exists()
+
+
+def test_relock_cmd_unset_defers_without_unlocking(home, tmp_path):
+    """R2 P0-3: never unlock without a way to re-lock. With no relock cmd (and an
+    unlock cmd that can't derive --lock), the locked task defers + never unlocks."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _seed(home, ws)
+    env = _env(home, tmp_path, initial="locked", opt_in=True, unlock_ok=True, relock=False)
+    assert _run(env).returncode == 0
+    assert _read(env, "_UNLOCK_SINK") == "", "no relock path → must NOT unlock"
+    marker = home / PROJECT / "queue" / f"{TASK}.deferred"
+    assert marker.exists() and "relock-cmd-unset" in marker.read_text()
+    assert (home / PROJECT / "queue" / f"{TASK}.uri").exists()
+
+
+def test_rc2_config_error_is_permanent_cooldown(home, tmp_path):
+    """R2 P0: unlock rc=2 (no password / config error) ⇒ manual-only — a far-future
+    next_retry, not a 30-min auto-retry loop."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _seed(home, ws)
+    env = _env(home, tmp_path, initial="locked", opt_in=True, unlock_ok=False, fail_rc=2)
+    assert _run(env).returncode == 0
+    cd = home / PROJECT / ".unlock-cooldown"
+    assert cd.exists(), "cooldown marker written"
+    body = cd.read_text()
+    assert "last_rc=2" in body
+    import time as _t
+
+    nr = int(
+        [ln for ln in body.splitlines() if ln.startswith("next_retry_epoch=")][0].split("=")[1]
+    )
+    assert nr > _t.time() + 365 * 24 * 3600, "rc=2 ⇒ effectively permanent pause (manual clear)"
 
 
 def test_cooldown_blocks_unlock(home, tmp_path):

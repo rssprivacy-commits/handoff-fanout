@@ -1,3 +1,12 @@
+# ⚠️ OBSOLETE — autoclose removed (2026-05-31)
+
+The autoclose tab-closing feature this extension drove was removed: VS Code
+tabs are the human-audit record and must not auto-close. This extension is no
+longer installed by `install/install.sh` (which now uninstalls it). Kept only
+for history.
+
+---
+
 # DHARMAXIS Handoff Helper
 
 Auto-closes a stale Claude Code tab after the handoff workflow spawns a fresh

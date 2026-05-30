@@ -194,11 +194,14 @@ screen_is_locked() {
     return 1
 }
 
-# Per-project unlock opt-in (default OFF; NO global default-on — P0-1).
+# Unlock opt-in (R2 P0-1: per-project ONLY — NO global sentinel). Auto-unlock
+# injects the login password, so every project must be enabled deliberately via
+# its own sentinel; there is intentionally no `$HANDOFF_ROOT/unlock.enabled`
+# all-projects switch. HANDOFF_UNLOCK_ENABLED (default OFF) is an explicit
+# operator/test override only.
 unlock_enabled_for_project() {
     local proj_dir="$1"
     [ "$HANDOFF_UNLOCK_ENABLED" = "1" ] && return 0
-    [ -f "$HANDOFF_ROOT/unlock.enabled" ] && return 0
     [ -f "$proj_dir/unlock.enabled" ] && return 0
     return 1
 }
@@ -215,7 +218,11 @@ run_with_timeout() {
     local pid=$! waited=0
     while kill -0 "$pid" 2>/dev/null; do
         if [ "$waited" -ge "$secs" ]; then
-            kill -TERM "$pid" 2>/dev/null; sleep 1; kill -KILL "$pid" 2>/dev/null
+            # R2 P1: reap immediate grandchildren too, not just the direct child.
+            pkill -TERM -P "$pid" 2>/dev/null
+            kill -TERM "$pid" 2>/dev/null; sleep 1
+            pkill -KILL -P "$pid" 2>/dev/null
+            kill -KILL "$pid" 2>/dev/null
             wait "$pid" 2>/dev/null; return 124
         fi
         sleep 1; waited=$((waited + 1))
@@ -274,7 +281,14 @@ unlock_fail_bump() {
     case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
     cnt=$((cnt + 1))
     local nr=$now
-    if [ "$cnt" -ge "$HANDOFF_UNLOCK_FAIL_THRESHOLD" ]; then
+    # R2 P0: rc=2 from the unlock CLI = a config/env error (no Keychain password,
+    # pyobjc missing) — auto-retry can NEVER fix it. Pause until the owner clears
+    # the marker (manual-only), don't loop every cooldown window.
+    if [ "$rc" = "2" ]; then
+        nr=$((now + 3153600000))   # ~100y = effectively permanent / manual-clear
+        "$HANDOFF_OSASCRIPT_CMD" -e "display notification \"自动解锁配置错误（无登录密码/环境缺失）— 已停用自动解锁，须人工修复后清除 .unlock-cooldown\" with title \"Handoff ⛔ 解锁配置\" sound name \"Basso\"" 2>>"$LOG" || true
+        log "UNLOCK-CONFIG-ERROR: project=$(basename "$proj_dir") rc=2 — manual-only until marker cleared"
+    elif [ "$cnt" -ge "$HANDOFF_UNLOCK_FAIL_THRESHOLD" ]; then
         nr=$((now + HANDOFF_UNLOCK_COOLDOWN))
         "$HANDOFF_OSASCRIPT_CMD" -e "display notification \"自动解锁连续失败 $cnt 次，已暂停自动解锁（密码错/Keychain 过期?），请人工处理\" with title \"Handoff ⚠️ 解锁\" sound name \"Basso\"" 2>>"$LOG" || true
         log "UNLOCK-COOLDOWN: project=$(basename "$proj_dir") count=$cnt rc=$rc — pause auto-unlock until $nr"
@@ -304,27 +318,56 @@ release_unlock_lock() {
     rmdir "$GLOBAL_UNLOCK_LOCK" 2>/dev/null || true
 }
 
-# Re-lock after a run we unlocked (P1-5): verify it actually re-locked; loud
-# notification on failure (never leave the Mac silently unlocked unattended).
+# Effective re-lock command: explicit HANDOFF_RELOCK_CMD, else derive from the
+# unlock cmd by swapping --unlock→--lock (the MP unlock CLI supports both). Empty
+# only if neither is available — in which case we must NOT have unlocked (guarded
+# at the call site so we never strand the Mac unlocked).
+effective_relock_cmd() {
+    if [ -n "$HANDOFF_RELOCK_CMD" ]; then printf '%s' "$HANDOFF_RELOCK_CMD"; return 0; fi
+    case "$HANDOFF_UNLOCK_CMD" in
+        *--unlock*) printf '%s' "${HANDOFF_UNLOCK_CMD/--unlock/--lock}" ;;
+        *) printf '' ;;
+    esac
+}
+
+# Re-lock after a run WE unlocked (R2 P0-3 / P1-5): mandatory + verified. On any
+# failure: loud notification + a durable .relock-failed marker + set RELOCK_FAILED
+# so the loop stops launching further sessions (never leave the Mac silently
+# unlocked + keep spawning).
+RELOCK_FAILED=0
 do_relock() {
-    [ -z "$HANDOFF_RELOCK_CMD" ] && return 0
-    run_with_timeout "$HANDOFF_RELOCK_TIMEOUT" $HANDOFF_RELOCK_CMD >>"$LOG" 2>&1
+    local cmd; cmd=$(effective_relock_cmd)
+    if [ -z "$cmd" ]; then
+        RELOCK_FAILED=1; : > "$HANDOFF_ROOT/.relock-failed" 2>/dev/null || true
+        "$HANDOFF_OSASCRIPT_CMD" -e 'display notification "自动解锁后无重新锁屏命令 — 屏幕仍解锁，已停止后续接续，请人工锁屏" with title "Handoff ⛔ 无法重锁" sound name "Basso"' 2>>"$LOG" || true
+        log "RELOCK-FAIL: no relock command — screen left UNLOCKED; halting further spawns"
+        return 1
+    fi
+    run_with_timeout "$HANDOFF_RELOCK_TIMEOUT" $cmd >>"$LOG" 2>&1
     sleep 1
     if ! screen_is_locked; then
-        "$HANDOFF_OSASCRIPT_CMD" -e 'display notification "自动接续后重新锁屏失败 — 屏幕可能仍解锁，请人工锁屏" with title "Handoff ⚠️ 重锁失败" sound name "Basso"' 2>>"$LOG" || true
-        log "RELOCK-FAIL: screen not re-locked (HANDOFF_RELOCK_CMD)"
+        RELOCK_FAILED=1; : > "$HANDOFF_ROOT/.relock-failed" 2>/dev/null || true
+        "$HANDOFF_OSASCRIPT_CMD" -e 'display notification "自动接续后重新锁屏失败 — 屏幕可能仍解锁，已停止后续接续，请人工锁屏" with title "Handoff ⚠️ 重锁失败" sound name "Basso"' 2>>"$LOG" || true
+        log "RELOCK-FAIL: screen not re-locked; halting further spawns"
+        return 1
     fi
+    return 0
 }
 
 # Per-iteration cleanup: stop the held caffeinate + re-lock if WE unlocked. Must
 # run before every `continue` AFTER the unlock gating, and at iteration end.
 CAFF_PID=""
 UNLOCKED_BY_US=0
+UNLOCK_LOCK_HELD=0
 _post_iter_cleanup() {
-    [ -n "$CAFF_PID" ] && kill "$CAFF_PID" 2>/dev/null
-    CAFF_PID=""
+    # Re-lock (while still holding the mutex + caffeinate) if WE unlocked, then
+    # drop caffeinate, then release the global unlock mutex last (P0-2: the mutex
+    # spans the whole unlock→submit→relock critical section).
     [ "$UNLOCKED_BY_US" = "1" ] && do_relock
     UNLOCKED_BY_US=0
+    [ -n "$CAFF_PID" ] && kill "$CAFF_PID" 2>/dev/null
+    CAFF_PID=""
+    [ "$UNLOCK_LOCK_HELD" = "1" ] && { release_unlock_lock; UNLOCK_LOCK_HELD=0; }
 }
 
 # 遍历所有项目子目录 — main spawn loop (gated by HANDOFF_SKIP_SPAWN).
@@ -371,6 +414,7 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
         # ── unlock-pivot gating (design §4): the GUI path needs an unlocked screen ──
         CAFF_PID=""
         UNLOCKED_BY_US=0
+        UNLOCK_LOCK_HELD=0
         screen_is_locked; _LRC=$?
         if [ "$_LRC" = "2" ]; then
             # UNKNOWN lock state ⇒ fail-closed: never GUI-submit blind.
@@ -387,9 +431,15 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
             if [ -z "$HANDOFF_UNLOCK_CMD" ]; then
                 defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "unlock-cmd-unset"; continue
             fi
+            # R2 P0-3: never unlock without a way to RE-lock — else we'd strand the
+            # Mac unlocked. Require an effective relock cmd (explicit or derived).
+            if [ -z "$(effective_relock_cmd)" ]; then
+                defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "relock-cmd-unset"; continue
+            fi
             if ! acquire_unlock_lock; then
                 defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "unlock-busy"; continue
             fi
+            UNLOCK_LOCK_HELD=1
             # Hold caffeinate across unlock→submit (P1-6: keep system awake so it
             # can't re-lock mid-window). Empty HANDOFF_CAFFEINATE_CMD disables.
             if [ -n "$HANDOFF_CAFFEINATE_CMD" ]; then $HANDOFF_CAFFEINATE_CMD >/dev/null 2>&1 & CAFF_PID=$!; fi
@@ -398,15 +448,17 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
                 run_with_timeout "$HANDOFF_UNLOCK_TIMEOUT" $HANDOFF_UNLOCK_CMD >>"$LOG" 2>&1; _URC=$?
                 if screen_is_locked; then
                     unlock_fail_bump "$PROJ_DIR" "$_URC"
-                    [ -n "$CAFF_PID" ] && kill "$CAFF_PID" 2>/dev/null; CAFF_PID=""
-                    release_unlock_lock
-                    defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "unlock-failed-rc$_URC"; continue
+                    defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "unlock-failed-rc$_URC"
+                    _post_iter_cleanup   # kills caffeinate + releases the mutex (no relock — we never unlocked)
+                    continue
                 fi
                 unlock_fail_reset "$PROJ_DIR"
                 UNLOCKED_BY_US=1
                 log "UNLOCK-OK: project=$PROJECT task=$TASK (rc=$_URC)"
             fi
-            release_unlock_lock
+            # R2 P0-2: HOLD the mutex across claim→submit (released in
+            # _post_iter_cleanup) so a 2nd tick can't see the unlocked screen and
+            # race the GUI/Enter. The whole locked-path spawn is globally serial.
         fi
 
         # Atomic claim
@@ -447,6 +499,10 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
                 # on unlock). caffeinate should normally prevent this.
                 log "ABORT-SUBMIT: screen re-locked before Enter — 未按 (tab 已开). project=$PROJECT task=$TASK"
                 write_ack "$PROJ_DIR" "$TASK" "failed" "screen re-locked before submit Enter"
+                # R2 P1: restore the .uri so a later (unlocked) tick can retry,
+                # and mark deferred. The already-open tab stays for audit.
+                mv "$LAUNCHED_FILE" "$URI_FILE" 2>/dev/null
+                defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "re-locked-before-submit"
             elif ! accessibility_trusted; then
                 # Skip the doomed keystroke entirely — it would just log a WARN
                 # and leave the tab un-submitted. Surface it loudly instead.
@@ -476,8 +532,14 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
             mv "$LAUNCHED_FILE" "$URI_FILE"
         fi
 
-        # post-iteration: stop the held caffeinate + re-lock if WE unlocked.
+        # post-iteration: re-lock if WE unlocked + stop caffeinate + release mutex.
         _post_iter_cleanup
+        # R2 P1: if re-lock failed, halt further spawns — do not keep launching
+        # sessions while the Mac is stuck unlocked.
+        if [ "$RELOCK_FAILED" = "1" ]; then
+            log "HALT: relock failed — stopping all further spawns this run"
+            break 2
+        fi
     done
 done
 
