@@ -626,6 +626,101 @@ def test_code_repo_not_a_git_repo_is_retry(handoff_home, tmp_path):
     assert outcome.subcode == "codex-audit-code-repo-invalid"
 
 
+def test_config_parses_audit_code_repos_and_filters_junk(tmp_path):
+    # config layer: audit_code_repos parses to a list[str], dropping non-string /
+    # empty entries (fail-safe so a malformed allowlist can't crash the gate).
+    from handoff_fanout import config as _cfg
+
+    home = tmp_path / "h"
+    home.mkdir()
+    (home / "config.json").write_text(
+        json.dumps({"audit_code_repos": ["/abs/repo", "", 123, None, "/abs/two"]}),
+        encoding="utf-8",
+    )
+    cfg = _cfg.load(home)
+    assert cfg.audit_code_repos == ["/abs/repo", "/abs/two"]
+    # absent key → empty list (unconfigured = opt-in OFF)
+    (home / "config.json").write_text(json.dumps({}), encoding="utf-8")
+    assert _cfg.load(home).audit_code_repos == []
+
+
+def _write_audit_allowlist(home, repos):
+    """Write config.json with an audit_code_repos allowlist into the handoff home."""
+    (home / "config.json").write_text(
+        json.dumps({"audit_code_repos": [str(r) for r in repos]}), encoding="utf-8"
+    )
+
+
+def test_code_repo_allowlist_allows_listed_repo(handoff_home, tmp_path):
+    # opt-in repo-identity allowlist (codex R1/R3 P1): a code_repo ON the list passes.
+    workspace = _init_git_repo(tmp_path / "launcher")
+    code_repo = _init_git_repo(tmp_path / "code", marker="allow-ok")
+    _write_audit_allowlist(handoff_home, [code_repo])
+    payload = _evidence_with_full_audit(
+        input_commit=_head(code_repo),
+        code_repo=str(code_repo),
+        project=PROJECT,
+        task="t-allow-ok",
+        workspace=workspace,
+    )
+    outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-allow-ok")
+    assert outcome.ok, (outcome.klass, outcome.subcode, outcome.detail)
+
+
+def test_code_repo_not_in_allowlist_rejected(handoff_home, tmp_path):
+    # a code_repo NOT on a configured allowlist is rejected (wrong-repo selector closed).
+    workspace = _init_git_repo(tmp_path / "launcher")
+    code_repo = _init_git_repo(tmp_path / "code", marker="not-allowed")
+    other_repo = _init_git_repo(tmp_path / "other", marker="the-only-allowed")
+    _write_audit_allowlist(handoff_home, [other_repo])  # code_repo is NOT listed
+    payload = _evidence_with_full_audit(
+        input_commit=_head(code_repo),
+        code_repo=str(code_repo),
+        project=PROJECT,
+        task="t-not-allowed",
+        workspace=workspace,
+    )
+    outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-not-allowed")
+    assert outcome.klass == "retry"
+    assert outcome.subcode == "codex-audit-code-repo-not-allowed"
+
+
+def test_code_repo_unconfigured_allowlist_is_unrestricted(handoff_home, tmp_path):
+    # backward-compat: no allowlist configured → any valid code_repo is accepted
+    # (the single-user friction + disclaimer still apply; this is opt-in).
+    workspace = _init_git_repo(tmp_path / "launcher")
+    code_repo = _init_git_repo(tmp_path / "code", marker="no-allowlist")
+    # no config.json written → allowlist empty
+    payload = _evidence_with_full_audit(
+        input_commit=_head(code_repo),
+        code_repo=str(code_repo),
+        project=PROJECT,
+        task="t-no-allowlist",
+        workspace=workspace,
+    )
+    outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-no-allowlist")
+    assert outcome.ok, (outcome.klass, outcome.subcode, outcome.detail)
+
+
+def test_code_repo_allowlist_resolves_symlink(handoff_home, tmp_path):
+    # a symlink pointing at an allowed repo is normalized (realpath) → accepted,
+    # so the allowlist can't be evaded or falsely-rejected via a symlink alias.
+    workspace = _init_git_repo(tmp_path / "launcher")
+    code_repo = _init_git_repo(tmp_path / "code", marker="symlink")
+    link = tmp_path / "code-link"
+    link.symlink_to(code_repo)
+    _write_audit_allowlist(handoff_home, [code_repo])  # list the real path
+    payload = _evidence_with_full_audit(
+        input_commit=_head(code_repo),
+        code_repo=str(link),  # evidence names the symlink
+        project=PROJECT,
+        task="t-symlink",
+        workspace=workspace,
+    )
+    outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-symlink")
+    assert outcome.ok, (outcome.klass, outcome.subcode, outcome.detail)
+
+
 def test_cross_repo_missing_code_repo_head_is_retry(handoff_home, tmp_path):
     # codex R2/R4: a cross-repo block MUST carry code_repo_head; absent → retry.
     workspace = _init_git_repo(tmp_path / "launcher")

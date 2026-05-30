@@ -926,6 +926,26 @@ def _resolve_audit_ws(block: dict, workspace: Path) -> tuple[Path | None, str | 
     rc, _ = _audit_git(["rev-parse", "--git-dir"], candidate)
     if rc != 0:
         return None, "codex-audit-code-repo-invalid"
+    # Opt-in repo-identity allowlist (Phase D P1 hardening / codex R1+R3). When the
+    # owner has configured audit_code_repos, a cross-repo code_repo MUST be one of
+    # them (realpath-normalized on both sides, so a symlink alias can't evade or
+    # falsely-reject). Empty/unconfigured → no restriction (single-user friction +
+    # disclaimer above still apply). This converts the wrong-repo trust boundary
+    # from "documented" to "enforced" once the owner opts in.
+    allow = _config.load().audit_code_repos
+    if allow:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return None, "codex-audit-code-repo-invalid"
+        allowed = set()
+        for a in allow:
+            try:
+                allowed.add(Path(a).expanduser().resolve())
+            except (OSError, RuntimeError, ValueError):
+                continue
+        if resolved not in allowed:
+            return None, "codex-audit-code-repo-not-allowed"
     return candidate, None
 
 
@@ -1733,7 +1753,12 @@ def evaluate_audit_gate(
     # absent → the launching workspace (same-repo, unchanged).
     audit_ws, ws_err = _resolve_audit_ws(block, workspace)
     if ws_err is not None:
-        return AuditGateOutcome("retry", ws_err, f"code_repo invalid: {block.get('code_repo')!r}")
+        reason = (
+            "not on the configured audit_code_repos allowlist"
+            if ws_err == "codex-audit-code-repo-not-allowed"
+            else "invalid"
+        )
+        return AuditGateOutcome("retry", ws_err, f"code_repo {reason}: {block.get('code_repo')!r}")
 
     rc, head_out = _audit_git(["rev-parse", "HEAD"], audit_ws)
     head_now = head_out.strip()

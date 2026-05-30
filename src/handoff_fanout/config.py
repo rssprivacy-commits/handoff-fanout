@@ -64,6 +64,12 @@ class Config:
     roadmap: RoadmapSpec = field(default_factory=RoadmapSpec)
     uri_template: str = DEFAULT_URI_TEMPLATE
     workspace_root: Path = field(default_factory=lambda: Path(DEFAULT_WORKSPACE_ROOT).expanduser())
+    # Opt-in codex-audit repo-identity allowlist (Phase D P1 hardening). Empty =
+    # unconfigured = no restriction (the cross-repo anchor's friction + single-
+    # user trust disclaimer still apply). When non-empty, the audit gate accepts
+    # a cross-repo ``code_repo`` ONLY if its realpath matches one of these
+    # (realpath-normalized) absolute paths — closing the wrong-repo selector.
+    audit_code_repos: list[str] = field(default_factory=list)
 
     def queue_dir(self, project: str) -> Path:
         return self.home / project / "queue"
@@ -128,4 +134,7 @@ def _from_dict(data: dict, home: Path) -> Config:
         roadmap=roadmap,
         uri_template=data.get("uri_template", DEFAULT_URI_TEMPLATE),
         workspace_root=Path(workspace_root_raw).expanduser(),
+        audit_code_repos=[
+            str(r) for r in (data.get("audit_code_repos", []) or []) if isinstance(r, str) and r
+        ],
     )
