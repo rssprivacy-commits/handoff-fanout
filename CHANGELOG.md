@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] — 2026-05-30
+
+Codex audit gate release (Phase A→D). Introduces the full codex-audit evidence
++ enforcement gate, **dormant by default** — the package ships the capability
+but it only hard-enforces when `HANDOFF_AUDIT_MANDATE=1` is set in the
+environment. MINOR bump — the public API and all consumers are unchanged when
+the flag is off; same-repo evidence is byte-identical (no schema-hash drift).
+
+### Added
+
+- **Codex audit gate G0–G9** (`codex_audit.evaluate_audit_gate`, wired into
+  `retro_gate` behind `audit_mandate_enabled`): when the mandate is on, a dump
+  whose code changed without a passing codex-audit block is `RETRY`→`BLOCKED`
+  ("缺陷不下传"). Off by default.
+- **Cross-repo evidence anchor**: the gate resolves `audit_ws = code_repo or
+  workspace` once at entry and binds G0 to the *audited* repo's HEAD, not the
+  launching workspace HEAD — so cross-repo handoff (audited code in repo X,
+  dump launched from workspace Y) no longer false-rejects. Optional
+  `code_repo` (absolute path) on the evidence block + `--code-repo` CLI flag on
+  `audit-run` / `audit-close`; absent → workspace (same-repo, unchanged).
+- **`owner_ack_token` (G7)**: a finding the AI argues to waive needs an on-disk
+  owner-ack binding `finding_hash + nonce + approved_at + 7-day expiry`
+  (tamper-evident + friction, honestly non-cryptographic / single-user trust
+  model).
+- **Bypass sidecar producer**: `codex_unavailable_bypass` (≥3 machine-proven
+  codex failures) auto-writes `ack/<task>.audit.override.json` with a
+  `follow_up_audit_task_id` the next session is forced to take (Phase C overdue
+  scanner blocks the next dump if the re-audit never lands).
+- **`install.sh --sync-launcher` + drift self-check**: pushes the canonical
+  `auto-continue.sh` (with the Phase C overdue scanner) to `~/.local/bin` and
+  records a canonical sha; the launcher warns (non-fatal) on drift.
+
+### Fixed
+
+- **Test hermeticity under mandate-on env**: a conftest autouse fixture now
+  clears `HANDOFF_AUDIT_MANDATE` so the suite is hermetic once the mandate is
+  flipped on globally (recorder-only tests assert OFF behavior; gate tests
+  `setenv` it on themselves). Exposed during the Phase D flip — 19 tests read
+  the ambient flag.
+
 ## [1.6.0] — 2026-05-30
 
 v6 concurrency release: the cross-process lock primitive is root-fixed onto

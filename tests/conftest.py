@@ -41,6 +41,21 @@ def no_pbcopy_during_tests(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(subprocess, "Popen", guarded_popen)
 
 
+@pytest.fixture(autouse=True)
+def neutralize_ambient_audit_mandate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin ``HANDOFF_AUDIT_MANDATE`` OFF by default so the suite is hermetic.
+
+    Once Phase D flips the mandate on globally (``~/.zshenv`` +
+    ``launchctl setenv`` + the LaunchAgent plist), any dev/CI shell inherits
+    ``HANDOFF_AUDIT_MANDATE=1``. Tests that exercise the *recorder-only* dump
+    path (retro, autoclose, heartbeat, clipboard, Phase A) assert OFF behavior
+    and must not read the ambient flag. Tests that need the gate enforced
+    (``test_audit_gate_phase_b``) ``monkeypatch.setenv`` it to ``"1"``
+    themselves, which runs after this autouse delenv and wins.
+    """
+    monkeypatch.delenv("HANDOFF_AUDIT_MANDATE", raising=False)
+
+
 @pytest.fixture
 def git_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """Initialise a throwaway git repo in ``tmp_path`` and chdir into it.

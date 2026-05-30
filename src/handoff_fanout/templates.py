@@ -111,7 +111,7 @@ fi
 
 **新会话不代签** (v5.4 spec §2.3 Q9): 缺 evidence 时**不要**自己跑 `handoff precheck` 假装补做 — Phase 0/1 是老会话对自身工作的闭环声明，新会话无法证明。若主人明确授权 forensic retro，用 `handoff precheck --mode forensic_retro` 显式标记。
 
-**Phase C — codex 审计门禁状态** (mandate OFF / 当前阶段): old_ready 的 `codex_audit_hash` / `codex_audit_mode` / `next_session_forced_task` 为审计门禁元数据 (spec §6 Phase C)。`HANDOFF_AUDIT_MANDATE` **未拨** (Phase D 才拨) → 上面的 forced-follow-up 检查目前是**会话自律**警示, 非工具层硬拒。详 `project-files/handoff/codex-audit-gate-spec-draft.md` §1.3 / §6。
+**Phase D — codex 审计门禁状态** (mandate ON / flipped 2026-05-30): old_ready 的 `codex_audit_hash` / `codex_audit_mode` / `next_session_forced_task` 为审计门禁元数据 (spec §6 Phase D)。`HANDOFF_AUDIT_MANDATE=1` **已拨** (三路径: `.zshenv` + `launchctl setenv` + `auto-continue.plist EnvironmentVariables`) → 上面的 forced-follow-up 检查现为**工具层硬拒** (非会话自律): 前任 codex 审计走 bypass 时下一棒接了别的 task = §0 拦下。详 `project-files/handoff/codex-audit-gate-spec-draft.md` §1.3 / §6。
 
 ## 第一步: 启动 heartbeat (v5.1+ / 529 风暴防御 / v4.1 单 task 模式)
 
@@ -244,7 +244,7 @@ handoff dump \\
 
 **当前阶段** (Phase 4c flipped 2026-05-29 / 已拨): `HANDOFF_RETRO_MANDATE=1` 在 `~/.zshenv` + `launchctl setenv` + `auto-continue.plist EnvironmentVariables` 三路径全量生效。不带 `--retro-evidence` 调 dump → exit 4 `ERR-RETRY` 拒绝; 紧急 P0 走 `HANDOFF_RETRO_BYPASS=1` + `ack/<task>.retro.override.json` (含 `follow_up_retro_task_id` + ISO-8601 `follow_up_deadline`)。
 
-### §-1.5 codex 审计门禁 — audit-close 流程 (Phase C / mandate OFF / spec §6)
+### §-1.5 codex 审计门禁 — audit-close 流程 (Phase D / mandate ON / spec §6)
 
 本 task 若**改了代码** (非纯文档), 闭环时应跑 codex 审计并用 `handoff audit-close` 替代裸 `handoff dump` —— 它在**单进程持锁内**把 codex 审计块 (机器可校验) 折进 retro evidence 再 dump, HEAD 不会在审计与 dump 之间漂移 (spec §1.6 / R2-P0-6)。
 
@@ -267,7 +267,7 @@ handoff audit-close \\
 
 **owner_override (豁免 finding / 需主人单按钮)**: AI 遇到一个它主张"豁免不修"的 P0/P1 → 调 AskUserQuestion 单按钮「确认豁免」(与 5/28 单按钮二段确认立法一致) → 主人点击后 AI 调 `write_owner_ack(...)` 写 `ack/<task>.owner_ack.<finding_hash_short>.json` (绑定 finding_hash + nonce + `owner_ack_token` 校验和 + 7天 `expires_at`) + 在 disposition 写 `disposition=owner_override` 带同一 `owner_ack_token`。gate G7 读 on-disk ack 校验: 存在 + schema 支持 + ack.finding_hash==该 finding + 重算 `sha256(task|finding_hash|nonce|approved_at)` 三方一致 + 未过期, 任一不满足 = BLOCKED。**诚实声明**: `owner_ack_token` = **防篡改 + 摩擦**绑定校验和, **非加密**; 防的是一次批准被静默复用到别的 finding / 无限期有效 / 无痕批准, **不防**恶意 AI 以主人身份伪造批准 (单用户场景接受 / 多用户上线再引入主人持密钥的 HMAC / 设计 §1 + §6)。
 
-**当前阶段** (Phase C / mandate OFF): `HANDOFF_AUDIT_MANDATE` 未拨, dump gate 暂**不**强制 G0-G9, audit-close 只**记录**审计块 (不阻断旧流程)。Phase D 三路径拨 `HANDOFF_AUDIT_MANDATE=1` 后才达成"缺陷不下传"。详 `project-files/handoff/codex-audit-gate-spec-draft.md` §6 + `owner-ack-token-design.md`。✅ Phase D 前置两项已补: `owner_ack_token` 绑定校验 (非加密 / G7) + bypass sidecar producer。
+**当前阶段** (Phase D / mandate ON / flipped 2026-05-30): `HANDOFF_AUDIT_MANDATE=1` **已拨** (三路径全量生效), dump gate **强制** G0-G9 — 改了代码却无通过的 codex 审计块 → dump 被 RETRY→BLOCKED ("缺陷不下传"已落地)。本 task 若改代码用 `handoff audit-close` 替代裸 `handoff dump`。详 `project-files/handoff/codex-audit-gate-spec-draft.md` §6 + `owner-ack-token-design.md`。✅ Phase D 前置两项已补: `owner_ack_token` 绑定校验 (非加密 / G7) + bypass sidecar producer。
 
 成功 → launchd / cron WatchPaths 1 秒内 spawn 新 Claude tab.
 
