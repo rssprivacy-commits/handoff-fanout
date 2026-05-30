@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -850,12 +851,16 @@ class AuditGateOutcome:
 _AUDIT_OK = AuditGateOutcome("ok")
 
 
-def _audit_git(args: list[str], cwd: Path) -> tuple[int, str]:
+def _audit_git(args: list[str], cwd: Path, env: dict[str, str] | None = None) -> tuple[int, str]:
     """Run git, returning ``(returncode, stdout)``; ``(-1, "")`` if unspawnable.
 
     Returning the rc lets the gate distinguish a genuinely-empty result (rc 0,
     e.g. an empty diff) from a git failure (rc != 0) — critical for fail-closed
     behaviour: a failed ``git diff`` must never read as "no changes".
+
+    ``env`` (when given) is MERGED over ``os.environ`` (not replacing it), so a
+    caller can neutralize repo-controlled history-rewrite knobs for identity checks
+    (e.g. ``GIT_GRAFT_FILE=/dev/null``) without dropping PATH/HOME.
     """
     try:
         r = subprocess.run(
@@ -865,6 +870,7 @@ def _audit_git(args: list[str], cwd: Path) -> tuple[int, str]:
             text=True,
             timeout=5,
             check=False,
+            env={**os.environ, **env} if env else None,
         )
         return r.returncode, r.stdout or ""
     except (subprocess.SubprocessError, OSError):
@@ -904,16 +910,27 @@ def _resolve_audit_ws(block: dict, workspace: Path) -> tuple[Path | None, str | 
 
     TRUST MODEL (codex R1/R3 / design §1, owner ruling #1 — SAME single-user model
     as owner_ack_token): ``code_repo`` is *self-asserted* by the evidence. There is
-    no project→repo registry, so the gate proves "THIS named repo @ its HEAD was
-    audited", not "the canonical repo for this project was audited". A caller could
-    name a different clean repo whose HEAD matches the audited commit — but that
-    repo must actually *contain* that commit (git SHAs are content+history hashes),
-    so it is a copy of the audited code, and a fully malicious AI that fabricates
-    evidence already had broader forgery paths in this single-user model. The
-    available NON-crypto friction (caller declares + gate binds ``code_repo_head``
-    to the live HEAD; see evaluate_audit_gate) is enforced; a repo-identity
-    allowlist / root-SHA binding is the owner-gated mandate-on hardening (deferred,
-    like the owner-held-key owner_ack in design §6), NOT done here.
+    no project→repo registry, so by default the gate proves "THIS named repo @ its
+    HEAD was audited", not "the canonical repo for this project was audited". A
+    caller could name a different clean repo whose HEAD matches the audited commit —
+    but that repo must actually *contain* that commit (git SHAs are content+history
+    hashes), so it is a copy of the audited code, and a fully malicious AI that
+    fabricates evidence already had broader forgery paths in this single-user model.
+
+    OPT-IN HARDENING (Phase D P1, owner ruling 2026-05-30): two independent owner-
+    configured allowlists close the wrong-repo selector. ``audit_code_repos`` (paths)
+    requires the resolved ``code_repo`` to be a listed directory;
+    ``audit_code_repo_roots`` (root-commit SHAs) requires EVERY root reachable from
+    its HEAD to be listed (subset — a merge of unrelated history carrying one allowed
+    root is rejected). The root identity is computed against the TRUE object graph:
+    refs/replace, legacy grafts, and the commit-graph cache are all neutralized, and a
+    shallow repo (whose truncated history can't establish a true root) is rejected
+    outright. Each enforces only when its config KEY is present;
+    both present → BOTH must pass; key present-but-empty fails CLOSED. HONEST SCOPING
+    (like owner_ack): a root SHA names a lineage family, not a unique repo — a fork
+    sharing the allowlisted root shares the identity. The remaining non-crypto friction
+    (gate binds ``code_repo_head`` to the live HEAD; see evaluate_audit_gate) is always
+    enforced. The owner-held-key HMAC for a multi-user future stays deferred (design §6).
     """
     raw = block.get("code_repo")
     if raw is None:
@@ -950,6 +967,43 @@ def _resolve_audit_ws(block: dict, workspace: Path) -> tuple[Path | None, str | 
                 continue
         if resolved not in allowed:
             return None, "codex-audit-code-repo-not-allowed"
+    # Opt-in ROOT-SHA identity allowlist (Phase D P1 / owner ruling — stronger,
+    # path-independent). Independent gate from the path allowlist: when the
+    # ``audit_code_repo_roots`` KEY is present the code_repo's root-commit SHA must
+    # be listed. Key present-but-empty (all entries junk) fails CLOSED — the
+    # intended-restriction set is empty, so no repo's root can be in it → reject
+    # (mirrors the path allowlist fail-closed). Both configured → BOTH must pass.
+    if cfg.audit_code_roots_configured:
+        allowed_roots = {r.strip().lower() for r in cfg.audit_code_repo_roots if r.strip()}
+        # An *identity* check must bind the TRUE object graph, not repo-controlled
+        # history knobs (codex P1 x4). Neutralize every one that can make HEAD appear
+        # rooted at a SHA it doesn't truly descend from:
+        #   --no-replace-objects     → refs/replace
+        #   GIT_GRAFT_FILE=/dev/null → legacy $GIT_DIR/info/grafts
+        #   -c core.commitGraph=false→ commit-graph cached parent lists (may live in
+        #                              alternates)
+        # and reject shallow repos outright — a .git/shallow boundary is treated as a
+        # root by git, so a truncated clone's true root can't be established.
+        _id_flags = ["-c", "core.commitGraph=false", "--no-replace-objects"]
+        _id_env = {"GIT_GRAFT_FILE": "/dev/null"}
+        rc_s, shallow_out = _audit_git(
+            [*_id_flags, "rev-parse", "--is-shallow-repository"], resolved, env=_id_env
+        )
+        if rc_s != 0 or shallow_out.strip().lower() != "false":
+            return None, "codex-audit-code-repo-shallow"
+        rc_r, root_out = _audit_git(
+            [*_id_flags, "rev-list", "--max-parents=0", "HEAD"], resolved, env=_id_env
+        )
+        if rc_r != 0:
+            return None, "codex-audit-code-repo-root-unknown"
+        repo_roots = {ln.strip().lower() for ln in root_out.splitlines() if ln.strip()}
+        # SUBSET, not intersection (codex P1): EVERY root reachable from HEAD must be
+        # allowlisted. A repo that merges unrelated history carrying one allowed root
+        # *plus its own unlisted root* is therefore rejected; a legit multi-root repo
+        # passes only when the owner lists all its roots. Empty set (no commits) →
+        # fail closed.
+        if not repo_roots or not (repo_roots <= allowed_roots):
+            return None, "codex-audit-code-repo-root-not-allowed"
     return resolved, None
 
 
@@ -1757,11 +1811,16 @@ def evaluate_audit_gate(
     # absent → the launching workspace (same-repo, unchanged).
     audit_ws, ws_err = _resolve_audit_ws(block, workspace)
     if ws_err is not None:
-        reason = (
-            "not on the configured audit_code_repos allowlist"
-            if ws_err == "codex-audit-code-repo-not-allowed"
-            else "invalid"
-        )
+        reason = {
+            "codex-audit-code-repo-not-allowed": "not on the configured audit_code_repos allowlist",
+            "codex-audit-code-repo-root-not-allowed": (
+                "root-commit SHA not on the configured audit_code_repo_roots allowlist"
+            ),
+            "codex-audit-code-repo-root-unknown": "root-commit SHA could not be determined",
+            "codex-audit-code-repo-shallow": (
+                "shallow repo — true root cannot be established for identity check"
+            ),
+        }.get(ws_err, "invalid")
         return AuditGateOutcome("retry", ws_err, f"code_repo {reason}: {block.get('code_repo')!r}")
 
     rc, head_out = _audit_git(["rev-parse", "HEAD"], audit_ws)

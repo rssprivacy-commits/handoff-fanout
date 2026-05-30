@@ -773,6 +773,276 @@ def test_allowlist_absent_key_stays_unrestricted(handoff_home, tmp_path):
     assert outcome.ok, (outcome.klass, outcome.subcode, outcome.detail)
 
 
+def _root_sha(repo: Path) -> str:
+    """Root-commit SHA of ``repo`` (the path-independent repo identity)."""
+    out = subprocess.run(
+        ["git", "rev-list", "--max-parents=0", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    return out.splitlines()[0].strip()
+
+
+def _write_audit_root_allowlist(home, roots, repos=None):
+    """Write config.json with an audit_code_repo_roots allowlist (and optional paths)."""
+    data = {"audit_code_repo_roots": [str(r) for r in roots]}
+    if repos is not None:
+        data["audit_code_repos"] = [str(r) for r in repos]
+    (home / "config.json").write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_code_repo_root_allowlist_allows_listed_root(handoff_home, tmp_path):
+    # opt-in root-SHA identity allowlist (Phase D P1 / owner ruling): a code_repo
+    # whose root-commit SHA is listed passes.
+    workspace = _init_git_repo(tmp_path / "launcher")
+    code_repo = _init_git_repo(tmp_path / "code", marker="root-ok")
+    _write_audit_root_allowlist(handoff_home, [_root_sha(code_repo)])
+    payload = _evidence_with_full_audit(
+        input_commit=_head(code_repo),
+        code_repo=str(code_repo),
+        project=PROJECT,
+        task="t-root-ok",
+        workspace=workspace,
+    )
+    outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-root-ok")
+    assert outcome.ok, (outcome.klass, outcome.subcode, outcome.detail)
+
+
+def test_code_repo_root_not_in_allowlist_rejected(handoff_home, tmp_path):
+    # a code_repo whose root SHA is NOT on a configured root allowlist is rejected.
+    workspace = _init_git_repo(tmp_path / "launcher")
+    code_repo = _init_git_repo(tmp_path / "code", marker="root-bad")
+    other = _init_git_repo(tmp_path / "other", marker="the-only-allowed-root")
+    _write_audit_root_allowlist(handoff_home, [_root_sha(other)])  # code_repo's root NOT listed
+    payload = _evidence_with_full_audit(
+        input_commit=_head(code_repo),
+        code_repo=str(code_repo),
+        project=PROJECT,
+        task="t-root-bad",
+        workspace=workspace,
+    )
+    outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-root-bad")
+    assert outcome.klass == "retry"
+    assert outcome.subcode == "codex-audit-code-repo-root-not-allowed"
+
+
+def test_code_repo_root_allowlist_is_path_independent(handoff_home, tmp_path):
+    # the value-add over the path allowlist: a repo moved to a DIFFERENT path still
+    # passes (identity = root SHA, not location). Verify by listing the root SHA but
+    # NOT the path, and naming the repo at its real (unlisted-as-path) location.
+    workspace = _init_git_repo(tmp_path / "launcher")
+    code_repo = _init_git_repo(tmp_path / "moved-here", marker="path-indep")
+    _write_audit_root_allowlist(handoff_home, [_root_sha(code_repo)])  # root only, no path
+    payload = _evidence_with_full_audit(
+        input_commit=_head(code_repo),
+        code_repo=str(code_repo),
+        project=PROJECT,
+        task="t-path-indep",
+        workspace=workspace,
+    )
+    outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-path-indep")
+    assert outcome.ok, (outcome.klass, outcome.subcode, outcome.detail)
+
+
+def test_code_repo_root_present_but_all_invalid_fails_closed(handoff_home, tmp_path):
+    # mirror the path allowlist fail-closed (codex P1-2): a root KEY present but
+    # yielding no valid entries means the owner intended a restriction → fail closed.
+    workspace = _init_git_repo(tmp_path / "launcher")
+    code_repo = _init_git_repo(tmp_path / "code", marker="root-junk")
+    (handoff_home / "config.json").write_text(
+        json.dumps({"audit_code_repo_roots": ["", 123, None]}), encoding="utf-8"
+    )
+    payload = _evidence_with_full_audit(
+        input_commit=_head(code_repo),
+        code_repo=str(code_repo),
+        project=PROJECT,
+        task="t-root-junk",
+        workspace=workspace,
+    )
+    outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-root-junk")
+    assert outcome.klass == "retry"
+    assert outcome.subcode == "codex-audit-code-repo-root-not-allowed"
+
+
+def test_code_repo_root_absent_key_stays_unrestricted(handoff_home, tmp_path):
+    # opt-in default: no audit_code_repo_roots key → no root restriction.
+    workspace = _init_git_repo(tmp_path / "launcher")
+    code_repo = _init_git_repo(tmp_path / "code", marker="root-absent")
+    (handoff_home / "config.json").write_text(
+        json.dumps({"workspace_root": "~/Projects"}), encoding="utf-8"
+    )
+    payload = _evidence_with_full_audit(
+        input_commit=_head(code_repo),
+        code_repo=str(code_repo),
+        project=PROJECT,
+        task="t-root-absent",
+        workspace=workspace,
+    )
+    outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-root-absent")
+    assert outcome.ok, (outcome.klass, outcome.subcode, outcome.detail)
+
+
+def test_code_repo_path_and_root_both_configured_both_must_pass(handoff_home, tmp_path):
+    # both allowlists configured → independent gates, BOTH must pass (never weakens).
+    workspace = _init_git_repo(tmp_path / "launcher")
+    code_repo = _init_git_repo(tmp_path / "code", marker="both-gates")
+    other = _init_git_repo(tmp_path / "other", marker="other-root")
+    # path matches but root is some OTHER repo's root → must REJECT (root gate fails).
+    _write_audit_root_allowlist(handoff_home, [_root_sha(other)], repos=[code_repo])
+    payload = _evidence_with_full_audit(
+        input_commit=_head(code_repo),
+        code_repo=str(code_repo),
+        project=PROJECT,
+        task="t-both",
+        workspace=workspace,
+    )
+    outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-both")
+    assert outcome.klass == "retry"
+    assert outcome.subcode == "codex-audit-code-repo-root-not-allowed"
+    # now list BOTH correctly → passes.
+    _write_audit_root_allowlist(handoff_home, [_root_sha(code_repo)], repos=[code_repo])
+    outcome2 = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-both")
+    assert outcome2.ok, (outcome2.klass, outcome2.subcode, outcome2.detail)
+
+
+def test_code_repo_multi_root_requires_all_roots_listed(handoff_home, tmp_path):
+    # codex P1: a repo that merged unrelated history has >1 root. Listing only ONE
+    # allowed root must NOT let it pass (subset semantics) — else an attacker grafts
+    # an allowed root onto its own unlisted history. Listing ALL roots → passes.
+    workspace = _init_git_repo(tmp_path / "launcher")
+    code_repo = _init_git_repo(tmp_path / "code", marker="multi-root-A")
+    root_a = _root_sha(code_repo)
+    # second, unrelated root via an orphan branch, then merge into main.
+    subprocess.run(["git", "checkout", "--orphan", "side"], cwd=code_repo, check=True)
+    (code_repo / "SIDE.md").write_text("unrelated B\n")
+    subprocess.run(["git", "add", "SIDE.md"], cwd=code_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "side root B"], cwd=code_repo, check=True)
+    root_b = _root_sha(code_repo)  # on 'side' this is B
+    subprocess.run(["git", "checkout", "main"], cwd=code_repo, check=True)
+    subprocess.run(
+        ["git", "merge", "--allow-unrelated-histories", "--no-edit", "side"],
+        cwd=code_repo,
+        check=True,
+    )
+    assert root_a != root_b
+    head = _head(code_repo)
+
+    # only root_a listed → subset fails → reject.
+    _write_audit_root_allowlist(handoff_home, [root_a])
+    payload = _evidence_with_full_audit(
+        input_commit=head, code_repo=str(code_repo), project=PROJECT,
+        task="t-multiroot", workspace=workspace,
+    )
+    out1 = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-multiroot")
+    assert out1.klass == "retry"
+    assert out1.subcode == "codex-audit-code-repo-root-not-allowed"
+
+    # both roots listed → subset holds → pass.
+    _write_audit_root_allowlist(handoff_home, [root_a, root_b])
+    out2 = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-multiroot")
+    assert out2.ok, (out2.klass, out2.subcode, out2.detail)
+
+
+def test_code_repo_graft_cannot_fake_root(handoff_home, tmp_path):
+    # codex R2 P1: a repo-local .git/info/grafts file can rewrite parentage so HEAD
+    # appears rooted at an allowlisted SHA it doesn't truly descend from. The gate must
+    # neutralize grafts (GIT_GRAFT_FILE=/dev/null) and bind the TRUE root.
+    workspace = _init_git_repo(tmp_path / "launcher")
+    code_repo = _init_git_repo(tmp_path / "code", marker="graft")
+    root_a = _root_sha(code_repo)  # true root A (current HEAD)
+    (code_repo / "B.md").write_text("b\n")
+    subprocess.run(["git", "add", "B.md"], cwd=code_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "B"], cwd=code_repo, check=True)
+    # allowlisted decoy root X via an orphan branch (no parents)
+    subprocess.run(["git", "checkout", "--orphan", "decoy"], cwd=code_repo, check=True)
+    (code_repo / "X.md").write_text("x\n")
+    subprocess.run(["git", "add", "X.md"], cwd=code_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "X decoy root"], cwd=code_repo, check=True)
+    root_x = _root_sha(code_repo)
+    subprocess.run(["git", "checkout", "main"], cwd=code_repo, check=True)
+    head = _head(code_repo)
+    # plant a graft: A's parent := X → with grafts honored, the root becomes X.
+    (code_repo / ".git" / "info").mkdir(exist_ok=True)
+    (code_repo / ".git" / "info" / "grafts").write_text(f"{root_a} {root_x}\n")
+    raw_roots = {
+        s.strip().lower()
+        for s in subprocess.run(
+            ["git", "rev-list", "--max-parents=0", "HEAD"],
+            cwd=code_repo,
+            capture_output=True,
+            text=True,
+        ).stdout.split()
+    }
+    if root_x.lower() not in raw_roots:
+        pytest.skip("this git build does not honor .git/info/grafts; bypass vector absent")
+    # grafts honored → WITHOUT the defense the gate would see X (allowlisted) and PASS.
+    _write_audit_root_allowlist(handoff_home, [root_x])  # only the decoy is listed
+    payload = _evidence_with_full_audit(
+        input_commit=head, code_repo=str(code_repo), project=PROJECT,
+        task="t-graft", workspace=workspace,
+    )
+    outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-graft")
+    # WITH GIT_GRAFT_FILE=/dev/null the gate sees the TRUE root A (unlisted) → reject.
+    assert outcome.klass == "retry"
+    assert outcome.subcode == "codex-audit-code-repo-root-not-allowed"
+
+
+def test_code_repo_shallow_repo_rejected(handoff_home, tmp_path):
+    # codex R3 P1: a shallow repo treats its .git/shallow boundary as a root, so its
+    # true root can't be established — the identity gate must reject it outright.
+    src = _init_git_repo(tmp_path / "src", marker="shallow-src")
+    (src / "B.md").write_text("b\n")
+    subprocess.run(["git", "add", "B.md"], cwd=src, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "B"], cwd=src, check=True)
+    shallow = tmp_path / "shallow"
+    subprocess.run(
+        ["git", "clone", "--quiet", "--depth=1", f"file://{src}", str(shallow)],
+        check=True,
+    )
+    # sanity: the clone really is shallow.
+    is_shallow = subprocess.run(
+        ["git", "rev-parse", "--is-shallow-repository"],
+        cwd=shallow, capture_output=True, text=True,
+    ).stdout.strip()
+    assert is_shallow == "true"
+    workspace = _init_git_repo(tmp_path / "launcher")
+    # allowlist the shallow boundary's apparent root — without the shallow guard it
+    # would pass; with it, the repo is rejected as shallow.
+    boundary = subprocess.run(
+        ["git", "rev-list", "--max-parents=0", "HEAD"],
+        cwd=shallow, capture_output=True, text=True,
+    ).stdout.split()
+    _write_audit_root_allowlist(handoff_home, boundary)
+    payload = _evidence_with_full_audit(
+        input_commit=_head(shallow), code_repo=str(shallow), project=PROJECT,
+        task="t-shallow", workspace=workspace,
+    )
+    outcome = codex_audit.evaluate_audit_gate(payload, workspace, PROJECT, "t-shallow")
+    assert outcome.klass == "retry"
+    assert outcome.subcode == "codex-audit-code-repo-shallow"
+
+
+def test_config_parses_audit_code_repo_roots_and_filters_junk(tmp_path):
+    from handoff_fanout import config as _cfg
+
+    home = tmp_path / "hh"
+    home.mkdir()
+    (home / "config.json").write_text(
+        json.dumps({"audit_code_repo_roots": ["abc123", "", 123, None, "DEF456"]}),
+        encoding="utf-8",
+    )
+    cfg = _cfg.load(home)
+    assert cfg.audit_code_repo_roots == ["abc123", "DEF456"]
+    assert cfg.audit_code_roots_configured is True
+    # absent key → unconfigured
+    (home / "config.json").write_text(json.dumps({"workspace_root": "~/x"}), encoding="utf-8")
+    cfg2 = _cfg.load(home)
+    assert cfg2.audit_code_repo_roots == []
+    assert cfg2.audit_code_roots_configured is False
+
+
 def test_cross_repo_missing_code_repo_head_is_retry(handoff_home, tmp_path):
     # codex R2/R4: a cross-repo block MUST carry code_repo_head; absent → retry.
     workspace = _init_git_repo(tmp_path / "launcher")

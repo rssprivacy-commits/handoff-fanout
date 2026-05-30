@@ -74,6 +74,20 @@ class Config:
     # single-user trust disclaimer still apply).
     audit_code_repos: list[str] = field(default_factory=list)
     audit_allowlist_configured: bool = False
+    # Opt-in root-commit-SHA lineage allowlist (Phase D P1 hardening / owner ruling).
+    # Stronger than ``audit_code_repos``: binds a cross-repo ``code_repo`` to its
+    # root-commit LINEAGE (path-independent — a repo that moved still passes; a
+    # different repo reusing an allowed path is rejected). HONEST SCOPING (like the
+    # owner_ack non-crypto disclaimer): a root SHA names a lineage family, NOT a unique
+    # repo — a fork/clone sharing the allowlisted first commit shares the identity
+    # (acceptable single-user: such a fork IS a copy of that lineage). When the
+    # ``audit_code_repo_roots`` KEY is present the gate accepts a cross-repo
+    # ``code_repo`` ONLY if EVERY root reachable from its HEAD is listed (subset, so a
+    # merge of unrelated history carrying one allowed root is rejected). Independent of
+    # the path allowlist: both configured → BOTH must pass (never weakens). Key
+    # present-but-empty fails CLOSED; key absent → unconfigured → no root restriction.
+    audit_code_repo_roots: list[str] = field(default_factory=list)
+    audit_code_roots_configured: bool = False
 
     def queue_dir(self, project: str) -> Path:
         return self.home / project / "queue"
@@ -142,4 +156,10 @@ def _from_dict(data: dict, home: Path) -> Config:
             str(r) for r in (data.get("audit_code_repos", []) or []) if isinstance(r, str) and r
         ],
         audit_allowlist_configured="audit_code_repos" in data,
+        audit_code_repo_roots=[
+            str(r)
+            for r in (data.get("audit_code_repo_roots", []) or [])
+            if isinstance(r, str) and r
+        ],
+        audit_code_roots_configured="audit_code_repo_roots" in data,
     )
