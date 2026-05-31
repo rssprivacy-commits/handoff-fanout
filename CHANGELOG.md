@@ -5,7 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.9.0] — 2026-05-31
+
+MINOR — unlock-pivot (Added: lock-screen auto-unlock) + autoclose removal (Removed;
+it was opt-in and never enabled) + the macOS-26 lock-probe fix (Fixed). The unlock
+feature ships in the **bash launcher** (synced via `install.sh --sync-launcher`),
+so this release is only for the `dump.py` atomic-write change + version hygiene —
+it is **not required** to use unlock. **Not published to PyPI** (the single-user
+editable install already runs the live source); tagged for repo hygiene only.
 
 ### Added
 - **VS Code lock-screen auto-unlock path** (`install/auto-continue.sh`). When a
@@ -31,6 +38,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ack/<task>.old_ready` + the follow-up overdue scanner are KEPT — they are
   load-bearing for the §0 new-session audit and the retro / Phase C-D codex-audit
   gates (not autoclose-specific).
+
+### Fixed
+- **Lock probe via Quartz (macOS-26 ioreg blind-spawn P0)**, found by on-box
+  Step-2c validation that the unit tests could not (they stub the probe). On
+  macOS 26 `ioreg`'s `CGSSessionScreenIsLocked` is absent even when LOCKED, so the
+  old probe always read "unlocked" → the launcher spawned the GUI behind the lock
+  screen and `osascript` Enter was a silent no-op (false "submitted" logs).
+  `screen_is_locked()` now prefers a reliable probe: (1) explicit
+  `HANDOFF_LOCK_CHECK_CMD`; (2) **Quartz** via the MP unlock CLI's `--status`
+  derived from `HANDOFF_UNLOCK_CMD`; (3) ioreg fallback only when neither is
+  configured, now with a loud unreliability warning. All re-probes (mutex /
+  post-unlock verify / pre-Enter) are three-state and **fail closed** on UNKNOWN;
+  an unlock cmd with no derivable `--status` returns UNKNOWN rather than trusting
+  ioreg. Verified on a real locked screen (`UNLOCK-OK` now appears).
 
 ## [1.8.0] — 2026-05-30
 
