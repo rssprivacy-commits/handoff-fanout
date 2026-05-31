@@ -362,3 +362,169 @@ def test_sigterm_after_unlock_before_flag_relocks(home, tmp_path):
     proc.wait(timeout=15)
     assert Path(env["_RELOCK_SINK"]).read_text() == "r", "TERM in race window must still re-lock"
     assert state.read_text().strip() == "locked", "screen must end re-locked, not stranded unlocked"
+
+
+def test_lockprobe_derives_quartz_status_when_no_explicit_check(home, tmp_path):
+    """P0 lock-probe fix: with NO explicit HANDOFF_LOCK_CHECK_CMD, the launcher must
+    derive a Quartz lock probe from HANDOFF_UNLOCK_CMD (--unlock→--status, exit-code
+    0=unlocked/1=locked) instead of the ioreg fallback (which on modern macOS reports
+    "unlocked" for a LOCKED screen — the on-box 2c P0). Drives locked→unlock→relock
+    entirely through the derived --status exit-code probe (no stdout stub, no ioreg)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _seed(home, ws)
+    stub = tmp_path / "stubs"
+    stub.mkdir(exist_ok=True)
+    state = tmp_path / "lockstate"
+    state.write_text("locked\n", encoding="utf-8")
+    unlock_sink = tmp_path / "u.log"
+    relock_sink = tmp_path / "r.log"
+    open_sink = tmp_path / "o.log"
+    # one mp-unlock stub multiplexing --status (exit-code), --unlock, --lock
+    _w(
+        stub / "mp",
+        '#!/bin/bash\ncase "$1" in\n'
+        '  --status) [ "$(cat "$_LOCKSTATE")" = locked ] && exit 1 || exit 0 ;;\n'
+        '  --unlock) printf u >> "$_UNLOCK_SINK"; echo unlocked > "$_LOCKSTATE"; exit 0 ;;\n'
+        '  --lock)   printf r >> "$_RELOCK_SINK"; echo locked > "$_LOCKSTATE"; exit 0 ;;\n'
+        "esac\nexit 2\n",
+    )
+    _w(stub / "open", f'#!/bin/bash\nprintf "%s\\n" "$*" >> "{open_sink}"\nexit 0\n')
+    _w(stub / "code", "#!/bin/bash\nexit 0\n")
+    _w(
+        stub / "osascript",
+        '#!/bin/bash\ncase "$*" in\n'
+        '  *"UI elements enabled"*) echo true ;;\n'
+        '  *"frontmost is true"*) echo Code ;;\n'
+        "esac\nexit 0\n",
+    )
+    (home / PROJECT / "unlock.enabled").write_text("", encoding="utf-8")
+    env = dict(os.environ)
+    env.update(
+        {
+            "HANDOFF_ROOT": str(home),
+            "HANDOFF_OPEN_CMD": str(stub / "open"),
+            "HANDOFF_OSASCRIPT_CMD": str(stub / "osascript"),
+            "HANDOFF_CODE_BIN": str(stub / "code"),
+            "HANDOFF_LOCK_CHECK_CMD": "",  # FORCE the derived Quartz --status path
+            "HANDOFF_UNLOCK_CMD": f"{stub / 'mp'} --unlock",
+            "HANDOFF_RELOCK_CMD": f"{stub / 'mp'} --lock",
+            "HANDOFF_CAFFEINATE_CMD": "",
+            "HANDOFF_SKIP_SPAWN": "0",
+            "HANDOFF_VSCODE_CHECK": "0",
+            "_LOCKSTATE": str(state),
+            "_UNLOCK_SINK": str(unlock_sink),
+            "_RELOCK_SINK": str(relock_sink),
+            "_OPEN_SINK": str(open_sink),
+        }
+    )
+    env.pop("HANDOFF_HOME", None)
+    assert _run(env).returncode == 0
+    assert unlock_sink.read_text() == "u", "derived --status detected locked → unlock attempted"
+    assert open_sink.read_text().strip(), "after unlock → GUI open invoked"
+    assert relock_sink.read_text() == "r", "we unlocked → relock"
+    assert state.read_text().strip() == "locked", "ended re-locked via derived probe"
+
+
+def test_unlock_cmd_without_unlock_flag_fails_closed_unknown(home, tmp_path):
+    """lock-probe P0-2: unlock CONFIGURED but no Quartz --status derivable (the cmd has
+    no `--unlock` token to swap) AND no explicit HANDOFF_LOCK_CHECK_CMD ⇒ screen_is_locked
+    returns UNKNOWN → fail-closed defer; it must NEVER fall back to the unreliable ioreg
+    (which on macOS 26 reads a locked screen as 'unlocked' → blind spawn behind the lock)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _seed(home, ws)
+    stub = tmp_path / "stubs"
+    stub.mkdir(exist_ok=True)
+    open_sink = tmp_path / "o.log"
+    ioreg_called = tmp_path / "ioreg_called"
+    _w(stub / "open", '#!/bin/bash\nprintf "%s\\n" "$*" >> "$_OPEN_SINK"\nexit 0\n')
+    _w(stub / "code", "#!/bin/bash\nexit 0\n")
+    _w(stub / "noop", "#!/bin/bash\nexit 0\n")
+    _w(stub / "mpwrap", "#!/bin/bash\nexit 0\n")  # an unlock cmd with NO --unlock token
+    # ioreg stub that records being called AND emits an "unlocked-looking" payload
+    # (no CGSSessionScreenIsLocked = Yes). If the code WRONGLY fell back to ioreg it
+    # would read "unlocked" → spawn; the P0-2 return-2 must short-circuit BEFORE this.
+    _w(stub / "ioreg", f'#!/bin/bash\ntouch "{ioreg_called}"\necho "  | nothing = here"\nexit 0\n')
+    (home / PROJECT / "unlock.enabled").write_text("", encoding="utf-8")
+    env = dict(os.environ)
+    env.update(
+        {
+            "HANDOFF_ROOT": str(home),
+            "HANDOFF_OPEN_CMD": str(stub / "open"),
+            "HANDOFF_OSASCRIPT_CMD": str(stub / "noop"),
+            "HANDOFF_CODE_BIN": str(stub / "code"),
+            "HANDOFF_IOREG_CMD": str(stub / "ioreg"),  # would say "unlocked" if reached
+            "HANDOFF_LOCK_CHECK_CMD": "",  # no explicit probe
+            "HANDOFF_UNLOCK_CMD": str(stub / "mpwrap"),  # non-empty, NO --unlock → underivable
+            "HANDOFF_RELOCK_CMD": str(stub / "mpwrap"),
+            "HANDOFF_CAFFEINATE_CMD": "",
+            "HANDOFF_SKIP_SPAWN": "0",
+            "HANDOFF_VSCODE_CHECK": "0",
+            "_OPEN_SINK": str(open_sink),
+        }
+    )
+    env.pop("HANDOFF_HOME", None)
+    assert _run(env).returncode == 0
+    assert not ioreg_called.exists(), (
+        "P0-2: must NOT fall back to ioreg when unlock configured but underivable"
+    )
+    txt = open_sink.read_text() if open_sink.exists() else ""
+    assert txt == "", "underivable probe + unlock configured → UNKNOWN → NO blind spawn"
+    marker = home / PROJECT / "queue" / f"{TASK}.deferred"
+    assert marker.exists() and "lock-unknown" in marker.read_text()
+    assert (home / PROJECT / "queue" / f"{TASK}.uri").exists()
+
+
+def test_unknown_after_unlock_fails_closed(home, tmp_path):
+    """lock-probe P0-1: if the POST-UNLOCK verify probe returns UNKNOWN (rc=2 — e.g. a
+    Quartz --status timeout/error right after the unlock CLI ran), the launcher must fail
+    CLOSED (defer + cooldown), NOT treat UNKNOWN as 'unlocked' and spawn into the void."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _seed(home, ws)
+    stub = tmp_path / "stubs"
+    stub.mkdir(exist_ok=True)
+    state = tmp_path / "lockstate"
+    state.write_text("locked\n", encoding="utf-8")
+    open_sink = tmp_path / "o.log"
+    unlock_sink = tmp_path / "u.log"
+    # --status: locked→1, unlocked→0, anything else→2; --unlock leaves state UNKNOWN
+    _w(
+        stub / "mp",
+        '#!/bin/bash\ncase "$1" in\n'
+        '  --status) case "$(cat "$_LOCKSTATE")" in locked) exit 1 ;; unlocked) exit 0 ;; *) exit 2 ;; esac ;;\n'
+        '  --unlock) printf u >> "$_UNLOCK_SINK"; echo unknown > "$_LOCKSTATE"; exit 0 ;;\n'
+        '  --lock)   echo locked > "$_LOCKSTATE"; exit 0 ;;\n'
+        "esac\nexit 2\n",
+    )
+    _w(stub / "open", '#!/bin/bash\nprintf "%s\\n" "$*" >> "$_OPEN_SINK"\nexit 0\n')
+    _w(stub / "code", "#!/bin/bash\nexit 0\n")
+    _w(stub / "noop", "#!/bin/bash\nexit 0\n")
+    (home / PROJECT / "unlock.enabled").write_text("", encoding="utf-8")
+    env = dict(os.environ)
+    env.update(
+        {
+            "HANDOFF_ROOT": str(home),
+            "HANDOFF_OPEN_CMD": str(stub / "open"),
+            "HANDOFF_OSASCRIPT_CMD": str(stub / "noop"),
+            "HANDOFF_CODE_BIN": str(stub / "code"),
+            "HANDOFF_LOCK_CHECK_CMD": "",
+            "HANDOFF_UNLOCK_CMD": f"{stub / 'mp'} --unlock",
+            "HANDOFF_RELOCK_CMD": f"{stub / 'mp'} --lock",
+            "HANDOFF_CAFFEINATE_CMD": "",
+            "HANDOFF_SKIP_SPAWN": "0",
+            "HANDOFF_VSCODE_CHECK": "0",
+            "_LOCKSTATE": str(state),
+            "_OPEN_SINK": str(open_sink),
+            "_UNLOCK_SINK": str(unlock_sink),
+        }
+    )
+    env.pop("HANDOFF_HOME", None)
+    assert _run(env).returncode == 0
+    assert unlock_sink.read_text() == "u", "initial locked → unlock attempted"
+    txt = open_sink.read_text() if open_sink.exists() else ""
+    assert txt == "", "post-unlock UNKNOWN → fail closed, NO GUI spawn"
+    marker = home / PROJECT / "queue" / f"{TASK}.deferred"
+    assert marker.exists() and "verify2" in marker.read_text()
+    assert (home / PROJECT / ".unlock-cooldown").exists(), "verify-failure ⇒ cooldown bumped"
