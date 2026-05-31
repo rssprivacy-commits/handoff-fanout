@@ -6,10 +6,9 @@
 #   2. $HANDOFF_HOME/config.json (from install/examples/config.json, if missing)
 #   3. git pre-commit hook in the current repo (if any), symlinked to install/git-hooks/pre-commit
 #   4. macOS launchd agent for the watchdog (if --no-launchd not given and uname=Darwin)
-#   5. handoff-helper VS Code extension for tab autoclose (if --no-extension not
-#      given and both `code` and `npm` are on PATH); builds the .vsix from source
-#      and `code --install-extension`s it. Idempotent — skips if the same version
-#      is already installed.
+#   5. migration: removes the obsolete handoff-helper VS Code extension (the
+#      autoclose feature was dropped — owner ruling 2026-05-31; tabs are the
+#      human-audit record). --no-extension skips this migration.
 #
 # Pre-req: `pip install handoff-fanout` (provides the `handoff` console script).
 #
@@ -23,7 +22,7 @@
 #   --no-hooks        skip git pre-commit hook installation
 #   --no-launchd      skip launchd plist installation (macOS only step regardless)
 #   --no-config       don't write $HANDOFF_HOME/config.json
-#   --no-extension    skip building/installing the handoff-helper VS Code extension
+#   --no-extension    skip the handoff-helper extension removal migration
 #   --uninstall       reverse everything this script installs
 #   --sync-launcher   push canonical auto-continue.sh → ~/.local/bin + record sha
 #                     (keeps the com.dharmaxis.auto-continue runtime copy canonical)
@@ -205,35 +204,19 @@ elif [[ $INSTALL_LAUNCHD -eq 1 ]]; then
     echo "⊘ launchd skipped (not macOS)"
 fi
 
-# ─── 5. handoff-helper VS Code extension (tab autoclose) ────────────────────
+# ─── 5. handoff-helper VS Code extension — REMOVED (autoclose feature dropped) ──
+# The autoclose tab-closing feature was removed (owner ruling 2026-05-31: VS Code
+# tabs are the human-audit record and must NOT auto-close). The handoff-helper
+# extension existed ONLY to drive autoclose, so it is no longer installed. As a
+# migration, uninstall any previously-installed copy so it doesn't linger dormant.
+# (--no-extension skips this migration.)
 if [[ $INSTALL_EXTENSION -eq 1 ]]; then
-    EXT_DIR="$(cd "$ASSET_DIR/.." && pwd)/extension"
     CODE_BIN="$(command -v code || true)"
-    if [[ -z "$CODE_BIN" ]]; then
-        echo "⊘ extension skipped (no \`code\` CLI on PATH — open VS Code → Cmd+Shift+P → 'Shell Command: Install code command')"
-    elif [[ ! -d "$EXT_DIR" ]]; then
-        echo "⊘ extension skipped (source dir not found: $EXT_DIR)"
-    else
-        # Read the target version from the extension manifest so the idempotency
-        # check compares against what we're about to build.
-        EXT_VERSION="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$EXT_DIR/package.json" | head -1)"
-        if "$CODE_BIN" --list-extensions --show-versions 2>/dev/null | grep -qx "dharmaxis.handoff-helper@$EXT_VERSION"; then
-            echo "✓ handoff-helper extension already installed (v$EXT_VERSION)"
-        elif ! command -v npm >/dev/null 2>&1; then
-            echo "⊘ extension skipped (npm not on PATH — needed to build the .vsix)"
+    if [[ -n "$CODE_BIN" ]] && "$CODE_BIN" --list-extensions 2>/dev/null | grep -qx "dharmaxis.handoff-helper"; then
+        if "$CODE_BIN" --uninstall-extension dharmaxis.handoff-helper >/dev/null 2>&1; then
+            echo "✓ removed obsolete handoff-helper extension (autoclose feature dropped)"
         else
-            echo "→ building handoff-helper.vsix (v$EXT_VERSION)"
-            VSIX="$EXT_DIR/handoff-helper.vsix"
-            # Guard the build in an `if` so a failure under `set -e` falls through
-            # to the warning instead of aborting the whole installer.
-            if ( cd "$EXT_DIR" && { [[ -d node_modules ]] || npm install --silent; } && npm run package --silent ) \
-                && [[ -f "$VSIX" ]] \
-                && "$CODE_BIN" --install-extension "$VSIX" --force >/dev/null 2>&1; then
-                echo "✓ installed handoff-helper extension (v$EXT_VERSION)"
-                echo "  (autoclose stays OFF until you opt in — see config.json autoclose note)"
-            else
-                echo "⚠ extension build/install failed — run \`cd $EXT_DIR && npm install && npm run package\` manually"
-            fi
+            echo "  ⚠ failed to remove handoff-helper extension — remove manually via 'code --uninstall-extension dharmaxis.handoff-helper'"
         fi
     fi
 fi

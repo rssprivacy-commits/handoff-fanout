@@ -1,10 +1,11 @@
-"""v5.4 Phase 4d / v4 path-D autoclose watcher tests.
+"""Follow-up overdue scanner (§7.9) + old_ready writer (D-3) tests.
 
-Implements ``v5.4-retro-mandate-draft.md §7.11 A-01 .. A-12`` plus follow-up
-overdue scanner cases (§7.9). Every test shells out to
+(The v4 tab-autoclose A-series was removed with the autoclose feature, 2026-05-31;
+``old_ready`` + the overdue scanner stay — load-bearing for the §0 new-session
+audit and the retro / Phase C-D codex-audit gates.) Every test shells out to
 ``install/auto-continue.sh`` with ``HANDOFF_SKIP_SPAWN=1`` and a tmpdir
-``HANDOFF_ROOT`` so the main launchd-driven spawn loop is bypassed and the
-only behaviour under test is the autoclose / overdue segments.
+``HANDOFF_ROOT`` so the main spawn loop is bypassed and the only behaviour under
+test is the overdue segment.
 
 External commands the script depends on (``open``, ``osascript``,
 ``shasum``, ``code``) are stubbed via shell scripts that simply record
@@ -167,237 +168,34 @@ def stubbed_env(home: Path, tmp_path: Path) -> dict[str, str]:
 # ─── A-01 happy path ────────────────────────────────────────────────────────
 
 
-def test_A01_full_old_ready_triggers_autoclose(home, tmp_path, stubbed_env):
-    evidence = _make_evidence(home, nonce="abc123")
-    _write_old_ready(home, TASK, evidence, nonce="abc123")
-    _touch_submitted(home, TASK)
-
-    proc = _run_script(stubbed_env)
-    assert proc.returncode == 0, proc.stderr
-
-    done = home / PROJECT / "ack" / f"{TASK}.autoclose_done"
-    failed = home / PROJECT / "ack" / f"{TASK}.autoclose_failed.txt"
-    assert done.exists(), (
-        f"expected autoclose_done, got dir: {list((home / PROJECT / 'ack').iterdir())}"
-    )
-    assert not failed.exists()
-    body = done.read_text()
-    assert TASK in body
-    assert "vscode://dharmaxis.handoff-helper/autoclose" in body
-    # Open stub was actually invoked with the right URI.
-    open_sink = Path(stubbed_env["_OPEN_SINK"])
-    assert open_sink.exists()
-    assert f"task_id={TASK}" in open_sink.read_text()
-    assert "nonce=abc123" in open_sink.read_text()
-
-
 # ─── A-02 nonce mismatch (helper extension territory; watcher fires anyway) ─
-
-
-def test_A02_watcher_passes_nonce_to_helper(home, tmp_path, stubbed_env):
-    """The watcher itself does not enforce nonce equality — the helper
-    extension does. This test pins the URI emission so a regression in the
-    nonce wiring would fail loudly.
-    """
-    evidence = _make_evidence(home, nonce="orig")
-    _write_old_ready(home, TASK, evidence, nonce="orig")
-    _touch_submitted(home, TASK)
-
-    _run_script(stubbed_env)
-    sink = Path(stubbed_env["_OPEN_SINK"]).read_text()
-    assert "nonce=orig" in sink
 
 
 # ─── A-03 spawned (submitted) not present → watcher skips silently ──────────
 
 
-def test_A03_no_submitted_marker_no_autoclose(home, stubbed_env):
-    evidence = _make_evidence(home)
-    _write_old_ready(home, TASK, evidence)
-    # Deliberately omit the .submitted ack — the spawn never confirmed.
-
-    _run_script(stubbed_env)
-    done = home / PROJECT / "ack" / f"{TASK}.autoclose_done"
-    failed = home / PROJECT / "ack" / f"{TASK}.autoclose_failed.txt"
-    assert not done.exists()
-    assert not failed.exists()
-    open_sink = Path(stubbed_env["_OPEN_SINK"])
-    assert not open_sink.exists() or "task_id" not in open_sink.read_text()
-
-
 # ─── A-04..A-06 helper-extension failure markers → watcher skips next pass ──
-
-
-@pytest.mark.parametrize(
-    "reason",
-    ["no_candidate", "multiple_candidates", "is_active_tab"],
-)
-def test_A04_A05_A06_failed_marker_short_circuits_retry(home, stubbed_env, reason):
-    evidence = _make_evidence(home)
-    _write_old_ready(home, TASK, evidence)
-    _touch_submitted(home, TASK)
-    ack = home / PROJECT / "ack"
-    pre_existing = ack / f"{TASK}.autoclose_failed.txt"
-    pre_existing.write_text(f"task_id: {TASK}\nreason: {reason}\n")
-
-    _run_script(stubbed_env)
-    # Watcher must not have re-dispatched (open stub silent).
-    open_sink = Path(stubbed_env["_OPEN_SINK"])
-    assert not open_sink.exists() or "task_id" not in open_sink.read_text()
-    # And must not have flipped failure into success.
-    done = ack / f"{TASK}.autoclose_done"
-    assert not done.exists()
-    # Pre-existing marker unchanged.
-    assert reason in pre_existing.read_text()
 
 
 # ─── A-07 per-task lock — concurrent runs only emit one autoclose ──────────
 
 
-def test_A07_per_task_lock_serializes_two_runs(home, tmp_path, stubbed_env):
-    evidence = _make_evidence(home, nonce="lockx")
-    _write_old_ready(home, TASK, evidence, nonce="lockx")
-    _touch_submitted(home, TASK)
-
-    # Slow down the `open` stub a touch so race chance is real.
-    open_stub = Path(stubbed_env["HANDOFF_OPEN_CMD"])
-    open_stub.write_text(
-        '#!/bin/bash\nprintf "%s\\n" "$*" >> "$_OPEN_SINK"\nsleep 0.5\nexit 0\n',
-    )
-    open_stub.chmod(0o755)
-
-    proc_a = subprocess.Popen(
-        ["/bin/bash", str(SCRIPT)],
-        env=stubbed_env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    time.sleep(0.05)  # ensure proc_a acquires lock first
-    proc_b = subprocess.Popen(
-        ["/bin/bash", str(SCRIPT)],
-        env=stubbed_env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    proc_a.wait(timeout=20)
-    proc_b.wait(timeout=20)
-
-    done = home / PROJECT / "ack" / f"{TASK}.autoclose_done"
-    assert done.exists()
-    # Exactly one URI was dispatched even though two scripts raced.
-    sink = Path(stubbed_env["_OPEN_SINK"]).read_text()
-    assert sink.count("task_id=") == 1, sink
-
-
 # ─── A-08 stale lock self-clean ─────────────────────────────────────────────
-
-
-def test_A08_stale_lock_is_recycled(home, stubbed_env):
-    evidence = _make_evidence(home, nonce="stale")
-    _write_old_ready(home, TASK, evidence, nonce="stale")
-    _touch_submitted(home, TASK)
-    # Stamp a stale lock (10 minutes old) — older than the 5-min TTL.
-    locks = home / PROJECT / "locks"
-    locks.mkdir()
-    stale = locks / f"{TASK}.autoclose.lock"
-    stale.mkdir()
-    old = time.time() - 600
-    os.utime(stale, (old, old))
-
-    _run_script(stubbed_env)
-
-    done = home / PROJECT / "ack" / f"{TASK}.autoclose_done"
-    assert done.exists()
 
 
 # ─── A-09 retro_evidence_hash tampered → reject ─────────────────────────────
 
 
-def test_A09_evidence_hash_mismatch_rejects(home, stubbed_env):
-    evidence = _make_evidence(home, nonce="tamper")
-    _write_old_ready(home, TASK, evidence, nonce="tamper", override_hash="0" * 64)
-    _touch_submitted(home, TASK)
-
-    _run_script(stubbed_env)
-    failed = home / PROJECT / "ack" / f"{TASK}.autoclose_failed.txt"
-    done = home / PROJECT / "ack" / f"{TASK}.autoclose_done"
-    assert failed.exists()
-    assert not done.exists()
-    body = failed.read_text()
-    assert "retro_evidence_invalid" in body
-    # Helper URI never fired.
-    open_sink = Path(stubbed_env["_OPEN_SINK"])
-    assert not open_sink.exists() or "task_id" not in open_sink.read_text()
-
-
 # ─── A-10 missing retro_evidence path → reject ──────────────────────────────
-
-
-def test_A10_missing_evidence_file_rejects(home, stubbed_env):
-    # Build old_ready that points at a path that doesn't exist.
-    fake = home / PROJECT / "precheck" / "missing.retro.evidence.json"
-    fake.parent.mkdir(parents=True, exist_ok=True)
-    fake.write_text("{}")  # write so we can compute a hash
-    _write_old_ready(home, TASK, fake)
-    fake.unlink()  # delete after writing old_ready so paths inside resolve to nothing
-    _touch_submitted(home, TASK)
-
-    _run_script(stubbed_env)
-    failed = home / PROJECT / "ack" / f"{TASK}.autoclose_failed.txt"
-    assert failed.exists()
-    assert "missing_retro_evidence" in failed.read_text()
 
 
 # ─── A-11 BLOCKED.md present → watcher skip (no helper URI) ────────────────
 
 
-def test_A11_BLOCKED_md_skips_autoclose(home, stubbed_env):
-    evidence = _make_evidence(home)
-    _write_old_ready(home, TASK, evidence)
-    _touch_submitted(home, TASK)
-    blocked = home / PROJECT / "queue" / f"{TASK}.BLOCKED.md"
-    blocked.parent.mkdir(parents=True, exist_ok=True)
-    blocked.write_text("# BLOCKED — manual hold\n")
-
-    _run_script(stubbed_env)
-    open_sink = Path(stubbed_env["_OPEN_SINK"])
-    assert not open_sink.exists() or "task_id" not in open_sink.read_text()
-    done = home / PROJECT / "ack" / f"{TASK}.autoclose_done"
-    assert not done.exists()
-    failed = home / PROJECT / "ack" / f"{TASK}.autoclose_failed.txt"
-    assert not failed.exists()
-
-
 # ─── A-12 unknown schema_version → reject ──────────────────────────────────
 
 
-def test_A12_unknown_schema_version_rejects(home, stubbed_env):
-    evidence = _make_evidence(home)
-    _write_old_ready(home, TASK, evidence, schema_version="v9.9.9-future")
-    _touch_submitted(home, TASK)
-
-    _run_script(stubbed_env)
-    failed = home / PROJECT / "ack" / f"{TASK}.autoclose_failed.txt"
-    assert failed.exists()
-    assert "schema_version_unknown" in failed.read_text()
-
-
 # ─── default-OFF guard ──────────────────────────────────────────────────────
-
-
-def test_autoclose_disabled_by_default_no_helper_call(home, tmp_path):
-    """Without ``HANDOFF_AUTOCLOSE_ENABLED=1`` and no sentinel file, the
-    section must short-circuit per spec §7.6 / 改进 #6.
-    """
-    env = _stubbed_env(home, tmp_path, autoclose=False)
-    evidence = _make_evidence(home)
-    _write_old_ready(home, TASK, evidence)
-    _touch_submitted(home, TASK)
-    _run_script(env)
-    done = home / PROJECT / "ack" / f"{TASK}.autoclose_done"
-    failed = home / PROJECT / "ack" / f"{TASK}.autoclose_failed.txt"
-    assert not done.exists()
-    assert not failed.exists()
 
 
 # ─── follow-up overdue scanner (§7.9) ──────────────────────────────────────
@@ -611,48 +409,3 @@ def test_V08_path_traversal_follow_task_is_skipped(home, stubbed_env):
     override = home / PROJECT / "ack" / f"{TASK}.retro.override.json"
     assert not marker.exists()
     assert override.exists()  # not cleared by a crafted follow_task
-
-
-def test_A13_unsafe_nonce_rejected_before_uri(home, stubbed_env):
-    # P0-3: a nonce with URI-significant chars must fail closed, never reach the
-    # helper URI (which could otherwise be steered onto the wrong tab).
-    evidence = _make_evidence(home, nonce="ok")
-    _write_old_ready(home, TASK, evidence, nonce="bad&project=other")
-    _touch_submitted(home, TASK)
-
-    _run_script(stubbed_env)
-    failed = home / PROJECT / "ack" / f"{TASK}.autoclose_failed.txt"
-    done = home / PROJECT / "ack" / f"{TASK}.autoclose_done"
-    assert failed.exists()
-    assert not done.exists()
-    assert "unsafe_uri_param" in failed.read_text()
-    open_sink = Path(stubbed_env["_OPEN_SINK"])
-    assert not open_sink.exists() or "task_id" not in open_sink.read_text()
-
-
-def test_A14_prior_schema_version_v540_accepted(home, stubbed_env):
-    # P1-2: an old_ready written by an earlier build (v5.4.0) must still
-    # autoclose — the watcher allow-list keeps prior versions for compat.
-    evidence = _make_evidence(home, nonce="compat")
-    _write_old_ready(home, TASK, evidence, nonce="compat", schema_version="v5.4.0")
-    _touch_submitted(home, TASK)
-
-    _run_script(stubbed_env)
-    done = home / PROJECT / "ack" / f"{TASK}.autoclose_done"
-    failed = home / PROJECT / "ack" / f"{TASK}.autoclose_failed.txt"
-    assert done.exists(), list((home / PROJECT / "ack").iterdir())
-    assert not failed.exists()
-
-
-def test_A15_current_schema_version_550_accepted(home, stubbed_env):
-    # Phase A bumped OLD_READY_SCHEMA_VERSION to 5.5.0; the watcher allow-list
-    # MUST track it (else every new old_ready fails autoclose as unknown).
-    evidence = _make_evidence(home, nonce="v55")
-    _write_old_ready(home, TASK, evidence, nonce="v55", schema_version="5.5.0")
-    _touch_submitted(home, TASK)
-
-    _run_script(stubbed_env)
-    done = home / PROJECT / "ack" / f"{TASK}.autoclose_done"
-    failed = home / PROJECT / "ack" / f"{TASK}.autoclose_failed.txt"
-    assert done.exists(), list((home / PROJECT / "ack").iterdir())
-    assert not failed.exists()

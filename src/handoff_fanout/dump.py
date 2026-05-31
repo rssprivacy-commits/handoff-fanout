@@ -391,7 +391,13 @@ def write_active_dump(
         handoff_home=cfg.home,
         handoff_md_path=md_path,
     )
-    md_path.write_text(handoff_content, encoding="utf-8")
+    # Crash-/kill-atomic single-task write (temp+os.replace). A supervisor kill
+    # mid-dump must never leave a partial .md the launcher then misreads. The
+    # atomic_replace temp name (`.{name}.tmp.<pid>.<ns>`) never matches the
+    # launcher's `*.uri`/`*.md` globs (so an early WatchPaths wake on the temp is
+    # a harmless no-op). NOT write_with_fsync (in-place O_TRUNC = durable but NOT
+    # crash-atomic-replace). See docs/design-unlock-pivot-and-autoclose-removal §3.7.
+    atomic.atomic_replace(md_path, handoff_content)
     print(f"[dump] wrote {md_path} ({len(handoff_content)} bytes)")
 
     if status == "done":
@@ -425,7 +431,8 @@ def write_active_dump(
     # active: write .uri sidecar + clipboard + notification
     uri = build_uri(cfg, project, task)
     uri_path = queue_dir / f"{task}.uri"
-    uri_path.write_text(f"WORKSPACE={workspace}\nURI={uri}\n", encoding="utf-8")
+    # §3.7 — atomic .uri write (see the .md note above).
+    atomic.atomic_replace(uri_path, f"WORKSPACE={workspace}\nURI={uri}\n")
     print(f"[dump] wrote {uri_path}")
 
     _maybe_pbcopy(handoff_content)
@@ -443,11 +450,11 @@ def write_active_dump(
         if old_ready_path is None:
             # The gate passed with an evidence file, yet old_ready couldn't be
             # written (evidence vanished / unreadable between the gate and here).
-            # Don't fail the already-published dump, but make it loud: autoclose
-            # silently won't fire without this artifact.
+            # Don't fail the already-published dump, but make it loud: without
+            # this artifact the §0 new-session audit can't verify this session.
             print(
                 "[dump] ⚠️  retro evidence supplied but old_ready was NOT written "
-                "(evidence vanished/unreadable); autoclose will not trigger for "
+                "(evidence vanished/unreadable); §0 new-session audit can't verify "
                 f"{project}/{task}"
             )
 
@@ -468,10 +475,14 @@ def _write_old_ready(
     """Write ``ack/<task>.old_ready`` per spec §7.6.
 
     Only invoked when the retro gate ran with an evidence file and passed. The
-    artifact tells the v4 autoclose watcher that this session is closed and
-    references the on-disk evidence so the watcher can verify integrity before
-    closing the old tab. Returns the written path (or ``None`` if the evidence
-    file vanished between the gate check and this call).
+    artifact is **audit metadata** read by the §0 new-session predecessor audit
+    and the Phase C/D codex-audit gate (it carries ``retro_evidence_hash`` +
+    ``codex_audit_hash`` / ``codex_audit_mode`` / ``next_session_forced_task``),
+    so a new session can verify the prior session actually closed + audited.
+    (Historically it also drove the v4 tab-autoclose watcher, now removed — the
+    artifact stays because the audit/retro-mandate chain depends on it.) Returns
+    the written path (or ``None`` if the evidence file vanished between the gate
+    check and this call).
     """
     if not evidence_path.exists():
         return None
@@ -514,8 +525,8 @@ def _write_old_ready(
         "retro_evidence_path_absolute": str(evidence_path.resolve()),
     }
 
-    # Phase C — surface the codex audit block so the next session (§0) and the
-    # autoclose watcher can verify it. ``codex_audit_hash`` lets them detect a
+    # Phase C — surface the codex audit block so the next session's §0 audit can
+    # verify it. ``codex_audit_hash`` lets it detect a
     # tampered block; ``next_session_forced_task`` is set ONLY for a bypass
     # (the next session owes the skipped audit, spec §1.3). Non-bypass modes
     # impose no forced task. Lazy import: codex_audit imports dump (in
