@@ -35,13 +35,12 @@ Autoclose is **off by default**. It is enabled on the watcher side via
 `HANDOFF_AUTOCLOSE_ENABLED=1` or an `autoclose.enabled` sentinel file — see the
 handoff-fanout docs. Installing this extension alone does not start closing tabs.
 
-## Build & install
+## Status — do NOT install
 
-```sh
-npm install
-npm run package                       # → handoff-helper.vsix
-code --install-extension handoff-helper.vsix --force
-```
-
-`install/install.sh` performs these steps automatically (pass `--no-extension`
-to skip).
+This extension is **obsolete** (autoclose removed, 2026-05-31) and intentionally
+has **no install instructions**. `install/install.sh` no longer builds or installs
+it — it now *uninstalls* any previously-installed copy (`code --uninstall-extension
+dharmaxis.handoff-helper`; pass `--no-extension` to skip that migration). The
+source is retained for history only; re-installing it would resurrect the
+tab-closing behaviour that the 2026-05-31 owner ruling removed (VS Code tabs are
+the human-audit record and must not auto-close).

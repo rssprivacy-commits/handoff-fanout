@@ -245,3 +245,56 @@ def test_cooldown_blocks_unlock(home, tmp_path):
     assert _read(env, "_UNLOCK_SINK") == "", "in cooldown → never attempt unlock"
     marker = home / PROJECT / "queue" / f"{TASK}.deferred"
     assert marker.exists() and "unlock-cooldown" in marker.read_text()
+
+
+def test_global_env_does_not_enable_unlock(home, tmp_path):
+    """Full-sweep A1: the REMOVED global ``HANDOFF_UNLOCK_ENABLED=1`` env must NOT
+    enable auto-unlock — only the per-project ``unlock.enabled`` sentinel does. A
+    stray export (launchd / shell rc) must not arm password injection for a project
+    that never opted in (red-line ③)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _seed(home, ws)
+    # locked + NO per-project sentinel, but the old global backdoor env set to 1.
+    env = _env(home, tmp_path, initial="locked", opt_in=False, unlock_ok=True)
+    env["HANDOFF_UNLOCK_ENABLED"] = "1"  # must be ignored now
+    assert _run(env).returncode == 0
+    assert _read(env, "_UNLOCK_SINK") == "", "global env must NOT trigger unlock without sentinel"
+    assert _read(env, "_OPEN_SINK") == "", "no unlock → no GUI"
+    marker = home / PROJECT / "queue" / f"{TASK}.deferred"
+    assert marker.exists() and "locked-unlock-not-enabled" in marker.read_text()
+    assert (home / PROJECT / "queue" / f"{TASK}.uri").exists()
+
+
+def test_relock_failed_marker_halts_spawns_durably(home, tmp_path):
+    """Full-sweep A3: a durable ``$HANDOFF_ROOT/.relock-failed`` marker (a prior run
+    could not re-lock the Mac) must halt ALL spawns on subsequent runs — even on an
+    already-unlocked screen — until the owner clears it. Without this the relay
+    resumes spawning on an unattended unlocked Mac (red-line ②)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _seed(home, ws)
+    (home / ".relock-failed").write_text("", encoding="utf-8")
+    env = _env(home, tmp_path, initial="unlocked", opt_in=False, unlock_ok=True)
+    assert _run(env).returncode == 0
+    assert _read(env, "_OPEN_SINK") == "", ".relock-failed present → spawn skipped (no GUI)"
+    assert (home / PROJECT / "queue" / f"{TASK}.uri").exists(), (
+        ".uri kept until owner clears the halt"
+    )
+
+
+def test_corrupt_cooldown_marker_fails_closed(home, tmp_path):
+    """Full-sweep A4: a PRESENT-but-corrupt cooldown marker (no numeric
+    ``next_retry_epoch`` — e.g. a kill mid-write) must fail CLOSED — pause
+    auto-unlock — not fall through and re-inject the login password."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _seed(home, ws)
+    cd = home / PROJECT / ".unlock-cooldown"
+    cd.write_text("count=oops\nlast_epoch=\n", encoding="utf-8")  # no valid next_retry_epoch
+    env = _env(home, tmp_path, initial="locked", opt_in=True, unlock_ok=True)
+    assert _run(env).returncode == 0
+    assert _read(env, "_UNLOCK_SINK") == "", "corrupt cooldown → fail closed, no unlock attempt"
+    marker = home / PROJECT / "queue" / f"{TASK}.deferred"
+    assert marker.exists() and "unlock-cooldown" in marker.read_text()
+    assert (home / PROJECT / "queue" / f"{TASK}.uri").exists()

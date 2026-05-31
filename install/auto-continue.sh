@@ -49,7 +49,6 @@ HANDOFF_PYTHON_CMD="${HANDOFF_PYTHON_CMD:-python3}"
 # injection CLI), then run the visible GUI path so the owner can still audit the
 # tab. Locked + not-opted-in / unlock-failed / unknown ⇒ defer (keep .uri, notify,
 # resume on unlock) — never a silent dead-stall, never a blind-box. Default OFF.
-HANDOFF_UNLOCK_ENABLED="${HANDOFF_UNLOCK_ENABLED:-0}"   # per-project opt-in (P0-1)
 HANDOFF_LOCK_CHECK_CMD="${HANDOFF_LOCK_CHECK_CMD:-}"    # tests stub: prints locked|unlocked|*
 HANDOFF_IOREG_CMD="${HANDOFF_IOREG_CMD:-/usr/sbin/ioreg}"
 HANDOFF_UNLOCK_CMD="${HANDOFF_UNLOCK_CMD:-}"            # e.g. "<mp>/.venv/bin/python -m src.agent.unlock_cli --unlock"
@@ -116,6 +115,19 @@ if [ "$HANDOFF_SKIP_SPAWN" != "1" ]; then
         log "FATAL: code CLI not found (workspace routing unavailable)"
         exit 1
     fi
+fi
+
+# 全局 Guard 6 (full-sweep A3): a PRIOR run failed to RE-LOCK the Mac after an
+# auto-unlock and left a durable `.relock-failed` marker. That halt must persist
+# ACROSS runs — the in-run `break 2` alone is not enough, because the next launchd
+# tick finds the screen already unlocked, skips the unlock branch, and would
+# happily resume spawning on an unattended unlocked Mac (red-line ②). Skip ALL
+# spawns until the owner re-locks and clears the marker; the (read-only) overdue
+# scanner further below still runs. Documented in the runbook brakes table.
+RELOCK_HALT=0
+if [ -f "$HANDOFF_ROOT/.relock-failed" ]; then
+    RELOCK_HALT=1
+    log "HALT: .relock-failed present — skipping all spawns until re-locked + 'rm $HANDOFF_ROOT/.relock-failed'"
 fi
 
 SPAWNED=0
@@ -194,14 +206,16 @@ screen_is_locked() {
     return 1
 }
 
-# Unlock opt-in (R2 P0-1: per-project ONLY — NO global sentinel). Auto-unlock
-# injects the login password, so every project must be enabled deliberately via
-# its own sentinel; there is intentionally no `$HANDOFF_ROOT/unlock.enabled`
-# all-projects switch. HANDOFF_UNLOCK_ENABLED (default OFF) is an explicit
-# operator/test override only.
+# Unlock opt-in (R2 P0-1 / full-sweep A1: the per-project `<project>/unlock.enabled`
+# sentinel is the ONLY enabler). Auto-unlock injects the Mac login password, so
+# every project must be enabled deliberately via its own sentinel. The former
+# global `HANDOFF_UNLOCK_ENABLED=1` env enabler was REMOVED: a single stray export
+# (launchd EnvironmentVariables / a shell rc) would otherwise arm password
+# injection for EVERY project at once (red-line ③ — per-project opt-in). There is
+# intentionally no global / all-projects switch on the production path; tests opt
+# in by writing the same per-project sentinel under a tmp HANDOFF_ROOT.
 unlock_enabled_for_project() {
     local proj_dir="$1"
-    [ "$HANDOFF_UNLOCK_ENABLED" = "1" ] && return 0
     [ -f "$proj_dir/unlock.enabled" ] && return 0
     return 1
 }
@@ -270,7 +284,16 @@ _unlock_cd_marker() { echo "$1/.unlock-cooldown"; }
 unlock_in_cooldown() {
     local m; m=$(_unlock_cd_marker "$1"); [ -f "$m" ] || return 1
     local nr; nr=$(sed -n 's/^next_retry_epoch=//p' "$m" 2>/dev/null | head -1)
-    case "$nr" in ''|*[!0-9]*) return 1 ;; esac
+    # A4 (full-sweep): a PRESENT-but-corrupt cooldown marker (missing/non-numeric
+    # next_retry_epoch — e.g. a kill mid-write) must fail CLOSED. This marker gates
+    # Mac login-password injection; an unparseable value formerly fell through to
+    # "not in cooldown" (fail-OPEN) and re-attempted unlock. Treat it as in-cooldown
+    # (pause auto-unlock until the owner clears it). Absent marker = genuinely not
+    # in cooldown (handled by the -f test above).
+    case "$nr" in ''|*[!0-9]*)
+        log "UNLOCK-COOLDOWN-CORRUPT: $(basename "$1") — unparseable next_retry_epoch, failing closed (manual clear of $m)"
+        return 0 ;;
+    esac
     local now; now=$(/bin/date +%s)
     [ "$now" -lt "$nr" ]
 }
@@ -370,6 +393,23 @@ _post_iter_cleanup() {
     [ "$UNLOCK_LOCK_HELD" = "1" ] && { release_unlock_lock; UNLOCK_LOCK_HELD=0; }
 }
 
+# A2 (full-sweep): a signal/exit trap GUARANTEES we never leave the Mac unlocked,
+# leak the global unlock mutex, or orphan caffeinate if the launcher is killed
+# (launchd unload / SIGTERM / SIGINT / SIGHUP) AFTER we auto-unlocked but BEFORE
+# the normal per-iteration cleanup ran. _post_iter_cleanup is idempotent: in the
+# normal exit path UNLOCKED_BY_US/CAFF_PID/UNLOCK_LOCK_HELD are already reset so
+# the EXIT trap is a no-op; only an interrupted critical section has work to undo
+# (re-lock via do_relock, kill caffeinate, release the mutex). Red-line ②.
+_on_terminate() {
+    trap - EXIT HUP INT TERM   # disarm so the handler can't re-enter itself
+    _post_iter_cleanup
+    exit "${1:-143}"
+}
+trap '_post_iter_cleanup' EXIT
+trap '_on_terminate 129' HUP
+trap '_on_terminate 130' INT
+trap '_on_terminate 143' TERM
+
 # 遍历所有项目子目录 — main spawn loop (gated by HANDOFF_SKIP_SPAWN).
 if [ "$HANDOFF_SKIP_SPAWN" = "1" ]; then
     log "SKIP-SPAWN: HANDOFF_SKIP_SPAWN=1 — skipping main spawn loop (test mode)"
@@ -381,6 +421,7 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
 
     [ ! -d "$QUEUE" ] && continue
     [ "$HANDOFF_SKIP_SPAWN" = "1" ] && continue
+    [ "$RELOCK_HALT" = "1" ] && continue   # A3: durable .relock-failed halt
 
     # Per-project Guard: 项目级 STOP_AUTO / done
     if [ -f "$PROJ_DIR/STOP_AUTO" ]; then
