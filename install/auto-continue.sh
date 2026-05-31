@@ -107,27 +107,29 @@ if [ "$HANDOFF_VSCODE_CHECK" = "1" ]; then
     fi
 fi
 
-# 全局 Guard 5: code CLI 必须可用 (workspace routing 核心)
-# Skip the strict check when only running the overdue segment since it does
-# not touch `code -r`.
-if [ "$HANDOFF_SKIP_SPAWN" != "1" ]; then
-    if [ -z "$CODE_BIN" ] || [ ! -x "$CODE_BIN" ]; then
-        log "FATAL: code CLI not found (workspace routing unavailable)"
-        exit 1
-    fi
-fi
-
-# 全局 Guard 6 (full-sweep A3): a PRIOR run failed to RE-LOCK the Mac after an
-# auto-unlock and left a durable `.relock-failed` marker. That halt must persist
-# ACROSS runs — the in-run `break 2` alone is not enough, because the next launchd
-# tick finds the screen already unlocked, skips the unlock branch, and would
-# happily resume spawning on an unattended unlocked Mac (red-line ②). Skip ALL
-# spawns until the owner re-locks and clears the marker; the (read-only) overdue
-# scanner further below still runs. Documented in the runbook brakes table.
+# 全局 Guard 5 (full-sweep A3 / Gate0b P2): a PRIOR run failed to RE-LOCK the Mac
+# after an auto-unlock and left a durable `.relock-failed` marker. That halt must
+# persist ACROSS runs — the in-run `break 2` alone is not enough, because the next
+# launchd tick finds the screen already unlocked, skips the unlock branch, and
+# would happily resume spawning on an unattended unlocked Mac (red-line ②). Skip
+# ALL spawns until the owner re-locks and clears the marker; the (read-only)
+# overdue scanner further below still runs. Evaluated BEFORE the code-CLI guard so
+# a missing `code` can't abort the run before that scanner (which needs no `code`).
+# Documented in the runbook brakes table.
 RELOCK_HALT=0
 if [ -f "$HANDOFF_ROOT/.relock-failed" ]; then
     RELOCK_HALT=1
     log "HALT: .relock-failed present — skipping all spawns until re-locked + 'rm $HANDOFF_ROOT/.relock-failed'"
+fi
+
+# 全局 Guard 6: code CLI 必须可用 (workspace routing 核心). Skipped when only the
+# overdue segment runs (HANDOFF_SKIP_SPAWN) or when spawns are halted (RELOCK_HALT)
+# — neither touches `code -r`, so a missing `code` must not abort the overdue scan.
+if [ "$HANDOFF_SKIP_SPAWN" != "1" ] && [ "$RELOCK_HALT" != "1" ]; then
+    if [ -z "$CODE_BIN" ] || [ ! -x "$CODE_BIN" ]; then
+        log "FATAL: code CLI not found (workspace routing unavailable)"
+        exit 1
+    fi
 fi
 
 SPAWNED=0
@@ -382,12 +384,28 @@ do_relock() {
 CAFF_PID=""
 UNLOCKED_BY_US=0
 UNLOCK_LOCK_HELD=0
+MAY_NEED_RELOCK=0   # Gate0b P1: set BEFORE the unlock CLI runs (race-window guard)
 _post_iter_cleanup() {
     # Re-lock (while still holding the mutex + caffeinate) if WE unlocked, then
     # drop caffeinate, then release the global unlock mutex last (P0-2: the mutex
     # spans the whole unlock→submit→relock critical section).
-    [ "$UNLOCKED_BY_US" = "1" ] && do_relock
+    #
+    # Two relock triggers (Gate0b P1 — close the signal race): the normal
+    # UNLOCKED_BY_US flag, OR — covering a TERM/EXIT that lands AFTER the unlock
+    # CLI injected+unlocked but BEFORE UNLOCKED_BY_US was set — MAY_NEED_RELOCK
+    # (an unlock was attempted this iteration) while the screen is NOT currently
+    # locked. `! screen_is_locked` is true for both unlocked AND unknown, so an
+    # undecidable probe still fails CLOSED (attempt relock; do_relock verifies and
+    # marks .relock-failed if it can't confirm a re-lock). If the attempt left the
+    # screen still locked we never unlocked → no relock (and a synthetic keystroke
+    # against a lock screen is forbidden anyway).
+    if [ "$UNLOCKED_BY_US" = "1" ]; then
+        do_relock
+    elif [ "$MAY_NEED_RELOCK" = "1" ] && ! screen_is_locked; then
+        do_relock
+    fi
     UNLOCKED_BY_US=0
+    MAY_NEED_RELOCK=0
     [ -n "$CAFF_PID" ] && kill "$CAFF_PID" 2>/dev/null
     CAFF_PID=""
     [ "$UNLOCK_LOCK_HELD" = "1" ] && { release_unlock_lock; UNLOCK_LOCK_HELD=0; }
@@ -456,6 +474,7 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
         CAFF_PID=""
         UNLOCKED_BY_US=0
         UNLOCK_LOCK_HELD=0
+        MAY_NEED_RELOCK=0
         screen_is_locked; _LRC=$?
         if [ "$_LRC" = "2" ]; then
             # UNKNOWN lock state ⇒ fail-closed: never GUI-submit blind.
@@ -486,6 +505,12 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
             if [ -n "$HANDOFF_CAFFEINATE_CMD" ]; then $HANDOFF_CAFFEINATE_CMD >/dev/null 2>&1 & CAFF_PID=$!; fi
             # Re-probe under the mutex (P0-2): another tick may have unlocked already.
             if screen_is_locked; then
+                # Gate0b P1: from the instant we invoke the unlock CLI, a kill must
+                # be able to trigger a re-lock — the CLI may unlock the screen
+                # before we reach `UNLOCKED_BY_US=1` below. The cleanup relocks iff
+                # the screen is actually unlocked, so the failure path (still
+                # locked) won't keystroke a lock screen.
+                MAY_NEED_RELOCK=1
                 run_with_timeout "$HANDOFF_UNLOCK_TIMEOUT" $HANDOFF_UNLOCK_CMD >>"$LOG" 2>&1; _URC=$?
                 if screen_is_locked; then
                     unlock_fail_bump "$PROJ_DIR" "$_URC"

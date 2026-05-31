@@ -19,7 +19,9 @@ stateful lock/unlock/relock stubs (a shared state file the stubs read/write).
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -298,3 +300,65 @@ def test_corrupt_cooldown_marker_fails_closed(home, tmp_path):
     marker = home / PROJECT / "queue" / f"{TASK}.deferred"
     assert marker.exists() and "unlock-cooldown" in marker.read_text()
     assert (home / PROJECT / "queue" / f"{TASK}.uri").exists()
+
+
+def test_cooldown_marker_nonnumeric_next_retry_fails_closed(home, tmp_path):
+    """Gate0b A4 variant: a NON-numeric next_retry_epoch (not just a missing one)
+    also fails closed — exercises the other half of the corrupt-marker branch."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _seed(home, ws)
+    cd = home / PROJECT / ".unlock-cooldown"
+    cd.write_text("count=2\nlast_epoch=0\nnext_retry_epoch=abc\nlast_rc=1\n", encoding="utf-8")
+    env = _env(home, tmp_path, initial="locked", opt_in=True, unlock_ok=True)
+    assert _run(env).returncode == 0
+    assert _read(env, "_UNLOCK_SINK") == "", "non-numeric next_retry → fail closed, no unlock"
+    marker = home / PROJECT / "queue" / f"{TASK}.deferred"
+    assert marker.exists() and "unlock-cooldown" in marker.read_text()
+
+
+def test_sigterm_after_unlock_before_flag_relocks(home, tmp_path):
+    """Gate0b P1 (A2 race): a TERM that lands AFTER the unlock CLI already unlocked
+    the screen but BEFORE ``UNLOCKED_BY_US=1`` is set must STILL re-lock — via the
+    ``MAY_NEED_RELOCK`` guard set before the unlock CLI runs — or the Mac is stranded
+    unlocked (red-line ②). We force that exact window by making the unlock stub flip
+    state→unlocked immediately, then block (sleep) so the launcher is still inside
+    run_with_timeout (UNLOCKED_BY_US not yet set) when we deliver SIGTERM."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _seed(home, ws)
+    env = _env(home, tmp_path, initial="locked", opt_in=True, unlock_ok=True)
+    stub = tmp_path / "stubs"
+    # flip state→unlocked NOW, then block so the launcher is mid-run_with_timeout.
+    _w(
+        stub / "unlock",
+        '#!/bin/bash\nprintf u >> "$_UNLOCK_SINK"\necho unlocked > "$_LOCKSTATE"\nsleep 6\nexit 0\n',
+    )
+    proc = subprocess.Popen(
+        ["/bin/bash", str(SCRIPT)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    state = Path(env["_LOCKSTATE"])
+    unlock_sink = Path(env["_UNLOCK_SINK"])
+    deadline = time.time() + 8
+    in_window = False
+    while time.time() < deadline:
+        if (
+            unlock_sink.exists()
+            and unlock_sink.read_text() == "u"
+            and state.read_text().strip() == "unlocked"
+        ):
+            in_window = True
+            break
+        time.sleep(0.1)
+    if not in_window:
+        proc.kill()
+        proc.wait(timeout=10)
+        raise AssertionError("unlock stub did not reach the race window in time")
+    proc.send_signal(signal.SIGTERM)
+    proc.wait(timeout=15)
+    assert Path(env["_RELOCK_SINK"]).read_text() == "r", "TERM in race window must still re-lock"
+    assert state.read_text().strip() == "locked", "screen must end re-locked, not stranded unlocked"
