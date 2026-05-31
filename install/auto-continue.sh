@@ -55,6 +55,7 @@ HANDOFF_UNLOCK_CMD="${HANDOFF_UNLOCK_CMD:-}"            # e.g. "<mp>/.venv/bin/p
 HANDOFF_RELOCK_CMD="${HANDOFF_RELOCK_CMD:-}"            # e.g. "<mp>/.venv/bin/python -m src.agent.unlock_cli --lock"
 HANDOFF_UNLOCK_TIMEOUT="${HANDOFF_UNLOCK_TIMEOUT:-90}"  # wall-clock cap for the unlock CLI (P1-5)
 HANDOFF_RELOCK_TIMEOUT="${HANDOFF_RELOCK_TIMEOUT:-20}"
+HANDOFF_LOCKCHECK_TIMEOUT="${HANDOFF_LOCKCHECK_TIMEOUT:-15}"  # cap for the Quartz --status lock probe (P0 lock-probe fix)
 HANDOFF_CAFFEINATE_CMD="${HANDOFF_CAFFEINATE_CMD:-caffeinate -d -i}"  # held across unlock→submit (P1-6); empty disables
 HANDOFF_UNLOCK_FAIL_THRESHOLD="${HANDOFF_UNLOCK_FAIL_THRESHOLD:-2}"   # consecutive fails → manual-only (P0-3 / B3)
 HANDOFF_UNLOCK_COOLDOWN="${HANDOFF_UNLOCK_COOLDOWN:-1800}"            # seconds to wait after threshold reached
@@ -189,18 +190,84 @@ warn_accessibility_once() {
     "$HANDOFF_OSASCRIPT_CMD" -e 'display notification "自动接续无法按 Enter：缺辅助功能权限。tab 已打开，请手动按 Enter，并到 系统设置 → 隐私与安全性 → 辅助功能 授权。" with title "Handoff ⚠️ 辅助功能权限" sound name "Basso"' 2>>"$LOG" || true
 }
 
+# lock-probe P0 (no-unlock fallback): the launcher fell back to the ioreg lock
+# probe because NEITHER an explicit HANDOFF_LOCK_CHECK_CMD NOR a derivable Quartz
+# `--status` (from HANDOFF_UNLOCK_CMD) is configured. On modern macOS (≥ ~14,
+# verified macOS 26) ioreg's CGSSessionScreenIsLocked is absent EVEN WHEN LOCKED,
+# so this probe cannot distinguish locked from unlocked and may report a locked
+# screen as "unlocked" → the GUI spawns behind the lock + Enter is a silent no-op.
+# We CANNOT safely fix this without a reliable probe (forcing UNKNOWN here would
+# also defer every genuinely-unlocked run → 100% stall). So make the risk LOUD
+# (the original silent failure went undetected precisely because the log showed
+# "success") and tell the operator to configure a probe. Once per run + per 6h.
+LOCKPROBE_WARNED=0
+warn_lockprobe_unreliable_once() {
+    [ "$LOCKPROBE_WARNED" = "1" ] && return 0
+    LOCKPROBE_WARNED=1
+    local marker="$HANDOFF_ROOT/.lockprobe-unreliable-warned"
+    if [ -f "$marker" ]; then
+        local mt now
+        mt=$(/usr/bin/stat -f %m "$marker" 2>/dev/null || echo 0)
+        now=$(/bin/date +%s)
+        [ "$((now - mt))" -lt 21600 ] && return 0
+    fi
+    : > "$marker" 2>/dev/null || true
+    log "LOCKPROBE-UNRELIABLE-FALLBACK: 无可靠锁屏探针 (未配 HANDOFF_LOCK_CHECK_CMD / HANDOFF_UNLOCK_CMD --unlock), 退回 ioreg — 新版 macOS 锁屏时该探针可能误判'未锁', 锁屏下自动接续可能把 tab 开在锁屏背后且 Enter 无效. 修复: 配置 HANDOFF_UNLOCK_CMD='<mp-unlock> --unlock' (即启用 unlock-pivot) 或显式 HANDOFF_LOCK_CHECK_CMD."
+    "$HANDOFF_OSASCRIPT_CMD" -e 'display notification "锁屏探针不可靠 (ioreg 回退)：锁屏下自动接续可能失效。请配置 unlock 命令或锁屏探针。" with title "Handoff ⚠️ 锁屏探针" sound name "Basso"' 2>>"$LOG" || true
+}
+
 # ─── unlock-pivot helpers (lock-aware GUI gating; defined before the loop) ───
 
-# Lock probe. exit 0=locked / 1=unlocked / 2=UNKNOWN (ioreg failed/empty).
-# EMPIRICAL: unlocked macs have CGSSessionScreenIsLocked ABSENT (no `= No`); only
-# `= Yes` = locked. key-absent ⇒ UNLOCKED — mapping it to UNKNOWN would defer
-# every unlocked machine (100% stall). Only a genuine ioreg failure is UNKNOWN.
+# Effective Quartz lock-probe command. The MP unlock CLI exposes `--status`
+# (exit 0=unlocked / 1=locked / 2=error) backed by Quartz
+# CGSessionCopyCurrentDictionary — the RELIABLE lock probe on modern macOS.
+# Derived from HANDOFF_UNLOCK_CMD by swapping --unlock→--status (mirrors
+# effective_relock_cmd's --lock). Empty when no unlock cmd is configured.
+effective_lockcheck_cmd() {
+    case "$HANDOFF_UNLOCK_CMD" in
+        *--unlock*) printf '%s' "${HANDOFF_UNLOCK_CMD/--unlock/--status}" ;;
+        *) printf '' ;;
+    esac
+}
+
+# Lock probe. exit 0=locked / 1=unlocked / 2=UNKNOWN. Probe priority:
+#   1. HANDOFF_LOCK_CHECK_CMD — explicit stdout-contract override (prints
+#      locked|unlocked|*); used by tests and power users.
+#   2. Quartz via the MP unlock CLI's `--status` (exit-code contract) — the
+#      RELIABLE default whenever the unlock feature is configured.
+#   3. ioreg `CGSSessionScreenIsLocked` — LAST-RESORT fallback ONLY. ⚠️ On modern
+#      macOS (verified macOS 26 / Tahoe, 2026-05-31 on-box 2c) this property is
+#      ABSENT even when the screen is LOCKED, so this path reports "unlocked" for a
+#      locked screen — a silent killer (the launcher would spawn the GUI behind the
+#      lock screen, osascript Enter a no-op, session dead). Reached only when no
+#      unlock cmd is configured (unlock feature unused); when it IS, path 2 wins.
 screen_is_locked() {
     if [ -n "$HANDOFF_LOCK_CHECK_CMD" ]; then
         case "$("$HANDOFF_LOCK_CHECK_CMD" 2>/dev/null)" in
             locked) return 0 ;; unlocked) return 1 ;; *) return 2 ;;
         esac
     fi
+    local qcmd; qcmd=$(effective_lockcheck_cmd)
+    if [ -n "$qcmd" ]; then
+        run_with_timeout "${HANDOFF_LOCKCHECK_TIMEOUT:-15}" $qcmd >/dev/null 2>&1
+        case $? in 0) return 1 ;; 1) return 0 ;; *) return 2 ;; esac
+    fi
+    # Gate0b/lock-probe P0-2: unlock is CONFIGURED ($HANDOFF_UNLOCK_CMD non-empty)
+    # but we could NOT derive a reliable Quartz `--status` probe from it (e.g. the
+    # cmd has no `--unlock` token to swap, or a typo'd flag). Do NOT trust the
+    # known-broken ioreg fallback here — that is exactly the macOS-26 silent killer
+    # (locked screen read as "unlocked" → GUI spawned behind the lock). Return
+    # UNKNOWN so the caller fails CLOSED (defer), never blind-spawns.
+    if [ -n "$HANDOFF_UNLOCK_CMD" ]; then
+        log "LOCKPROBE-UNRELIABLE: HANDOFF_UNLOCK_CMD set but no Quartz --status derivable (need a '--unlock' token or explicit HANDOFF_LOCK_CHECK_CMD); refusing ioreg fallback → UNKNOWN"
+        return 2
+    fi
+    # No unlock feature in use → legacy ioreg fallback (best-effort; unreliable on
+    # modern macOS, but only reached when the unlock path is entirely unconfigured).
+    # Make the unreliability LOUD so a locked-screen mis-read can't fail silently
+    # (the original silent failure hid behind "success" logs). Skipped under a stub
+    # ioreg in tests via HANDOFF_LOCKPROBE_QUIET=1.
+    [ "${HANDOFF_LOCKPROBE_QUIET:-0}" = "1" ] || warn_lockprobe_unreliable_once
     local out
     out=$("$HANDOFF_IOREG_CMD" -n Root -d1 2>/dev/null) || return 2
     [ -z "$out" ] && return 2
@@ -503,25 +570,38 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
             # Hold caffeinate across unlock→submit (P1-6: keep system awake so it
             # can't re-lock mid-window). Empty HANDOFF_CAFFEINATE_CMD disables.
             if [ -n "$HANDOFF_CAFFEINATE_CMD" ]; then $HANDOFF_CAFFEINATE_CMD >/dev/null 2>&1 & CAFF_PID=$!; fi
-            # Re-probe under the mutex (P0-2): another tick may have unlocked already.
-            if screen_is_locked; then
-                # Gate0b P1: from the instant we invoke the unlock CLI, a kill must
-                # be able to trigger a re-lock — the CLI may unlock the screen
-                # before we reach `UNLOCKED_BY_US=1` below. The cleanup relocks iff
-                # the screen is actually unlocked, so the failure path (still
-                # locked) won't keystroke a lock screen.
+            # Re-probe under the mutex (P0-2): another tick may have unlocked
+            # already. Three-state (lock-probe P0-1): only rc=1 (genuinely unlocked)
+            # is safe to proceed without unlocking; rc=2 (UNKNOWN — e.g. a Quartz
+            # `--status` timeout) must fail CLOSED, never blind-spawn behind a lock.
+            screen_is_locked; _RC=$?
+            if [ "$_RC" = "2" ]; then
+                defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "lock-unknown-premutex"
+                _post_iter_cleanup; continue
+            fi
+            if [ "$_RC" = "0" ]; then
+                # Still locked → auto-unlock. Gate0b P1: from the instant we invoke
+                # the unlock CLI a kill must be able to trigger a re-lock (the CLI may
+                # unlock before we reach UNLOCKED_BY_US=1); cleanup relocks iff the
+                # screen is actually unlocked.
                 MAY_NEED_RELOCK=1
                 run_with_timeout "$HANDOFF_UNLOCK_TIMEOUT" $HANDOFF_UNLOCK_CMD >>"$LOG" 2>&1; _URC=$?
-                if screen_is_locked; then
+                # Verify (lock-probe P0-1): ONLY rc=1 (confirmed unlocked) is success.
+                # rc=0 (still locked) OR rc=2 (UNKNOWN) ⇒ fail CLOSED (defer + cooldown);
+                # never proceed to GUI on an unconfirmed-unlocked screen.
+                screen_is_locked; _VRC=$?
+                if [ "$_VRC" != "1" ]; then
                     unlock_fail_bump "$PROJ_DIR" "$_URC"
-                    defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "unlock-failed-rc$_URC"
-                    _post_iter_cleanup   # kills caffeinate + releases the mutex (no relock — we never unlocked)
+                    defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "unlock-failed-rc$_URC-verify$_VRC"
+                    _post_iter_cleanup   # relocks iff MAY_NEED_RELOCK && screen not locked
                     continue
                 fi
                 unlock_fail_reset "$PROJ_DIR"
                 UNLOCKED_BY_US=1
                 log "UNLOCK-OK: project=$PROJECT task=$TASK (rc=$_URC)"
             fi
+            # _RC=1 ⇒ another tick already unlocked; proceed to spawn on the
+            # genuinely-unlocked screen (mutex held; UNLOCKED_BY_US stays 0).
             # R2 P0-2: HOLD the mutex across claim→submit (released in
             # _post_iter_cleanup) so a 2nd tick can't see the unlocked screen and
             # race the GUI/Enter. The whole locked-path spawn is globally serial.
@@ -558,13 +638,18 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
             # 等 sleep 1.5 后必须验证 frontmost app 是 Code 才按 Enter
             # 否则可能按到 finder / 别 app, 触发不可预期行为 (写入文件名 / 触发快捷键等)
             sleep 1.5  # 等 Claude Code 渲染输入栏 + prompt 粘贴完成
-            if screen_is_locked; then
-                # P1-6: screen re-locked during the unlock→submit window — a synthetic
-                # Enter against the lock screen is forbidden + dangerous. Abort the
-                # submit; the tab is open but unsubmitted (visible park, owner finishes
-                # on unlock). caffeinate should normally prevent this.
-                log "ABORT-SUBMIT: screen re-locked before Enter — 未按 (tab 已开). project=$PROJECT task=$TASK"
-                write_ack "$PROJ_DIR" "$TASK" "failed" "screen re-locked before submit Enter"
+            # Three-state (lock-probe P0-1): only a CONFIRMED-unlocked screen (rc=1)
+            # may receive the synthetic Enter. rc=0 (re-locked mid-window) OR rc=2
+            # (UNKNOWN — Quartz probe timeout/error) ⇒ abort the submit; a keystroke
+            # into a locked/indeterminate screen is forbidden + a silent no-op.
+            screen_is_locked; _SRC=$?
+            if [ "$_SRC" != "1" ]; then
+                # P1-6: screen re-locked (or lock state unconfirmable) during the
+                # unlock→submit window. Abort the submit; the tab is open but
+                # unsubmitted (visible park, owner finishes on unlock). caffeinate
+                # should normally prevent a re-lock.
+                log "ABORT-SUBMIT: screen not confirmed unlocked before Enter (rc=$_SRC) — 未按 (tab 已开). project=$PROJECT task=$TASK"
+                write_ack "$PROJ_DIR" "$TASK" "failed" "screen not confirmed unlocked before submit Enter (rc=$_SRC)"
                 # R2 P1: restore the .uri so a later (unlocked) tick can retry,
                 # and mark deferred. The already-open tab stays for audit.
                 mv "$LAUNCHED_FILE" "$URI_FILE" 2>/dev/null
