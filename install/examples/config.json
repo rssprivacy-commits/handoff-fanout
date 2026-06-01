@@ -28,6 +28,9 @@
     "fallback_tail_chars": 3000
   },
 
+  "_mandate_projects_comment": "Optional v5.4 mandate roll-out allowlist (must be a NON-EMPTY list of slugs). The global dump entry re-execs the engine, so the global HANDOFF_RETRO_MANDATE / HANDOFF_AUDIT_MANDATE env would enforce on EVERY project's active dump. List only projects ready for the precheck + --retro-evidence flow; unlisted siblings take the legacy (no-gate) path. FAIL-CLOSED: every degenerate shape — key absent, [], a bare string typo, all-invalid entries — enforces EVERYWHERE (an accidental empty never silently disables the mandate). To genuinely disable, unset the env mandate, not this key. An explicit --retro-evidence or HANDOFF_RETRO_BYPASS always runs the gate regardless.",
+  "mandate_projects": ["my-repo"],
+
   "uri_template": "vscode://anthropic.claude-code/open?prompt={prompt}",
 
   "workspace_root": "~/Projects"

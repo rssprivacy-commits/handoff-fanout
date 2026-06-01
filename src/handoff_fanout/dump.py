@@ -225,6 +225,7 @@ def _run_retro_gate(
     args: argparse.Namespace,
     workspace: Path,
     project: str,
+    cfg,
 ) -> retro_gate.GateResult | None:
     """Decide whether the v5.4 retro gate runs and return its verdict.
 
@@ -237,10 +238,42 @@ def _run_retro_gate(
     if args.batch_done or args.batch_blocked or args.open_batch or args.batch_fan_in:
         return None
 
+    evidence_path = Path(args.retro_evidence) if args.retro_evidence else None
+
+    # Narrow terminal-status exemption: a ``done`` / ``blocked`` closure with NO
+    # explicit evidence has no successor task — retro ("did you retro before the
+    # NEXT task") and audit ("don't propagate defects to the next session") both
+    # presuppose a successor. ``batch_done`` / ``batch_blocked`` are already exempt
+    # above for the same reason; this extends it to plain terminal dumps so marking
+    # a task done — or honestly reporting it blocked, when a stuck session may not
+    # even be able to produce clean evidence — is never itself gated. NARROW (codex
+    # R1): if ``--retro-evidence`` IS supplied (e.g. ``handoff audit-close
+    # --status done``), fall through and validate it — an attested closure must not
+    # silently skip validation.
+    if args.status in ("done", "blocked") and evidence_path is None:
+        return None
+
     bypass = os.environ.get("HANDOFF_RETRO_BYPASS") == "1"
     mandate = os.environ.get("HANDOFF_RETRO_MANDATE") == "1"
     audit_mandate = os.environ.get("HANDOFF_AUDIT_MANDATE") == "1"
-    evidence_path = Path(args.retro_evidence) if args.retro_evidence else None
+
+    # Project-scoped mandate roll-out (R1 cross-project blast-radius mitigation):
+    # a shared ``$HANDOFF_HOME/config.json`` may list ``mandate_projects`` (a NON-EMPTY
+    # list of slugs — see config.py for the fail-closed parsing of empty/typo values).
+    # When configured, only listed projects enforce the env mandate on a no-evidence
+    # dump — unlisted siblings take the legacy path so routing the global dump entry
+    # to the engine doesn't brick not-yet-migrated projects. NOT applied when
+    # ``HANDOFF_RETRO_BYPASS`` is set (codex R2-P1): a bypass must always reach the gate
+    # so its override.json validation + bypass-debt recording run, even for an unlisted
+    # project. An explicit ``--retro-evidence`` likewise always runs the gate (handled
+    # by the ``evidence_path is None`` guard) — opt-in evidence is never ignored.
+    if (
+        evidence_path is None
+        and not bypass
+        and getattr(cfg, "mandate_projects_configured", False)
+        and project not in getattr(cfg, "mandate_projects", [])
+    ):
+        return None
 
     if evidence_path is None and not bypass and not mandate and not audit_mandate:
         # legacy path: no gate, preserve pre-v5.4 ERP shim behaviour
@@ -501,16 +534,33 @@ def write_active_dump(
         _notify(osascript_subtitle or task, f"自动接续 / {project}", task, sound="Basso")
         return 0
 
-    # active: write .uri sidecar + clipboard + notification
+    # active: prepare all sidecars FIRST, then publish the .uri trigger LAST.
+    # CRITICAL ORDERING (codex+Gemini R2): the .uri sidecar is the launchd WatchPaths
+    # trigger — the instant it lands, the launcher spawns the next session, whose §0
+    # audit immediately reads ack/<task>.old_ready. So .uri MUST be written AFTER
+    # .queued AND .old_ready (the latter runs a slow `git rev-parse`); otherwise the
+    # new session can race ahead of old_ready and false-BLOCK. Everything below the
+    # "publish" line is the trigger; everything above is preparation.
     uri = build_uri(cfg, project, task)
     uri_path = queue_dir / f"{task}.uri"
-    # §3.7 — atomic .uri write (see the .md note above).
-    atomic.atomic_replace(uri_path, f"WORKSPACE={workspace}\nURI={uri}\n")
-    print(f"[dump] wrote {uri_path}")
 
-    _maybe_pbcopy(handoff_content)
+    # ack/<task>.queued — early "dump ran, awaiting spawn" breadcrumb (parity with
+    # the pre-A4 standalone global). The launcher writes .spawned/.submitted/.failed
+    # afterward; the spawn-new-session skill's Step 5 poll uses .queued to tell
+    # "dump ran, launchd is slow" apart from "dump never ran". Best-effort.
+    try:
+        ack_dir = cfg.ack_dir(project)
+        ack_dir.mkdir(parents=True, exist_ok=True)
+        (ack_dir / f"{task}.queued").write_text(
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"workspace={workspace}\nstatus={status}\n",
+            encoding="utf-8",
+        )
+    except OSError as e:
+        print(f"[dump] (non-fatal) could not write queued ack: {e}")
 
-    # §7.6 — write ack/<task>.old_ready when retro evidence drove the dump.
+    # §7.6 — write ack/<task>.old_ready when retro evidence drove the dump. MUST be
+    # before the .uri publish so the next session's §0 audit sees it (see ordering note).
     if retro_evidence_path is not None:
         old_ready_path = _write_old_ready(
             project=project,
@@ -530,6 +580,13 @@ def write_active_dump(
                 "(evidence vanished/unreadable); §0 new-session audit can't verify "
                 f"{project}/{task}"
             )
+
+    _maybe_pbcopy(handoff_content)
+
+    # ── PUBLISH: write the .uri trigger LAST (all sidecars now exist) ────────────
+    # §3.7 — atomic .uri write (see the .md note above).
+    atomic.atomic_replace(uri_path, f"WORKSPACE={workspace}\nURI={uri}\n")
+    print(f"[dump] wrote {uri_path}")
 
     _notify(next_brief, f"自动接续 / {project}", task)
     print(f"[dump] ✅ active dump complete for {project}/{task}")
@@ -1104,6 +1161,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="optional per-task nonce; must match payload.nonce when present (§7.2)",
     )
+    # Deprecated no-op (backward-compat). The pre-v5.4 standalone global dump
+    # auto-appended a ``-YYYYMMDD-HHMMSS`` suffix to active task IDs unless
+    # ``--no-dedupe`` was passed. v5.4 binds the task ID to its evidence file
+    # (``precheck/<task>.retro.evidence.json``) + ``old_ready`` lookups, so task
+    # IDs MUST be exact — no auto-suffix. The flag is accepted and ignored so old
+    # callers / scripts that still pass it don't crash with "unrecognized arguments".
+    ap.add_argument(
+        "--no-dedupe",
+        action="store_true",
+        help="(deprecated, ignored) task IDs are exact under v5.4; no timestamp suffix",
+    )
     return ap
 
 
@@ -1114,9 +1182,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.cleanup_orphan:
         return handle_cleanup_orphan(args)
 
-    if not args.task or not args.next_brief:
-        raise SystemExit("❌ --task and --next are required (except under --cleanup-orphan)")
-    validate_task_id(args.task)
+    # --open-batch opens a fan-out batch from a manifest.json; the sub-task IDs come
+    # from the manifest (handle_open_batch never reads args.task), so it does NOT
+    # require --task/--next. codex R2-P1: the documented global invocation
+    # ``dump-handoff.py --open-batch <manifest>`` was wrongly blocked by this guard.
+    if not args.open_batch and (not args.task or not args.next_brief):
+        raise SystemExit(
+            "❌ --task and --next are required (except under --cleanup-orphan / --open-batch)"
+        )
+    if args.task:
+        validate_task_id(args.task)
 
     workspace = Path(args.workspace).resolve() if args.workspace else Path.cwd().resolve()
     if not workspace.exists():
@@ -1132,7 +1207,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[dump] STOP detected at {stop_path}, exit 0 (no write)")
         return 0
 
-    gate_result = _run_retro_gate(args, workspace, project)
+    gate_result = _run_retro_gate(args, workspace, project, cfg)
     if gate_result is not None and not gate_result.is_ok:
         gate_result.emit()
         return gate_result.exit_code

@@ -26,6 +26,8 @@
 #   --uninstall       reverse everything this script installs
 #   --sync-launcher   push canonical auto-continue.sh → ~/.local/bin + record sha
 #                     (keeps the com.dharmaxis.auto-continue runtime copy canonical)
+#   --sync-dump       push canonical dump-handoff.py re-exec shim → ~/.local/bin
+#                     + record sha (routes the global dump entry to the v5.4 engine)
 #   -h | --help       show this message
 
 set -euo pipefail
@@ -38,6 +40,7 @@ INSTALL_CONFIG=1
 INSTALL_EXTENSION=1
 UNINSTALL=0
 DO_SYNC_LAUNCHER=0
+DO_SYNC_DUMP=0
 REPO_URL="https://github.com/rssprivacy-commits/handoff-fanout.git"
 
 usage() {
@@ -53,6 +56,7 @@ while [[ $# -gt 0 ]]; do
         --no-extension) INSTALL_EXTENSION=0; shift ;;
         --uninstall)   UNINSTALL=1; shift ;;
         --sync-launcher) DO_SYNC_LAUNCHER=1; shift ;;
+        --sync-dump)   DO_SYNC_DUMP=1; shift ;;
         -h|--help)     usage; exit 0 ;;
         *)             echo "Unknown arg: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -98,6 +102,32 @@ if [[ $DO_SYNC_LAUNCHER -eq 1 ]]; then
         echo "✓ launcher synced: $DEST == canonical ($(cat "$SHA_FILE"))"
     else
         echo "✗ launcher sync verify FAILED" >&2; exit 1
+    fi
+    exit 0
+fi
+
+# ─── --sync-dump : push canonical dump-handoff.py re-exec shim to the runtime ─
+# The global dump entry (~/.local/bin/dump-handoff.py) is a deployed COPY of this
+# repo's canonical install/dump-handoff.py. The pre-A4 deployer (ERP
+# install-handoff.sh) only copied it when MISSING, so it drifted to a stale
+# standalone that never routed to the engine (v5.4 mandate gate silently dead).
+# This step force-refreshes the canonical re-exec shim to the runtime location,
+# records its sha, and verifies the byte-for-byte copy. Idempotent: re-running
+# converges to the canonical content (no skip-if-exists drift). Standalone.
+if [[ $DO_SYNC_DUMP -eq 1 ]]; then
+    SRC="$ASSET_DIR/dump-handoff.py"
+    DEST="$HOME/.local/bin/dump-handoff.py"
+    SHA_FILE="$HOME/.claude-handoff/.dump-handoff.canonical.sha"
+    if [[ ! -f "$SRC" ]]; then
+        echo "❌ canonical dump shim missing: $SRC" >&2; exit 1
+    fi
+    mkdir -p "$HOME/.local/bin" "$HOME/.claude-handoff"
+    cp "$SRC" "$DEST" && chmod +x "$DEST"
+    shasum "$SRC" | awk '{print $1}' > "$SHA_FILE"
+    if [[ "$(shasum "$DEST" | awk '{print $1}')" == "$(cat "$SHA_FILE")" ]]; then
+        echo "✓ dump shim synced: $DEST == canonical ($(cat "$SHA_FILE"))"
+    else
+        echo "✗ dump shim sync verify FAILED" >&2; exit 1
     fi
     exit 0
 fi

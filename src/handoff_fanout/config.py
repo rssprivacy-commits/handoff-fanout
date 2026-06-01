@@ -121,6 +121,20 @@ class Config:
     # present-but-empty fails CLOSED; key absent → unconfigured → no root restriction.
     audit_code_repo_roots: list[str] = field(default_factory=list)
     audit_code_roots_configured: bool = False
+    # Opt-in project-scoped mandate roll-out (cross-project blast-radius control).
+    # The retro/audit mandates live in GLOBAL env (``HANDOFF_RETRO_MANDATE`` /
+    # ``HANDOFF_AUDIT_MANDATE``), but a single shared ``$HANDOFF_HOME/config.json``
+    # drives every project under that home. When ``mandate_projects`` is a NON-EMPTY
+    # list of slugs, only those projects enforce the env mandate on a no-evidence dump;
+    # unlisted siblings take the legacy (no-gate) path. This lets the global dump entry
+    # route to the engine without bricking not-yet-migrated projects' auto-continue
+    # chains. FAIL-CLOSED (codex R2-P1): every degenerate shape — key absent, ``[]``,
+    # a bare string typo, or all-invalid entries — leaves ``mandate_projects_configured``
+    # False ⇒ enforce everywhere (an accidental empty must never silently disable the
+    # mandate). See ``_parse_mandate_projects``. An explicit ``--retro-evidence`` or
+    # ``HANDOFF_RETRO_BYPASS`` always runs the gate regardless of this list.
+    mandate_projects: list[str] = field(default_factory=list)
+    mandate_projects_configured: bool = False
 
     def queue_dir(self, project: str) -> Path:
         return self.home / project / "queue"
@@ -209,4 +223,28 @@ def _from_dict(data: dict, home: Path) -> Config:
             if isinstance(r, str) and r
         ],
         audit_code_roots_configured="audit_code_repo_roots" in data,
+        **_parse_mandate_projects(data),
     )
+
+
+def _parse_mandate_projects(data: dict) -> dict:
+    """Fail-CLOSED parse of ``mandate_projects`` (codex R2-P1 footgun fix).
+
+    Scoping is honored ONLY when the value is a NON-EMPTY list of non-empty strings.
+    Every degenerate shape → ``configured=False`` → enforce everywhere (never silently
+    disables the mandate):
+      * key absent                       → enforce everywhere
+      * ``[]`` (empty list)              → enforce everywhere (NOT opt-out — a security
+                                           mandate must fail closed on an accidental empty)
+      * ``"erp-system"`` (string, typo)  → enforce everywhere (do NOT iterate chars)
+      * ``["", null, 123]`` (all invalid)→ enforce everywhere
+    To genuinely disable enforcement, unset the env mandate — not via this key.
+    """
+    raw = data.get("mandate_projects")
+    projects = (
+        [str(p) for p in raw if isinstance(p, str) and p] if isinstance(raw, list) else []
+    )
+    return {
+        "mandate_projects": projects,
+        "mandate_projects_configured": bool(projects),
+    }
