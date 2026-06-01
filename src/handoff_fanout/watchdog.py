@@ -294,10 +294,15 @@ def _dump_degraded_fan_in(
         missing=missing,
     )
     fan_in_task = manifest["fan_in_task"] + "-watchdog"
-    atomic.write_with_fsync(queue_dir / f"{fan_in_task}.md", content)
+    # Launcher-visible degraded fan-in description + trigger: atomic_replace, not
+    # write_with_fsync. This is the watchdog's batch fan-in producer and shares
+    # the same launchd WatchPaths surface as dump.trigger_fan_in_if_ready — an
+    # in-place O_TRUNC window would expose a torn read to the launcher / spawned
+    # session (same rationale as the single-task path, dump.write_active_dump §3.7).
+    atomic.atomic_replace(queue_dir / f"{fan_in_task}.md", content)
 
     uri = dump.build_uri(cfg, project, fan_in_task)
-    atomic.write_with_fsync(
+    atomic.atomic_replace(
         queue_dir / f"{fan_in_task}.uri",
         f"WORKSPACE={workspace}\nURI={uri}\n",
     )

@@ -175,6 +175,39 @@ def test_cleanup_orphan_apply_deletes_all(isolated_handoff_home):
     assert record[0]["task"] == "g2"
 
 
+def test_cleanup_orphan_apply_removes_old_ready_and_heartbeat(isolated_handoff_home):
+    """Gap 2: --apply must also delete ack/<task>.old_ready + queue/<task>.heartbeat.
+
+    A leaked heartbeat keeps ticking and watchdog mode 6 mis-flags the orphan as
+    529-suspected; a leaked old_ready accumulates as stale audit metadata.
+    """
+    p = _setup_project(isolated_handoff_home)
+    spawned = p["ack"] / "g2.spawned"
+    spawned.write_text("(test)")
+    old_ready = p["ack"] / "g2.old_ready"
+    old_ready.write_text('{"task_id": "g2"}')
+    heartbeat = p["queue"] / "g2.heartbeat"
+    heartbeat.write_text("")
+
+    args = SimpleNamespace(project=None, apply=True, kill_spawned=False)
+    dump.handle_cleanup_orphan(args)
+
+    assert not spawned.exists()
+    assert not old_ready.exists()
+    assert not heartbeat.exists()
+
+
+def test_find_orphans_exposes_old_ready_and_heartbeat_paths(isolated_handoff_home):
+    """Gap 2: the orphan dict carries the new residue paths for cleanup."""
+    p = _setup_project(isolated_handoff_home)
+    (p["ack"] / "g2.spawned").write_text("(test)")
+    found = dump.find_orphans()
+    assert len(found) == 1
+    o = found[0]
+    assert o["old_ready_path"] == p["ack"] / "g2.old_ready"
+    assert o["heartbeat_path"] == p["queue"] / "g2.heartbeat"
+
+
 def test_cleanup_orphan_no_orphans_no_recovery_record(isolated_handoff_home, capsys):
     _setup_project(isolated_handoff_home)
     args = SimpleNamespace(project=None, apply=True, kill_spawned=False)

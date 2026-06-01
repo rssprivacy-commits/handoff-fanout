@@ -366,6 +366,114 @@ def test_D3_no_old_ready_when_retro_evidence_omitted(tmp_path, monkeypatch):
     assert not old_ready.exists()
 
 
+# ─── Gap 3 — cross-repo anchor surfaced into old_ready ──────────────────────────
+
+
+def _git_init_commit(repo: Path) -> str:
+    """Init a throwaway repo with one commit; return its HEAD sha."""
+    repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "--quiet", "--initial-branch=main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=repo, check=True)
+    # Distinct content per repo so the two repos get distinct commit SHAs (a
+    # shared tree + same-second timestamp would otherwise collide deterministically).
+    (repo / "f.txt").write_text(f"{repo.name}\n")
+    subprocess.run(["git", "add", "f.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _write_evidence_with_codex_audit(home: Path, codex_audit: dict | None) -> Path:
+    """Hand-craft a minimal evidence file (+ optional codex_audit block) for
+    ``dump._write_old_ready``, which only needs a dict with phase0 / nonce /
+    optional codex_audit (it does not re-validate the full precheck schema)."""
+    payload = {
+        "schema_version": "5.5.0",
+        "nonce": "gap3",
+        "phase0": {"tests": {"status": "✅"}, "memory": {"status": "✅"}},
+        "phase1": {k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS},
+    }
+    if codex_audit is not None:
+        payload["codex_audit"] = codex_audit
+    out = home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload), encoding="utf-8")
+    return out
+
+
+def test_old_ready_surfaces_cross_repo_anchor(tmp_path, monkeypatch):
+    """A dual-repo audit-close (--code-repo) puts code_repo/_head in the codex_audit
+    block; _write_old_ready must surface both so the §0 audit can trace the
+    engine-side commit that the workspace HEAD alone misses."""
+    from handoff_fanout import dump
+
+    home = tmp_path / "handoff"
+    monkeypatch.setenv("HANDOFF_HOME", str(home))
+    ws = tmp_path / "ws"
+    _git_init_commit(ws)
+    code_repo = tmp_path / "engine"
+    code_head = _git_init_commit(code_repo)
+
+    codex_audit = {
+        "audit_mode": "full_codex_audit",
+        "audit_runs": [{"run_index": 1, "input_commit": "deadbeef", "original_findings": []}],
+        "dispositions": [],
+        "code_repo": str(code_repo),
+        "code_repo_head": code_head,
+    }
+    evidence = _write_evidence_with_codex_audit(home, codex_audit)
+    ack_dir = home / PROJECT / "ack"
+
+    out = dump._write_old_ready(
+        project=PROJECT,
+        task=TASK,
+        workspace=ws,
+        evidence_path=evidence,
+        ack_dir=ack_dir,
+        home=home,
+    )
+    assert out is not None
+    body = json.loads(out.read_text())
+    assert body["code_repo"] == str(code_repo)
+    assert body["code_repo_head"] == code_head
+    # commit_hash still anchors the WORKSPACE HEAD, not the code repo.
+    assert body["commit_hash"] != code_head
+    assert body["codex_audit_mode"] == "full_codex_audit"
+
+
+def test_old_ready_omits_cross_repo_anchor_for_same_repo(tmp_path, monkeypatch):
+    """Same-repo audit (codex_audit block without code_repo keys) must NOT add the
+    fields → old_ready stays byte-stable for the common case."""
+    from handoff_fanout import dump
+
+    home = tmp_path / "handoff"
+    monkeypatch.setenv("HANDOFF_HOME", str(home))
+    ws = tmp_path / "ws"
+    _git_init_commit(ws)
+
+    codex_audit = {
+        "audit_mode": "full_codex_audit",
+        "audit_runs": [{"run_index": 1, "input_commit": "deadbeef", "original_findings": []}],
+        "dispositions": [],
+    }
+    evidence = _write_evidence_with_codex_audit(home, codex_audit)
+    out = dump._write_old_ready(
+        project=PROJECT,
+        task=TASK,
+        workspace=ws,
+        evidence_path=evidence,
+        ack_dir=home / PROJECT / "ack",
+        home=home,
+    )
+    assert out is not None
+    body = json.loads(out.read_text())
+    assert "code_repo" not in body
+    assert "code_repo_head" not in body
+
+
 # ─── Phase 4e R2 gap-close — codex R1 P0/P1 regressions ─────────────────────
 #
 # These pin the fixes for the 2026-05-29 codex R1 audit of the Phase 4d

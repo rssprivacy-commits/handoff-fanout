@@ -89,7 +89,7 @@ EVID="$HOME/.claude-handoff/$PROJ/precheck/$TASK.retro.evidence.json"
 OLDREADY="$HOME/.claude-handoff/$PROJ/ack/$TASK.old_ready"
 if [ -f "$EVID" ]; then
     jq '{{head, mode, phase0, phase1, next_brief, evidence_hash}}' "$EVID" 2>/dev/null || cat "$EVID"
-    [ -f "$OLDREADY" ] && jq '{{session_id_kind, retro_evidence_hash, commit_hash, codex_audit_hash, codex_audit_mode, next_session_forced_task}}' "$OLDREADY"
+    [ -f "$OLDREADY" ] && jq '{{session_id_kind, retro_evidence_hash, commit_hash, codex_audit_hash, codex_audit_mode, next_session_forced_task, code_repo, code_repo_head}}' "$OLDREADY"
     echo "✅ 前任 retro evidence 在位 — 可推进 task"
 else
     echo "⛔ 前任无 retro.evidence.json — HANDOFF_RETRO_MANDATE=1 已拨 (Phase 4c, 2026-05-29)。"

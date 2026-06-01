@@ -672,6 +672,25 @@ def _write_old_ready(
         forced = _ca.forced_follow_up_task(codex_audit)
         if forced is not None:
             old_ready["next_session_forced_task"] = forced
+        # Cross-repo anchor (gap 3): for a dual-repo task (audited code lives in a
+        # repo distinct from this workspace, declared via audit-close --code-repo),
+        # the codex_audit block carries the already-validated code_repo (abs path)
+        # + code_repo_head (sha). commit_hash above only anchors the WORKSPACE HEAD,
+        # so without this the §0 new-session audit can't trace the engine-side
+        # commit. Surface it as optional additive metadata — absent for same-repo
+        # tasks (the common case), so old_ready stays byte-stable there. No schema
+        # bump: old_ready is unhashed, and the value is copied from the already
+        # schema-versioned codex_audit block, not recomputed.
+        code_repo = codex_audit.get("code_repo")
+        code_repo_head = codex_audit.get("code_repo_head")
+        if (
+            isinstance(code_repo, str)
+            and code_repo
+            and isinstance(code_repo_head, str)
+            and code_repo_head
+        ):
+            old_ready["code_repo"] = code_repo
+            old_ready["code_repo_head"] = code_repo_head
 
     ack_dir.mkdir(parents=True, exist_ok=True)
     out = ack_dir / f"{task}.old_ready"
@@ -807,7 +826,12 @@ def handle_open_batch(
             handoff_home=cfg.home,
             git_guard_path=git_guard_dir(),
         )
-        atomic.write_with_fsync(queue_dir / f"{sub_id}.md", content)
+        # Launcher-visible: written with atomic_replace (temp + os.replace), NOT
+        # write_with_fsync — the launchd WatchPaths watcher tails queue/*.uri and
+        # the spawned session reads queue/*.md, so an in-place O_TRUNC window
+        # would expose a torn read. Same rationale as the single-task path
+        # (write_active_dump §3.7).
+        atomic.atomic_replace(queue_dir / f"{sub_id}.md", content)
 
         if idx > 0:
             print(f"[open-batch]   stagger sleep {STAGGER_SPAWN_SECONDS}s ...")
@@ -818,7 +842,8 @@ def handle_open_batch(
             raise SystemExit(f"❌ env vanished mid-spawn ({sub_id}): {env_path}")
 
         uri = build_uri(cfg, project, sub_id)
-        atomic.write_with_fsync(
+        # Launcher-visible trigger — atomic_replace (see the .md note above).
+        atomic.atomic_replace(
             queue_dir / f"{sub_id}.uri",
             f"WORKSPACE={workspace}\nURI={uri}\n",
         )
@@ -886,10 +911,12 @@ def trigger_fan_in_if_ready(
         inject_blocks=cfg.inject_blocks,
         handoff_home=cfg.home,
     )
-    atomic.write_with_fsync(queue_dir / f"{fan_in_task}.md", content)
+    # Launcher-visible fan-in description + trigger: atomic_replace, not
+    # write_with_fsync (same torn-read rationale as the single-task path).
+    atomic.atomic_replace(queue_dir / f"{fan_in_task}.md", content)
 
     uri = build_uri(cfg, project, fan_in_task)
-    atomic.write_with_fsync(
+    atomic.atomic_replace(
         queue_dir / f"{fan_in_task}.uri",
         f"WORKSPACE={workspace}\nURI={uri}\n",
     )
@@ -1020,6 +1047,14 @@ def find_orphans(project_filter: str | None = None) -> list[dict]:
                     "submitted_path": ack_dir / f"{task_id}.submitted",
                     "queued_path": ack_dir / f"{task_id}.queued",
                     "blocked_md_path": queue_dir / f"{task_id}.BLOCKED.md",
+                    # Single-task orphan residue the engine also produces per task:
+                    # old_ready (retro audit metadata, ack/) + heartbeat (queue/,
+                    # left ticking → watchdog mode 6 mis-flags it 529-suspected).
+                    # Batch sub-task heartbeats live in batches/<batch>/ and are
+                    # owned by the batch_dir lifecycle (handle_batch_done/blocked),
+                    # so they are intentionally out of this single-task cleanup.
+                    "old_ready_path": ack_dir / f"{task_id}.old_ready",
+                    "heartbeat_path": queue_dir / f"{task_id}.heartbeat",
                     "launched_paths": launched_paths,
                     "age_seconds": time.time() - spawned.stat().st_mtime,
                 }
@@ -1051,7 +1086,14 @@ def handle_cleanup_orphan(args) -> int:
 
     cleaned = 0
     for o in orphans:
-        for p in [o["spawned_path"], o["submitted_path"], o["queued_path"], o["blocked_md_path"]]:
+        for p in [
+            o["spawned_path"],
+            o["submitted_path"],
+            o["queued_path"],
+            o["blocked_md_path"],
+            o["old_ready_path"],
+            o["heartbeat_path"],
+        ]:
             try:
                 p.unlink(missing_ok=True)
             except OSError as e:
