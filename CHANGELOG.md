@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.0] — 2026-06-01
+
+MINOR — generic project-scoped **`dump_preflight_commands`** gate. A project may
+configure preflight commands that `handoff dump` runs as a HARD pre-req before
+producing the closure artifact; a non-zero exit (the gate's verdict) blocks the
+dump. The engine stays progress-agnostic — it only runs what the project
+configured. **Not published to PyPI** (single-user editable install runs the live
+source); tagged for repo hygiene only.
+
+### Added
+- **`config.PreflightSpec`** + **`dump.run_preflight_gates()`**: per-spec
+  `command` / `timeout` / `statuses` / `on_error` (`block` fail-closed default vs
+  `warn` fail-open-LOUD for reminder gates) / **`projects`** scoping. The project
+  filter is load-bearing: one `$HANDOFF_HOME/config.json` is shared by every
+  project under that home, so a project-bound gate (e.g. ERP's progress-site
+  `progress_pending.py --preflight`) MUST list its project to avoid running for —
+  and blocking — sibling projects' dumps. Skipped for batch/fan-in/dry-run.
+  Absent config ⇒ zero impact on non-opted-in projects. (`tests/test_dump_preflight.py`)
+
 ## [1.9.0] — 2026-05-31
 
 MINOR — unlock-pivot (Added: lock-screen auto-unlock) + autoclose removal (Removed;
