@@ -107,6 +107,79 @@ def run(cmd: list[str], cwd: Path, timeout: float = 10.0) -> str:
         return f"<error: {e}>"
 
 
+def run_preflight_gates(cfg, *, workspace: Path, project: str, status: str) -> int:
+    """Run project-configured ``dump_preflight_commands`` (generic 2C gate).
+
+    Returns a non-zero exit code to BLOCK the dump, or 0 when no gate applies /
+    all pass. FAIL-CLOSED: a gate that exits non-zero, times out, or cannot be
+    launched blocks the dump. The engine is progress-agnostic — it only runs
+    whatever the project configured (e.g. ``progress_pending.py --gate``).
+
+    A spec runs only when ``project`` is in its ``projects`` list (empty list =
+    every project) AND ``status`` is in its ``statuses``. The project filter
+    matters because one ``$HANDOFF_HOME/config.json`` is SHARED by all projects
+    under that home — a project-bound gate must not run for siblings.
+
+    Skipped entirely for projects with no ``dump_preflight_commands`` config
+    (zero impact on non-opted-in projects).
+    """
+    specs = getattr(cfg, "dump_preflight_commands", None) or []
+    for spec in specs:
+        if spec.projects and project not in spec.projects:
+            continue
+        if status not in spec.statuses:
+            continue
+        warn = spec.on_error == "warn"
+        try:
+            r = subprocess.run(
+                spec.command,
+                cwd=str(workspace),
+                capture_output=True,
+                text=True,
+                timeout=spec.timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            if warn:
+                print(
+                    f"⚠️ [preflight:{spec.name}] timed out after {spec.timeout}s "
+                    f"(on_error=warn → dump allowed, gate DEGRADED)",
+                    file=sys.stderr,
+                )
+                continue
+            print(
+                f"❌ [preflight:{spec.name}] timed out after {spec.timeout}s "
+                f"(fail-closed, dump blocked)",
+                file=sys.stderr,
+            )
+            return 3
+        except (OSError, subprocess.SubprocessError) as e:
+            if warn:
+                print(
+                    f"⚠️ [preflight:{spec.name}] could not run {spec.command!r}: {e} "
+                    f"(on_error=warn → dump allowed, gate DEGRADED)",
+                    file=sys.stderr,
+                )
+                continue
+            print(
+                f"❌ [preflight:{spec.name}] could not run {spec.command!r}: {e} "
+                f"(fail-closed, dump blocked)",
+                file=sys.stderr,
+            )
+            return 3
+        if r.returncode != 0:
+            if (r.stdout or "").strip():
+                print(r.stdout.rstrip(), file=sys.stderr)
+            if (r.stderr or "").strip():
+                print(r.stderr.rstrip(), file=sys.stderr)
+            print(
+                f"❌ [preflight:{spec.name}] exit {r.returncode} (fail-closed, dump blocked)",
+                file=sys.stderr,
+            )
+            return r.returncode or 3
+    return 0
+
+
 def now_iso() -> str:
     return datetime.now(UTC).astimezone().isoformat(timespec="seconds")
 
@@ -1074,6 +1147,15 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             "❌ --batch-id must be paired with --batch-done / --batch-blocked / --batch-fan-in"
         )
+
+    # Project-scoped preflight gates (2C / generic): a fail-closed pre-req run
+    # before producing the closure artifact. Skipped for --dry-run previews and
+    # for projects without dump_preflight_commands config.
+    if not args.dry_run:
+        preflight_rc = run_preflight_gates(
+            cfg, workspace=workspace, project=project, status=args.status)
+        if preflight_rc:
+            return preflight_rc
 
     print(f"[dump] project={project} task={args.task} status={args.status}")
     print(f"[dump] workspace={workspace}")

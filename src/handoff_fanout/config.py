@@ -57,10 +57,43 @@ class RoadmapSpec:
 
 
 @dataclass
+class PreflightSpec:
+    """A project-scoped pre-dump gate command (generic / progress-agnostic).
+
+    ``handoff dump`` runs each spec whose ``statuses`` includes the dump status
+    as a HARD pre-req before producing the closure artifact. A non-zero exit
+    (or a command that times out / cannot launch) FAILS CLOSED and blocks the
+    dump. The engine never interprets what the command checks — it only runs
+    what the project configured (e.g. ERP's ``progress_pending.py --gate``).
+
+    Absent config ⇒ empty list ⇒ zero impact on projects that don't opt in.
+    """
+
+    name: str
+    command: list[str]
+    timeout: float = 30.0
+    statuses: tuple[str, ...] = ("active", "done")
+    # What to do when the command cannot be LAUNCHED or times out (infra failure,
+    # NOT the gate's verdict). ``"block"`` (default) fails closed — right for a
+    # security / de-id gate. ``"warn"`` fails open with a LOUD message — right for
+    # a reminder / drift gate that must not brick every closure if its interpreter
+    # path breaks (I8: dev-convenience checks fail-open). A command that RUNS and
+    # exits non-zero is the gate's verdict and ALWAYS blocks regardless of this.
+    on_error: str = "block"
+    # Project slugs this gate applies to. EMPTY = all projects. Because a single
+    # ``$HANDOFF_HOME/config.json`` is shared by every project under that home,
+    # a project-specific gate (e.g. ERP's progress gate, which runs a script
+    # bound to the ERP repo) MUST list its project here so it does not run for —
+    # and block — sibling projects' dumps (dharmaxis / rakeforge / ...).
+    projects: tuple[str, ...] = ()
+
+
+@dataclass
 class Config:
     home: Path = field(default_factory=lambda: Path(DEFAULT_HOME).expanduser())
     inject_blocks: list[str] = field(default_factory=list)
     baseline_hooks: list[HookSpec] = field(default_factory=list)
+    dump_preflight_commands: list[PreflightSpec] = field(default_factory=list)
     roadmap: RoadmapSpec = field(default_factory=RoadmapSpec)
     uri_template: str = DEFAULT_URI_TEMPLATE
     workspace_root: Path = field(default_factory=lambda: Path(DEFAULT_WORKSPACE_ROOT).expanduser())
@@ -144,11 +177,25 @@ def _from_dict(data: dict, home: Path) -> Config:
         )
         for h in hooks_raw
     ]
+    preflight_raw = data.get("dump_preflight_commands", []) or []
+    dump_preflight_commands = [
+        PreflightSpec(
+            name=str(p.get("name", "preflight")),
+            command=[str(c) for c in p["command"]],
+            timeout=float(p.get("timeout", 30.0)),
+            statuses=tuple(str(s) for s in p.get("statuses", ("active", "done"))),
+            on_error=("warn" if str(p.get("on_error", "block")) == "warn" else "block"),
+            projects=tuple(str(s) for s in (p.get("projects", ()) or ())),
+        )
+        for p in preflight_raw
+        if isinstance(p, dict) and p.get("command")
+    ]
     workspace_root_raw = data.get("workspace_root", DEFAULT_WORKSPACE_ROOT)
     return Config(
         home=home,
         inject_blocks=list(data.get("inject_blocks", []) or []),
         baseline_hooks=baseline_hooks,
+        dump_preflight_commands=dump_preflight_commands,
         roadmap=roadmap,
         uri_template=data.get("uri_template", DEFAULT_URI_TEMPLATE),
         workspace_root=Path(workspace_root_raw).expanduser(),
