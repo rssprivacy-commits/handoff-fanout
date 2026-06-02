@@ -1,0 +1,332 @@
+"""Per-session git worktree isolation (worktree.py).
+
+A real bare ``origin`` + working clone exercises the integration-branch resolution,
+the published-HEAD merge-back gate, collision classification, file linking, and the
+fail-safe removal path. Mode resolution is pure (env/sentinel/config).
+"""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from handoff_fanout import config as _config
+from handoff_fanout import worktree as wt
+
+# ─── git harness ─────────────────────────────────────────────────────────────
+
+
+def _run(args: list[str], cwd: Path) -> None:
+    subprocess.run(args, cwd=str(cwd), check=True, capture_output=True, text=True)
+
+
+def _init_repo_config(ws: Path) -> None:
+    for k, v in (
+        ("user.email", "t@t.test"),
+        ("user.name", "t"),
+        ("commit.gpgsign", "false"),
+    ):
+        _run(["git", "config", k, v], ws)
+
+
+def _bare_and_clone(tmp_path: Path) -> tuple[Path, Path]:
+    """A bare ``origin`` (default branch main) + a working clone on main, pushed."""
+    bare = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main", str(bare)], check=True, capture_output=True
+    )
+    ws = tmp_path / "ws"
+    subprocess.run(["git", "clone", str(bare), str(ws)], check=True, capture_output=True)
+    _init_repo_config(ws)
+    (ws / "README.md").write_text("base\n")
+    _run(["git", "add", "."], ws)
+    _run(["git", "commit", "-qm", "init"], ws)
+    _run(["git", "push", "-q", "origin", "main"], ws)
+    # Make origin/HEAD resolve to main (clone sets it; be explicit for robustness).
+    subprocess.run(
+        ["git", "remote", "set-head", "origin", "main"], cwd=str(ws), capture_output=True
+    )
+    return bare, ws
+
+
+def _commit(ws: Path, fname: str, content: str, msg: str) -> str:
+    (ws / fname).write_text(content)
+    _run(["git", "add", "."], ws)
+    _run(["git", "commit", "-qm", msg], ws)
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(ws), capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _cfg(home: Path, **overrides) -> _config.Config:
+    cfg = _config.Config(home=home)
+    for k, v in overrides.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+@pytest.fixture
+def home(tmp_path: Path) -> Path:
+    h = tmp_path / "handoff"
+    h.mkdir()
+    return h
+
+
+# ─── resolve_mode ────────────────────────────────────────────────────────────
+
+
+def test_mode_default_off(home):
+    assert wt.resolve_mode(_cfg(home), "proj", env={}) == wt.MODE_OFF
+
+
+@pytest.mark.parametrize(
+    "val,expected",
+    [
+        ("1", wt.MODE_ON),
+        ("on", wt.MODE_ON),
+        ("true", wt.MODE_ON),
+        ("report", wt.MODE_REPORT),
+        ("0", wt.MODE_OFF),
+        ("off", wt.MODE_OFF),
+    ],
+)
+def test_mode_env(home, val, expected):
+    assert wt.resolve_mode(_cfg(home), "proj", env={"HANDOFF_WORKTREE_ISOLATION": val}) == expected
+
+
+def test_mode_env_unknown_falls_through_to_config(home):
+    cfg = _cfg(home, worktree_mode="report")
+    assert (
+        wt.resolve_mode(cfg, "proj", env={"HANDOFF_WORKTREE_ISOLATION": "garbage"})
+        == wt.MODE_REPORT
+    )
+
+
+def test_mode_global_sentinel(home):
+    (home / "worktree.enabled").touch()
+    assert wt.resolve_mode(_cfg(home), "proj", env={}) == wt.MODE_ON
+
+
+def test_mode_project_sentinel(home):
+    (home / "proj").mkdir()
+    (home / "proj" / "worktree.enabled").touch()
+    assert wt.resolve_mode(_cfg(home), "proj", env={}) == wt.MODE_ON
+    assert wt.resolve_mode(_cfg(home), "other", env={}) == wt.MODE_OFF
+
+
+def test_mode_config_projects(home):
+    cfg = _cfg(home, worktree_projects=["erp-system"])
+    assert wt.resolve_mode(cfg, "erp-system", env={}) == wt.MODE_ON
+    assert wt.resolve_mode(cfg, "other", env={}) == wt.MODE_OFF
+
+
+def test_mode_env_overrides_sentinel(home):
+    (home / "worktree.enabled").touch()
+    assert (
+        wt.resolve_mode(_cfg(home), "proj", env={"HANDOFF_WORKTREE_ISOLATION": "off"})
+        == wt.MODE_OFF
+    )
+
+
+# ─── resolve_integration_branch ──────────────────────────────────────────────
+
+
+def test_int_branch_config_override(home, tmp_path):
+    _, ws = _bare_and_clone(tmp_path)
+    cfg = _cfg(home, worktree_default_branch="release")
+    assert wt.resolve_integration_branch(ws, cfg) == "release"
+
+
+def test_int_branch_origin_head(home, tmp_path):
+    _, ws = _bare_and_clone(tmp_path)
+    assert wt.resolve_integration_branch(ws, _cfg(home), allow_network=False) == "main"
+
+
+def test_int_branch_never_a_task_branch(home, tmp_path):
+    """In a worktree on handoff/<task>, must NOT pick the task branch (R1-X2)."""
+    _, ws = _bare_and_clone(tmp_path)
+    _run(["git", "checkout", "-qb", "handoff/some-task"], ws)
+    # origin/HEAD still → main; abbrev-ref HEAD would be handoff/some-task (the trap).
+    assert wt.resolve_integration_branch(ws, _cfg(home), allow_network=False) == "main"
+
+
+def test_int_branch_local_main_fallback(home, tmp_path):
+    ws = tmp_path / "local"
+    ws.mkdir()
+    subprocess.run(["git", "init", "-qb", "main", str(ws)], check=True, capture_output=True)
+    _init_repo_config(ws)
+    _commit(ws, "a.txt", "x", "init")
+    assert wt.resolve_integration_branch(ws, _cfg(home), allow_network=False) == "main"
+
+
+def test_int_branch_unresolvable(home, tmp_path):
+    ws = tmp_path / "weird"
+    ws.mkdir()
+    subprocess.run(["git", "init", "-qb", "trunk-xyz", str(ws)], check=True, capture_output=True)
+    _init_repo_config(ws)
+    _commit(ws, "a.txt", "x", "init")
+    assert wt.resolve_integration_branch(ws, _cfg(home), allow_network=False) is None
+
+
+# ─── create_worktree ─────────────────────────────────────────────────────────
+
+
+def test_create_off(home, tmp_path):
+    _, ws = _bare_and_clone(tmp_path)
+    r = wt.create_worktree(
+        source_workspace=ws, project="proj", task="t1", cfg=_cfg(home), mode=wt.MODE_OFF
+    )
+    assert r.status == wt.ST_OFF
+    assert r.spawn_workspace == ws
+
+
+def test_create_report_mutates_nothing(home, tmp_path):
+    _, ws = _bare_and_clone(tmp_path)
+    cfg = _cfg(home)
+    r = wt.create_worktree(
+        source_workspace=ws, project="proj", task="t1", cfg=cfg, mode=wt.MODE_REPORT
+    )
+    assert r.status == wt.ST_REPORT
+    assert r.spawn_workspace == ws  # shared tree
+    assert r.branch == "handoff/t1"
+    assert r.integration_branch == "main"
+    assert "worktree add" in (r.planned_cmd or "")
+    # Nothing created.
+    assert not wt.worktree_path(cfg, "proj", "t1").exists()
+    assert not (home / "proj" / "worktrees").exists()
+
+
+def test_create_happy_path(home, tmp_path):
+    _, ws = _bare_and_clone(tmp_path)
+    (ws / ".env").write_text("SECRET=1\n")  # gitignored-style essential file
+    cfg = _cfg(home, worktree_link_files=[".env"], worktree_link_venv=False)
+    r = wt.create_worktree(source_workspace=ws, project="proj", task="t1", cfg=cfg, mode=wt.MODE_ON)
+    assert r.status == wt.ST_CREATED, r.reason
+    assert r.spawn_workspace == wt.worktree_path(cfg, "proj", "t1")
+    assert r.spawn_workspace.exists()
+    assert r.branch == "handoff/t1"
+    assert r.integration_branch == "main"
+    # The worktree is on its own branch at origin/main.
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(r.spawn_workspace), capture_output=True, text=True
+    ).stdout.strip()
+    assert head == r.base_sha
+    # Tracked file present; linked .env present (symlink).
+    assert (r.spawn_workspace / "README.md").exists()
+    assert (r.spawn_workspace / ".env").is_symlink()
+    assert ".env" in r.linked
+
+
+def test_create_blocks_on_unpublished_head(home, tmp_path):
+    _, ws = _bare_and_clone(tmp_path)
+    _commit(ws, "new.txt", "wip", "unpublished work")  # committed but NOT pushed
+    r = wt.create_worktree(
+        source_workspace=ws, project="proj", task="t1", cfg=_cfg(home), mode=wt.MODE_ON
+    )
+    assert r.status == wt.ST_BLOCKED
+    assert "not published" in (r.reason or "")
+    assert r.spawn_workspace == ws  # caller will abort, not spawn isolated
+
+
+def test_create_degrades_without_remote(home, tmp_path):
+    ws = tmp_path / "local"
+    ws.mkdir()
+    subprocess.run(["git", "init", "-qb", "main", str(ws)], check=True, capture_output=True)
+    _init_repo_config(ws)
+    _commit(ws, "a.txt", "x", "init")
+    r = wt.create_worktree(
+        source_workspace=ws, project="proj", task="t1", cfg=_cfg(home), mode=wt.MODE_ON
+    )
+    assert r.status == wt.ST_DEGRADED
+    assert "remote" in (r.reason or "")
+    assert r.spawn_workspace == ws
+
+
+def test_create_degrades_when_not_a_repo(home, tmp_path):
+    ws = tmp_path / "plain"
+    ws.mkdir()
+    r = wt.create_worktree(
+        source_workspace=ws, project="proj", task="t1", cfg=_cfg(home), mode=wt.MODE_ON
+    )
+    assert r.status == wt.ST_DEGRADED
+    assert r.spawn_workspace == ws
+
+
+def test_recreate_clean_published_worktree(home, tmp_path):
+    """A re-dump of the same task whose prior worktree is clean+published recreates it."""
+    _, ws = _bare_and_clone(tmp_path)
+    cfg = _cfg(home, worktree_link_venv=False)
+    r1 = wt.create_worktree(
+        source_workspace=ws, project="proj", task="t1", cfg=cfg, mode=wt.MODE_ON
+    )
+    assert r1.status == wt.ST_CREATED
+    r2 = wt.create_worktree(
+        source_workspace=ws, project="proj", task="t1", cfg=cfg, mode=wt.MODE_ON
+    )
+    assert r2.status == wt.ST_CREATED, r2.reason
+    assert r2.spawn_workspace.exists()
+
+
+def test_collision_dirty_worktree_blocks(home, tmp_path):
+    """A same-task worktree with uncommitted work is retained + blocked (R1-R3)."""
+    _, ws = _bare_and_clone(tmp_path)
+    cfg = _cfg(home, worktree_link_venv=False)
+    r1 = wt.create_worktree(
+        source_workspace=ws, project="proj", task="t1", cfg=cfg, mode=wt.MODE_ON
+    )
+    assert r1.status == wt.ST_CREATED
+    (r1.spawn_workspace / "dirty.txt").write_text("uncommitted")
+    _run(["git", "add", "dirty.txt"], r1.spawn_workspace)  # staged, uncommitted
+    r2 = wt.create_worktree(
+        source_workspace=ws, project="proj", task="t1", cfg=cfg, mode=wt.MODE_ON
+    )
+    assert r2.status == wt.ST_BLOCKED
+    assert r1.spawn_workspace.exists()  # retained, not destroyed
+
+
+# ─── classify / remove ───────────────────────────────────────────────────────
+
+
+def test_remove_clean_published(home, tmp_path):
+    _, ws = _bare_and_clone(tmp_path)
+    cfg = _cfg(home, worktree_link_venv=False)
+    r = wt.create_worktree(source_workspace=ws, project="proj", task="t1", cfg=cfg, mode=wt.MODE_ON)
+    removed, reason = wt.remove_worktree(ws, r.spawn_workspace, r.branch, "main")
+    assert removed, reason
+    assert not r.spawn_workspace.exists()
+
+
+def test_remove_retains_dirty(home, tmp_path):
+    _, ws = _bare_and_clone(tmp_path)
+    cfg = _cfg(home, worktree_link_venv=False)
+    r = wt.create_worktree(source_workspace=ws, project="proj", task="t1", cfg=cfg, mode=wt.MODE_ON)
+    (r.spawn_workspace / "x.txt").write_text("uncommitted")
+    removed, reason = wt.remove_worktree(ws, r.spawn_workspace, r.branch, "main")
+    assert not removed
+    assert "uncommitted" in reason
+    assert r.spawn_workspace.exists()
+
+
+def test_remove_retains_committed_unpublished(home, tmp_path):
+    """Clean but committed-unpushed → retained (the redline: never lose work)."""
+    _, ws = _bare_and_clone(tmp_path)
+    cfg = _cfg(home, worktree_link_venv=False)
+    r = wt.create_worktree(source_workspace=ws, project="proj", task="t1", cfg=cfg, mode=wt.MODE_ON)
+    # Commit inside the worktree but do NOT push → clean tree, unpublished commit.
+    _init_repo_config(r.spawn_workspace)
+    _commit(r.spawn_workspace, "feat.txt", "work", "isolated work, unpushed")
+    removed, reason = wt.remove_worktree(ws, r.spawn_workspace, r.branch, "main")
+    assert not removed
+    assert "unpublished" in reason
+    assert r.spawn_workspace.exists()
+
+
+def test_list_worktrees(home, tmp_path):
+    _, ws = _bare_and_clone(tmp_path)
+    cfg = _cfg(home, worktree_link_venv=False)
+    wt.create_worktree(source_workspace=ws, project="proj", task="t1", cfg=cfg, mode=wt.MODE_ON)
+    items = wt.list_worktrees(ws)
+    paths = [i["path"] for i in items]
+    assert any("worktrees/t1" in p for p in paths)

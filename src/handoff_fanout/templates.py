@@ -38,6 +38,56 @@ def _format_baseline_block(baseline: dict) -> str:
     return "\n".join(lines)
 
 
+def _worktree_banner(worktree_info: dict | None, project: str, workspace: Path) -> str:
+    """Markdown banner shown to the successor when worktree isolation is in play.
+
+    For a CREATED worktree it states the isolation + the merge-back closure protocol
+    (commit to the task branch, push it, then ff-publish to the integration branch);
+    for DEGRADE it warns the session it is on the shared tree (local main may lag
+    origin). Empty string when isolation is off / no worktree info.
+    """
+    if not worktree_info:
+        return ""
+    status = worktree_info.get("status")
+    if status == "created":
+        branch = worktree_info.get("branch")
+        intb = worktree_info.get("integration_branch")
+        return f"""
+## 🌿 隔离 worktree (per-session git worktree isolation)
+
+> 本会话在**独立 git worktree** 工作，与其它会话/主树互不影响（你的 `git stash` /
+> `reset --hard` / pytest 只动这棵树）。**目录 basename = task-id ≠ project** —— 所有
+> `handoff` 命令必须显式带 `--project {project}`（见 §-1，已注入）。
+
+- **worktree**: `{workspace}`
+- **branch**: `{branch}`（从 `origin/{intb}` 切出）
+- **integration branch**: `{intb}`
+
+### 闭环合并协议 (merge-back / 不可省)
+1. 在本 worktree 正常 `commit` 到分支 `{branch}` + `git push origin {branch}`（保留分支）。
+2. **闭环 dump 前**把工作 ff-publish 到集成分支：`git push origin HEAD:{intb}`。
+3. 然后才跑 §-1 的 `handoff precheck` + `handoff dump`（引擎会校验 `origin/{intb}` 已含本会话
+   HEAD；未 publish → dump 被 BLOCK，提示先 push）。
+4. 终态后本 worktree 由 `handoff prune` / `handoff worktree gc` 安全回收（脏/未合并则保留现场）。
+"""
+    if status == "degraded":
+        reason = worktree_info.get("reason") or "unknown"
+        return f"""
+## ⚠️ worktree 隔离已降级 (degraded → 共享主树)
+
+> 本会话请求了 worktree 隔离但**降级回共享主树**（原因：{reason}）。你在主树工作，
+> 若本项目曾用 worktree relay，本地 `{worktree_info.get("integration_branch") or "main"}`
+> 可能滞后 origin —— 必要时先 `git pull --ff-only`。注意与其它会话的共享树并发风险。
+"""
+    if status == "report":
+        return f"""
+## 🌿 worktree 隔离 report-only（未创建 / 仅演示）
+
+> report-only 模式：本会话仍在共享主树。计划命令：`{worktree_info.get("planned_cmd") or ""}`。
+"""
+    return ""
+
+
 def build_handoff_md(
     *,
     task: str,
@@ -51,9 +101,20 @@ def build_handoff_md(
     inject_blocks: Iterable[str],
     handoff_home: Path,
     handoff_md_path: Path,
+    worktree_info: dict | None = None,
 ) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     baseline_block = _format_baseline_block(baseline)
+    wt_banner = _worktree_banner(worktree_info, project, workspace)
+    # R1-X1: under worktree isolation the cwd basename is the task-id, NOT the
+    # project, so every generated handoff command MUST carry an explicit
+    # ``--project``/``--workspace`` or it writes evidence/queue/ack under a project
+    # named after the task. Empty for the non-worktree path (byte-identical legacy).
+    wt_args = (
+        f" --project {project} --workspace {workspace}"
+        if worktree_info and worktree_info.get("status") == "created"
+        else ""
+    )
 
     test_section = ""
     if tests:
@@ -77,7 +138,7 @@ pytest {tests} 2>&1 | tail -10
 **Project**: `{project}` ({workspace})
 {baseline_block}
 **Status**: `{status}`
-
+{wt_banner}
 ## §0 上任审计 — 核对前任 retro evidence (v5.4 / 不可跳过)
 
 > **触发**: 本会话被 launchd 由前任 dump 触发开张。第一步**不是**写代码，是审计前任是否真的复盘了。
@@ -205,7 +266,7 @@ touch {handoff_home}/{project}/queue/{task}.done      # 仅停本 task
 cd {workspace}
 # 1) 生成 retro evidence (Phase 0 五项 + Phase 1 五类显式声明 / status enum 见 §7.13)
 handoff precheck \\
-    --task <next-task-id> \\
+    --task <next-task-id>{wt_args} \\
     --phase0-status memory=✅ --phase0-status tests=✅ \\
     --phase0-status audit=✅ --phase0-status commit=✅ \\
     --phase0-status code_review=✅ \\
@@ -216,12 +277,13 @@ handoff precheck \\
 
 # 2) dump 时传 --retro-evidence; HANDOFF_RETRO_MANDATE=1 强制激活 gate
 handoff dump \\
-    --task <next-task-id> \\
+    --task <next-task-id>{wt_args} \\
     --next "<next-task-brief>" \\
     --status active \\
     --tests "<test-files>" \\
     --retro-evidence ~/.claude-handoff/{project}/precheck/<next-task-id>.retro.evidence.json
-# project + workspace 自动从 cwd 推断
+# project + workspace 自动从 cwd 推断（worktree 隔离下 cwd basename = task-id ≠ project，
+# 故上面已显式注入 --project/--workspace）
 ```
 
 **status enum** (Phase 4a 实施 / `handoff_fanout.handoff_precheck`):
@@ -251,12 +313,12 @@ handoff dump \\
 ```bash
 cd {workspace}
 # 1) 跑 codex 审计 → 登记机器产物 (按 spec §3 / Phase B 已能记录)
-handoff audit-run --task <next-task-id> --run-index 1 ...        # 写 codex-findings.json + sidecar manifest
-handoff audit-disposition --task <next-task-id> ...             # 每个 P0/P1 一条 disposition
+handoff audit-run --task <next-task-id>{wt_args} --run-index 1 ...   # 写 codex-findings.json + sidecar manifest
+handoff audit-disposition --task <next-task-id>{wt_args} ...        # 每个 P0/P1 一条 disposition
 
 # 2) audit-close: full 模式 (有代码改动) — 把审计块折进 evidence + dump 一气呵成
 handoff audit-close \\
-    --task <next-task-id> --next "<brief>" --status active \\
+    --task <next-task-id>{wt_args} --next "<brief>" --status active \\
     --audit-mode full_codex_audit --run-record '<run-record-json>' \\
     --phase0-status memory=✅ ... --phase1-status codex=✅ ...
 ```

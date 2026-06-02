@@ -34,6 +34,7 @@ from pathlib import Path
 
 from handoff_fanout import atomic, retro_gate, templates
 from handoff_fanout import config as _config
+from handoff_fanout import worktree as _worktree
 from handoff_fanout.git_guard import git_guard_dir
 from handoff_fanout.handoff_precheck import (
     EVIDENCE_SCHEMA_VERSION,
@@ -480,8 +481,16 @@ def write_active_dump(
     queue_dir: Path,
     osascript_subtitle: str | None = None,
     retro_evidence_path: Path | None = None,
+    source_workspace: Path | None = None,
+    old_head: str | None = None,
+    worktree_info: dict | None = None,
 ) -> int:
     roadmap_excerpt = get_roadmap_excerpt(cfg)
+    # ``workspace`` is the successor's tree (a worktree under isolation, else the
+    # source tree); ``source_workspace`` is the closing session's tree used only for
+    # the old_ready predecessor anchor (R1-C1). Default to identity for legacy callers.
+    if source_workspace is None:
+        source_workspace = workspace
 
     md_path = queue_dir / f"{task}.md"
     handoff_content = templates.build_handoff_md(
@@ -496,6 +505,7 @@ def write_active_dump(
         inject_blocks=cfg.inject_blocks,
         handoff_home=cfg.home,
         handoff_md_path=md_path,
+        worktree_info=worktree_info,
     )
     # Crash-/kill-atomic single-task write (temp+os.replace). A supervisor kill
     # mid-dump must never leave a partial .md the launcher then misreads. The
@@ -561,14 +571,17 @@ def write_active_dump(
 
     # §7.6 — write ack/<task>.old_ready when retro evidence drove the dump. MUST be
     # before the .uri publish so the next session's §0 audit sees it (see ordering note).
+    # ``source_workspace`` + ``old_head`` keep the predecessor anchor on the CLOSING
+    # session's tree even when ``workspace`` is the successor's worktree (R1-C1).
     if retro_evidence_path is not None:
         old_ready_path = _write_old_ready(
             project=project,
             task=task,
-            workspace=workspace,
+            workspace=source_workspace,
             evidence_path=retro_evidence_path,
             ack_dir=cfg.ack_dir(project),
             home=cfg.home,
+            commit_hash=old_head,
         )
         if old_ready_path is None:
             # The gate passed with an evidence file, yet old_ready couldn't be
@@ -580,6 +593,26 @@ def write_active_dump(
                 "(evidence vanished/unreadable); §0 new-session audit can't verify "
                 f"{project}/{task}"
             )
+
+    # ack/<task>.worktree — record the worktree (path/branch/base/integration) so
+    # prune/gc can find + reclaim it, and the §0/fan-in steps can trace it. Written
+    # BEFORE the .uri publish (same ordering rule as old_ready). Only for a CREATED
+    # worktree; degrade/report leave no sidecar.
+    if worktree_info and worktree_info.get("status") == _worktree.ST_CREATED:
+        try:
+            ack_dir = cfg.ack_dir(project)
+            ack_dir.mkdir(parents=True, exist_ok=True)
+            (ack_dir / f"{task}.worktree").write_text(
+                json.dumps(
+                    {**worktree_info, "source_workspace": str(source_workspace)},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        except OSError as e:
+            print(f"[dump] (non-fatal) could not write .worktree sidecar: {e}")
 
     _maybe_pbcopy(handoff_content)
 
@@ -601,6 +634,7 @@ def _write_old_ready(
     evidence_path: Path,
     ack_dir: Path,
     home: Path,
+    commit_hash: str | None = None,
 ) -> Path | None:
     """Write ``ack/<task>.old_ready`` per spec §7.6.
 
@@ -624,7 +658,10 @@ def _write_old_ready(
         return None
 
     sid, sid_kind = resolve_session_id()
-    commit_hash = run(["git", "rev-parse", "HEAD"], workspace) or "(unknown)"
+    # Prefer the explicitly captured closing-session HEAD (R1-C1): under worktree
+    # isolation ``workspace`` is the source tree, but capturing the SHA before any
+    # substitution removes any doubt the anchor reflects the predecessor.
+    commit_hash = commit_hash or run(["git", "rev-parse", "HEAD"], workspace) or "(unknown)"
 
     project_root = (home / project).resolve()
     try:
@@ -1138,6 +1175,98 @@ def handle_cleanup_orphan(args) -> int:
     return 0
 
 
+# ─── per-session worktree isolation (opt-in) ────────────────────────────────
+
+
+def _worktree_info_dict(result: _worktree.WorktreeResult, mode: str) -> dict:
+    """Serialize a WorktreeResult into the dict threaded to the handoff template
+    + the ``.worktree`` sidecar."""
+    return {
+        "mode": mode,
+        "status": result.status,
+        "path": str(result.spawn_workspace),
+        "branch": result.branch,
+        "base_sha": result.base_sha,
+        "integration_branch": result.integration_branch,
+        "linked": result.linked,
+        "degraded": result.status == _worktree.ST_DEGRADED,
+        "reason": result.reason,
+    }
+
+
+def _write_worktree_block(queue_dir: Path, project: str, task: str, head: str, reason: str) -> None:
+    """Write a BLOCKED.md for an unsafe worktree state (unpublished HEAD / dirty
+    collision) so the closing session sees why + how to unblock, and drop the .uri
+    trigger so the launcher does not spawn a successor on stale/unsafe state."""
+    blocked_file = queue_dir / f"{task}.BLOCKED.md"
+    blocked_file.write_text(
+        templates.build_blocked_md(
+            project=project,
+            task=task,
+            head=head,
+            reason=f"worktree isolation gate: {reason}",
+        ),
+        encoding="utf-8",
+    )
+    (queue_dir / f"{task}.uri").unlink(missing_ok=True)
+    print(f"[dump] ⛔ worktree gate BLOCKED → {blocked_file}\n[dump]    {reason}")
+    _notify(reason, f"worktree gate / {project}", task, sound="Basso")
+
+
+def resolve_spawn_workspace(
+    *,
+    args,
+    cfg: _config.Config,
+    source_workspace: Path,
+    project: str,
+    queue_dir: Path,
+) -> tuple[Path, dict | None, int | None]:
+    """Resolve where the successor session works (the shared tree or a new worktree).
+
+    Returns ``(spawn_workspace, worktree_info, block_exit_code)``. When
+    ``block_exit_code`` is non-None the caller must return it immediately (an unsafe
+    state was detected + a BLOCKED.md written) — never spawn a successor. Worktree
+    isolation applies ONLY to the single-task ``active`` path (not batch / done /
+    blocked / dry-run); every other path returns the source tree unchanged
+    (byte-identical legacy behavior).
+    """
+    mode = _worktree.resolve_mode(cfg, project)
+    if mode == _worktree.MODE_OFF:
+        return source_workspace, None, None
+
+    result = _worktree.create_worktree(
+        source_workspace=source_workspace,
+        project=project,
+        task=args.task,
+        cfg=cfg,
+        mode=mode,
+    )
+    if result.is_blocked:
+        head = _worktree.head_sha(source_workspace) or "(unknown)"
+        _write_worktree_block(queue_dir, project, args.task, head, result.reason or "unsafe")
+        return source_workspace, _worktree_info_dict(result, mode), 2  # ERR-BLOCKED-ish
+
+    if result.status == _worktree.ST_REPORT:
+        print(f"[dump] [worktree:report] would run: {result.planned_cmd}")
+        if result.reason:
+            print(f"[dump] [worktree:report] note: {result.reason}")
+        return source_workspace, _worktree_info_dict(result, mode), None
+
+    if result.status == _worktree.ST_DEGRADED:
+        print(
+            f"[dump] ⚠️  worktree isolation requested but unavailable "
+            f"({result.reason}); falling back to shared tree"
+        )
+        return source_workspace, _worktree_info_dict(result, mode), None
+
+    # created
+    print(
+        f"[dump] [worktree] {result.spawn_workspace} on {result.branch} "
+        f"(base {(result.base_sha or '?')[:8]} / linked {result.linked})"
+    )
+    return result.spawn_workspace, _worktree_info_dict(result, mode), None
+
+
 # ─── CLI ────────────────────────────────────────────────────────────────────
 
 
@@ -1270,14 +1399,38 @@ def main(argv: list[str] | None = None) -> int:
     # for projects without dump_preflight_commands config.
     if not args.dry_run:
         preflight_rc = run_preflight_gates(
-            cfg, workspace=workspace, project=project, status=args.status)
+            cfg, workspace=workspace, project=project, status=args.status
+        )
         if preflight_rc:
             return preflight_rc
 
     print(f"[dump] project={project} task={args.task} status={args.status}")
-    print(f"[dump] workspace={workspace}")
+    # ``workspace`` is the CLOSING session's tree (source); retro/preflight gates
+    # already ran against it above. Per-session worktree isolation (opt-in) may
+    # redirect the SUCCESSOR to its own worktree — keep the two roles distinct so
+    # old_ready stays anchored to the source and the successor's baseline/handoff/
+    # .uri point at the worktree (design §8.1 R1-C1).
+    source_workspace = workspace
+    print(f"[dump] source_workspace={source_workspace}")
 
-    baseline = detect_baseline(workspace, cfg=cfg)
+    # old_ready's commit anchor MUST be the closing session's HEAD, captured BEFORE
+    # any worktree substitution (R1-C1 / Gemini P1-3).
+    old_head = _worktree.head_sha(source_workspace)
+
+    spawn_workspace = source_workspace
+    worktree_info: dict | None = None
+    if args.status == "active" and not args.dry_run:
+        spawn_workspace, worktree_info, block_rc = resolve_spawn_workspace(
+            args=args,
+            cfg=cfg,
+            source_workspace=source_workspace,
+            project=project,
+            queue_dir=queue_dir,
+        )
+        if block_rc is not None:
+            return block_rc
+
+    baseline = detect_baseline(spawn_workspace, cfg=cfg)
     print(f"[dump] HEAD={baseline['git_head']}")
 
     if args.dry_run:
@@ -1286,7 +1439,7 @@ def main(argv: list[str] | None = None) -> int:
         content = templates.build_handoff_md(
             task=args.task,
             project=project,
-            workspace=workspace,
+            workspace=spawn_workspace,
             next_brief=args.next_brief,
             status=args.status,
             tests=args.tests or None,
@@ -1295,6 +1448,7 @@ def main(argv: list[str] | None = None) -> int:
             inject_blocks=cfg.inject_blocks,
             handoff_home=cfg.home,
             handoff_md_path=md_path,
+            worktree_info=worktree_info,
         )
         print("=" * 60)
         print(f"DRY-RUN: target paths\n  {md_path}\n  {queue_dir / f'{args.task}.uri'}")
@@ -1320,7 +1474,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg=cfg,
         project=project,
         task=args.task,
-        workspace=workspace,
+        workspace=spawn_workspace,
         next_brief=args.next_brief,
         status=args.status,
         tests=args.tests or None,
@@ -1328,6 +1482,9 @@ def main(argv: list[str] | None = None) -> int:
         queue_dir=queue_dir,
         osascript_subtitle=args.blocked_reason or None,
         retro_evidence_path=retro_evidence_path,
+        source_workspace=source_workspace,
+        old_head=old_head,
+        worktree_info=worktree_info,
     )
 
 

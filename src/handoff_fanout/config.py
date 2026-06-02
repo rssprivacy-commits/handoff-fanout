@@ -135,6 +135,26 @@ class Config:
     # ``HANDOFF_RETRO_BYPASS`` always runs the gate regardless of this list.
     mandate_projects: list[str] = field(default_factory=list)
     mandate_projects_configured: bool = False
+    # ── Per-session git worktree isolation (opt-in / default OFF) ──────────────
+    # Each spawned session works in its own ``git worktree`` instead of the shared
+    # main tree, so one session's ``git stash`` / ``reset --hard`` / pytest can't
+    # clobber another's. See ``worktree.py`` + design-per-session-worktree-isolation.
+    # ``worktree_mode``: "off" (default / byte-identical) | "report" (log what WOULD
+    # happen, mutate nothing) | "on" (create worktrees). Env ``HANDOFF_WORKTREE_ISOLATION``
+    # + sentinels override (resolved in ``worktree.resolve_mode``); this is the config
+    # floor. ``worktree_projects`` is a per-project allow-list that flips mode to "on"
+    # for listed projects (fail-OPEN — an accidental empty must NOT enable a tree-mutating
+    # feature globally, unlike the security mandate list). ``worktree_link_files`` are
+    # gitignored paths symlinked into a fresh worktree so the session has them
+    # (``.env`` DB creds, ``.claude`` settings); ``.venv`` is linked separately (it can
+    # defeat isolation for editable-self-installed projects — see design §8.2 R1-X3).
+    worktree_mode: str = "off"
+    worktrees_root: Path | None = None  # default: home/<project>/worktrees
+    worktree_branch_prefix: str = "handoff/"
+    worktree_link_files: list[str] = field(default_factory=lambda: [".env", ".claude"])
+    worktree_link_venv: bool = True
+    worktree_default_branch: str | None = None  # explicit integration-branch override
+    worktree_projects: list[str] = field(default_factory=list)
 
     def queue_dir(self, project: str) -> Path:
         return self.home / project / "queue"
@@ -224,7 +244,49 @@ def _from_dict(data: dict, home: Path) -> Config:
         ],
         audit_code_roots_configured="audit_code_repo_roots" in data,
         **_parse_mandate_projects(data),
+        **_parse_worktree(data),
     )
+
+
+def _parse_worktree(data: dict) -> dict:
+    """Parse the worktree-isolation config block (all optional, safe defaults).
+
+    ``worktree_mode`` is clamped to the known enum (anything unknown → "off", the
+    fail-safe). ``worktree_projects`` is a permissive list of slug strings (fail-OPEN:
+    a degenerate value just yields an empty list = no project flipped on — never the
+    security-mandate's fail-closed semantics, since enabling a tree-mutating feature on
+    an accidental empty would be the wrong default). ``worktrees_root`` expands ``~``.
+    """
+    mode_raw = str(data.get("worktree_mode", "off")).strip().lower()
+    mode = mode_raw if mode_raw in ("off", "report", "on") else "off"
+    root_raw = data.get("worktrees_root")
+    worktrees_root = Path(str(root_raw)).expanduser() if root_raw else None
+    link_files_raw = data.get("worktree_link_files")
+    if isinstance(link_files_raw, list):
+        link_files = [str(f) for f in link_files_raw if isinstance(f, str) and f]
+    else:
+        link_files = [".env", ".claude"]
+    projects_raw = data.get("worktree_projects")
+    projects = (
+        [str(p) for p in projects_raw if isinstance(p, str) and p]
+        if isinstance(projects_raw, list)
+        else []
+    )
+    default_branch_raw = data.get("worktree_default_branch")
+    default_branch = (
+        str(default_branch_raw)
+        if isinstance(default_branch_raw, str) and default_branch_raw
+        else None
+    )
+    return {
+        "worktree_mode": mode,
+        "worktrees_root": worktrees_root,
+        "worktree_branch_prefix": str(data.get("worktree_branch_prefix", "handoff/")),
+        "worktree_link_files": link_files,
+        "worktree_link_venv": bool(data.get("worktree_link_venv", True)),
+        "worktree_default_branch": default_branch,
+        "worktree_projects": projects,
+    }
 
 
 def _parse_mandate_projects(data: dict) -> dict:
@@ -241,9 +303,7 @@ def _parse_mandate_projects(data: dict) -> dict:
     To genuinely disable enforcement, unset the env mandate — not via this key.
     """
     raw = data.get("mandate_projects")
-    projects = (
-        [str(p) for p in raw if isinstance(p, str) and p] if isinstance(raw, list) else []
-    )
+    projects = [str(p) for p in raw if isinstance(p, str) and p] if isinstance(raw, list) else []
     return {
         "mandate_projects": projects,
         "mandate_projects_configured": bool(projects),
