@@ -140,9 +140,16 @@ def resolve_mode(cfg: _config.Config, project: str, env: dict[str, str] | None =
       1. env ``HANDOFF_WORKTREE_ISOLATION`` (on/report/off) — the master switch.
       2. sentinels ``$HANDOFF_HOME/worktree.enabled`` (all projects) /
          ``$HANDOFF_HOME/<project>/worktree.enabled`` (one project) → on.
-      3. config ``worktree_projects`` lists ``project`` → on.
-      4. config ``worktree_mode``.
-      5. off.
+      3. sentinels ``$HANDOFF_HOME/[<project>/]worktree.report`` → report (the
+         scoped report-only pilot opt-in: log what WOULD happen, mutate nothing).
+      4. config ``worktree_projects`` lists ``project`` → on.
+      5. config ``worktree_mode``.
+      6. off.
+
+    A project-scoped ``worktree.report`` sentinel is the clean way to pilot ONE
+    project in report-only without flipping the GLOBAL env/``worktree_mode`` (which
+    would make every project's dump run the report path). ``enabled`` (on) wins over
+    ``report`` if both are set for the same scope (explicit on > observe).
     """
     if env is None:
         env = dict(os.environ)
@@ -153,6 +160,8 @@ def resolve_mode(cfg: _config.Config, project: str, env: dict[str, str] | None =
         cfg.home / project / "worktree.enabled"
     ).exists():
         return MODE_ON
+    if (cfg.home / "worktree.report").exists() or (cfg.home / project / "worktree.report").exists():
+        return MODE_REPORT
     if project in cfg.worktree_projects:
         return MODE_ON
     if cfg.worktree_mode in (MODE_OFF, MODE_REPORT, MODE_ON):

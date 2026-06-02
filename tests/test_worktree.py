@@ -122,6 +122,27 @@ def test_mode_config_projects(home):
     assert wt.resolve_mode(cfg, "other", env={}) == wt.MODE_OFF
 
 
+def test_mode_project_report_sentinel(home):
+    """Scoped report-only pilot: worktree.report sentinel → report for that project."""
+    (home / "proj").mkdir()
+    (home / "proj" / "worktree.report").touch()
+    assert wt.resolve_mode(_cfg(home), "proj", env={}) == wt.MODE_REPORT
+    assert wt.resolve_mode(_cfg(home), "other", env={}) == wt.MODE_OFF
+
+
+def test_mode_global_report_sentinel(home):
+    (home / "worktree.report").touch()
+    assert wt.resolve_mode(_cfg(home), "anyproj", env={}) == wt.MODE_REPORT
+
+
+def test_mode_enabled_wins_over_report(home):
+    """enabled (on) beats report when both set for the same scope."""
+    (home / "proj").mkdir()
+    (home / "proj" / "worktree.enabled").touch()
+    (home / "proj" / "worktree.report").touch()
+    assert wt.resolve_mode(_cfg(home), "proj", env={}) == wt.MODE_ON
+
+
 def test_mode_env_overrides_sentinel(home):
     (home / "worktree.enabled").touch()
     assert (
