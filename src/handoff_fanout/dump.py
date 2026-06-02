@@ -602,9 +602,11 @@ def write_active_dump(
         try:
             ack_dir = cfg.ack_dir(project)
             ack_dir.mkdir(parents=True, exist_ok=True)
-            # R2 P2-H: crash-atomic write (temp + fsync + rename) like old_ready —
-            # a kill mid-write must not leave a partial JSON the GC then mis-parses.
-            atomic.write_with_fsync(
+            # R2 P2-H (+ R5): crash-atomic via temp + os.replace (atomic_replace), NOT
+            # write_with_fsync — the latter is in-place O_TRUNC (durable but a kill mid-
+            # write leaves partial JSON the GC would mis-parse). atomic_replace's temp
+            # name never matches a launcher glob, so the pre-.uri ordering is safe.
+            atomic.atomic_replace(
                 ack_dir / f"{task}.worktree",
                 json.dumps(
                     {**worktree_info, "source_workspace": str(source_workspace)},
