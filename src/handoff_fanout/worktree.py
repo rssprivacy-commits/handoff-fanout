@@ -109,10 +109,45 @@ def branch_head(workspace: Path, branch: str) -> str | None:
     return out if rc == 0 and out else None
 
 
-def is_dirty(workspace: Path) -> bool:
-    """True iff the working tree has uncommitted (staged or unstaged) changes."""
+def is_dirty(workspace: Path, ignore: set[str] | tuple[str, ...] = ()) -> bool:
+    """True iff the working tree has uncommitted (staged or unstaged) changes.
+
+    ``ignore`` is a set of top-level path names to DISCOUNT (the engine-linked
+    convenience files — ``.env`` / ``.claude`` / ``.venv``). A fresh worktree shows
+    those as untracked because the project's ``.gitignore`` uses directory patterns
+    (``.venv/``) that don't match the *symlink* the engine creates — so without this
+    filter every worktree reads as "dirty" and GC's fail-safe never reclaims it
+    (R-ON: real-machine ON test). A change to any NON-ignored path still → dirty, so
+    genuine WIP is still retained.
+    """
     rc, out, _ = _git(["status", "--porcelain"], workspace)
-    return bool(rc != 0 or out.strip())
+    if rc != 0:
+        return True
+    if not out.strip():
+        return False
+    if not ignore:
+        return True
+    ignore = set(ignore)
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        path = line[3:].strip()  # porcelain: "XY <path>"
+        if " -> " in path:  # rename: "old -> new"
+            path = path.split(" -> ", 1)[1]
+        path = path.strip().strip('"')
+        first = path.split("/", 1)[0]
+        if path in ignore or first in ignore:
+            continue
+        return True  # a non-ignored change → genuinely dirty
+    return False  # every change was an engine-linked file → clean
+
+
+def _link_names(cfg: _config.Config) -> set[str]:
+    """The engine-managed link names to discount when checking worktree dirtiness."""
+    names = set(cfg.worktree_link_files)
+    if cfg.worktree_link_venv:
+        names.add(".venv")
+    return names
 
 
 # ─── mode resolution ─────────────────────────────────────────────────────────
@@ -279,12 +314,17 @@ class WorktreeResult:
 
 
 def classify_worktree(
-    wt_path: Path, branch: str, integration_branch: str, repo_workspace: Path
+    wt_path: Path,
+    branch: str,
+    integration_branch: str,
+    repo_workspace: Path,
+    ignore_names: set[str] | tuple[str, ...] = (),
 ) -> dict:
     """Classify an existing worktree's safety for removal/reuse.
 
     Returns ``{exists, dirty, branch_head, published}`` where:
-      * ``dirty``     — uncommitted changes (``git status --porcelain`` non-empty).
+      * ``dirty``     — uncommitted changes, DISCOUNTING the engine-linked convenience
+        files (``ignore_names``) that always read as untracked symlinks (R-ON).
       * ``published`` — branch HEAD ⊆ ``origin/<integration_branch>`` (no unmerged
         local commits). A clean-but-``not published`` worktree holds committed,
         unpushed work → must be RETAINED, never force-removed (R1-C3 / Gemini P1-4).
@@ -297,8 +337,7 @@ def classify_worktree(
     }
     if not wt_path.exists():
         return info
-    rc, out, _ = _git(["status", "--porcelain"], wt_path)
-    info["dirty"] = bool(rc != 0 or out.strip())
+    info["dirty"] = is_dirty(wt_path, ignore=ignore_names)
     bh = head_sha(wt_path)
     info["branch_head"] = bh
     if bh:
@@ -488,7 +527,7 @@ def create_worktree(
     # re-dump / concurrent dump). Classify BOTH the worktree AND the branch before
     # touching either — a clean-looking absence of a worktree must NOT license
     # deleting a branch that still holds unpublished commits (R2 P0-A, both brains).
-    existing = classify_worktree(wt, br, int_branch, source_workspace)
+    existing = classify_worktree(wt, br, int_branch, source_workspace, _link_names(cfg))
     br_head = branch_head(source_workspace, br)  # SHA or None
     branch_exists = br_head is not None
     if existing["exists"] or branch_exists:
@@ -574,17 +613,22 @@ def create_worktree(
 
 
 def remove_worktree(
-    repo_workspace: Path, wt_path: Path, branch: str, integration_branch: str
+    repo_workspace: Path,
+    wt_path: Path,
+    branch: str,
+    integration_branch: str,
+    ignore_names: set[str] | tuple[str, ...] = (),
 ) -> tuple[bool, str]:
     """Remove a worktree IFF safe (clean + published). Returns ``(removed, reason)``.
 
     Fail-safe (the redline this whole feature defends): a worktree with uncommitted
     OR committed-but-unpublished work is RETAINED, never destroyed. Only a clean,
     fully-published worktree is removed; its branch is deleted only when published.
+    ``ignore_names`` discounts the engine-linked convenience files (R-ON).
     """
     if not wt_path.exists():
         return False, "worktree path does not exist"
-    info = classify_worktree(wt_path, branch, integration_branch, repo_workspace)
+    info = classify_worktree(wt_path, branch, integration_branch, repo_workspace, ignore_names)
     if info["dirty"]:
         return False, "retained: uncommitted changes"
     if not info["published"]:
@@ -685,7 +729,9 @@ def find_reclaimable(cfg: _config.Config, project: str) -> list[dict]:
             )
             classification = {"exists": False}
         else:
-            classification = classify_worktree(wt_path, branch or "", intb or "", source)
+            classification = classify_worktree(
+                wt_path, branch or "", intb or "", source, _link_names(cfg)
+            )
             branch_pub = classification.get("published")
         out.append(
             {
@@ -755,7 +801,11 @@ def gc(cfg: _config.Config, project: str | None, *, execute: bool) -> int:
                 print(f"  would gc {proj}/{task} @ {wt_path}: {verdict}")
                 continue
             removed, reason = remove_worktree(
-                rec["source"], wt_path, rec["branch"] or "", rec["integration_branch"] or ""
+                rec["source"],
+                wt_path,
+                rec["branch"] or "",
+                rec["integration_branch"] or "",
+                _link_names(cfg),
             )
             print(f"  {'rm' if removed else 'retain'} {proj}/{task}: {reason}")
             if removed:

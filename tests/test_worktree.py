@@ -384,6 +384,41 @@ def test_remove_retains_committed_unpublished(home, tmp_path):
     assert r.spawn_workspace.exists()
 
 
+def test_linked_files_do_not_count_as_dirty(home, tmp_path):
+    """R-ON: engine-linked .env/.claude (untracked symlinks/copies) must NOT make a
+    fresh worktree read as dirty — else GC's fail-safe leaks every worktree. Real WIP
+    still does."""
+    _, ws = _bare_and_clone(tmp_path)
+    (ws / ".env").write_text("X=1\n")
+    (ws / ".claude").mkdir()
+    (ws / ".claude" / "s.json").write_text("{}\n")
+    cfg = _cfg(home, worktree_link_files=[".env", ".claude"], worktree_link_venv=False)
+    r = wt.create_worktree(source_workspace=ws, project="proj", task="t1", cfg=cfg, mode=wt.MODE_ON)
+    assert r.status == wt.ST_CREATED
+    # Raw status IS non-empty (the linked files show as untracked), but the
+    # link-aware dirtiness check discounts them → clean → removable.
+    assert wt.is_dirty(r.spawn_workspace)  # unfiltered: dirty
+    assert not wt.is_dirty(r.spawn_workspace, ignore={".env", ".claude"})  # filtered: clean
+    removed, reason = wt.remove_worktree(
+        ws, r.spawn_workspace, r.branch, "main", {".env", ".claude"}
+    )
+    assert removed, reason
+    assert not r.spawn_workspace.exists()
+
+
+def test_real_wip_still_dirty_despite_link_ignore(home, tmp_path):
+    """A non-linked untracked file is still WIP → retained even with the link filter."""
+    _, ws = _bare_and_clone(tmp_path)
+    (ws / ".env").write_text("X=1\n")
+    cfg = _cfg(home, worktree_link_files=[".env"], worktree_link_venv=False)
+    r = wt.create_worktree(source_workspace=ws, project="proj", task="t1", cfg=cfg, mode=wt.MODE_ON)
+    (r.spawn_workspace / "real_wip.txt").write_text("important")  # genuine WIP
+    removed, reason = wt.remove_worktree(ws, r.spawn_workspace, r.branch, "main", {".env"})
+    assert not removed
+    assert "uncommitted" in reason
+    assert r.spawn_workspace.exists()
+
+
 def test_list_worktrees(home, tmp_path):
     _, ws = _bare_and_clone(tmp_path)
     cfg = _cfg(home, worktree_link_venv=False)
