@@ -419,6 +419,25 @@ def test_real_wip_still_dirty_despite_link_ignore(home, tmp_path):
     assert r.spawn_workspace.exists()
 
 
+def test_is_dirty_only_discounts_untracked_links(home, tmp_path):
+    """REDLINE (codex R-ON P1/P2): ignore discounts ONLY untracked link-named files.
+    Tracked changes + weird ' -> ' filenames are still genuine WIP → dirty."""
+    _, ws = _bare_and_clone(tmp_path)
+    # (1) untracked link-named file → discounted → clean.
+    (ws / ".env").write_text("x")
+    assert wt.is_dirty(ws, ignore={".env"}) is False
+    # (2) a weird untracked filename containing ' -> ' must NOT be mis-parsed as a
+    # rename to '.env' and discounted — it is real WIP.
+    (ws / "a -> .env").write_text("y")
+    assert wt.is_dirty(ws, ignore={".env"}) is True
+    (ws / "a -> .env").unlink()
+    # (3) a TRACKED modification of a link-named file is genuine WIP → dirty despite ignore.
+    _run(["git", "add", ".env"], ws)
+    _run(["git", "commit", "-qm", "track env"], ws)
+    (ws / ".env").write_text("modified")
+    assert wt.is_dirty(ws, ignore={".env"}) is True
+
+
 def test_list_worktrees(home, tmp_path):
     _, ws = _bare_and_clone(tmp_path)
     cfg = _cfg(home, worktree_link_venv=False)

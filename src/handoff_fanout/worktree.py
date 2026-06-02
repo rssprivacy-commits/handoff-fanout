@@ -112,13 +112,18 @@ def branch_head(workspace: Path, branch: str) -> str | None:
 def is_dirty(workspace: Path, ignore: set[str] | tuple[str, ...] = ()) -> bool:
     """True iff the working tree has uncommitted (staged or unstaged) changes.
 
-    ``ignore`` is a set of top-level path names to DISCOUNT (the engine-linked
-    convenience files — ``.env`` / ``.claude`` / ``.venv``). A fresh worktree shows
-    those as untracked because the project's ``.gitignore`` uses directory patterns
-    (``.venv/``) that don't match the *symlink* the engine creates — so without this
-    filter every worktree reads as "dirty" and GC's fail-safe never reclaims it
-    (R-ON: real-machine ON test). A change to any NON-ignored path still → dirty, so
-    genuine WIP is still retained.
+    ``ignore`` is a set of top-level path names to DISCOUNT — but ONLY when they are
+    **untracked** (``??``). The engine symlinks ``.claude`` / ``.venv`` (and copies
+    ``.env``); a fresh worktree shows those as untracked because the project's
+    ``.gitignore`` uses directory patterns (``.venv/``) that don't match the *symlink*
+    the engine creates, so without this filter every worktree reads "dirty" and GC's
+    fail-safe never reclaims it (R-ON: real-machine ON test).
+
+    REDLINE (codex R-ON P1): only untracked link-named entries are discounted. ANY
+    tracked change — ``M .env`` / ``D .claude/settings.json`` / a rename — is genuine
+    WIP regardless of name and still → dirty, so real work is never silently made
+    destroyable. (Untracked entries never carry a ``->`` rename, so the P2 weird-name
+    parse is moot once we gate on ``??``.)
     """
     rc, out, _ = _git(["status", "--porcelain"], workspace)
     if rc != 0:
@@ -131,15 +136,14 @@ def is_dirty(workspace: Path, ignore: set[str] | tuple[str, ...] = ()) -> bool:
     for line in out.splitlines():
         if not line.strip():
             continue
-        path = line[3:].strip()  # porcelain: "XY <path>"
-        if " -> " in path:  # rename: "old -> new"
-            path = path.split(" -> ", 1)[1]
-        path = path.strip().strip('"')
-        first = path.split("/", 1)[0]
-        if path in ignore or first in ignore:
-            continue
-        return True  # a non-ignored change → genuinely dirty
-    return False  # every change was an engine-linked file → clean
+        code = line[:2]
+        path = line[3:].strip().strip('"')
+        if code == "??":  # untracked — the only kind we may discount
+            first = path.split("/", 1)[0]
+            if path in ignore or first in ignore:
+                continue
+        return True  # tracked change, OR an untracked non-link path → genuinely dirty
+    return False  # every change was an untracked engine-linked file → clean
 
 
 def _link_names(cfg: _config.Config) -> set[str]:
