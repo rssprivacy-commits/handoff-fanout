@@ -201,7 +201,9 @@ def test_create_report_mutates_nothing(home, tmp_path):
 def test_create_happy_path(home, tmp_path):
     _, ws = _bare_and_clone(tmp_path)
     (ws / ".env").write_text("SECRET=1\n")  # gitignored-style essential file
-    cfg = _cfg(home, worktree_link_files=[".env"], worktree_link_venv=False)
+    (ws / ".claude").mkdir()  # gitignored dir
+    (ws / ".claude" / "settings.json").write_text("{}\n")
+    cfg = _cfg(home, worktree_link_files=[".env", ".claude"], worktree_link_venv=False)
     r = wt.create_worktree(source_workspace=ws, project="proj", task="t1", cfg=cfg, mode=wt.MODE_ON)
     assert r.status == wt.ST_CREATED, r.reason
     assert r.spawn_workspace == wt.worktree_path(cfg, "proj", "t1")
@@ -213,10 +215,14 @@ def test_create_happy_path(home, tmp_path):
         ["git", "rev-parse", "HEAD"], cwd=str(r.spawn_workspace), capture_output=True, text=True
     ).stdout.strip()
     assert head == r.base_sha
-    # Tracked file present; linked .env present (symlink).
+    # Tracked file present.
     assert (r.spawn_workspace / "README.md").exists()
-    assert (r.spawn_workspace / ".env").is_symlink()
-    assert ".env" in r.linked
+    # R2 P1-G: regular files are COPIED (Docker-mount portable), dirs are SYMLINKED.
+    env_dst = r.spawn_workspace / ".env"
+    assert env_dst.is_file() and not env_dst.is_symlink()
+    assert env_dst.read_text() == "SECRET=1\n"
+    assert (r.spawn_workspace / ".claude").is_symlink()
+    assert {".env", ".claude"} <= set(r.linked)
 
 
 def test_create_blocks_on_unpublished_head(home, tmp_path):
@@ -284,6 +290,40 @@ def test_collision_dirty_worktree_blocks(home, tmp_path):
     )
     assert r2.status == wt.ST_BLOCKED
     assert r1.spawn_workspace.exists()  # retained, not destroyed
+
+
+def test_collision_branch_only_unpublished_blocks(home, tmp_path):
+    """R2 P0-A: a lingering branch (worktree dir gone) with unpublished commits must
+    NOT be force-deleted — re-dump BLOCKs instead of `git branch -D`."""
+    _, ws = _bare_and_clone(tmp_path)
+    cfg = _cfg(home, worktree_link_venv=False)
+    r1 = wt.create_worktree(
+        source_workspace=ws, project="proj", task="t1", cfg=cfg, mode=wt.MODE_ON
+    )
+    assert r1.status == wt.ST_CREATED
+    # Commit unpublished work on the branch, then remove the worktree DIR (branch ref lingers).
+    _init_repo_config(r1.spawn_workspace)
+    _commit(r1.spawn_workspace, "feat.txt", "work", "unpublished branch work")
+    _run(["git", "worktree", "remove", "--force", str(r1.spawn_workspace)], ws)
+    assert not r1.spawn_workspace.exists()
+    assert wt.branch_head(ws, "handoff/t1") is not None  # branch ref survives
+    r2 = wt.create_worktree(
+        source_workspace=ws, project="proj", task="t1", cfg=cfg, mode=wt.MODE_ON
+    )
+    assert r2.status == wt.ST_BLOCKED
+    assert "unpublished" in (r2.reason or "")
+    assert wt.branch_head(ws, "handoff/t1") is not None  # branch NOT deleted
+
+
+def test_dirty_source_warns_not_blocks(home, tmp_path):
+    """R2 P0-B: a dirty source worktree WARNs (benign hook dirt must not brick the
+    relay) — the worktree is still created, with the advisory surfaced."""
+    _, ws = _bare_and_clone(tmp_path)
+    (ws / "uncommitted.txt").write_text("benign hook dirt")  # untracked dirt in source
+    cfg = _cfg(home, worktree_link_venv=False)
+    r = wt.create_worktree(source_workspace=ws, project="proj", task="t1", cfg=cfg, mode=wt.MODE_ON)
+    assert r.status == wt.ST_CREATED
+    assert any("uncommitted" in w for w in r.warnings)
 
 
 # ─── classify / remove ───────────────────────────────────────────────────────

@@ -602,14 +602,16 @@ def write_active_dump(
         try:
             ack_dir = cfg.ack_dir(project)
             ack_dir.mkdir(parents=True, exist_ok=True)
-            (ack_dir / f"{task}.worktree").write_text(
+            # R2 P2-H: crash-atomic write (temp + fsync + rename) like old_ready —
+            # a kill mid-write must not leave a partial JSON the GC then mis-parses.
+            atomic.write_with_fsync(
+                ack_dir / f"{task}.worktree",
                 json.dumps(
                     {**worktree_info, "source_workspace": str(source_workspace)},
                     ensure_ascii=False,
                     indent=2,
                 )
                 + "\n",
-                encoding="utf-8",
             )
         except OSError as e:
             print(f"[dump] (non-fatal) could not write .worktree sidecar: {e}")
@@ -1191,6 +1193,8 @@ def _worktree_info_dict(result: _worktree.WorktreeResult, mode: str) -> dict:
         "linked": result.linked,
         "degraded": result.status == _worktree.ST_DEGRADED,
         "reason": result.reason,
+        "warnings": result.warnings,
+        "planned_cmd": result.planned_cmd,
     }
 
 
@@ -1264,6 +1268,8 @@ def resolve_spawn_workspace(
         f"[dump] [worktree] {result.spawn_workspace} on {result.branch} "
         f"(base {(result.base_sha or '?')[:8]} / linked {result.linked})"
     )
+    for w in result.warnings:
+        print(f"[dump] [worktree] ⚠️  {w}")
     return result.spawn_workspace, _worktree_info_dict(result, mode), None
 
 
@@ -1411,14 +1417,16 @@ def main(argv: list[str] | None = None) -> int:
     # old_ready stays anchored to the source and the successor's baseline/handoff/
     # .uri point at the worktree (design §8.1 R1-C1).
     source_workspace = workspace
-    print(f"[dump] source_workspace={source_workspace}")
-
-    # old_ready's commit anchor MUST be the closing session's HEAD, captured BEFORE
-    # any worktree substitution (R1-C1 / Gemini P1-3).
-    old_head = _worktree.head_sha(source_workspace)
 
     spawn_workspace = source_workspace
     worktree_info: dict | None = None
+    # old_ready's commit anchor is the CLOSING session's HEAD. It is read from
+    # ``source_workspace`` inside ``_write_old_ready`` (lazily, only when retro
+    # evidence drives a dump), so the default-OFF path adds ZERO git subprocesses
+    # (R2 codex P2-I byte-identical). When a worktree IS created we capture it
+    # explicitly here — the source tree is never moved by worktree creation, so this
+    # is the same SHA, but the explicit anchor documents R1-C1.
+    old_head: str | None = None
     if args.status == "active" and not args.dry_run:
         spawn_workspace, worktree_info, block_rc = resolve_spawn_workspace(
             args=args,
@@ -1429,6 +1437,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         if block_rc is not None:
             return block_rc
+        if worktree_info and worktree_info.get("status") == _worktree.ST_CREATED:
+            old_head = _worktree.head_sha(source_workspace)
 
     baseline = detect_baseline(spawn_workspace, cfg=cfg)
     print(f"[dump] HEAD={baseline['git_head']}")

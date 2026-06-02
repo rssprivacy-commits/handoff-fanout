@@ -52,8 +52,13 @@ def _worktree_banner(worktree_info: dict | None, project: str, workspace: Path) 
     if status == "created":
         branch = worktree_info.get("branch")
         intb = worktree_info.get("integration_branch")
+        warns = worktree_info.get("warnings") or []
+        warn_block = ""
+        if warns:
+            warn_block = "\n> ⚠️ **前任 dump 警告**:\n" + "".join(f">   - {w}\n" for w in warns)
         return f"""
 ## 🌿 隔离 worktree (per-session git worktree isolation)
+{warn_block}
 
 > 本会话在**独立 git worktree** 工作，与其它会话/主树互不影响（你的 `git stash` /
 > `reset --hard` / pytest 只动这棵树）。**目录 basename = task-id ≠ project** —— 所有

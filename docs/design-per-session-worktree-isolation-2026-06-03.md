@@ -286,3 +286,68 @@ consensus, implemented within mandate). Findings → revised decisions:
      - .worktree sidecar {path, branch, base_sha, INT, link_files}
 ```
 
+
+## 9. R2–R4 dual-brain results + fixes (2026-06-03)
+
+codex (impl/edge-cases) + Gemini 3 Pro (business-goal/concurrency) audited the
+implemented code independently; CC cross-validated. Convergent + each-unique findings,
+all fixed (tests in `tests/test_worktree.py` / `tests/test_worktree_dump.py`):
+
+### 9.1 P0 (fixed)
+- **R2-P0-A (both) — branch-only collision force-deleted unpublished WIP.** A lingering
+  `handoff/<task>` branch (worktree dir manually removed) with committed-but-unpushed
+  commits was `git branch -D`'d on re-dump. Fix: `create_worktree` resolves the branch
+  SHA separately and BLOCKs if `branch_head` ⊄ `origin/<int>` — never deletes it.
+- **R2-P0-B (codex) — dirty source not handled.** A closing worktree's uncommitted
+  changes don't reach the successor (which branches from `origin/<int>`). Fix: **WARN**
+  (not BLOCK — benign hook auto-edits routinely leave the tree dirty; a hard block would
+  brick every real dump) + retain the source worktree (work preserved) + surface the
+  advisory in the successor's handoff banner.
+- **R2-P0-C (Gemini) — happy-path worktrees never reclaimed.** The serial relay never
+  writes `A.done` (A closes by dumping B `--status active`), so a `.done`-gated GC leaked
+  every worktree. Fix: GC reclaims on **session-gone** (absent/stale
+  `queue/<task>.heartbeat`, `HEARTBEAT_LIVE_SEC`) — a LIVE heartbeat is skipped (never
+  pulls a running tab's rug) — combined with the clean+published fail-safe.
+
+### 9.2 P1 (fixed)
+- **R2-P1-D (codex) — fetch unreliable + rc ignored.** Explicit refspec
+  `+refs/heads/<int>:refs/remotes/origin/<int>` + rc check; a fetch failure only risks a
+  SAFE false-BLOCK (push already updated the tracking ref), so warn + proceed.
+- **R2-P1-E (both) — same-task add race degraded to shared tree.** On `worktree add`
+  failure, "already exists / already used / already checked out" → BLOCK (retry), not
+  degrade — never spawn a duplicate session onto the shared tree.
+- **R2-P1-F (both) — GC claimed success on failed remove.** `remove_worktree` now checks
+  both remove rc and returns `(False, …)` on failure, so the recovery sidecar is kept.
+- **R2-P1-G (Gemini) — absolute `.env` symlink breaks Docker mounts.** `link_files` COPIES
+  regular files (portable into a bind-mounted container) and SYMLINKS dirs (`.claude`,
+  `.venv`). Orphan-branch GC: a *published* orphan branch is `branch -d`'d; an
+  *unpublished* one is retained.
+
+### 9.3 P2 (fixed)
+- **R2-P2-H (both)** `.worktree` sidecar → `atomic.write_with_fsync` (crash-atomic).
+- **R2-P2-I (codex)** default-OFF byte-identical: `old_head` is no longer precomputed
+  unconditionally — read lazily inside `_write_old_ready` (source tree) only when retro
+  evidence drives a dump; captured explicitly only when a worktree is actually created.
+
+### 9.4 Pre-existing (FLAGGED, deferred — orthogonal to worktree, works in prod)
+- **§0 template hardcodes `$HOME/.claude-handoff`** in `build_handoff_md` (ignores
+  `{handoff_home}`). Correct for the real ERP deployment (home IS `~/.claude-handoff`),
+  wrong for the library default / a non-default home. Not introduced by this bar; fixing
+  it touches every handoff. → follow-up.
+- **old_ready write-fail is swallowed** (warn + publish `.uri`) — a missing predecessor
+  anchor could let the next session escape a forced audit follow-up. Pre-existing
+  best-effort behavior; hardening (BLOCK on old_ready failure) is a separate decision.
+
+### 9.5 Real-machine verification (design §5)
+On a real bare-remote + clone with `HANDOFF_WORKTREE_ISOLATION=on`: spawn task-a (main
+tree) → worktree A; A ff-publishes to `origin/main` → dump task-b → worktree B **sees A's
+work**. In worktree A, `git stash` + `git reset --hard` reset **only A's** tree — **B's
+uncommitted WIP + the source main tree's WIP both stayed intact**; per-worktree index
+files confirmed. GC reclaimed clean+published A, **retained dirty B** (fail-safe).
+
+**Honest boundary discovered (added to §1 OUT):** worktree isolates the **working tree**
+(the catastrophic silent clobber of the incident) — but `refs/stash` is a **repo-global
+ref**, so `git stash list`/`pop` is shared across worktrees. The destructive working-tree
+wipe is fully isolated; the shared stash STACK is a lesser, *explicit-action* footgun
+(`git stash pop` in one worktree can pop another's saved stash). Documented, not solved
+in v1 — the incident was the silent working-tree wipe, which worktree fully prevents.

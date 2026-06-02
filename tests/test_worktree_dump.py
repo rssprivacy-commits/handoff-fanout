@@ -119,8 +119,8 @@ def test_dump_on_creates_worktree(tmp_path, monkeypatch):
     assert f"cd {expected_wt}" in md
     assert "隔离 worktree" in md
     assert f"--project {PROJECT}" in md
-    # linked .env present in worktree.
-    assert (expected_wt / ".env").is_symlink()
+    # linked .env present in worktree as a real file (copied — Docker-mount portable).
+    assert (expected_wt / ".env").is_file() and not (expected_wt / ".env").is_symlink()
 
 
 def test_dump_on_old_ready_anchored_to_source(tmp_path, monkeypatch):
@@ -219,3 +219,31 @@ def test_worktree_gc_retains_dirty_terminal(tmp_path, monkeypatch):
     cfg = _config.load(home)
     wt.gc(cfg, PROJECT, execute=True)
     assert wt_path.exists()  # retained — never destroy WIP
+
+
+def test_worktree_gc_reclaims_without_done_marker(tmp_path, monkeypatch):
+    """R2 P0-C: the serial relay never writes <task>.done — a clean+published
+    worktree with NO live heartbeat is reclaimed anyway (session gone)."""
+    _, ws = _bare_and_clone(tmp_path)
+    home = _home(tmp_path)
+    (home / "config.json").write_text(json.dumps({"worktree_link_venv": False}))
+    _dump(home, ws, monkeypatch, on=True)
+    wt_path = home / PROJECT / "worktrees" / TASK
+    assert wt_path.exists()
+    # No .done, no heartbeat → session gone.
+    cfg = _config.load(home)
+    wt.gc(cfg, PROJECT, execute=True)
+    assert not wt_path.exists()  # reclaimed despite no .done marker
+
+
+def test_worktree_gc_skips_live_heartbeat(tmp_path, monkeypatch):
+    """A fresh heartbeat = live session → GC must NOT pull its worktree out."""
+    _, ws = _bare_and_clone(tmp_path)
+    home = _home(tmp_path)
+    (home / "config.json").write_text(json.dumps({"worktree_link_venv": False}))
+    _dump(home, ws, monkeypatch, on=True)
+    wt_path = home / PROJECT / "worktrees" / TASK
+    (home / PROJECT / "queue" / f"{TASK}.heartbeat").touch()  # fresh heartbeat = live
+    cfg = _config.load(home)
+    wt.gc(cfg, PROJECT, execute=True)
+    assert wt_path.exists()  # retained — live session protected

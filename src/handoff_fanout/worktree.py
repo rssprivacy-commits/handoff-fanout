@@ -27,12 +27,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from handoff_fanout import config as _config
+
+# A worktree whose ``queue/<task>.heartbeat`` was touched within this window is
+# treated as a LIVE session — GC never reclaims it out from under a running tab.
+HEARTBEAT_LIVE_SEC = 600
 
 MODE_OFF = "off"
 MODE_REPORT = "report"
@@ -93,6 +99,20 @@ def is_ancestor(workspace: Path, ancestor: str, descendant: str) -> bool:
     """True iff ``ancestor`` commit is reachable from ``descendant`` (⊆ history)."""
     rc, _, _ = _git(["merge-base", "--is-ancestor", ancestor, descendant], workspace)
     return rc == 0
+
+
+def branch_head(workspace: Path, branch: str) -> str | None:
+    """SHA of local ``refs/heads/<branch>``, or None if it does not resolve."""
+    rc, out, _ = _git(
+        ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}"], workspace
+    )
+    return out if rc == 0 and out else None
+
+
+def is_dirty(workspace: Path) -> bool:
+    """True iff the working tree has uncommitted (staged or unstaged) changes."""
+    rc, out, _ = _git(["status", "--porcelain"], workspace)
+    return bool(rc != 0 or out.strip())
 
 
 # ─── mode resolution ─────────────────────────────────────────────────────────
@@ -231,6 +251,9 @@ class WorktreeResult:
     integration_branch: str | None = None
     reason: str | None = None
     linked: list[str] = field(default_factory=list)
+    # Non-fatal advisories surfaced to the successor (e.g. a dirty source whose
+    # uncommitted changes are NOT propagated to the worktree base — R2 codex P0-B).
+    warnings: list[str] = field(default_factory=list)
     # report-only: the command that WOULD run (for the log), without running it.
     planned_cmd: str | None = None
 
@@ -293,8 +316,12 @@ def link_files(source_workspace: Path, wt_path: Path, cfg: _config.Config) -> li
     linked separately because a shared venv can run the MAIN checkout for editable
     self-installs (R1-X3 / codex P1) — opt-out via ``worktree_link_venv: false``.
 
-    Never overwrites an existing path in the worktree (a tracked file of the same
-    name wins). Best-effort: a failed link is skipped (logged by the caller).
+    Regular **files** are COPIED (R2 Gemini P1-5): an absolute symlink to
+    ``/Users/.../.env`` breaks the instant a worktree is bind-mounted into a Docker
+    container (the host path doesn't exist there), so a real file is portable. **Dirs**
+    (``.claude``, ``.venv``) are symlinked (copying a venv is absurd; a dir symlink
+    survives the host-side toolchain). Never overwrites a tracked file of the same
+    name; best-effort (a failed link/copy is skipped).
     """
     names = list(cfg.worktree_link_files)
     if cfg.worktree_link_venv:
@@ -308,7 +335,10 @@ def link_files(source_workspace: Path, wt_path: Path, cfg: _config.Config) -> li
         if dst.exists() or dst.is_symlink():
             continue
         try:
-            dst.symlink_to(src.resolve())
+            if src.is_dir():
+                dst.symlink_to(src.resolve())
+            else:
+                shutil.copy2(src, dst)
             linked.append(name)
         except OSError:
             continue
@@ -388,11 +418,34 @@ def create_worktree(
     if source_head is None:
         return _degrade(source_workspace, "could not resolve source HEAD")
 
-    # Best-effort refresh of the integration tracking ref so the contained-check
-    # below sees the session's just-pushed closure commit (the push already updated
-    # refs/remotes/origin/<int>, but fetch is idempotent + covers a tracking miss).
-    _git(["fetch", "origin", int_branch], source_workspace, timeout=30.0)
+    warnings: list[str] = []
+    # R2 codex P0-B: a dirty source worktree's uncommitted changes are NOT carried
+    # into the successor (which branches from origin/<int>). Unlike the shared-tree
+    # path (where the next session inherits the tree), they stay only in the source
+    # worktree (retained, never destroyed). WARN rather than BLOCK: benign hook
+    # auto-edits (AGENTS.md / state files) routinely leave the tree dirty, and a hard
+    # block would brick every real dump.
+    if is_dirty(source_workspace):
+        warnings.append(
+            "source worktree had uncommitted changes at dump time — they are NOT in "
+            "the successor's base (preserved in the source worktree; commit + publish "
+            "them first if the successor should build on them)"
+        )
+
+    # Refresh the integration tracking ref so the contained-check sees the session's
+    # just-pushed closure commit. Use an explicit refspec (R2 codex P1-D) so the
+    # tracking ref is actually updated, and check rc. A push already updates
+    # refs/remotes/origin/<int> directly, so a fetch failure (offline) still leaves
+    # the ref authoritative — a stale ref only risks a SAFE false-BLOCK (the session
+    # re-dumps), never a wrong-base spawn, so we warn + proceed rather than degrade.
     origin_ref = f"refs/remotes/origin/{int_branch}"
+    rc_fetch, _, ferr = _git(
+        ["fetch", "origin", f"+refs/heads/{int_branch}:refs/remotes/origin/{int_branch}"],
+        source_workspace,
+        timeout=30.0,
+    )
+    if rc_fetch != 0:
+        warnings.append(f"fetch origin/{int_branch} failed ({ferr[:80]}); using local tracking ref")
     if not _ref_exists(source_workspace, origin_ref):
         return _degrade(source_workspace, f"origin/{int_branch} not found after fetch")
 
@@ -422,9 +475,13 @@ def create_worktree(
 
     base_sha = head_sha(source_workspace)  # informational; worktree branches off origin_ref
 
-    # Collision: a worktree dir or branch already exists for this task (retry/re-dump).
+    # Collision: a worktree dir and/or branch already exists for this task (retry/
+    # re-dump / concurrent dump). Classify BOTH the worktree AND the branch before
+    # touching either — a clean-looking absence of a worktree must NOT license
+    # deleting a branch that still holds unpublished commits (R2 P0-A, both brains).
     existing = classify_worktree(wt, br, int_branch, source_workspace)
-    branch_exists = _ref_exists(source_workspace, f"refs/heads/{br}")
+    br_head = branch_head(source_workspace, br)  # SHA or None
+    branch_exists = br_head is not None
     if existing["exists"] or branch_exists:
         if existing["dirty"]:
             # Unsafe: a same-task worktree with uncommitted work. Retain + BLOCK —
@@ -441,11 +498,27 @@ def create_worktree(
                 f"publish or remove manually",
                 integration_branch=int_branch,
             )
-        # Clean + published (or only a stale branch ref) → safe to drop + recreate.
+        # R2 P0-A: the BRANCH may carry unpublished commits even with no worktree dir
+        # (owner deleted the dir, or a same-name branch lingers). Never `branch -D`
+        # such a ref — that destroys the last pointer to committed-but-unpushed work.
+        if branch_exists and not is_ancestor(source_workspace, br_head, origin_ref):
+            return _block(
+                source_workspace,
+                f"branch {br} holds unpublished commits ({br_head[:8]} not in "
+                f"origin/{int_branch}); publish or delete it manually",
+                integration_branch=int_branch,
+            )
+        # Clean + published (or only a published/stale branch ref) → safe to recreate.
         if existing["exists"]:
-            _git(["worktree", "remove", "--force", str(wt)], source_workspace)
+            rc_rm, _, _ = _git(["worktree", "remove", "--force", str(wt)], source_workspace)
+            if rc_rm != 0:
+                return _block(
+                    source_workspace,
+                    f"could not remove stale worktree {wt}; retained — resolve manually",
+                    integration_branch=int_branch,
+                )
         if branch_exists:
-            _git(["branch", "-D", br], source_workspace)
+            _git(["branch", "-D", br], source_workspace)  # safe: published verified above
 
     try:
         worktrees_root(cfg, project).mkdir(parents=True, exist_ok=True)
@@ -456,8 +529,23 @@ def create_worktree(
         ["worktree", "add", "-b", br, str(wt), origin_ref], source_workspace, timeout=60.0
     )
     if rc != 0:
-        # Clean up a half-created worktree admin entry, then degrade.
+        # R2 P1-E: distinguish a concurrent same-task collision (another dump won the
+        # race + created the path/branch) from a genuine environmental failure. A
+        # collision must BLOCK (a duplicate session on the shared tree re-opens the
+        # unsafe class), not degrade.
+        low = err.lower()
         _git(["worktree", "prune"], source_workspace)
+        if (
+            "already exists" in low
+            or "already used by worktree" in low
+            or "already checked out" in low
+        ):
+            return _block(
+                source_workspace,
+                f"worktree/branch for {task} already exists (concurrent dump?); "
+                f"retry after the other session settles — not degrading to shared tree",
+                integration_branch=int_branch,
+            )
         return _degrade(source_workspace, f"git worktree add failed: {err[:200]}")
 
     linked = link_files(source_workspace, wt, cfg)
@@ -469,6 +557,7 @@ def create_worktree(
         base_sha=created_base,
         integration_branch=int_branch,
         linked=linked,
+        warnings=warnings,
     )
 
 
@@ -493,9 +582,14 @@ def remove_worktree(
         return False, "retained: committed but unpublished (would lose work)"
     rc, _, err = _git(["worktree", "remove", str(wt_path)], repo_workspace)
     if rc != 0:
-        _git(["worktree", "remove", "--force", str(wt_path)], repo_workspace)
-    # Delete the branch only if it is fully published (info.published already True).
-    _git(["branch", "-d", branch], repo_workspace)
+        rc, _, err = _git(["worktree", "remove", "--force", str(wt_path)], repo_workspace)
+    # R2 P1-F: only claim success (and delete the branch + drop the sidecar) when the
+    # remove actually succeeded — otherwise the caller must keep the recovery pointer.
+    if rc != 0:
+        return False, f"retained: worktree remove failed ({err[:80]})"
+    # Delete the branch only when fully published (info.published already True).
+    if branch:
+        _git(["branch", "-d", branch], repo_workspace)
     _git(["worktree", "prune"], repo_workspace)
     return True, "removed (clean + published)"
 
@@ -526,31 +620,37 @@ def list_worktrees(repo_workspace: Path) -> list[dict]:
 _BLOCKED_SUFFIX = ".BLOCKED.md"
 
 
-def _terminal_tasks(cfg: _config.Config, project: str) -> set[str]:
-    qd = cfg.queue_dir(project)
-    if not qd.is_dir():
-        return set()
-    done = {f.stem for f in qd.glob("*.done")}
-    blocked = {f.name[: -len(_BLOCKED_SUFFIX)] for f in qd.glob(f"*{_BLOCKED_SUFFIX}")}
-    return done | blocked
+def _heartbeat_fresh(cfg: _config.Config, project: str, task: str) -> bool:
+    """True iff ``queue/<task>.heartbeat`` was touched within ``HEARTBEAT_LIVE_SEC``.
+
+    A fresh heartbeat = a LIVE session still working in the worktree → GC must never
+    reclaim it. Absent / stale = the session closed (the handoff closure kills its
+    heartbeat) → the worktree is a GC candidate.
+    """
+    hb = cfg.queue_dir(project) / f"{task}.heartbeat"
+    try:
+        return (time.time() - hb.stat().st_mtime) < HEARTBEAT_LIVE_SEC
+    except OSError:
+        return False
 
 
 def find_reclaimable(cfg: _config.Config, project: str) -> list[dict]:
-    """One record per terminal task that still has a ``.worktree`` sidecar.
+    """One record per ``.worktree`` sidecar whose session is no longer live.
 
-    Record: ``{task, sidecar, path, source, branch, integration_branch,
-    classification}``. ``classification`` is from ``classify_worktree`` (or a
-    ``missing`` marker when the worktree dir is already gone).
+    R2 P0-C (Gemini): the serial relay never writes ``A.done`` (task A closes by
+    dumping B with ``--status active``), so gating on ``.done``/``.BLOCKED`` leaks
+    every happy-path worktree. The real reclaim signal is **the session is gone** —
+    proven by an absent/stale heartbeat — combined with the fail-safe (clean +
+    published) check at removal time. A LIVE heartbeat → skip (never pull a running
+    tab's rug). Record carries ``live`` + ``branch_published`` (for the orphan-branch
+    case where the worktree dir was manually removed).
     """
     ack = cfg.ack_dir(project)
     if not ack.is_dir():
         return []
-    terminal = _terminal_tasks(cfg, project)
     out: list[dict] = []
     for sc in sorted(ack.glob("*.worktree")):
         task = sc.stem
-        if task not in terminal:
-            continue
         try:
             info = json.loads(sc.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -559,12 +659,25 @@ def find_reclaimable(cfg: _config.Config, project: str) -> list[dict]:
         source = Path(info["source_workspace"]) if info.get("source_workspace") else None
         branch = info.get("branch")
         intb = info.get("integration_branch")
+        live = _heartbeat_fresh(cfg, project, task)
         if wt_path is None or source is None or not source.exists():
             classification = {"exists": bool(wt_path and wt_path.exists()), "unresolved": True}
+            branch_pub = None
         elif not wt_path.exists():
+            # Dir gone — but the branch may linger (Gemini P1-6). Resolve its
+            # publication so gc can delete a published orphan branch but RETAIN an
+            # unpublished one.
+            bh = branch_head(source, branch) if branch else None
+            origin_ref = f"refs/remotes/origin/{intb}"
+            branch_pub = (
+                is_ancestor(source, bh, origin_ref)
+                if (bh and _ref_exists(source, origin_ref))
+                else (False if bh else None)
+            )
             classification = {"exists": False}
         else:
             classification = classify_worktree(wt_path, branch or "", intb or "", source)
+            branch_pub = classification.get("published")
         out.append(
             {
                 "task": task,
@@ -574,19 +687,22 @@ def find_reclaimable(cfg: _config.Config, project: str) -> list[dict]:
                 "branch": branch,
                 "integration_branch": intb,
                 "classification": classification,
+                "live": live,
+                "branch_published": branch_pub,
             }
         )
     return out
 
 
 def gc(cfg: _config.Config, project: str | None, *, execute: bool) -> int:
-    """Reclaim worktrees of terminal tasks. Dry-run by default (R1-X5).
+    """Reclaim worktrees whose session has closed. Dry-run by default (R1-X5).
 
-    Removes ONLY clean + published worktrees (``remove_worktree`` enforces the
-    fail-safe); dirty / unpublished are RETAINED with a printed reason. The
-    ``.worktree`` sidecar is dropped only once the worktree is actually removed (or
-    was already gone). ``git worktree prune`` runs at the end to clear stale admin
-    entries for any reclaimed dir.
+    Skips LIVE worktrees (fresh heartbeat). Removes ONLY clean + published worktrees
+    (``remove_worktree`` enforces the fail-safe); dirty / unpublished are RETAINED.
+    A worktree dir gone but a *published* branch lingering → the orphan branch is
+    deleted + sidecar dropped; an *unpublished* orphan branch is RETAINED (keep the
+    last pointer to its commits). The ``.worktree`` sidecar is dropped only once the
+    worktree is actually removed (R2 P1-F).
     """
     projects = [project] if project else _iter_projects(cfg)
     total = 0
@@ -596,15 +712,28 @@ def gc(cfg: _config.Config, project: str | None, *, execute: bool) -> int:
             total += 1
             cls = rec["classification"]
             wt_path = rec["path"]
+            task = rec["task"]
+            if rec["live"]:
+                print(f"  skip {proj}/{task}: live session (fresh heartbeat)")
+                continue
             if cls.get("unresolved"):
-                print(f"  ? {proj}/{rec['task']}: sidecar unresolved (source missing) — skip")
+                print(f"  ? {proj}/{task}: sidecar unresolved (source missing) — skip")
                 continue
             if not cls.get("exists"):
-                # worktree dir already gone → just drop the stale sidecar.
+                # Worktree dir gone. Clean a PUBLISHED orphan branch; retain an
+                # unpublished one (its commits would be lost otherwise).
+                if rec["branch_published"] is False:
+                    print(
+                        f"  retain {proj}/{task}: orphan branch {rec['branch']} unpublished — kept"
+                    )
+                    continue
                 if execute:
+                    if rec["branch"] and rec["branch_published"]:
+                        _git(["branch", "-d", rec["branch"]], rec["source"])
+                        _git(["worktree", "prune"], rec["source"])
                     rec["sidecar"].unlink(missing_ok=True)
                 print(
-                    f"  {'rm' if execute else 'would rm'} {proj}/{rec['task']}: stale sidecar (worktree gone)"
+                    f"  {'rm' if execute else 'would rm'} {proj}/{task}: stale sidecar (worktree gone)"
                 )
                 reclaimed += 1
                 continue
@@ -614,24 +743,23 @@ def gc(cfg: _config.Config, project: str | None, *, execute: bool) -> int:
                     if (not cls.get("dirty") and cls.get("published"))
                     else "RETAIN: " + ("dirty" if cls.get("dirty") else "unpublished")
                 )
-                print(f"  would gc {proj}/{rec['task']} @ {wt_path}: {verdict}")
+                print(f"  would gc {proj}/{task} @ {wt_path}: {verdict}")
                 continue
             removed, reason = remove_worktree(
                 rec["source"], wt_path, rec["branch"] or "", rec["integration_branch"] or ""
             )
-            print(f"  {'rm' if removed else 'retain'} {proj}/{rec['task']}: {reason}")
+            print(f"  {'rm' if removed else 'retain'} {proj}/{task}: {reason}")
             if removed:
                 rec["sidecar"].unlink(missing_ok=True)
                 reclaimed += 1
-        # admin GC for any source repo (best-effort): prune stale worktree entries.
         src = cfg.workspace_root / proj
         if execute and src.exists():
             _git(["worktree", "prune"], src)
     if total == 0:
-        print("[worktree gc] nothing to reclaim — no terminal tasks with worktrees.")
+        print("[worktree gc] nothing to reclaim — no closed-session worktrees.")
     else:
         verb = "reclaimed" if execute else "would reclaim"
-        print(f"[worktree gc] {verb} {reclaimed}/{total} terminal-task worktree(s).")
+        print(f"[worktree gc] {verb} {reclaimed}/{total} worktree(s).")
         if not execute:
             print("[worktree gc] dry-run — re-run with --execute to apply.")
     return 0
