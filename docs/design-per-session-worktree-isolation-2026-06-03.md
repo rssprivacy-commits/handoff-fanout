@@ -351,3 +351,48 @@ ref**, so `git stash list`/`pop` is shared across worktrees. The destructive wor
 wipe is fully isolated; the shared stash STACK is a lesser, *explicit-action* footgun
 (`git stash pop` in one worktree can pop another's saved stash). Documented, not solved
 in v1 — the incident was the silent working-tree wipe, which worktree fully prevents.
+
+## 10. Report-only pilot runbook (2026-06-03)
+
+The rollout is **report-only → flip** (design §2.3). A per-project `worktree.report`
+sentinel (commit 90709cc) pilots ONE project in report-only without flipping the global
+env/`worktree_mode`.
+
+### Enable (pilot erp-system)
+```bash
+touch ~/.claude-handoff/erp-system/worktree.report     # scoped report-only for erp-system
+```
+Now every erp-system `handoff dump --status active` runs the report path: it LOGS the
+worktree it WOULD create and mutates nothing (no fetch / mkdir / symlink / ref update).
+The dump still proceeds on the shared tree exactly as before (byte-identical), plus:
+- stdout: `[dump] [worktree:report] would run: git -C <repo> worktree add -b handoff/<task> <path> origin/<int>`
+- the handoff `.md` carries a `🌿 worktree 隔离 report-only` banner.
+
+### Observe (what to check over a few real dumps)
+1. **Integration branch resolves correctly** — the `origin/<int>` in the planned command
+   is `origin/main` (not a `handoff/*` task branch, not `<UNRESOLVED>`).
+2. **Planned worktree path is sane** — `~/.claude-handoff/erp-system/worktrees/<task>`.
+3. **No `integration branch unresolved` / degrade notes** in the report log.
+4. Confirm the report path adds NO latency/side-effect to real dumps (it's local-only).
+
+### Flip criteria → MODE_ON (after stable observation)
+All of: int branch consistently `origin/main`; planned paths correct; no unresolved/degrade
+surprises; the merge-back closure protocol (session ff-publishes `HEAD:main` before dumping
+the successor — see the worktree handoff banner) is understood + acceptable; erp-system has
+a working `origin` remote (it does: GitHub). Then:
+```bash
+rm  ~/.claude-handoff/erp-system/worktree.report
+touch ~/.claude-handoff/erp-system/worktree.enabled    # → MODE_ON (creates real worktrees)
+```
+
+### Abort / pause
+```bash
+rm ~/.claude-handoff/erp-system/worktree.report         # back to OFF (byte-identical)
+```
+
+### Honest note
+Report-only does NOT exercise the actual worktree create / merge-back / GC paths (those run
+only under MODE_ON). It de-risks the **resolution + planning** layer (int branch, paths) and
+surfaces the protocol to the owner before any tree is created — but the first real ON dump is
+where create/merge-back/GC get their first production exercise (they ARE covered by the test
+suite + the real-machine verification in §9.5).
