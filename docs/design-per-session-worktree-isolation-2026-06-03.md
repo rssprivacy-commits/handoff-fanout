@@ -396,3 +396,31 @@ only under MODE_ON). It de-risks the **resolution + planning** layer (int branch
 surfaces the protocol to the owner before any tree is created — but the first real ON dump is
 where create/merge-back/GC get their first production exercise (they ARE covered by the test
 suite + the real-machine verification in §9.5).
+
+## 11. R-ON: real-machine ON flip findings (2026-06-03)
+
+Before flipping erp-system from report → ON, a controlled real-ON test on the actual
+erp-system repo (not a tmp fixture) caught two issues the tmp tests missed — the value of
+verifying at the user-experience layer:
+
+- **R-ON-1 (GC leak)**: `link_files` symlinks `.claude`/`.venv` (dirs), but a project's
+  `.gitignore` uses dir patterns (`.venv/`) that don't match a *symlink* named `.venv` →
+  `git status` shows `?? .claude` `?? .venv` → a fresh worktree reads "dirty" → the
+  remove/GC fail-safe RETAINS it → every ON worktree leaks. (`.env` is a copied file →
+  matches `.env` → clean.) Fix: `is_dirty(workspace, ignore=...)` discounts the
+  engine-linked names; threaded via `_link_names(cfg)` into classify/remove/gc/create
+  (commit 6e0cc3d).
+- **R-ON-2 (codex sanity P1/P2)**: the discount was status-code blind — it would discount a
+  *tracked* `M .env` / `D .claude/settings.json` or a `' -> '` filename, making genuine WIP
+  destroyable (redline). Tightened to discount ONLY untracked (`??`) link-named entries;
+  any tracked change is WIP regardless of name (commit ed9ee36).
+
+**Flip done**: `rm worktree.report` + `touch ~/.claude-handoff/erp-system/worktree.enabled`
+→ erp-system = ON. End-to-end real-ON dump verified: worktree created, `.uri` → worktree,
+handoff banner + `--project erp-system` injected, `.worktree` sidecar, venv works, ERP code
+present, clean GC. Full suite 509 pass / 1 known uv-shim artifact.
+
+**Known degradation (honest)**: `.codegraph` / `.gitnexus` are gitignored per-tree indexes —
+NOT linked into worktrees (linking a shared SQLite graph across worktrees risks concurrent
+re-index corruption). So worktree sessions get "CG/GN not initialized" and fall back to grep
+(the routing rules explicitly support this). Per-worktree code-intel is a future option.
