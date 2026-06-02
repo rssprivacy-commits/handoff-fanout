@@ -90,6 +90,12 @@ def head_sha(workspace: Path) -> str | None:
     return out if rc == 0 and out else None
 
 
+def head_sha_of_ref(workspace: Path, ref: str) -> str | None:
+    """Resolve ``ref`` (e.g. ``refs/remotes/origin/main``) to its commit SHA."""
+    rc, out, _ = _git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], workspace)
+    return out if rc == 0 and out else None
+
+
 def _ref_exists(workspace: Path, ref: str) -> bool:
     rc, _, _ = _git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], workspace)
     return rc == 0
@@ -138,10 +144,13 @@ def is_dirty(workspace: Path, ignore: set[str] | tuple[str, ...] = ()) -> bool:
             continue
         code = line[:2]
         path = line[3:].strip().strip('"')
-        if code == "??":  # untracked — the only kind we may discount
-            first = path.split("/", 1)[0]
-            if path in ignore or first in ignore:
-                continue
+        # Discount ONLY an untracked entry whose FULL path is an engine link name
+        # (codex dual-brain P0): a prefix/first-component match would discount
+        # ``?? src/new.py`` if a tracked dir name (``src``) were ever configured as a
+        # link → real WIP silently destroyable. A linked dir is a *symlink* (git shows
+        # ``?? .claude`` exactly, never its contents), so exact-match is sufficient.
+        if code == "??" and path in ignore:
+            continue
         return True  # tracked change, OR an untracked non-link path → genuinely dirty
     return False  # every change was an untracked engine-linked file → clean
 
@@ -177,32 +186,34 @@ def resolve_mode(cfg: _config.Config, project: str, env: dict[str, str] | None =
 
     Precedence (first decisive wins):
       1. env ``HANDOFF_WORKTREE_ISOLATION`` (on/report/off) — the master switch.
-      2. sentinels ``$HANDOFF_HOME/worktree.enabled`` (all projects) /
-         ``$HANDOFF_HOME/<project>/worktree.enabled`` (one project) → on.
-      3. sentinels ``$HANDOFF_HOME/[<project>/]worktree.report`` → report (the
-         scoped report-only pilot opt-in: log what WOULD happen, mutate nothing).
-      4. config ``worktree_projects`` lists ``project`` → on.
+      2. sentinels ``$HANDOFF_HOME/[<project>/]worktree.enabled`` → on.
+      3. config ``worktree_projects`` lists ``project`` → on.
+      4. sentinels ``$HANDOFF_HOME/[<project>/]worktree.report`` → report.
       5. config ``worktree_mode``.
       6. off.
 
-    A project-scoped ``worktree.report`` sentinel is the clean way to pilot ONE
-    project in report-only without flipping the GLOBAL env/``worktree_mode`` (which
-    would make every project's dump run the report path). ``enabled`` (on) wins over
-    ``report`` if both are set for the same scope (explicit on > observe).
+    EXPLICIT ON (the ``enabled`` sentinel AND the ``worktree_projects`` config list)
+    OUTRANKS the ``report`` sentinel (dual-brain P1: a global ``worktree.report``
+    touched to pilot an off project must NOT silently demote a production project that
+    is ON via config into a shared-tree report — that re-opens the very collision
+    class isolation defends). A project-scoped ``worktree.report`` is the clean way to
+    pilot ONE project without flipping the GLOBAL env/``worktree_mode``.
     """
     if env is None:
         env = dict(os.environ)
     em = _env_mode(env)
     if em is not None:
         return em
+    # — explicit ON (sentinel + config) first —
     if (cfg.home / "worktree.enabled").exists() or (
         cfg.home / project / "worktree.enabled"
     ).exists():
         return MODE_ON
-    if (cfg.home / "worktree.report").exists() or (cfg.home / project / "worktree.report").exists():
-        return MODE_REPORT
     if project in cfg.worktree_projects:
         return MODE_ON
+    # — report (observe) only after explicit ON has had its say —
+    if (cfg.home / "worktree.report").exists() or (cfg.home / project / "worktree.report").exists():
+        return MODE_REPORT
     if cfg.worktree_mode in (MODE_OFF, MODE_REPORT, MODE_ON):
         return cfg.worktree_mode
     return MODE_OFF
@@ -216,8 +227,17 @@ def resolve_mode(cfg: _config.Config, project: str, env: dict[str, str] | None =
 _TASK_BRANCH_PREFIXES = ("handoff/", "task/")
 
 
-def _looks_like_task_branch(name: str) -> bool:
-    return any(name.startswith(p) for p in _TASK_BRANCH_PREFIXES)
+def _looks_like_task_branch(name: str, cfg: _config.Config | None = None) -> bool:
+    """True if ``name`` is a per-session task branch (never an integration branch).
+
+    Includes the configured ``worktree_branch_prefix`` (dual-brain Gemini P2) so a
+    project that customized it (e.g. ``feat/``) doesn't mis-pick a ``feat/xxx`` task
+    branch as the integration branch.
+    """
+    prefixes = _TASK_BRANCH_PREFIXES
+    if cfg is not None and cfg.worktree_branch_prefix:
+        prefixes = (*prefixes, cfg.worktree_branch_prefix)
+    return any(name.startswith(p) for p in prefixes)
 
 
 def resolve_integration_branch(
@@ -240,7 +260,7 @@ def resolve_integration_branch(
     rc, out, _ = _git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], workspace)
     if rc == 0 and out.startswith("refs/remotes/origin/"):
         name = out[len("refs/remotes/origin/") :]
-        if name and not _looks_like_task_branch(name):
+        if name and not _looks_like_task_branch(name, cfg):
             return name
 
     if allow_network and has_remote(workspace):
@@ -250,7 +270,7 @@ def resolve_integration_branch(
                 line = line.strip()
                 if line.startswith("HEAD branch:"):
                     name = line.split(":", 1)[1].strip()
-                    if name and name != "(unknown)" and not _looks_like_task_branch(name):
+                    if name and name != "(unknown)" and not _looks_like_task_branch(name, cfg):
                         return name
 
     for cand in ("main", "master"):
@@ -560,7 +580,34 @@ def create_worktree(
                 f"origin/{int_branch}); publish or delete it manually",
                 integration_branch=int_branch,
             )
-        # Clean + published (or only a published/stale branch ref) → safe to recreate.
+        # REUSE (dual-brain P1 race): a clean + published worktree already AT the
+        # target base (origin/<int> HEAD) is exactly what we'd recreate — reuse it
+        # instead of remove+recreate. This makes a same-task concurrent dump
+        # idempotent (the loser adopts the winner's worktree rather than clobbering it
+        # or writing a relay-stalling BLOCKED), and avoids needless churn on retry.
+        origin_head = head_sha_of_ref(source_workspace, origin_ref)
+        if (
+            existing["exists"]
+            and not existing["dirty"]
+            and existing["published"]
+            and existing["branch_head"]
+            and origin_head
+            and existing["branch_head"] == origin_head
+        ):
+            linked = link_files(source_workspace, wt, cfg)
+            return WorktreeResult(
+                status=ST_CREATED,
+                spawn_workspace=wt,
+                branch=br,
+                base_sha=existing["branch_head"],
+                integration_branch=int_branch,
+                linked=linked,
+                warnings=[
+                    *warnings,
+                    "reused an existing clean+published worktree at the same base",
+                ],
+            )
+        # Otherwise the worktree is stale (base advanced) → drop + recreate.
         if existing["exists"]:
             rc_rm, _, _ = _git(["worktree", "remove", "--force", str(wt)], source_workspace)
             if rc_rm != 0:
@@ -713,11 +760,23 @@ def find_reclaimable(cfg: _config.Config, project: str) -> list[dict]:
         except (OSError, json.JSONDecodeError):
             info = {}
         wt_path = Path(info["path"]) if info.get("path") else None
-        source = Path(info["source_workspace"]) if info.get("source_workspace") else None
+        recorded_source = Path(info["source_workspace"]) if info.get("source_workspace") else None
         branch = info.get("branch")
         intb = info.get("integration_branch")
+        # P0 (dual-brain Gemini): the recorded source is the PREDECESSOR's worktree
+        # (the chain dumps B from A's worktree). Once A is GC'd, that path is gone and
+        # the old code marked B "unresolved" → gc skipped B → the whole descendant
+        # chain leaked forever. All worktrees share ONE git repo, so fall back to the
+        # main repo for the git analysis/removal — any valid checkout of the repo works.
+        main_repo = cfg.workspace_root / project
+        source = recorded_source if (recorded_source and recorded_source.exists()) else None
+        if source is None and main_repo.exists():
+            source = main_repo
+        # Discount the files THIS worktree actually linked (codex P0: not current
+        # config, which may have drifted), falling back to current config.
+        ignore = set(info.get("linked") or _link_names(cfg))
         live = _heartbeat_fresh(cfg, project, task)
-        if wt_path is None or source is None or not source.exists():
+        if wt_path is None or source is None:
             classification = {"exists": bool(wt_path and wt_path.exists()), "unresolved": True}
             branch_pub = None
         elif not wt_path.exists():
@@ -733,9 +792,7 @@ def find_reclaimable(cfg: _config.Config, project: str) -> list[dict]:
             )
             classification = {"exists": False}
         else:
-            classification = classify_worktree(
-                wt_path, branch or "", intb or "", source, _link_names(cfg)
-            )
+            classification = classify_worktree(wt_path, branch or "", intb or "", source, ignore)
             branch_pub = classification.get("published")
         out.append(
             {
@@ -748,6 +805,7 @@ def find_reclaimable(cfg: _config.Config, project: str) -> list[dict]:
                 "classification": classification,
                 "live": live,
                 "branch_published": branch_pub,
+                "ignore": ignore,
             }
         )
     return out
@@ -809,7 +867,7 @@ def gc(cfg: _config.Config, project: str | None, *, execute: bool) -> int:
                 wt_path,
                 rec["branch"] or "",
                 rec["integration_branch"] or "",
-                _link_names(cfg),
+                rec["ignore"],
             )
             print(f"  {'rm' if removed else 'retain'} {proj}/{task}: {reason}")
             if removed:

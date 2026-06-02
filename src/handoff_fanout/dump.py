@@ -544,6 +544,13 @@ def write_active_dump(
         _notify(osascript_subtitle or task, f"自动接续 / {project}", task, sound="Basso")
         return 0
 
+    # A successful active dump SUPERSEDES any prior terminal BLOCKED.md for this task
+    # (dual-brain P0): the worktree merge-back gate / a same-task collision writes
+    # <task>.BLOCKED.md + returns 2; once the session publishes + re-dumps active, a
+    # stale BLOCKED.md would make the launcher (auto-continue.sh: `[ -f
+    # <task>.BLOCKED.md ] && continue`) skip this valid .uri → the relay STALLS.
+    (queue_dir / f"{task}.BLOCKED.md").unlink(missing_ok=True)
+
     # active: prepare all sidecars FIRST, then publish the .uri trigger LAST.
     # CRITICAL ORDERING (codex+Gemini R2): the .uri sidecar is the launchd WatchPaths
     # trigger — the instant it lands, the launcher spawns the next session, whose §0

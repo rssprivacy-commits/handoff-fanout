@@ -92,6 +92,21 @@ def test_dump_off_is_shared_tree(tmp_path, monkeypatch):
     assert not (home / PROJECT / "worktrees").exists()
 
 
+def test_active_dump_clears_stale_blocked_md(tmp_path, monkeypatch):
+    """Dual-brain P0: a stale <task>.BLOCKED.md (from a prior merge-back-gate block)
+    must be cleared on a successful active dump — else the launcher skips the .uri and
+    the relay stalls."""
+    _, ws = _bare_and_clone(tmp_path)
+    home = _home(tmp_path)
+    qdir = home / PROJECT / "queue"
+    qdir.mkdir(parents=True, exist_ok=True)
+    (qdir / f"{TASK}.BLOCKED.md").write_text("# BLOCKED (stale)\n")
+    rc = _dump(home, ws, monkeypatch, on=False)
+    assert rc == 0
+    assert (qdir / f"{TASK}.uri").exists()
+    assert not (qdir / f"{TASK}.BLOCKED.md").exists()  # cleared → launcher won't skip
+
+
 # ─── mode on: worktree created + artifacts point at it ───────────────────────
 
 

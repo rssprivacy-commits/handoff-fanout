@@ -60,9 +60,10 @@ def _worktree_banner(worktree_info: dict | None, project: str, workspace: Path) 
 ## 🌿 隔离 worktree (per-session git worktree isolation)
 {warn_block}
 
-> 本会话在**独立 git worktree** 工作，与其它会话/主树互不影响（你的 `git stash` /
-> `reset --hard` / pytest 只动这棵树）。**目录 basename = task-id ≠ project** —— 所有
-> `handoff` 命令必须显式带 `--project {project}`（见 §-1，已注入）。
+> 本会话在**独立 git worktree** 工作：你的 `reset --hard` / 工作树改动 / pytest **只动这棵树**，
+> 不会卷走其它会话或主树的 WIP（事故根治点）。⚠️ **但 `refs/stash` 是 repo 全局的** —— `git
+> stash list` / `pop` 跨 worktree 共享，别用 `git stash` 当隔离手段（优先 commit，不要 stash/pop）。
+> **目录 basename = task-id ≠ project** —— 所有 `handoff` 命令必须显式带 `--project {project}`（见 §-1，已注入）。
 
 - **worktree**: `{workspace}`
 - **branch**: `{branch}`（从 `origin/{intb}` 切出）

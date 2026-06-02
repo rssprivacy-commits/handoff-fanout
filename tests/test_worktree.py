@@ -7,6 +7,7 @@ fail-safe removal path. Mode resolution is pure (env/sentinel/config).
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -141,6 +142,14 @@ def test_mode_enabled_wins_over_report(home):
     (home / "proj" / "worktree.enabled").touch()
     (home / "proj" / "worktree.report").touch()
     assert wt.resolve_mode(_cfg(home), "proj", env={}) == wt.MODE_ON
+
+
+def test_mode_config_on_beats_global_report_sentinel(home):
+    """Dual-brain P1: a global worktree.report must NOT demote a config-ON project."""
+    (home / "worktree.report").touch()  # global pilot sentinel
+    cfg = _cfg(home, worktree_projects=["erp-system"])  # erp-system ON via config
+    assert wt.resolve_mode(cfg, "erp-system", env={}) == wt.MODE_ON  # not demoted
+    assert wt.resolve_mode(cfg, "other", env={}) == wt.MODE_REPORT  # off project observes
 
 
 def test_mode_env_overrides_sentinel(home):
@@ -445,3 +454,50 @@ def test_list_worktrees(home, tmp_path):
     items = wt.list_worktrees(ws)
     paths = [i["path"] for i in items]
     assert any("worktrees/t1" in p for p in paths)
+
+
+def test_gc_source_fallback_when_predecessor_gone(home, tmp_path):
+    """Dual-brain P0 (cascade leak): a worktree whose recorded source (a predecessor's
+    worktree) was GC'd must STILL be reclaimable via the main-repo fallback — not
+    leaked forever as 'unresolved'."""
+    # Main repo named 'proj' under workspace_root=tmp_path (so the fallback resolves).
+    bare = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "main", str(bare)], check=True, capture_output=True
+    )
+    proj = tmp_path / "proj"
+    subprocess.run(["git", "clone", str(bare), str(proj)], check=True, capture_output=True)
+    _init_repo_config(proj)
+    (proj / "README.md").write_text("x")
+    _run(["git", "add", "."], proj)
+    _run(["git", "commit", "-qm", "init"], proj)
+    _run(["git", "push", "-q", "origin", "main"], proj)
+    subprocess.run(
+        ["git", "remote", "set-head", "origin", "main"], cwd=str(proj), capture_output=True
+    )
+    cfg = _cfg(home, worktree_link_venv=False, workspace_root=tmp_path)
+    r = wt.create_worktree(
+        source_workspace=proj, project="proj", task="t1", cfg=cfg, mode=wt.MODE_ON
+    )
+    assert r.status == wt.ST_CREATED
+    # Sidecar records a DEAD predecessor source (simulating task-A GC'd).
+    ack = home / "proj" / "ack"
+    ack.mkdir(parents=True, exist_ok=True)
+    (ack / "t1.worktree").write_text(
+        json.dumps(
+            {
+                "status": "created",
+                "path": str(r.spawn_workspace),
+                "branch": r.branch,
+                "integration_branch": "main",
+                "linked": r.linked,
+                "source_workspace": str(tmp_path / "worktrees" / "dead-predecessor"),
+            }
+        )
+    )
+    recs = wt.find_reclaimable(cfg, "proj")
+    assert len(recs) == 1
+    assert not recs[0]["classification"].get("unresolved")  # resolved via fallback
+    assert recs[0]["source"] == proj  # fell back to the main repo
+    wt.gc(cfg, "proj", execute=True)
+    assert not r.spawn_workspace.exists()  # reclaimed, not leaked
