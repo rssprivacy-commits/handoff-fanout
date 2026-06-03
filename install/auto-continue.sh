@@ -259,26 +259,103 @@ wait_code_frontmost() {
 # (warm reuse, default VS Code title's rootName). Token is passed as argv (not string-interpolated)
 # → no AppleScript injection. Returns 0 ONLY when Enter was sent to the matching window (echo "sent").
 submit_enter_if_front_window_contains() {
-    local token="$1" out
-    out=$("$HANDOFF_OSASCRIPT_CMD" -e '
-        on run argv
-            set token to item 1 of argv
-            tell application "System Events"
-                set frontApp to name of first application process whose frontmost is true
-                if frontApp is not "Code" then return "nofront"
-                tell process "Code"
-                    if (count of windows) is 0 then return "nowin"
-                    if name of front window contains token then
+    local token="$1" do_focus="${2:-0}" out focus_cmd="" script fkey
+    # do_focus=1 (COLD worktree): the fresh window opens with the LEFT sidebar (Explorer) focused, so a
+    # bare `keystroke return` lands on the sidebar — NOT the Claude input (owner-diagnosed on stage1-10d:
+    # Claude renders in the side panel; AXRaise + default focus leaves the keyboard on the Explorer).
+    # First run Claude Code's "Focus input" command via a dedicated keybinding (HANDOFF_FOCUS_KEY +
+    # cmd/ctrl/alt — install/keybindings-claude-focus.json must bind it to claude-vscode.focus), THEN
+    # re-assert the window and press Enter so it reaches the Claude input.
+    if [ "$do_focus" = "1" ]; then
+        fkey="${HANDOFF_FOCUS_KEY:-0}"
+        case "$fkey" in [0-9A-Za-z]) : ;; *) fkey=0 ;; esac   # single alnum only (no AppleScript injection / R2 P2)
+        focus_cmd="keystroke \"$fkey\" using {command down, control down, option down}
+                        delay 0.3"
+    fi
+    script="on run argv
+        set token to item 1 of argv
+        tell application \"System Events\"
+            set frontApp to name of first application process whose frontmost is true
+            if frontApp is not \"Code\" then return \"nofront\"
+            tell process \"Code\"
+                if (count of windows) is 0 then return \"nowin\"
+                if name of front window contains token then
+                    $focus_cmd
+                    -- R2 codex+Gemini P1: the focus chord + delay re-opened a focus-drift window, so
+                    -- RE-ASSERT (app=Code is guaranteed by the outer tell; re-check the front window)
+                    -- before the Enter — a stray Enter must never land on a window the owner just
+                    -- switched to during the delay. (do_focus=0 / warm: focus_cmd empty → immediate.)
+                    if (count of windows) > 0 and name of front window contains token then
                         keystroke return
-                        return "sent"
+                        return \"sent\"
                     end if
-                    return "mismatch"
-                end tell
+                    return \"mismatch\"
+                end if
+                return \"mismatch\"
             end tell
-        end run' "$token" 2>>"$LOG") || return 2
+        end tell
+    end run"
+    out=$("$HANDOFF_OSASCRIPT_CMD" -e "$script" "$token" 2>>"$LOG") || return 2
     # rc: 0 = Enter sent to the matching window | 2 = osascript/keystroke genuinely errored
     # (accessibility revoked mid-run) | 1 = nofront/nowin/mismatch (focus drift, not accessibility).
     [ "$out" = "sent" ] && return 0
+    return 1
+}
+
+# Worktree session transcript line count — the cold-submit "prompt actually submitted" signal
+# (2026-06-03 cold-start-swallow fix). The Claude session writes its transcript (<sid>.jsonl) the
+# instant it begins PROCESSING the submitted prompt (thinking + tool calls) → it GROWS within ~seconds
+# of a real submit, far earlier than queue/<task>.heartbeat (which the AI only touches after reading the
+# whole prompt + §0, tens of seconds later — too late to gate a retry without risking a double-submit).
+# Project slug = the absolute workspace path with every '/' and '.' replaced by '-' (Claude Code
+# convention). HANDOFF_TRANSCRIPT_ROOT overridable for tests. Echoes the newest .jsonl's line count (0 if none).
+worktree_transcript_lines() {
+    local ws="$1" slug pd total
+    slug=$(printf '%s' "$ws" | sed 's#[/.]#-#g')
+    pd="${HANDOFF_TRANSCRIPT_ROOT:-$HOME/.claude/projects}/$slug"
+    [ -d "$pd" ] || { echo 0; return; }
+    # SUM lines across ALL .jsonl (monotonic-increasing during a spawn). Using only the NEWEST file's
+    # count is NON-monotonic (codex+Gemini R2 P0/P1): a reused worktree's old high-line transcript makes
+    # a fresh new-session file (1 line) read as a DECREASE → growth missed → blind retry → DOUBLE-SUBMIT.
+    # A new session file ADDS to the sum, so sum > base detects it. `find -exec cat` avoids the
+    # nullglob/stdin-hang hazard of a bare `cat "$pd"/*.jsonl` (empty glob → cat reads stdin → hang).
+    total=$(/usr/bin/find "$pd" -maxdepth 1 -name '*.jsonl' -exec cat {} + 2>/dev/null | wc -l | tr -d ' ')
+    echo "${total:-0}"
+}
+
+# Cold worktree submit with bounded, transcript-GATED retry (2026-06-03 owner-approved hardening).
+# The Claude extension cold-starts slower than the render wait, so a single Enter can be SWALLOWED
+# (input box not yet focused) → owner had to press Enter manually (observed: stage1-10d). Retry the
+# Enter — but ONLY while the worktree transcript has NOT grown (= prompt not yet submitted / session
+# not started). So a retry is the first REAL submit, NEVER a double-submit into an already-started-but-
+# slow session (closes Gemini R2 P0-1: the heartbeat was too late to gate this; transcript growth is the
+# fast, reliable signal). Each Enter is window-guarded (submit_enter_if_front_window_contains re-asserts
+# the task window is frontmost) → never fires onto a wrong window even on retry. rc: 0 = transcript grew
+# (submitted) / 2 = osascript keystroke genuinely errored (accessibility) / 1 = attempts exhausted.
+cold_submit_with_retry() {
+    local token="$1" ws="$2"
+    local attempts="${HANDOFF_COLD_SUBMIT_ATTEMPTS:-3}"
+    local per="${HANDOFF_COLD_SUBMIT_WAIT_SECS:-8}"   # 3×8s + 6s render ≪ the 120s timeout wrapper (R2)
+    local base i=1 w rc
+    base=$(worktree_transcript_lines "$ws")
+    while [ "$i" -le "$attempts" ]; do
+        # already submitted (a prior Enter took / transcript grew) → STOP, never double-submit
+        [ "$(worktree_transcript_lines "$ws")" -gt "$base" ] && return 0
+        raise_task_window "$token"   # re-focus the task window (drift between attempts) — best-effort
+        submit_enter_if_front_window_contains "$token" 1; rc=$?   # do_focus=1: focus Claude input first
+        if [ "$rc" = "2" ]; then return 2; fi   # accessibility/keystroke error — escalate, retry won't help
+        if [ "$rc" != "0" ]; then
+            # mismatch (window not frontmost / focus drift) → NO Enter was sent, so polling the transcript
+            # for growth is futile; re-raise next iteration instead of burning `per` secs (R2 P2).
+            sleep 2; i=$((i + 1)); continue
+        fi
+        w=0
+        while [ "$w" -lt "$per" ]; do
+            [ "$(worktree_transcript_lines "$ws")" -gt "$base" ] && return 0
+            sleep 1; w=$((w + 1))
+        done
+        i=$((i + 1))
+    done
     return 1
 }
 
@@ -838,60 +915,60 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
                 log "ABORT-SUBMIT: Accessibility 权限缺失 — Enter 未按 (tab 已开, 需手动按一次). project=$PROJECT task=$TASK"
                 write_ack "$PROJ_DIR" "$TASK" "failed" "accessibility-missing: 需手动按 Enter (System Settings → 辅助功能)"
             elif is_frontmost_code; then
-                # Atomic submit (R2 dual-brain codex+Gemini): one osascript asserts app=Code AND the
-                # front window title contains the expected token, then presses Enter in the SAME process
-                # — closing the TOCTOU gap between a separate check and a separate keystroke (a stray
-                # Enter must never hit a wrong window: a terminal mid-command / a finance UI). token =
-                # task id (cold worktree, .code-workspace title) | workspace name (warm, default title
-                # rootName). Warm has an escape hatch (HANDOFF_WARM_WINDOW_GUARD=0) for a custom
-                # window.title that omits the folder name — falls back to the proven app-level Enter.
+                # Window-guarded submit. token = task id (cold worktree, .code-workspace title) |
+                # workspace name (warm, default title rootName). The window guard (one osascript asserts
+                # app=Code AND front window title contains token, then keystroke in the SAME process)
+                # closes the TOCTOU gap + never fires a stray Enter onto a wrong window. COLD uses a
+                # bounded transcript-GATED retry (cold-start can swallow a single Enter / owner-reported
+                # on stage1-10d); WARM submits once (window already rendered). Warm escape hatch
+                # HANDOFF_WARM_WINDOW_GUARD=0 → app-level Enter for a custom window.title without rootName.
                 _submit_token="$TASK"
                 [ "$COLD_WINDOW" != "1" ] && _submit_token=$(basename "$WORKSPACE")
-                if [ "$COLD_WINDOW" != "1" ] && [ "${HANDOFF_WARM_WINDOW_GUARD:-1}" = "0" ]; then
-                    # opt-out: legacy app-level Enter for a custom window.title that omits the folder name
+                if [ "$COLD_WINDOW" = "1" ]; then
+                    cold_submit_with_retry "$_submit_token" "$WORKSPACE"
+                    case $? in
+                        0)
+                            log "AUTO-SUBMIT: Enter + worktree-transcript verified (cold window) for project=$PROJECT task=$TASK"
+                            write_ack "$PROJ_DIR" "$TASK" "submitted" "Enter + worktree transcript growth verified (cold window)"
+                            ;;
+                        2)
+                            warn_accessibility_once
+                            log "WARN: osascript keystroke failed despite accessibility preflight OK (transient / 权限 mid-run 撤销?) project=$PROJECT task=$TASK"
+                            write_ack "$PROJ_DIR" "$TASK" "failed" "osascript keystroke failed post-preflight"
+                            ;;
+                        *)
+                            log "ABORT-SUBMIT: cold window — ${HANDOFF_COLD_SUBMIT_ATTEMPTS:-3} Enter attempts, no transcript growth — tab 已开, 主人手动按一次 Enter. project=$PROJECT task=$TASK"
+                            write_ack "$PROJ_DIR" "$TASK" "failed" "no transcript growth after retries — manual Enter needed (cold worktree window?)"
+                            ;;
+                    esac
+                elif [ "${HANDOFF_WARM_WINDOW_GUARD:-1}" = "0" ]; then
+                    # warm escape-hatch: legacy app-level Enter (custom window.title without folder name)
                     if "$HANDOFF_OSASCRIPT_CMD" -e 'tell application "System Events" to tell process "Code" to keystroke return' 2>>"$LOG"; then
-                        _submit_state="sent"
+                        log "AUTO-SUBMIT: pressed Enter (warm, app-level escape hatch) for project=$PROJECT task=$TASK"
+                        write_ack "$PROJ_DIR" "$TASK" "submitted" "Enter sent (warm app-level / window guard off)"
                     else
-                        _submit_state="oserror"
+                        warn_accessibility_once
+                        log "WARN: osascript keystroke failed despite accessibility preflight OK (transient / 权限 mid-run 撤销?) project=$PROJECT task=$TASK"
+                        write_ack "$PROJ_DIR" "$TASK" "failed" "osascript keystroke failed post-preflight"
                     fi
                 else
+                    # warm: single atomic window-guarded submit (warm window is already rendered/ready)
                     submit_enter_if_front_window_contains "$_submit_token"
                     case $? in
-                        0) _submit_state="sent" ;;
-                        2) _submit_state="oserror" ;;
-                        *) _submit_state="mismatch" ;;
+                        0)
+                            log "AUTO-SUBMIT: pressed Enter (warm, window-guarded '$_submit_token') for project=$PROJECT task=$TASK"
+                            write_ack "$PROJ_DIR" "$TASK" "submitted" "Enter sent to matched window ($_submit_token)"
+                            ;;
+                        2)
+                            warn_accessibility_once
+                            log "WARN: osascript keystroke failed despite accessibility preflight OK (transient / 权限 mid-run 撤销?) project=$PROJECT task=$TASK"
+                            write_ack "$PROJ_DIR" "$TASK" "failed" "osascript keystroke failed post-preflight"
+                            ;;
+                        *)
+                            log "ABORT-SUBMIT: front window not '$_submit_token' (focus drift) — tab 已开, 主人手动按一次 Enter. project=$PROJECT task=$TASK"
+                            write_ack "$PROJ_DIR" "$TASK" "failed" "submit withheld: front window not '$_submit_token' (focus drift)"
+                            ;;
                     esac
-                fi
-                if [ "$_submit_state" = "sent" ]; then
-                    # Truthful ack (2026-06-03): a sent Enter ≠ a submitted prompt. A COLD worktree
-                    # window cold-starts past the render wait, so verify the session genuinely STARTED
-                    # via queue/<task>.heartbeat before claiming `.submitted`. Warm reuse (proven path)
-                    # keeps the immediate `.submitted` once the Enter landed on the matched window.
-                    if [ "$COLD_WINDOW" != "1" ]; then
-                        log "AUTO-SUBMIT: pressed Enter (warm, window-guarded '$_submit_token') for project=$PROJECT task=$TASK"
-                        write_ack "$PROJ_DIR" "$TASK" "submitted" "Enter sent to matched window ($_submit_token)"
-                    elif verify_session_started "$QUEUE" "$TASK"; then
-                        log "AUTO-SUBMIT: Enter + session-start verified (cold window) for project=$PROJECT task=$TASK"
-                        write_ack "$PROJ_DIR" "$TASK" "submitted" "osascript Enter + heartbeat verified (cold window)"
-                    else
-                        # R2 Gemini P0-1: NO blind retry-Enter. A 2nd Enter could double-submit into a
-                        # slow-but-already-started session. One verify window, then fail honestly.
-                        log "ABORT-SUBMIT: Enter sent but no session-start heartbeat in ${HANDOFF_SUBMIT_VERIFY_SECS:-40}s (cold window) — tab 已开, 主人手动按一次 Enter. project=$PROJECT task=$TASK"
-                        write_ack "$PROJ_DIR" "$TASK" "failed" "Enter sent but no session-start heartbeat — manual Enter needed (cold worktree window?)"
-                    fi
-                elif [ "$_submit_state" = "oserror" ]; then
-                    # Preflight said trusted but the keystroke osascript still errored (transient, or
-                    # Accessibility revoked mid-run) → escalate as accessibility-class (preserve the
-                    # loud notification + post-preflight ack, unchanged from before the window guard).
-                    warn_accessibility_once
-                    log "WARN: osascript keystroke failed despite accessibility preflight OK (transient / 权限 mid-run 撤销?) project=$PROJECT task=$TASK"
-                    write_ack "$PROJ_DIR" "$TASK" "failed" "osascript keystroke failed post-preflight"
-                else
-                    # Front window is NOT the task/project window (focus drifted to another window) →
-                    # WITHHOLD the Enter (never fire blind onto a wrong window). Tab is open; the owner
-                    # submits manually. This is the core P1 guard, NOT an accessibility failure.
-                    log "ABORT-SUBMIT: front window not '$_submit_token' (focus drift) — tab 已开, 主人手动按一次 Enter. project=$PROJECT task=$TASK"
-                    write_ack "$PROJ_DIR" "$TASK" "failed" "submit withheld: front window not '$_submit_token' (focus drift)"
                 fi
             else
                 front_app=$("$HANDOFF_OSASCRIPT_CMD" -e 'tell application "System Events" to name of first application process whose frontmost is true' 2>/dev/null)

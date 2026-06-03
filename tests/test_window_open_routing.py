@@ -19,6 +19,7 @@ calls, and that drive ``is_frontmost_code`` / front-window-name deterministicall
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -54,7 +55,8 @@ def _seed(home: Path, ws: Path, task: str, *, heartbeat: bool = False) -> None:
         (q / f"{task}.heartbeat").write_text("", encoding="utf-8")
 
 
-def _env(home: Path, tmp_path: Path, *, front_window: str) -> dict:
+def _env(home: Path, tmp_path: Path, *, front_window: str,
+         grow_transcript: Path | None = None, grow_on_attempt: int | None = None) -> dict:
     stub = tmp_path / "stubs"
     stub.mkdir(exist_ok=True)
     code_sink = tmp_path / "code.log"
@@ -75,12 +77,20 @@ def _env(home: Path, tmp_path: Path, *, front_window: str) -> dict:
     #   - is_frontmost_code (`frontmost is true`): echo Code.
     _w(
         stub / "osascript",
-        "#!/bin/bash\nargs=\"$*\"\ncase \"$args\" in\n"
+        "#!/bin/bash\nargs=\"$*\"\n"
+        'printf "%s\\n" "$args" >> "$_OSA_SINK"\n'
+        "case \"$args\" in\n"
         '  *"UI elements enabled"*) echo true ;;\n'
         '  *"on run argv"*)\n'
         '      tok="${@: -1}"\n'
         '      case "$_FRONT_WIN" in\n'
-        '        *"$tok"*) printf k >> "$_KEY_SINK"; echo sent ;;\n'
+        '        *"$tok"*)\n'
+        '          printf k >> "$_KEY_SINK"\n'
+        # count submit attempts; grow the worktree transcript on/after attempt N (simulate the cold
+        # session finally STARTING — transcript appears → cold_submit_with_retry detects + stops).
+        '          n=$(cat "$_SUBMIT_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$_SUBMIT_COUNT"\n'
+        '          if [ -n "$_GROW_ON_ATTEMPT" ] && [ "$n" -ge "$_GROW_ON_ATTEMPT" ]; then echo x >> "$_GROW_TRANSCRIPT"; fi\n'
+        '          echo sent ;;\n'
         '        *) echo mismatch ;;\n'
         "      esac ;;\n"
         '  *"keystroke return"*) printf k >> "$_KEY_SINK"; echo ok ;;\n'
@@ -106,11 +116,18 @@ def _env(home: Path, tmp_path: Path, *, front_window: str) -> dict:
             "HANDOFF_COLD_RENDER_SECS": "0",
             "HANDOFF_WIN_FRONT_SECS": "2",
             "HANDOFF_WIN_FRONT_SECS_WARM": "1",
-            "HANDOFF_SUBMIT_VERIFY_SECS": "2",
+            # cold transcript-gated retry (fast): 2 attempts × 1s wait; transcript root in tmp
+            "HANDOFF_TRANSCRIPT_ROOT": str(tmp_path / "transcripts"),
+            "HANDOFF_COLD_SUBMIT_ATTEMPTS": "2",
+            "HANDOFF_COLD_SUBMIT_WAIT_SECS": "1",
             "_FRONT_WIN": front_window,
             "_KEY_SINK": str(key_sink),
             "_CODE_SINK": str(code_sink),
             "_OPEN_SINK": str(open_sink),
+            "_OSA_SINK": str(tmp_path / "osa.log"),
+            "_SUBMIT_COUNT": str(tmp_path / "submit_count.txt"),
+            "_GROW_TRANSCRIPT": str(grow_transcript) if grow_transcript else "",
+            "_GROW_ON_ATTEMPT": str(grow_on_attempt) if grow_on_attempt else "",
         }
     )
     env.pop("HANDOFF_HOME", None)
@@ -192,12 +209,24 @@ def _cold_ws(tmp_path: Path, task: str) -> Path:
     return ws
 
 
+def _cold_transcript(tmp_path: Path, ws: Path) -> Path:
+    """The worktree session transcript path the script derives from WORKSPACE (slug = the path with
+    every '/' and '.' → '-'). Create the (empty) dir so the osascript stub can grow a .jsonl into it
+    on submit — `cold_submit_with_retry` reads its line count as the 'session started' signal."""
+    slug = re.sub(r"[/.]", "-", str(ws))
+    tdir = tmp_path / "transcripts" / slug
+    tdir.mkdir(parents=True, exist_ok=True)
+    return tdir / "sess.jsonl"
+
+
 def test_cold_worktree_spawn_forces_new_window_with_dash_n(home, tmp_path):
     task = "cold-task"
     ws = _cold_ws(tmp_path, task)
-    _seed(home, ws, task, heartbeat=True)
-    # front window title carries the task → focus assert + frontmost-wait both pass immediately
-    env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py")
+    _seed(home, ws, task)
+    tr = _cold_transcript(tmp_path, ws)
+    # front window title carries the task → focus assert + frontmost-wait pass; transcript grows on 1st Enter
+    env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py",
+               grow_transcript=tr, grow_on_attempt=1)
     assert _run(env).returncode == 0
     code_log = _code_log(tmp_path)
     assert " -n " in f" {code_log} ", "cold worktree spawn must force a NEW dedicated window (-n)"
@@ -208,8 +237,8 @@ def test_cold_focus_assert_blocks_enter_when_task_window_not_frontmost(home, tmp
     """The synthetic Enter must NOT fire if the frontmost window isn't THE task window."""
     task = "cold-wrongwin"
     ws = _cold_ws(tmp_path, task)
-    _seed(home, ws, task, heartbeat=True)
-    # frontmost window belongs to a DIFFERENT project → focus assert must abort the keystroke
+    _seed(home, ws, task)
+    _cold_transcript(tmp_path, ws)  # dir exists, never grows (no Enter is ever sent)
     env = _env(home, tmp_path, front_window="some-other-project — z.py")
     assert _run(env).returncode == 0
     assert _read(tmp_path / "key.log") == "", "Enter must NOT be pressed onto a wrong window"
@@ -217,12 +246,83 @@ def test_cold_focus_assert_blocks_enter_when_task_window_not_frontmost(home, tmp
     assert not _ack(home, task, "submitted"), "must not claim submitted when Enter was withheld"
 
 
-def test_cold_focus_assert_allows_enter_when_task_window_frontmost(home, tmp_path):
-    """When THE task window is frontmost, the Enter fires and the heartbeat verifies the submit."""
-    task = "cold-rightwin"
+def test_cold_submit_succeeds_first_try_no_double(home, tmp_path):
+    """First Enter lands → worktree transcript grows → submitted; exactly ONE Enter (no double-submit)."""
+    task = "cold-ok"
     ws = _cold_ws(tmp_path, task)
-    _seed(home, ws, task, heartbeat=True)  # heartbeat present → verify_session_started passes
-    env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py")
+    _seed(home, ws, task)
+    tr = _cold_transcript(tmp_path, ws)
+    env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py",
+               grow_transcript=tr, grow_on_attempt=1)  # transcript grows on the 1st Enter
     assert _run(env).returncode == 0
-    assert _read(tmp_path / "key.log") == "k", "Enter must fire when the task window is frontmost"
-    assert _ack(home, task, "submitted"), "heartbeat present → submit verified"
+    assert _read(tmp_path / "key.log") == "k", "exactly ONE Enter — transcript grew → no retry/double-submit"
+    assert _ack(home, task, "submitted")
+
+
+def test_cold_submit_retries_when_first_enter_swallowed(home, tmp_path):
+    """1st Enter swallowed (no growth) → 2nd Enter lands (growth) → submitted (transcript-gated retry)."""
+    task = "cold-retry"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    tr = _cold_transcript(tmp_path, ws)
+    env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py",
+               grow_transcript=tr, grow_on_attempt=2)  # only the 2nd Enter grows the transcript
+    assert _run(env).returncode == 0
+    assert _read(tmp_path / "key.log") == "kk", "two Enters — first swallowed, retry submitted"
+    assert _ack(home, task, "submitted")
+
+
+def test_cold_submit_exhausts_honestly_when_never_grows(home, tmp_path):
+    """All attempts swallowed (transcript never grows) → honest `failed` (manual Enter needed)."""
+    task = "cold-exhaust"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    _cold_transcript(tmp_path, ws)  # dir exists, never grows → every Enter is swallowed
+    env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py")  # grow_on_attempt=None
+    assert _run(env).returncode == 0
+    assert _read(tmp_path / "key.log") == "kk", "both attempts sent Enter (window matched) but were swallowed"
+    assert _ack(home, task, "failed")
+    assert not _ack(home, task, "submitted")
+
+
+def test_cold_submit_monotonic_across_old_transcript_no_double(home, tmp_path):
+    """A REUSED worktree with an OLD high-line transcript must NOT double-submit: the monotonic SUM
+    signal sees the new (low-line) session file as growth on the 1st Enter. (With the buggy newest-file
+    count, base=100 and the fresh 1-line file reads 1 < 100 → growth missed → 2nd Enter. codex+Gemini R2 P0.)"""
+    task = "cold-reused"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    tr = _cold_transcript(tmp_path, ws)             # the NEW session file the stub grows
+    old = tr.parent / "old-session.jsonl"           # a prior session left a 100-line transcript here
+    old.write_text("{}\n" * 100, encoding="utf-8")
+    env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py",
+               grow_transcript=tr, grow_on_attempt=1)
+    assert _run(env).returncode == 0
+    assert _read(tmp_path / "key.log") == "k", "exactly ONE Enter — SUM(old 100 + new 1) > base 100 → growth"
+    assert _ack(home, task, "submitted")
+
+
+def test_cold_submit_runs_focus_command_before_enter(home, tmp_path):
+    """COLD submit must run claude-vscode.focus (the dedicated chord) before the Enter — else the Enter
+    lands on the left sidebar, not the Claude input (owner-diagnosed on stage1-10d)."""
+    task = "cold-focus"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    tr = _cold_transcript(tmp_path, ws)
+    env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py",
+               grow_transcript=tr, grow_on_attempt=1)
+    assert _run(env).returncode == 0
+    osa = _read(tmp_path / "osa.log")
+    assert "command down, control down, option down" in osa, "cold submit must send the focus chord before Enter"
+
+
+def test_warm_submit_does_not_run_focus_command(home, tmp_path):
+    """WARM submit must NOT send the focus chord — the proven project-window path is unchanged."""
+    task = "warm-nofocus"
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    _seed(home, ws, task)
+    env = _env(home, tmp_path, front_window=f"main.py — {ws.name}")
+    assert _run(env).returncode == 0
+    osa = _read(tmp_path / "osa.log")
+    assert "control down, option down" not in osa, "warm submit must NOT send the focus chord"
