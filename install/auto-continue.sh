@@ -176,6 +176,28 @@ verify_session_started() {
     return 1
 }
 
+# Raise THIS task's VS Code window to frontmost before the synthetic Enter (2026-06-03 worktree
+# multi-window fix). A fresh per-session worktree opens its OWN window that competes with the owner's
+# other project windows; `is_frontmost_code` only proves the *app* is Code, not *which window* — so
+# the Enter can land on a wrong project's window (observed: diagnostic Enter hit a family-business
+# window). The engine-injected .code-workspace sets `window.title` to contain the task id, so AXRaise
+# the window whose name contains it. Best-effort (always returns 0; a miss just falls back to the
+# pre-existing frontmost-app guard). Cold worktree windows only — main-window tab spawns don't need it.
+raise_task_window() {
+    local task="$1"
+    "$HANDOFF_OSASCRIPT_CMD" -e "tell application \"Visual Studio Code\" to activate" \
+        -e "delay 0.3" \
+        -e "tell application \"System Events\" to tell process \"Code\"
+            repeat with w in windows
+                if name of w contains \"${task}\" then
+                    perform action \"AXRaise\" of w
+                    exit repeat
+                end if
+            end repeat
+        end tell" 2>>"$LOG"
+    return 0
+}
+
 # Accessibility (UI-scripting) preflight. `keystroke` requires the process that
 # ultimately drives System Events (launchd's osascript binary) to hold the
 # Accessibility permission. Probe it NON-destructively via `UI elements enabled`
@@ -671,8 +693,16 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
             # 等 sleep 1.5 后必须验证 frontmost app 是 Code 才按 Enter
             # 否则可能按到 finder / 别 app, 触发不可预期行为 (写入文件名 / 触发快捷键等)
             # 等 Claude Code 渲染输入栏 + prompt 粘贴完成。cold worktree/.code-workspace 新窗口
-            # 冷启动 Claude 扩展远超历史 1.5s（吞掉 Enter 的根因）→ cold window 等更久。
-            if [ "$COLD_WINDOW" = "1" ]; then sleep "${HANDOFF_COLD_RENDER_SECS:-4.5}"; else sleep 1.5; fi
+            # 冷启动 Claude 扩展远超历史 1.5s（吞掉 Enter 的根因）→ cold window 等更久 + 显式把
+            # 本 task 的窗口 AXRaise 到前台（多窗口下 is_frontmost_code 只验 app 不验窗口 → Enter
+            # 可能落到别项目窗口；实测诊断 Enter 落到了 family-business 窗口）。
+            if [ "$COLD_WINDOW" = "1" ]; then
+                sleep "${HANDOFF_COLD_RENDER_SECS:-6}"
+                raise_task_window "$TASK"
+                sleep 1.0  # 让 AXRaise 生效 + Claude tab 输入框聚焦
+            else
+                sleep 1.5
+            fi
             # Three-state (lock-probe P0-1): only a CONFIRMED-unlocked screen (rc=1)
             # may receive the synthetic Enter. rc=0 (re-locked mid-window) OR rc=2
             # (UNKNOWN — Quartz probe timeout/error) ⇒ abort the submit; a keystroke
