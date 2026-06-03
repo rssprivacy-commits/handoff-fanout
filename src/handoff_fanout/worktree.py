@@ -40,6 +40,14 @@ from handoff_fanout import config as _config
 # treated as a LIVE session — GC never reclaims it out from under a running tab.
 HEARTBEAT_LIVE_SEC = 600
 
+# Fixed engine-generated VS Code workspace file injected into a spawn worktree (option-C /
+# 2026-06-03 worktree-spawn-bug fix). FIXED (not ``<project>.code-workspace``) so it (a) is
+# exact-matchable in ``is_dirty`` — discounting a broad ``*.code-workspace`` suffix would treat a
+# user's untracked ``my-wip.code-workspace`` as clean → GC data loss (R2 Gemini P0-2) — and (b)
+# is collision-unlikely with a user-tracked file (R2 Gemini P0-4). auto-continue.sh greps for this
+# exact name (only under ``*/worktrees/*``) to open it as the spawn window.
+WORKTREE_VSCODE_FILE = ".handoff.code-workspace"
+
 MODE_OFF = "off"
 MODE_REPORT = "report"
 MODE_ON = "on"
@@ -136,8 +144,10 @@ def is_dirty(workspace: Path, ignore: set[str] | tuple[str, ...] = ()) -> bool:
         return True
     if not out.strip():
         return False
-    if not ignore:
-        return True
+    # NB (option-C): the loop ALWAYS runs (even with an empty ``ignore``) because the
+    # engine-injected UX artifacts (.vscode / *.code-workspace) must be discounted
+    # unconditionally — a worktree carrying only those is clean. Any non-artifact /
+    # non-ignored change still falls through to dirty below.
     ignore = set(ignore)
     for line in out.splitlines():
         if not line.strip():
@@ -149,7 +159,13 @@ def is_dirty(workspace: Path, ignore: set[str] | tuple[str, ...] = ()) -> bool:
         # ``?? src/new.py`` if a tracked dir name (``src``) were ever configured as a
         # link → real WIP silently destroyable. A linked dir is a *symlink* (git shows
         # ``?? .claude`` exactly, never its contents), so exact-match is sufficient.
-        if code == "??" and path in ignore:
+        # Also discount the engine-injected VS Code spawn-UX artifacts (option-C / 2026-06-03):
+        # the ``.vscode`` symlink and the FIXED ``WORKTREE_VSCODE_FILE`` are deterministically
+        # engine-created, never user WIP. EXACT match (R2 Gemini P0-2: a broad ``*.code-workspace``
+        # suffix would silently treat a user's untracked ``my-wip.code-workspace`` as clean → GC
+        # could then reclaim real WIP). Same REDLINE: ``??``-gated only — a tracked change to either
+        # still falls through to dirty.
+        if code == "??" and (path in ignore or path == ".vscode" or path == WORKTREE_VSCODE_FILE):
             continue
         return True  # tracked change, OR an untracked non-link path → genuinely dirty
     return False  # every change was an untracked engine-linked file → clean
@@ -324,6 +340,11 @@ class WorktreeResult:
     warnings: list[str] = field(default_factory=list)
     # report-only: the command that WOULD run (for the log), without running it.
     planned_cmd: str | None = None
+    # option-C spawn-UX (2026-06-03 worktree-spawn-bug fix): the generated
+    # ``<project>.code-workspace`` in the worktree. auto-continue.sh opens THIS (not the
+    # bare folder) so the window has an identifiable title + inherited ``.vscode`` →
+    # fixes "新窗口认不出项目" + the bare-folder cold-start that swallowed the auto-submit Enter.
+    vscode_workspace_file: str | None = None
 
     @property
     def is_blocked(self) -> bool:
@@ -428,6 +449,58 @@ def _block(source_workspace: Path, reason: str, **extra) -> WorktreeResult:
     return WorktreeResult(
         status=ST_BLOCKED, spawn_workspace=source_workspace, reason=reason, **extra
     )
+
+
+def inject_vscode_workspace(source_workspace: Path, wt: Path, project: str, task: str) -> str | None:
+    """Make a fresh worktree open as an *identifiable VS Code workspace* (option-C / 2026-06-03
+    worktree-spawn-bug fix — dual-brain codex+Gemini).
+
+    A bare ``git worktree`` folder, opened via ``code -r <dir>``, (a) titles the window only
+    by the dir basename (``stage1-10c`` — unrecognizable as the project) and (b) has no
+    ``.vscode`` context, so VS Code cold-starts/re-indexes the Claude extension far past the
+    launcher's ``sleep`` → the synthetic auto-submit Enter lands before the input is ready and
+    is swallowed (the observed "粘贴了但没按 Enter"). This injects:
+
+    (a) a ``.vscode`` symlink to the source tree → inherits the project's formatter / linter /
+        launch config (so the spawned session also produces project-conforming code);
+    (b) a ``<project>.code-workspace`` whose ``window.title`` natively shows the project name +
+        task → auto-continue.sh opens this file (not the bare dir), fixing both the title and
+        (because VS Code treats it as a real workspace) much of the cold-start.
+
+    Best-effort: any OSError is swallowed (returns None) — UX polish must never brick a dump.
+    Returns the ``.code-workspace`` path (str) or None.
+    """
+    try:
+        vs_src = source_workspace / ".vscode"
+        vs_dst = wt / ".vscode"
+        if vs_src.is_dir() and not (vs_dst.exists() or vs_dst.is_symlink()):
+            vs_dst.symlink_to(vs_src.resolve())
+        # FIXED engine name (R2 Gemini P0-2/P0-4): NOT ``<project>.code-workspace``. A
+        # project-named file (a) could collide with a user-tracked ``<project>.code-workspace``
+        # → overwriting it makes the worktree born-``M``-dirty + never reusable, and (b) forced
+        # ``is_dirty`` to discount by the broad ``*.code-workspace`` suffix, which would silently
+        # treat a user's untracked ``my-wip.code-workspace`` as clean → GC data loss. A fixed,
+        # collision-unlikely name is exact-matchable in ``is_dirty`` + skipped if the user already
+        # has one.
+        ws_file = wt / WORKTREE_VSCODE_FILE
+        if ws_file.exists():
+            return str(ws_file)  # respect a pre-existing (tracked/user) file; never overwrite.
+        ws_file.write_text(
+            json.dumps(
+                {
+                    "folders": [{"path": "."}],
+                    "settings": {
+                        # ${...} are VS Code window-title variables (literal here; VS Code expands them).
+                        "window.title": f"{project} · {task} [worktree]${{separator}}${{activeEditorShort}}",
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return str(ws_file)
+    except OSError:
+        return None
 
 
 def create_worktree(
@@ -595,6 +668,7 @@ def create_worktree(
             and existing["branch_head"] == origin_head
         ):
             linked = link_files(source_workspace, wt, cfg)
+            vws = inject_vscode_workspace(source_workspace, wt, project, task)
             return WorktreeResult(
                 status=ST_CREATED,
                 spawn_workspace=wt,
@@ -606,6 +680,7 @@ def create_worktree(
                     *warnings,
                     "reused an existing clean+published worktree at the same base",
                 ],
+                vscode_workspace_file=vws,
             )
         # Otherwise the worktree is stale (base advanced) → drop + recreate.
         if existing["exists"]:
@@ -648,6 +723,7 @@ def create_worktree(
         return _degrade(source_workspace, f"git worktree add failed: {err[:200]}")
 
     linked = link_files(source_workspace, wt, cfg)
+    vws = inject_vscode_workspace(source_workspace, wt, project, task)
     created_base = head_sha(wt) or base_sha
     return WorktreeResult(
         status=ST_CREATED,
@@ -657,6 +733,7 @@ def create_worktree(
         integration_branch=int_branch,
         linked=linked,
         warnings=warnings,
+        vscode_workspace_file=vws,
     )
 
 

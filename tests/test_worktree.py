@@ -255,6 +255,45 @@ def test_create_happy_path(home, tmp_path):
     assert {".env", ".claude"} <= set(r.linked)
 
 
+def test_create_injects_vscode_workspace(home, tmp_path):
+    """option-C spawn-UX (2026-06-03 worktree-spawn-bug fix): create_worktree generates an
+    identifiable ``<project>.code-workspace`` + symlinks ``.vscode``, and those engine artifacts
+    do NOT make the worktree read dirty (else GC's fail-safe never reclaims it / remove retains
+    it forever). REAL untracked WIP still → dirty (redline preserved)."""
+    import json as _json
+
+    _, ws = _bare_and_clone(tmp_path)
+    (ws / ".vscode").mkdir()
+    (ws / ".vscode" / "settings.json").write_text('{"editor.tabSize": 2}\n')
+    cfg = _cfg(home, worktree_link_files=[".env"], worktree_link_venv=False)
+    r = wt.create_worktree(
+        source_workspace=ws, project="erp-system", task="stage1-10c", cfg=cfg, mode=wt.MODE_ON
+    )
+    assert r.status == wt.ST_CREATED, r.reason
+    cw = r.spawn_workspace / wt.WORKTREE_VSCODE_FILE  # FIXED engine name (not <project>.code-workspace)
+    assert cw.exists()
+    assert r.vscode_workspace_file == str(cw)
+    data = _json.loads(cw.read_text())
+    assert data["folders"] == [{"path": "."}]
+    # window.title carries project + task → window is identifiable (not the bare worktree dir name).
+    assert "erp-system" in data["settings"]["window.title"]
+    assert "stage1-10c" in data["settings"]["window.title"]
+    # .vscode inherited from the source (symlink → project formatter/linter/launch).
+    assert (r.spawn_workspace / ".vscode").is_symlink()
+    # REDLINE: the injected artifacts are discounted → the fresh worktree is CLEAN (GC-safe),
+    # both with the engine ignore set AND with no ignore (unconditional UX-artifact discount).
+    assert not wt.is_dirty(r.spawn_workspace, ignore=set(wt._link_names(cfg)))
+    assert not wt.is_dirty(r.spawn_workspace)
+    # R2 Gemini P0-2: a USER's own untracked `*.code-workspace` is NOT the engine file → must still
+    # count as dirty (else GC would reclaim it = data loss). Exact-name discount, not a suffix.
+    (r.spawn_workspace / "my-wip.code-workspace").write_text("{}\n")
+    assert wt.is_dirty(r.spawn_workspace)
+    (r.spawn_workspace / "my-wip.code-workspace").unlink()
+    # REAL untracked WIP still makes it dirty — the fail-safe is intact.
+    (r.spawn_workspace / "real_wip.py").write_text("x = 1\n")
+    assert wt.is_dirty(r.spawn_workspace)
+
+
 def test_create_blocks_on_unpublished_head(home, tmp_path):
     _, ws = _bare_and_clone(tmp_path)
     _commit(ws, "new.txt", "wip", "unpublished work")  # committed but NOT pushed

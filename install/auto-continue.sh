@@ -157,6 +157,25 @@ is_frontmost_code() {
     [ "$front" = "Code" ]
 }
 
+# Truthful auto-submit verification (2026-06-03 worktree-spawn-bug fix / dual-brain codex+Gemini).
+# osascript `keystroke return` exit 0 only proves the key event was SENT — NOT that the Claude
+# session received + submitted the prompt. The prior code wrote `.submitted` on osascript exit 0,
+# producing a FALSE-POSITIVE ack when a cold (worktree) window swallowed the Enter. A *real* submit
+# makes the spawned session touch `queue/<task>.heartbeat` early in the handoff prompt — poll for it.
+# Returns 0 (session genuinely started) / 1 (no heartbeat within the window → Enter didn't land).
+verify_session_started() {
+    local queue="$1" task="$2"
+    local hb="$queue/$task.heartbeat"
+    local secs="${HANDOFF_SUBMIT_VERIFY_SECS:-40}"
+    local i=0
+    while [ "$i" -lt "$secs" ]; do
+        [ -f "$hb" ] && return 0
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
 # Accessibility (UI-scripting) preflight. `keystroke` requires the process that
 # ultimately drives System Events (launchd's osascript binary) to hold the
 # Accessibility permission. Probe it NON-destructively via `UI elements enabled`
@@ -621,8 +640,22 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
         log "TRIGGER: project=$PROJECT task=$TASK workspace=$WORKSPACE"
 
         # Step 1: activate the project window (跨项目 routing 核心)
+        # worktree spawn-UX fix (2026-06-03): ONLY a per-session worktree spawn (workspace under
+        # */worktrees/*) is a fresh cold window needing the engine-injected .code-workspace open-target
+        # (identifiable title + inherited .vscode) + a longer cold-start wait + heartbeat-verified
+        # submit. A main-repo workspace stays on the proven warm-window fast path even if the owner
+        # keeps a *.code-workspace in its root (R2 Gemini P1-3). `find` takes the pattern as an arg →
+        # no shell-glob/nullglob hazard (an unmatched glob under `nullglob` would let `ls` list the CWD).
+        OPEN_TARGET="$WORKSPACE"; COLD_WINDOW=0
+        case "$WORKSPACE" in
+            */worktrees/*)
+                COLD_WINDOW=1
+                _cws=$(/usr/bin/find "$WORKSPACE" -maxdepth 1 -name '.handoff.code-workspace' 2>/dev/null | /usr/bin/head -1)
+                if [ -n "$_cws" ] && [ -f "$_cws" ]; then OPEN_TARGET="$_cws"; fi
+                ;;
+        esac
         if [ -n "$WORKSPACE" ] && [ -d "$WORKSPACE" ]; then
-            "$CODE_BIN" -r "$WORKSPACE" 2>>"$LOG" || log "WARN: code -r $WORKSPACE failed (continue with open)"
+            "$CODE_BIN" -r "$OPEN_TARGET" 2>>"$LOG" || log "WARN: code -r $OPEN_TARGET failed (continue with open)"
             sleep 0.4  # 等 VS Code 窗口 frontmost
         else
             log "WARN: WORKSPACE empty/invalid ($WORKSPACE), falling back to frontmost"
@@ -637,7 +670,9 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
             # 2026-05-28 codex audit blind-spot #4 修复:
             # 等 sleep 1.5 后必须验证 frontmost app 是 Code 才按 Enter
             # 否则可能按到 finder / 别 app, 触发不可预期行为 (写入文件名 / 触发快捷键等)
-            sleep 1.5  # 等 Claude Code 渲染输入栏 + prompt 粘贴完成
+            # 等 Claude Code 渲染输入栏 + prompt 粘贴完成。cold worktree/.code-workspace 新窗口
+            # 冷启动 Claude 扩展远超历史 1.5s（吞掉 Enter 的根因）→ cold window 等更久。
+            if [ "$COLD_WINDOW" = "1" ]; then sleep "${HANDOFF_COLD_RENDER_SECS:-4.5}"; else sleep 1.5; fi
             # Three-state (lock-probe P0-1): only a CONFIRMED-unlocked screen (rc=1)
             # may receive the synthetic Enter. rc=0 (re-locked mid-window) OR rc=2
             # (UNKNOWN — Quartz probe timeout/error) ⇒ abort the submit; a keystroke
@@ -662,8 +697,26 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
                 write_ack "$PROJ_DIR" "$TASK" "failed" "accessibility-missing: 需手动按 Enter (System Settings → 辅助功能)"
             elif is_frontmost_code; then
                 if "$HANDOFF_OSASCRIPT_CMD" -e 'tell application "System Events" to tell process "Code" to keystroke return' 2>>"$LOG"; then
-                    log "AUTO-SUBMIT: pressed Enter for project=$PROJECT task=$TASK"
-                    write_ack "$PROJ_DIR" "$TASK" "submitted" "osascript Enter success"
+                    # Truthful ack (2026-06-03): osascript exit 0 = "keystroke sent", NOT "prompt
+                    # submitted". For a COLD worktree/.code-workspace window the extension cold-starts
+                    # past the render wait, so the Enter can be swallowed → verify the session genuinely
+                    # STARTED via queue/<task>.heartbeat before writing `.submitted` (one retry, then
+                    # fail honestly). The proven main-window path (179 spawns / warm reused window) keeps
+                    # the unchanged immediate-submit so non-worktree spawns aren't slowed/regressed.
+                    if [ "$COLD_WINDOW" != "1" ]; then
+                        log "AUTO-SUBMIT: pressed Enter for project=$PROJECT task=$TASK"
+                        write_ack "$PROJ_DIR" "$TASK" "submitted" "osascript Enter success"
+                    elif verify_session_started "$QUEUE" "$TASK"; then
+                        log "AUTO-SUBMIT: Enter + session-start verified (cold window) for project=$PROJECT task=$TASK"
+                        write_ack "$PROJ_DIR" "$TASK" "submitted" "osascript Enter + heartbeat verified (cold window)"
+                    else
+                        # R2 Gemini P0-1: NO blind retry-Enter. A 2nd Enter could double-submit into a
+                        # slow-but-already-started session (extra keystroke mid-turn), and a 2nd verify
+                        # would block ~2× the window — starving the launchd tick + holding caffeinate/
+                        # unlock. One verify window, then fail honestly (tab open, owner Enters once).
+                        log "ABORT-SUBMIT: Enter sent but no session-start heartbeat in ${HANDOFF_SUBMIT_VERIFY_SECS:-40}s (cold window) — tab 已开, 主人手动按一次 Enter. project=$PROJECT task=$TASK"
+                        write_ack "$PROJ_DIR" "$TASK" "failed" "Enter sent but no session-start heartbeat — manual Enter needed (cold worktree window?)"
+                    fi
                 else
                     # Preflight said trusted but keystroke still failed — transient,
                     # or permission revoked mid-run. Treat as accessibility-class.
