@@ -557,6 +557,13 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
         continue
     fi
 
+    # Per-project Guard: terminal.enabled → iTerm watchdog 接管本项目, VS Code 路径跳过 (B+C 共存)
+    # 默认 OFF (sentinel 不存在则零行为变化)。避免 iTerm + VS Code 两边抢 spawn 同一 task。
+    if [ -f "$PROJ_DIR/terminal.enabled" ]; then
+        log "SKIP(terminal): $PROJECT 由 iTerm watchdog 接管 (terminal.enabled sentinel)"
+        continue
+    fi
+
     mkdir -p "$LAUNCHED"
 
     # 遍历项目 queue 内 .uri 文件
