@@ -198,6 +198,90 @@ raise_task_window() {
     return 0
 }
 
+# Window-level frontmost helpers (2026-06-03 code-r-clobber fix / dual-brain codex+Gemini).
+# `is_frontmost_code` only proves the *app* is Code — insufficient for a cold worktree spawn that
+# opens its OWN window competing with the owner's other Code windows. These resolve *which* window
+# is frontmost by its title (the engine-injected .handoff.code-workspace sets window.title to carry
+# the task id), so we can (a) wait for the fresh window to render + take focus BEFORE `open URI`
+# (consensus: no hardcoded sleep), and (b) refuse the synthetic Enter unless THE task window is the
+# frontmost one (consensus P1: a stray Enter must never land on a wrong window — terminal mid-command
+# / finance UI). Returns "" when Code isn't frontmost or has no window → callers treat as not-ready.
+frontmost_code_window_name() {
+    "$HANDOFF_OSASCRIPT_CMD" -e 'tell application "System Events"
+        set frontApp to name of first application process whose frontmost is true
+        if frontApp is not "Code" then return ""
+        tell process "Code"
+            if (count of windows) is 0 then return ""
+            return name of front window
+        end tell
+    end tell' 2>/dev/null
+}
+
+# 0 = the frontmost Code window's title contains <task> (THE task window has focus).
+target_window_frontmost() {
+    local task="$1" name
+    name=$(frontmost_code_window_name)
+    case "$name" in
+        *"$task"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Poll until THE task window is frontmost (cold spawn render+focus), up to <secs> (default 8). 0=ready.
+# 0.2s step (focus/render usually settles in 10s–100s of ms; R2: a 1s step wastes up to ~0.9s/iter).
+wait_target_window_frontmost() {
+    local task="$1" i=0 attempts=$(( ${2:-8} * 5 ))
+    while [ "$i" -lt "$attempts" ]; do
+        target_window_frontmost "$task" && return 0
+        sleep 0.2
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# Poll until the Code *app* is frontmost (warm reuse path), up to <secs> (default 3). 0=ready.
+# Returns immediately when already frontmost → non-regressive vs the old fixed `sleep 0.4`.
+wait_code_frontmost() {
+    local i=0 attempts=$(( ${1:-3} * 5 ))
+    while [ "$i" -lt "$attempts" ]; do
+        is_frontmost_code && return 0
+        sleep 0.2
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# Atomic submit (R2 dual-brain codex+Gemini / closes a TOCTOU gap): ONE osascript asserts (frontmost
+# app is Code AND the front window title contains <token>) and ONLY then presses Enter — in the SAME
+# process, so focus cannot drift between a separate check and a separate keystroke (a stray Enter must
+# never land on a wrong window: a terminal mid-command / a finance UI). <token> = the task id (cold
+# worktree window, whose .handoff.code-workspace title carries it) or the workspace display name
+# (warm reuse, default VS Code title's rootName). Token is passed as argv (not string-interpolated)
+# → no AppleScript injection. Returns 0 ONLY when Enter was sent to the matching window (echo "sent").
+submit_enter_if_front_window_contains() {
+    local token="$1" out
+    out=$("$HANDOFF_OSASCRIPT_CMD" -e '
+        on run argv
+            set token to item 1 of argv
+            tell application "System Events"
+                set frontApp to name of first application process whose frontmost is true
+                if frontApp is not "Code" then return "nofront"
+                tell process "Code"
+                    if (count of windows) is 0 then return "nowin"
+                    if name of front window contains token then
+                        keystroke return
+                        return "sent"
+                    end if
+                    return "mismatch"
+                end tell
+            end tell
+        end run' "$token" 2>>"$LOG") || return 2
+    # rc: 0 = Enter sent to the matching window | 2 = osascript/keystroke genuinely errored
+    # (accessibility revoked mid-run) | 1 = nofront/nowin/mismatch (focus drift, not accessibility).
+    [ "$out" = "sent" ] && return 0
+    return 1
+}
+
 # Accessibility (UI-scripting) preflight. `keystroke` requires the process that
 # ultimately drives System Events (launchd's osascript binary) to hold the
 # Accessibility permission. Probe it NON-destructively via `UI elements enabled`
@@ -683,9 +767,30 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
                 if [ -n "$_cws" ] && [ -f "$_cws" ]; then OPEN_TARGET="$_cws"; fi
                 ;;
         esac
+        # code-r-clobber fix (2026-06-03 / dual-brain codex+Gemini / owner ruling: 分治).
+        # The pre-existing `code -r` ("reuse window") FORCE-replaces the last-active window when
+        # OPEN_TARGET isn't already open — so a background spawn for project B silently clobbered the
+        # owner's focused window belonging to a *different* running project A (observed: a warm
+        # `code -r /Private/ledger` at 18:47:17 replaced a focused erp worktree window, freezing that
+        # session the same second). Drop `-r` on BOTH paths and split by window kind:
+        #   cold (worktree): `-n` forces a NEW dedicated window — config-independent (works regardless
+        #                    of window.openFoldersInNewWindow), never reuses/clobbers anything.
+        #   warm (main repo): no flag = reuse the project window if already open, else new window;
+        #                     under the default openFoldersInNewWindow it never replaces a folder-window.
         if [ -n "$WORKSPACE" ] && [ -d "$WORKSPACE" ]; then
-            "$CODE_BIN" -r "$OPEN_TARGET" 2>>"$LOG" || log "WARN: code -r $OPEN_TARGET failed (continue with open)"
-            sleep 0.4  # 等 VS Code 窗口 frontmost
+            if [ "$COLD_WINDOW" = "1" ]; then
+                "$CODE_BIN" -n "$OPEN_TARGET" 2>>"$LOG" || log "WARN: code -n $OPEN_TARGET failed (continue with open)"
+                # Wait for the fresh window to render + take focus (title carries the task id) BEFORE
+                # `open URI`, so the Claude tab lands in THIS window — not a stale/other Code window.
+                if ! wait_target_window_frontmost "$TASK" "${HANDOFF_WIN_FRONT_SECS:-8}"; then
+                    # fallback: AXRaise THE task window, then re-wait for IT (not merely the Code app —
+                    # else the URI/Enter could still target a wrong window; R2 codex). Best-effort.
+                    raise_task_window "$TASK"; wait_target_window_frontmost "$TASK" 3
+                fi
+            else
+                "$CODE_BIN" "$OPEN_TARGET" 2>>"$LOG" || log "WARN: code $OPEN_TARGET failed (continue with open)"
+                wait_code_frontmost "${HANDOFF_WIN_FRONT_SECS_WARM:-3}" || sleep 0.4  # frontmost or floor
+            fi
         else
             log "WARN: WORKSPACE empty/invalid ($WORKSPACE), falling back to frontmost"
         fi
@@ -733,33 +838,60 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
                 log "ABORT-SUBMIT: Accessibility 权限缺失 — Enter 未按 (tab 已开, 需手动按一次). project=$PROJECT task=$TASK"
                 write_ack "$PROJ_DIR" "$TASK" "failed" "accessibility-missing: 需手动按 Enter (System Settings → 辅助功能)"
             elif is_frontmost_code; then
-                if "$HANDOFF_OSASCRIPT_CMD" -e 'tell application "System Events" to tell process "Code" to keystroke return' 2>>"$LOG"; then
-                    # Truthful ack (2026-06-03): osascript exit 0 = "keystroke sent", NOT "prompt
-                    # submitted". For a COLD worktree/.code-workspace window the extension cold-starts
-                    # past the render wait, so the Enter can be swallowed → verify the session genuinely
-                    # STARTED via queue/<task>.heartbeat before writing `.submitted` (one retry, then
-                    # fail honestly). The proven main-window path (179 spawns / warm reused window) keeps
-                    # the unchanged immediate-submit so non-worktree spawns aren't slowed/regressed.
+                # Atomic submit (R2 dual-brain codex+Gemini): one osascript asserts app=Code AND the
+                # front window title contains the expected token, then presses Enter in the SAME process
+                # — closing the TOCTOU gap between a separate check and a separate keystroke (a stray
+                # Enter must never hit a wrong window: a terminal mid-command / a finance UI). token =
+                # task id (cold worktree, .code-workspace title) | workspace name (warm, default title
+                # rootName). Warm has an escape hatch (HANDOFF_WARM_WINDOW_GUARD=0) for a custom
+                # window.title that omits the folder name — falls back to the proven app-level Enter.
+                _submit_token="$TASK"
+                [ "$COLD_WINDOW" != "1" ] && _submit_token=$(basename "$WORKSPACE")
+                if [ "$COLD_WINDOW" != "1" ] && [ "${HANDOFF_WARM_WINDOW_GUARD:-1}" = "0" ]; then
+                    # opt-out: legacy app-level Enter for a custom window.title that omits the folder name
+                    if "$HANDOFF_OSASCRIPT_CMD" -e 'tell application "System Events" to tell process "Code" to keystroke return' 2>>"$LOG"; then
+                        _submit_state="sent"
+                    else
+                        _submit_state="oserror"
+                    fi
+                else
+                    submit_enter_if_front_window_contains "$_submit_token"
+                    case $? in
+                        0) _submit_state="sent" ;;
+                        2) _submit_state="oserror" ;;
+                        *) _submit_state="mismatch" ;;
+                    esac
+                fi
+                if [ "$_submit_state" = "sent" ]; then
+                    # Truthful ack (2026-06-03): a sent Enter ≠ a submitted prompt. A COLD worktree
+                    # window cold-starts past the render wait, so verify the session genuinely STARTED
+                    # via queue/<task>.heartbeat before claiming `.submitted`. Warm reuse (proven path)
+                    # keeps the immediate `.submitted` once the Enter landed on the matched window.
                     if [ "$COLD_WINDOW" != "1" ]; then
-                        log "AUTO-SUBMIT: pressed Enter for project=$PROJECT task=$TASK"
-                        write_ack "$PROJ_DIR" "$TASK" "submitted" "osascript Enter success"
+                        log "AUTO-SUBMIT: pressed Enter (warm, window-guarded '$_submit_token') for project=$PROJECT task=$TASK"
+                        write_ack "$PROJ_DIR" "$TASK" "submitted" "Enter sent to matched window ($_submit_token)"
                     elif verify_session_started "$QUEUE" "$TASK"; then
                         log "AUTO-SUBMIT: Enter + session-start verified (cold window) for project=$PROJECT task=$TASK"
                         write_ack "$PROJ_DIR" "$TASK" "submitted" "osascript Enter + heartbeat verified (cold window)"
                     else
                         # R2 Gemini P0-1: NO blind retry-Enter. A 2nd Enter could double-submit into a
-                        # slow-but-already-started session (extra keystroke mid-turn), and a 2nd verify
-                        # would block ~2× the window — starving the launchd tick + holding caffeinate/
-                        # unlock. One verify window, then fail honestly (tab open, owner Enters once).
+                        # slow-but-already-started session. One verify window, then fail honestly.
                         log "ABORT-SUBMIT: Enter sent but no session-start heartbeat in ${HANDOFF_SUBMIT_VERIFY_SECS:-40}s (cold window) — tab 已开, 主人手动按一次 Enter. project=$PROJECT task=$TASK"
                         write_ack "$PROJ_DIR" "$TASK" "failed" "Enter sent but no session-start heartbeat — manual Enter needed (cold worktree window?)"
                     fi
-                else
-                    # Preflight said trusted but keystroke still failed — transient,
-                    # or permission revoked mid-run. Treat as accessibility-class.
+                elif [ "$_submit_state" = "oserror" ]; then
+                    # Preflight said trusted but the keystroke osascript still errored (transient, or
+                    # Accessibility revoked mid-run) → escalate as accessibility-class (preserve the
+                    # loud notification + post-preflight ack, unchanged from before the window guard).
                     warn_accessibility_once
                     log "WARN: osascript keystroke failed despite accessibility preflight OK (transient / 权限 mid-run 撤销?) project=$PROJECT task=$TASK"
                     write_ack "$PROJ_DIR" "$TASK" "failed" "osascript keystroke failed post-preflight"
+                else
+                    # Front window is NOT the task/project window (focus drifted to another window) →
+                    # WITHHOLD the Enter (never fire blind onto a wrong window). Tab is open; the owner
+                    # submits manually. This is the core P1 guard, NOT an accessibility failure.
+                    log "ABORT-SUBMIT: front window not '$_submit_token' (focus drift) — tab 已开, 主人手动按一次 Enter. project=$PROJECT task=$TASK"
+                    write_ack "$PROJ_DIR" "$TASK" "failed" "submit withheld: front window not '$_submit_token' (focus drift)"
                 fi
             else
                 front_app=$("$HANDOFF_OSASCRIPT_CMD" -e 'tell application "System Events" to name of first application process whose frontmost is true' 2>/dev/null)

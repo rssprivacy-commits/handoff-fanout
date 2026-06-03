@@ -27,12 +27,22 @@ TASK = "demo-task"
 
 def _osascript_stub(path: Path, sink: Path, *, ui_enabled: str, keystroke_exit: int = 0) -> None:
     """Smart osascript stub: answers the probe, frontmost, and records calls."""
+    # The atomic submit helper runs ONE `on run argv` script that both checks the window and presses
+    # Enter; it must be answered BEFORE the bare `frontmost is true` case (the atomic script contains
+    # both substrings). keystroke_exit!=0 → exit non-zero (simulate keystroke failure → helper rc 2 →
+    # accessibility-class escalate); keystroke_exit==0 → echo "sent" (matching window + Enter sent).
+    atomic_case = (
+        f'  *"on run argv"*) exit {keystroke_exit} ;;\n'
+        if keystroke_exit
+        else '  *"on run argv"*) echo "sent" ;;\n'
+    )
     path.write_text(
         "#!/bin/bash\n"
         'args="$*"\n'
         f'printf "%s\\n" "$args" >> "{sink}"\n'
         'case "$args" in\n'
         f'  *"UI elements enabled"*) echo "{ui_enabled}" ;;\n'
+        f"{atomic_case}"
         '  *"frontmost is true"*) echo "Code" ;;\n'
         f'  *"keystroke return"*) exit {keystroke_exit} ;;\n'
         "esac\n"
