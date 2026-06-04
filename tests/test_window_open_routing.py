@@ -234,14 +234,18 @@ def test_cold_worktree_spawn_forces_new_window_with_dash_n(home, tmp_path):
 
 
 def test_cold_focus_assert_blocks_enter_when_task_window_not_frontmost(home, tmp_path):
-    """The synthetic Enter must NOT fire if the frontmost window isn't THE task window."""
+    """The synthetic Enter must NOT fire if the frontmost window isn't THE task window — and on that
+    mismatch the launcher must AXRaise the task window back to front (owner: "if it's not on top, let it
+    be on top, then Enter") so a later attempt can submit. AXRaise preserves the editor focus (proven
+    live); only the removed focus chord broke it."""
     task = "cold-wrongwin"
     ws = _cold_ws(tmp_path, task)
     _seed(home, ws, task)
-    _cold_transcript(tmp_path, ws)  # dir exists, never grows (no Enter is ever sent)
+    _cold_transcript(tmp_path, ws)  # dir exists, never grows (no Enter is ever sent — front window mismatches)
     env = _env(home, tmp_path, front_window="some-other-project — z.py")
     assert _run(env).returncode == 0
     assert _read(tmp_path / "key.log") == "", "Enter must NOT be pressed onto a wrong window"
+    assert "AXRaise" in _read(tmp_path / "osa.log"), "on mismatch the task window must be AXRaised back to front"
     assert _ack(home, task, "failed"), "abort must record a truthful `failed` ack (manual Enter needed)"
     assert not _ack(home, task, "submitted"), "must not claim submitted when Enter was withheld"
 
