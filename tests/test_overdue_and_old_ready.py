@@ -517,3 +517,27 @@ def test_V08_path_traversal_follow_task_is_skipped(home, stubbed_env):
     override = home / PROJECT / "ack" / f"{TASK}.retro.override.json"
     assert not marker.exists()
     assert override.exists()  # not cleared by a crafted follow_task
+
+
+def test_overdue_scanner_survives_shadowed_python3_shim_on_path(home, tmp_path):
+    """The overdue scanner is a SAFETY gate (retro/audit mandate-debt tracking). Its iso_now_past_deadline
+    fail-safes a parse error to "not overdue", so a `python3` that exits non-zero would SILENTLY no-op the
+    gate (debt never flagged). A dev/interactive shell may shadow bare `python3` with a wrapper-shim (e.g.
+    the tob-modern-python uv-shim that exits non-zero on `python3 -c`). auto-continue.sh therefore defaults
+    its interpreter to the absolute /usr/bin/python3, bypassing any PATH shim (2026-06-05 hardening). This
+    test injects a broken `python3` shim FIRST on PATH and asserts the overdue marker is still written —
+    catching a regression of the hardening even on CI (whose own python3 is fine)."""
+    if not Path("/usr/bin/python3").exists():
+        pytest.skip("hardening targets the absolute /usr/bin/python3, absent here")
+    _write_override(home, TASK, "2020-01-01T00:00:00+00:00", "next-task")
+    env = _stubbed_env(home, tmp_path)
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "python3"
+    shim.write_text("#!/bin/bash\necho 'ERROR: use uv run python3' >&2\nexit 1\n")
+    shim.chmod(0o755)
+    env["PATH"] = f"{shim_dir}:{env.get('PATH', '')}"   # a broken `python3` now shadows PATH
+    env.pop("HANDOFF_PYTHON_CMD", None)                 # rely on the script's default (must dodge the shim)
+    _run_script(env)
+    marker = home / PROJECT / "ack" / f"{TASK}.retro_overdue.txt"
+    assert marker.exists(), "overdue SAFETY gate must still fire despite a broken python3 shim shadowing PATH"

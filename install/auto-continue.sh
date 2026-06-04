@@ -40,7 +40,17 @@ HANDOFF_VSCODE_CHECK="${HANDOFF_VSCODE_CHECK:-1}"
 # python3 is a hard dependency of this system (the dump/precheck CLIs are a
 # Python package); the overdue scanner uses it for timezone-correct ISO-8601
 # comparison. Overridable so tests can point at a specific interpreter.
-HANDOFF_PYTHON_CMD="${HANDOFF_PYTHON_CMD:-python3}"
+# Prefer the ABSOLUTE /usr/bin/python3 over a bare PATH `python3` (2026-06-05): an
+# interactive/dev shell may put a wrapper-shim first on PATH (e.g. the tob-modern-python
+# uv-shim that intercepts bare `python3` and exits non-zero). The overdue scanner is a
+# SAFETY mechanism (retro/audit mandate-debt tracking) whose iso_now_past_deadline
+# fail-safes a parse error to "not overdue" — so a shimmed `python3` would SILENTLY
+# no-op the gate (debt never flagged). The scanner only needs stdlib (datetime/json),
+# satisfied by the system python3. Same hardening as the dump-handoff /usr/bin/python3
+# absolute shebang. An explicit HANDOFF_PYTHON_CMD always wins (tests / power users).
+if [ -z "${HANDOFF_PYTHON_CMD:-}" ]; then
+    if [ -x /usr/bin/python3 ]; then HANDOFF_PYTHON_CMD=/usr/bin/python3; else HANDOFF_PYTHON_CMD=python3; fi
+fi
 
 # ── unlock-pivot (lock-screen → auto-unlock → visible GUI; design §4 / codex R1) ──
 # The GUI submit (code -r / open / osascript Enter) needs an UNLOCKED screen —

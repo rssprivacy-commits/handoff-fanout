@@ -63,7 +63,7 @@ def _queue_md(home: Path) -> Path:
 def test_preflight_pass_allows_dump(tmp_path, monkeypatch):
     ws = _git_ws(tmp_path)
     home = _home_with_config(tmp_path, [
-        {"name": "ok-gate", "command": ["python3", "-c", "import sys; sys.exit(0)"]},
+        {"name": "ok-gate", "command": ["/usr/bin/python3", "-c", "import sys; sys.exit(0)"]},
     ])
     rc = _run_dump(home, ws, monkeypatch)
     assert rc == 0
@@ -73,7 +73,7 @@ def test_preflight_pass_allows_dump(tmp_path, monkeypatch):
 def test_preflight_fail_blocks_dump(tmp_path, monkeypatch):
     ws = _git_ws(tmp_path)
     home = _home_with_config(tmp_path, [
-        {"name": "block-gate", "command": ["python3", "-c", "import sys; sys.exit(1)"]},
+        {"name": "block-gate", "command": ["/usr/bin/python3", "-c", "import sys; sys.exit(1)"]},
     ])
     rc = _run_dump(home, ws, monkeypatch)
     assert rc != 0                                      # 被 fail-closed 阻断
@@ -108,7 +108,7 @@ def test_preflight_on_error_warn_still_blocks_on_nonzero_verdict(tmp_path, monke
     # on_error=warn 只放过"跑不起来"；命令真跑了且 exit 非 0（闸判定不通过）仍 block。
     ws = _git_ws(tmp_path)
     home = _home_with_config(tmp_path, [
-        {"name": "real-verdict", "command": ["python3", "-c", "import sys; sys.exit(1)"],
+        {"name": "real-verdict", "command": ["/usr/bin/python3", "-c", "import sys; sys.exit(1)"],
          "on_error": "warn"},
     ])
     rc = _run_dump(home, ws, monkeypatch)
@@ -130,7 +130,7 @@ def test_preflight_scoped_status_skips_other_status(tmp_path, monkeypatch):
     # gate 只对 status=blocked 生效；本 dump 是 active → 闸不该跑（命令会失败但 dump 通过）
     ws = _git_ws(tmp_path)
     home = _home_with_config(tmp_path, [
-        {"name": "blocked-only", "command": ["python3", "-c", "import sys; sys.exit(1)"],
+        {"name": "blocked-only", "command": ["/usr/bin/python3", "-c", "import sys; sys.exit(1)"],
          "statuses": ["blocked"]},
     ])
     rc = _run_dump(home, ws, monkeypatch, status="active")
@@ -144,7 +144,7 @@ def test_preflight_project_scoped_skips_other_project(tmp_path, monkeypatch):
     # （否则共享 config.json 会让 ERP 的 gate 污染 dharmaxis/rakeforge 等 dump）
     ws = _git_ws(tmp_path)
     home = _home_with_config(tmp_path, [
-        {"name": "erp-only", "command": ["python3", "-c", "import sys; sys.exit(1)"],
+        {"name": "erp-only", "command": ["/usr/bin/python3", "-c", "import sys; sys.exit(1)"],
          "projects": ["erp-system"]},
     ])
     rc = _run_dump(home, ws, monkeypatch)               # project=ptest（见 _run_dump）
@@ -155,7 +155,7 @@ def test_preflight_project_scoped_skips_other_project(tmp_path, monkeypatch):
 def test_preflight_project_scoped_runs_for_matching_project(tmp_path, monkeypatch):
     ws = _git_ws(tmp_path)
     home = _home_with_config(tmp_path, [
-        {"name": "ptest-only", "command": ["python3", "-c", "import sys; sys.exit(1)"],
+        {"name": "ptest-only", "command": ["/usr/bin/python3", "-c", "import sys; sys.exit(1)"],
          "projects": ["ptest"]},
     ])
     rc = _run_dump(home, ws, monkeypatch)               # project=ptest → 匹配 → 阻断
@@ -167,7 +167,7 @@ def test_preflight_project_scoped_runs_for_matching_project(tmp_path, monkeypatc
 def test_preflight_dry_run_not_blocked(tmp_path, monkeypatch):
     ws = _git_ws(tmp_path)
     home = _home_with_config(tmp_path, [
-        {"name": "block-gate", "command": ["python3", "-c", "import sys; sys.exit(1)"]},
+        {"name": "block-gate", "command": ["/usr/bin/python3", "-c", "import sys; sys.exit(1)"]},
     ])
     rc = _run_dump(home, ws, monkeypatch, extra=["--dry-run"])
     assert rc == 0                                      # 预览不被闸挡
