@@ -492,6 +492,14 @@ def inject_vscode_workspace(source_workspace: Path, wt: Path, project: str, task
                     "settings": {
                         # ${...} are VS Code window-title variables (literal here; VS Code expands them).
                         "window.title": f"{project} · {task} [worktree]${{separator}}${{activeEditorShort}}",
+                        # Belt for the cold auto-submit focus fix (2026-06-05 / dual-brain codex+Gemini):
+                        # the URI opens the handoff prompt in the EDITOR Claude (primaryEditor.open), and
+                        # the focus chord routes through `claude-vscode.focus → editor.openLast`, which
+                        # opens the SIDEBAR Claude instead when `claudeCode.preferredLocation == "sidebar"`.
+                        # Pin it to "panel" so editor.openLast deterministically targets the editor Claude
+                        # that holds the prompt (the keybinding closes the sidebar; this guarantees the
+                        # reveal target even if the user's global config drifted to "sidebar").
+                        "claudeCode.preferredLocation": "panel",
                     },
                 },
                 indent=2,

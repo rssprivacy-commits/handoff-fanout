@@ -326,3 +326,72 @@ def test_warm_submit_does_not_run_focus_command(home, tmp_path):
     assert _run(env).returncode == 0
     osa = _read(tmp_path / "osa.log")
     assert "control down, option down" not in osa, "warm submit must NOT send the focus chord"
+
+
+# ------------------------------------------------------ cold per-attempt diagnostics (2026-06-05 / E-1)
+
+
+def _log(home: Path) -> str:
+    return _read(home / "auto-continue.log")
+
+
+def test_cold_submit_logs_per_attempt_when_enter_sent_but_swallowed(home, tmp_path):
+    """An Enter that is SENT (window matched) but never grows the transcript (focus landed on the empty
+    sidebar Claude) must be logged distinctly per attempt — rc=0 + the frontmost window name — so a live
+    spawn can tell this focus-target failure apart from a window MISMATCH. (Dual-brain Day-1 ask.)"""
+    task = "cold-diag-swallow"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    _cold_transcript(tmp_path, ws)  # never grows → every Enter swallowed
+    fw = f"demo · {task} [worktree] — x.py"
+    env = _env(home, tmp_path, front_window=fw)  # window matches token → rc=0 (sent)
+    assert _run(env).returncode == 0
+    log = _log(home)
+    assert "COLD-SUBMIT-START:" in log, "must log the cold-submit start with base line count"
+    assert "COLD-SUBMIT-ATTEMPT 1/2: rc=0" in log, "a SENT Enter must be logged with rc=0 per attempt"
+    assert f"front_window='{fw}'" in log, "the frontmost window name must be captured for diagnosis"
+    assert "swallowed or focus on EMPTY sidebar Claude" in log, "a sent-but-no-growth must say so"
+    assert _ack(home, task, "failed")
+
+
+def test_cold_submit_logs_mismatch_distinct_from_sent(home, tmp_path):
+    """A window MISMATCH (focus drift to a wrong window, NO Enter sent) must log rc=1 — distinct from the
+    rc=0 sent-but-swallowed case — so the two failure modes are never conflated in the log."""
+    task = "cold-diag-mismatch"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    _cold_transcript(tmp_path, ws)
+    env = _env(home, tmp_path, front_window="some-other-project — z.py")  # title lacks token → rc=1
+    assert _run(env).returncode == 0
+    log = _log(home)
+    assert "COLD-SUBMIT-ATTEMPT 1/2: rc=1" in log, "a withheld Enter (wrong window) must log rc=1 (mismatch)"
+    assert "rc=0" not in log, "a pure mismatch must never be logged as a sent (rc=0) attempt"
+    assert _read(tmp_path / "key.log") == "", "no Enter is sent on a mismatch"
+    assert _ack(home, task, "failed")
+
+
+def test_cold_submit_resolves_symlinked_workspace_for_transcript(home, tmp_path):
+    """A symlinked workspace root (e.g. macOS /tmp → /private/tmp) must still detect transcript growth.
+    Claude Code writes its transcript under the RESOLVED cwd, so the slug must be computed from the
+    resolved path. Without resolution the slug is wrong → growth is never seen → false ABORT + blind
+    retries that defeat the monotonic-SUM double-submit guard (2026-06-05 live-test finding). With the
+    fix the growth is detected through the symlink → exactly ONE Enter (submitted, no blind retry)."""
+    task = "cold-symlink"
+    realroot = (tmp_path / "real").resolve()
+    real_ws = realroot / "worktrees" / task          # canonical location (where the transcript is keyed)
+    real_ws.mkdir(parents=True)
+    (real_ws / ".handoff.code-workspace").write_text("{}", encoding="utf-8")
+    alias = tmp_path / "alias"
+    alias.symlink_to(realroot)                        # WORKSPACE the launcher receives goes via the symlink
+    ws = alias / "worktrees" / task                   # contains '/worktrees/' (cold path) AND is symlinked
+    _seed(home, ws, task)
+    # the transcript lives under the RESOLVED slug (that is where Claude Code actually writes it)
+    resolved_slug = re.sub(r"[/.]", "-", str(real_ws))
+    tdir = tmp_path / "transcripts" / resolved_slug
+    tdir.mkdir(parents=True)
+    tr = tdir / "sess.jsonl"
+    env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py",
+               grow_transcript=tr, grow_on_attempt=1)
+    assert _run(env).returncode == 0
+    assert _read(tmp_path / "key.log") == "k", "ONE Enter — growth detected through the symlink (no blind retry)"
+    assert _ack(home, task, "submitted"), "the resolved-path slug must find the real transcript → submitted"

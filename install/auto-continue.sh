@@ -310,8 +310,17 @@ submit_enter_if_front_window_contains() {
 # Project slug = the absolute workspace path with every '/' and '.' replaced by '-' (Claude Code
 # convention). HANDOFF_TRANSCRIPT_ROOT overridable for tests. Echoes the newest .jsonl's line count (0 if none).
 worktree_transcript_lines() {
-    local ws="$1" slug pd total
-    slug=$(printf '%s' "$ws" | sed 's#[/.]#-#g')
+    local ws="$1" slug pd total rp
+    # Resolve symlinks first (2026-06-05 live-test finding): Claude Code derives its project dir from the
+    # CANONICAL (symlink-resolved) cwd, so the slug MUST be computed from the resolved path. A symlinked
+    # workspace root otherwise yields a wrong slug → the real transcript is never found → growth is missed
+    # → false ABORT *and* blind retries that defeat the monotonic-SUM double-submit guard (observed: a /tmp
+    # test worktree wrote to ~/.claude/projects/-private-tmp-… but the slug read -tmp-…). `cd && pwd -P`
+    # resolves every symlink component; fall back to the raw path if the dir is gone. Real worktrees under
+    # ~/.claude-handoff are not symlinked, so this is a no-op there (resolved path == raw path).
+    rp=$(cd "$ws" 2>/dev/null && pwd -P) || rp=""
+    [ -n "$rp" ] || rp="$ws"
+    slug=$(printf '%s' "$rp" | sed 's#[/.]#-#g')
     pd="${HANDOFF_TRANSCRIPT_ROOT:-$HOME/.claude/projects}/$slug"
     [ -d "$pd" ] || { echo 0; return; }
     # SUM lines across ALL .jsonl (monotonic-increasing during a spawn). Using only the NEWEST file's
@@ -336,13 +345,25 @@ cold_submit_with_retry() {
     local token="$1" ws="$2"
     local attempts="${HANDOFF_COLD_SUBMIT_ATTEMPTS:-3}"
     local per="${HANDOFF_COLD_SUBMIT_WAIT_SECS:-8}"   # 3×8s + 6s render ≪ the 120s timeout wrapper (R2)
-    local base i=1 w rc
+    local base i=1 w rc cur fw
     base=$(worktree_transcript_lines "$ws")
+    # Per-attempt diagnostics (2026-06-05 / dual-brain codex+Gemini Day-1 ask): the old loop logged
+    # NOTHING per attempt, so an ABORT couldn't be told apart — Enter SENT but transcript never grew
+    # (focus landed on an EMPTY sidebar Claude: claude-vscode.focus skips editor.openLast while a sidebar
+    # Claude webview is visible) vs window MISMATCH (focus drifted to a wrong window, no Enter sent). Log
+    # rc + the frontmost window name + base→current transcript lines so the next live spawn pins it down.
+    log "COLD-SUBMIT-START: token=$token base_lines=$base attempts=$attempts per=${per}s ws=$ws"
     while [ "$i" -le "$attempts" ]; do
         # already submitted (a prior Enter took / transcript grew) → STOP, never double-submit
-        [ "$(worktree_transcript_lines "$ws")" -gt "$base" ] && return 0
+        cur=$(worktree_transcript_lines "$ws")
+        if [ "$cur" -gt "$base" ]; then
+            log "COLD-SUBMIT: transcript grew ${base}→${cur} before attempt $i — already submitted, stop (no double-submit)"
+            return 0
+        fi
         raise_task_window "$token"   # re-focus the task window (drift between attempts) — best-effort
+        fw=$(frontmost_code_window_name)   # diagnostic: which Code window is actually frontmost now
         submit_enter_if_front_window_contains "$token" 1; rc=$?   # do_focus=1: focus Claude input first
+        log "COLD-SUBMIT-ATTEMPT $i/$attempts: rc=$rc (0=sent/1=mismatch/2=osa-err) front_window='$fw' lines=$base"
         if [ "$rc" = "2" ]; then return 2; fi   # accessibility/keystroke error — escalate, retry won't help
         if [ "$rc" != "0" ]; then
             # mismatch (window not frontmost / focus drift) → NO Enter was sent, so polling the transcript
@@ -351,9 +372,14 @@ cold_submit_with_retry() {
         fi
         w=0
         while [ "$w" -lt "$per" ]; do
-            [ "$(worktree_transcript_lines "$ws")" -gt "$base" ] && return 0
+            cur=$(worktree_transcript_lines "$ws")
+            if [ "$cur" -gt "$base" ]; then
+                log "COLD-SUBMIT: Enter landed on attempt $i — transcript grew ${base}→${cur} (submitted)"
+                return 0
+            fi
             sleep 1; w=$((w + 1))
         done
+        log "COLD-SUBMIT-ATTEMPT $i: Enter sent (rc=0) but transcript still $base after ${per}s — swallowed or focus on EMPTY sidebar Claude"
         i=$((i + 1))
     done
     return 1
