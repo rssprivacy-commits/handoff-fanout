@@ -537,6 +537,7 @@ def build_codex_audit_block(
     attestation: dict | None = None,
     bypass: dict | None = None,
     code_repo: str | None = None,
+    base_source: str | None = None,
 ) -> dict:
     """Assemble the mode-specific ``codex_audit`` block embedded in evidence.
 
@@ -572,11 +573,21 @@ def build_codex_audit_block(
             raise ValueError(
                 f"empty_diff_attestation requires an attestation with {list(required)}"
             )
-        return {
+        block = {
             "audit_mode": audit_mode,
             "empty_diff_attestation": {k: attestation[k] for k in required},
             **code_repo_keys,
         }
+        # Provenance (#48 A1' / forensics): how the base was chosen — recorded as a
+        # sibling key so it does NOT enter the gate-verified attestation. The gate
+        # ignores unknown block keys; this is audit metadata only (codex+gemini both
+        # asked for it). Sibling, not inside the attestation, so it can't shift the
+        # 4 required fields the gate recomputes against.
+        if base_source is not None:
+            if not isinstance(base_source, str) or not base_source.strip():
+                raise ValueError("base_source must be a non-empty string when provided")
+            block["empty_diff_base_source"] = base_source.strip()
+        return block
 
     # AUDIT_MODE_BYPASS
     if not bypass or not bypass.get("codex_failure_attempts"):
@@ -822,6 +833,10 @@ BYPASS_MIN_FAILURES = MIN_CODEX_FAILURES
 OWNER_ACK_SCHEMA_VERSION = "1.0"
 BYPASS_OVERRIDE_SCHEMA_VERSION = "1.0"
 SUPPORTED_OWNER_ACK_SCHEMA_VERSIONS = ("1.0",)
+
+# A1' (#48 / owner ruling 2026-06-04): the auto empty_diff producer's mode-decider
+# stamp. Recorded in the attestation for forensics; the gate does NOT validate it.
+EMPTY_DIFF_AUTO_DECIDER_VERSION = "audit-close-auto-empty/1"
 
 # docs_only legitimacy (spec §2.2): only these suffixes may be "docs", and
 # CLAUDE.md / AGENTS.md / GEMINI.md / anything under prompts/ are force-full
@@ -1225,6 +1240,47 @@ def _audit_base_from_session(payload: dict, workspace: Path) -> str | None:
         return out.strip()
     # oldest is the root commit → diff against the empty tree
     return _EMPTY_TREE_SHA
+
+
+def auto_empty_diff_attestation(workspace: Path, base_ref: str) -> dict | None:
+    """Build an ``empty_diff_attestation`` for ``base_ref..HEAD``, or ``None``.
+
+    The no-code dispatcher / post-done-dump path (#48 / A1' conservative-safe,
+    owner ruling 2026-06-04). Returns the attestation dict ``{base, head,
+    diff_hash, mode_decider_version}`` ONLY when ``git diff base_ref..HEAD`` is
+    genuinely empty; ``None`` when base/HEAD can't be resolved or the diff is
+    non-empty — a session that committed code must NOT ride the no-code path
+    (caller fails closed → full audit).
+
+    SAFETY HINGE (codex R, accepted over gemini in CC arbitration): ``base_ref``
+    is an EXPLICIT caller-supplied baseline — the producer never silently defaults
+    to ``@{upstream}`` (which equals HEAD after the session pushes, so it would
+    mask pushed-but-unaudited code). The base's trustworthiness as the session's
+    true start is vouched by the owner's spawn confirmation; in the single-user
+    non-malicious trust model (same as :func:`compute_owner_ack_token`) this raises
+    the bar from "silent automatic" to "explicit + provenance-logged". The gate
+    (:func:`_gate_empty_diff`) still INDEPENDENTLY recomputes the diff + binds head
+    to live HEAD, so a base that yields a non-empty diff is rejected there too.
+    """
+    rc_h, head_out = _audit_git(["rev-parse", "--verify", "HEAD^{commit}"], workspace)
+    head = head_out.strip()
+    if rc_h != 0 or not head:
+        return None
+    rc_b, base_out = _audit_git(["rev-parse", "--verify", f"{base_ref}^{{commit}}"], workspace)
+    base = base_out.strip()
+    if rc_b != 0 or not base:
+        return None
+    rc_d, diff_out = _audit_git(["diff", "--no-color", base, head], workspace)
+    # Same emptiness test the gate uses (_gate_empty_diff): a non-empty (or failed)
+    # diff means real code rode along → refuse to auto-attest.
+    if rc_d != 0 or diff_out.strip() != "":
+        return None
+    return {
+        "base": base,
+        "head": head,
+        "diff_hash": "sha256:" + hashlib.sha256(diff_out.encode("utf-8")).hexdigest(),
+        "mode_decider_version": EMPTY_DIFF_AUTO_DECIDER_VERSION,
+    }
 
 
 def _gate_bypass(block: dict) -> AuditGateOutcome:
@@ -2059,6 +2115,13 @@ def main_audit_close(argv: list[str] | None = None) -> int:
         "--run-record", action="append", default=[], help="repeatable: a run record JSON"
     )
     ap.add_argument("--attestation-file", default=None, help="empty_diff_attestation JSON file")
+    ap.add_argument(
+        "--audit-base",
+        default=None,
+        help="explicit baseline commit/ref for AUTO empty_diff_attestation "
+        "(no-code dispatcher / #48): required when --audit-mode empty_diff_attestation "
+        "and no --attestation-file. Never silently defaulted (codex safety hinge).",
+    )
     ap.add_argument("--bypass-file", default=None, help="codex_unavailable_bypass JSON file")
     ap.add_argument(
         "--code-repo",
@@ -2140,6 +2203,33 @@ def main_audit_close(argv: list[str] | None = None) -> int:
             # Resolve a relative --code-repo to abs so the gate's is_absolute()
             # admission passes; absent → None (same-repo, unchanged).
             code_repo_abs = str(Path(args.code_repo).resolve()) if args.code_repo else None
+
+            # A1' (#48 / owner ruling 2026-06-04): auto-produce the empty_diff
+            # attestation for a no-code dispatcher when the caller didn't hand one
+            # in. Done UNDER the dump lock so HEAD can't drift between producing the
+            # attestation and the gate re-verifying it. REQUIRES an explicit
+            # --audit-base (never a silent upstream default — the safety hinge); a
+            # non-empty base..HEAD diff refuses (a session that committed code can't
+            # ride the no-code path). The gate independently re-verifies.
+            base_source = None
+            if args.audit_mode == _pc.AUDIT_MODE_EMPTY_DIFF and attestation is None:
+                if not args.audit_base:
+                    sys.stderr.write(
+                        "ERR-FATAL empty-diff-needs-base: --audit-mode empty_diff_attestation "
+                        "requires --attestation-file or --audit-base <commit> "
+                        "(no silent upstream default)\n"
+                    )
+                    return 1
+                auto_ws = Path(code_repo_abs) if code_repo_abs else workspace
+                attestation = auto_empty_diff_attestation(auto_ws, args.audit_base)
+                if attestation is None:
+                    sys.stderr.write(
+                        "ERR-FATAL empty-diff-not-empty: base..HEAD diff is non-empty, or base "
+                        f"{args.audit_base!r}/HEAD unresolvable — use full_codex_audit\n"
+                    )
+                    return 1
+                base_source = "explicit_audit_base"
+
             try:
                 block = build_codex_audit_block(
                     args.audit_mode,
@@ -2148,6 +2238,7 @@ def main_audit_close(argv: list[str] | None = None) -> int:
                     attestation=attestation,
                     bypass=bypass,
                     code_repo=code_repo_abs,
+                    base_source=base_source,
                 )
             except ValueError as e:
                 sys.stderr.write(f"ERR-FATAL codex-audit-block-invalid: {e}\n")
