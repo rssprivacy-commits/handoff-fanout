@@ -302,10 +302,14 @@ def test_cold_submit_monotonic_across_old_transcript_no_double(home, tmp_path):
     assert _ack(home, task, "submitted")
 
 
-def test_cold_submit_runs_focus_command_before_enter(home, tmp_path):
-    """COLD submit must run claude-vscode.focus (the dedicated chord) before the Enter — else the Enter
-    lands on the left sidebar, not the Claude input (owner-diagnosed on stage1-10d)."""
-    task = "cold-focus"
+def test_cold_submit_uses_bare_enter_no_focus_chord(home, tmp_path):
+    """COLD submit must NOT run any focus chord before the Enter (2026-06-05 owner-diagnosed simplification,
+    verified 3/3 live). The URI paste already leaves keyboard focus ON the editor Claude input; raising the
+    window (AXRaise reset focus to the left sidebar/Explorer) + the claude-vscode.focus chord (grabbed the
+    empty sidebar CC) were superfluous actions that MOVED focus off the editor → the Enter submitted the
+    empty sidebar → ABORT. "Paste, then bare Enter" submits the editor input. So the focus chord (the
+    cmd+ctrl+option modifier keystroke) must NOT appear in the osascript log."""
+    task = "cold-bare"
     ws = _cold_ws(tmp_path, task)
     _seed(home, ws, task)
     tr = _cold_transcript(tmp_path, ws)
@@ -313,7 +317,9 @@ def test_cold_submit_runs_focus_command_before_enter(home, tmp_path):
                grow_transcript=tr, grow_on_attempt=1)
     assert _run(env).returncode == 0
     osa = _read(tmp_path / "osa.log")
-    assert "command down, control down, option down" in osa, "cold submit must send the focus chord before Enter"
+    assert "command down, control down, option down" not in osa, "cold submit must NOT send a focus chord (bare Enter)"
+    assert _read(tmp_path / "key.log") == "k", "exactly ONE bare Enter — transcript grew → submitted, no retry"
+    assert _ack(home, task, "submitted")
 
 
 def test_warm_submit_does_not_run_focus_command(home, tmp_path):
@@ -336,9 +342,9 @@ def _log(home: Path) -> str:
 
 
 def test_cold_submit_logs_per_attempt_when_enter_sent_but_swallowed(home, tmp_path):
-    """An Enter that is SENT (window matched) but never grows the transcript (focus landed on the empty
-    sidebar Claude) must be logged distinctly per attempt — rc=0 + the frontmost window name — so a live
-    spawn can tell this focus-target failure apart from a window MISMATCH. (Dual-brain Day-1 ask.)"""
+    """An Enter that is SENT (window matched) but never grows the transcript (paste not settled / input
+    not focused) must be logged distinctly per attempt — rc=0 + the frontmost window name — so a live
+    spawn can tell this apart from a window MISMATCH. (Per-attempt diagnostics, 2026-06-05.)"""
     task = "cold-diag-swallow"
     ws = _cold_ws(tmp_path, task)
     _seed(home, ws, task)
@@ -350,7 +356,7 @@ def test_cold_submit_logs_per_attempt_when_enter_sent_but_swallowed(home, tmp_pa
     assert "COLD-SUBMIT-START:" in log, "must log the cold-submit start with base line count"
     assert "COLD-SUBMIT-ATTEMPT 1/2: rc=0" in log, "a SENT Enter must be logged with rc=0 per attempt"
     assert f"front_window='{fw}'" in log, "the frontmost window name must be captured for diagnosis"
-    assert "swallowed or focus on EMPTY sidebar Claude" in log, "a sent-but-no-growth must say so"
+    assert "swallowed (paste not settled yet?)" in log, "a sent-but-no-growth must say so"
     assert _ack(home, task, "failed")
 
 

@@ -1,40 +1,15 @@
-// auto-continue cold-worktree-spawn focus fix (2026-06-03; hardened 2026-06-05 / dual-brain codex+Gemini).
+// DEPRECATED 2026-06-05 — do NOT merge into keybindings.json. No keybinding is needed anymore.
 //
-// A fresh per-session worktree window has TWO Claude inputs in play:
-//   - the handoff URI (.../open?prompt=) opens the prompt in the EDITOR-area Claude panel
-//     (claude-vscode.primaryEditor.open → viewType claudeVSCodePanel), AND
-//   - the window may ALSO restore a visible SIDEBAR Claude view from the previous window's layout.
+// History: 2026-06-03 a `claude-vscode.focus` chord was added to "focus the Claude input" before the
+// synthetic Enter on a cold worktree spawn; 2026-06-05 it was upgraded to runCommands[closeSidebar,
+// closeAuxiliaryBar, claude-vscode.focus]. BOTH were WRONG — a cascade of compensating hacks:
+//   - auto-continue.sh AXRaised the spawned window (raise_task_window), which reset keyboard focus to the
+//     window default (the LEFT Explorer / sidebar Claude);
+//   - the `claude-vscode.focus` chord then GRABBED the empty sidebar Claude input (it focuses a visible
+//     sidebar webview), so the Enter submitted nothing → ABORT.
 //
-// The extension's `claude-vscode.focus` only reveals/focuses the EDITOR Claude when NO sidebar Claude
-// webview is visible:  `if(!hasVisibleWebview()) await editor.openLast(); ...`  — and `hasVisibleWebview()`
-// counts ONLY the registered SIDEBAR views (claudeVSCodeSidebar / -Secondary), NOT the editor panel.
-// So when a sidebar Claude IS visible, the focus command SKIPS editor.openLast and the keyboard focus
-// stays on the EMPTY sidebar Claude → the synthetic Enter submits nothing → the worktree transcript
-// never grows → auto-continue.sh ABORTs ("3 Enter attempts, no transcript growth"; observed 2026-06-05
-// 03:09 on erp-reset-phase2-execute; the evening cold spawns succeeded because their sidebar was the
-// Explorer, not Claude). Root cause confirmed by decompiling anthropic.claude-code 2.1.162.
-//
-// Fix: bind the chord auto-continue.sh sends on COLD windows (ctrl+alt+cmd+0, HANDOFF_FOCUS_KEY=0) to
-// `runCommands` that FIRST closes both sidebars (primary + secondary) so no sidebar Claude is visible
-// (hasVisibleWebview()=false), THEN runs claude-vscode.focus — which now deterministically routes to
-// editor.openLast and focuses the editor Claude holding the prompt. Paired with
-// `"claudeCode.preferredLocation": "panel"` injected into the worktree .handoff.code-workspace so
-// editor.openLast targets the editor (not the sidebar) even if the global config drifted.
-//
-// WARM (main-repo) spawns do NOT send this chord (auto-continue do_focus=0), so their windows are
-// untouched — closing sidebars only ever happens on freshly-spawned cold worktree windows.
-//
-// Merge this object into ~/Library/Application Support/Code/User/keybindings.json (the array).
-[
-  {
-    "key": "ctrl+alt+cmd+0",
-    "command": "runCommands",
-    "args": {
-      "commands": [
-        "workbench.action.closeSidebar",
-        "workbench.action.closeAuxiliaryBar",
-        "claude-vscode.focus"
-      ]
-    }
-  }
-]
+// Root simplification (owner-diagnosed, verified 3/3 live): the URI paste already leaves keyboard focus
+// ON the editor Claude input. "Paste, then Enter" — with NO AXRaise and NO focus command — submits
+// reliably. auto-continue.sh now uses a bare, front-window-guarded Enter (do_focus=0) on the cold path.
+// There is nothing to bind. Kept as a tombstone so a future session does not re-introduce the chord.
+[]

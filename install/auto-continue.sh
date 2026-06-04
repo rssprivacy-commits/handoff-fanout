@@ -357,11 +357,10 @@ cold_submit_with_retry() {
     local per="${HANDOFF_COLD_SUBMIT_WAIT_SECS:-8}"   # 3×8s + 6s render ≪ the 120s timeout wrapper (R2)
     local base i=1 w rc cur fw
     base=$(worktree_transcript_lines "$ws")
-    # Per-attempt diagnostics (2026-06-05 / dual-brain codex+Gemini Day-1 ask): the old loop logged
-    # NOTHING per attempt, so an ABORT couldn't be told apart — Enter SENT but transcript never grew
-    # (focus landed on an EMPTY sidebar Claude: claude-vscode.focus skips editor.openLast while a sidebar
-    # Claude webview is visible) vs window MISMATCH (focus drifted to a wrong window, no Enter sent). Log
-    # rc + the frontmost window name + base→current transcript lines so the next live spawn pins it down.
+    # Per-attempt diagnostics (2026-06-05): the old loop logged NOTHING per attempt, so an ABORT couldn't
+    # be told apart — Enter SENT but transcript never grew (focus off the editor input) vs window MISMATCH
+    # (front window not the task window → no Enter sent). Log rc + the frontmost window name + base→current
+    # transcript lines so any future failure stays diagnosable.
     log "COLD-SUBMIT-START: token=$token base_lines=$base attempts=$attempts per=${per}s ws=$ws"
     while [ "$i" -le "$attempts" ]; do
         # already submitted (a prior Enter took / transcript grew) → STOP, never double-submit
@@ -370,9 +369,15 @@ cold_submit_with_retry() {
             log "COLD-SUBMIT: transcript grew ${base}→${cur} before attempt $i — already submitted, stop (no double-submit)"
             return 0
         fi
-        raise_task_window "$token"   # re-focus the task window (drift between attempts) — best-effort
+        # Bare Enter — NO AXRaise, NO focus command (2026-06-05 owner-diagnosed simplification; verified
+        # 3/3 live). The URI paste already left keyboard focus ON the Claude editor input. Raising the
+        # window (AXRaise reset focus to the window default = the left Explorer/sidebar Claude) and
+        # claude-vscode.focus (grabbed the EMPTY sidebar CC input) were superfluous actions that MOVED
+        # focus off the editor → the Enter hit the empty sidebar → no submit → ABORT. do_focus=0 =
+        # front-window-guarded bare Enter (the proven warm path); the front-window guard alone (not
+        # AXRaise) keeps a stray Enter off a wrong project window.
         fw=$(frontmost_code_window_name)   # diagnostic: which Code window is actually frontmost now
-        submit_enter_if_front_window_contains "$token" 1; rc=$?   # do_focus=1: focus Claude input first
+        submit_enter_if_front_window_contains "$token" 0; rc=$?   # do_focus=0: bare Enter, no focus chord
         log "COLD-SUBMIT-ATTEMPT $i/$attempts: rc=$rc (0=sent/1=mismatch/2=osa-err) front_window='$fw' lines=$base"
         if [ "$rc" = "2" ]; then return 2; fi   # accessibility/keystroke error — escalate, retry won't help
         if [ "$rc" != "0" ]; then
@@ -389,7 +394,7 @@ cold_submit_with_retry() {
             fi
             sleep 1; w=$((w + 1))
         done
-        log "COLD-SUBMIT-ATTEMPT $i: Enter sent (rc=0) but transcript still $base after ${per}s — swallowed or focus on EMPTY sidebar Claude"
+        log "COLD-SUBMIT-ATTEMPT $i: Enter sent (rc=0) but transcript still $base after ${per}s — swallowed (paste not settled yet?) — retry bare Enter"
         i=$((i + 1))
     done
     return 1
@@ -918,13 +923,14 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
             # 等 sleep 1.5 后必须验证 frontmost app 是 Code 才按 Enter
             # 否则可能按到 finder / 别 app, 触发不可预期行为 (写入文件名 / 触发快捷键等)
             # 等 Claude Code 渲染输入栏 + prompt 粘贴完成。cold worktree/.code-workspace 新窗口
-            # 冷启动 Claude 扩展远超历史 1.5s（吞掉 Enter 的根因）→ cold window 等更久 + 显式把
-            # 本 task 的窗口 AXRaise 到前台（多窗口下 is_frontmost_code 只验 app 不验窗口 → Enter
-            # 可能落到别项目窗口；实测诊断 Enter 落到了 family-business 窗口）。
+            # 冷启动 Claude 扩展比 warm 慢 → cold window 等更久（settle）。
+            # 2026-06-05 主人诊断的关键简化：URI 粘贴 prompt 后焦点【本来就在中间编辑区 Claude 输入框】。
+            # 旧逻辑画蛇添足——raise_task_window 的 AXRaise 把焦点重置到窗口默认（左侧 Explorer/侧栏 Claude），
+            # 随后的 claude-vscode.focus 又抓了空侧栏 CC 输入框 → Enter 提交空侧栏 → ABORT。去掉这些多余动作，
+            # 「粘贴完 → 直接 Enter」即提交（实测 3/3）。多窗口安全靠 submit 时的 front-window 守卫（不是 AXRaise）：
+            # 前台窗口标题不含 task → 不发 Enter（withhold），不会误打别项目窗口。
             if [ "$COLD_WINDOW" = "1" ]; then
-                sleep "${HANDOFF_COLD_RENDER_SECS:-6}"
-                raise_task_window "$TASK"
-                sleep 1.0  # 让 AXRaise 生效 + Claude tab 输入框聚焦
+                sleep "${HANDOFF_COLD_RENDER_SECS:-8}"   # settle: 让 prompt 粘完 + 输入框聚焦; 无 raise/无 focus
             else
                 sleep 1.5
             fi
