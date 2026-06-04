@@ -179,7 +179,7 @@ if [[ $INSTALL_CONFIG -eq 1 ]]; then
     fi
 fi
 
-# ─── 3. git pre-commit hook (per-repo) ──────────────────────────────────────
+# ─── 3. git hooks (per-repo): pre-commit (layer-2 guard) + post-commit (runtime auto-sync) ──
 if [[ $INSTALL_HOOKS -eq 1 ]]; then
     if git rev-parse --git-dir >/dev/null 2>&1; then
         GIT_DIR="$(git rev-parse --git-dir)"
@@ -187,22 +187,32 @@ if [[ $INSTALL_HOOKS -eq 1 ]]; then
         CONFIGURED_HOOKS_DIR="$(git config --get core.hooksPath || true)"
         HOOK_BASE="${CONFIGURED_HOOKS_DIR:-$GIT_DIR/hooks}"
         mkdir -p "$HOOK_BASE"
-        HOOK_PATH="$HOOK_BASE/pre-commit"
-        SRC="$ASSET_DIR/git-hooks/pre-commit"
-        chmod +x "$SRC"
-        if [[ -L "$HOOK_PATH" ]] && readlink "$HOOK_PATH" | grep -q "handoff-fanout"; then
-            echo "✓ git pre-commit already symlinked to handoff-fanout"
-        else
-            if [[ -e "$HOOK_PATH" ]]; then
-                BAK="$HOOK_PATH.bak-$(date +%s)"
-                mv "$HOOK_PATH" "$BAK"
-                echo "  (backed up existing hook → $BAK)"
+        # _link_hook NAME — symlink $ASSET_DIR/git-hooks/NAME into the repo's hook dir, backing up any
+        # pre-existing non-handoff hook. post-commit auto-fires --sync-launcher / --sync-dump when a
+        # commit touches the canonical asset, so the deployed runtime copy never drifts behind a fix.
+        _link_hook() {
+            local name="$1" hp="$HOOK_BASE/$1" src="$ASSET_DIR/git-hooks/$1"
+            if [[ ! -f "$src" ]]; then
+                echo "⊘ git $name skipped (asset missing: $src)"
+                return 0
             fi
-            ln -sfn "$SRC" "$HOOK_PATH"
-            echo "✓ symlinked git pre-commit → $HOOK_PATH"
-        fi
+            chmod +x "$src"
+            if [[ -L "$hp" ]] && readlink "$hp" | grep -q "handoff-fanout"; then
+                echo "✓ git $name already symlinked to handoff-fanout"
+            else
+                if [[ -e "$hp" ]]; then
+                    local bak="$hp.bak-$(date +%s)"
+                    mv "$hp" "$bak"
+                    echo "  (backed up existing $name → $bak)"
+                fi
+                ln -sfn "$src" "$hp"
+                echo "✓ symlinked git $name → $hp"
+            fi
+        }
+        _link_hook pre-commit
+        _link_hook post-commit
     else
-        echo "⊘ git hook skipped (not in a git repo)"
+        echo "⊘ git hooks skipped (not in a git repo)"
     fi
 fi
 

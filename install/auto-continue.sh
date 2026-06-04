@@ -80,17 +80,30 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"
 }
 
-# Drift guard (Phase D / Task 2): warn — never abort — when this DEPLOYED copy
-# has diverged from the canonical install/auto-continue.sh that `install.sh
-# --sync-launcher` last pushed. The mandate-on overdue-debt scanner lives only
-# in the canonical copy, so a stale runtime launcher silently never enforces it.
-# Non-fatal so a missing/older sha file can never break the接续 loop.
-_CANON_SHA_FILE="$HANDOFF_ROOT/.auto-continue.canonical.sha"
-if [ -f "$_CANON_SHA_FILE" ]; then
+# Drift guard (甲 / 2026-06-05 owner ruling B+C — backstop to the post-commit auto-sync). The launchd
+# copy ~/.local/bin/auto-continue.sh is a DEPLOYED COPY of the canonical SOURCE install/auto-continue.sh,
+# normally kept current by the post-commit hook's `install.sh --sync-launcher`. If that auto-sync ever
+# does NOT happen (hook uninstalled / sync failed / runtime hand-edited), the running copy ($0) diverges
+# from the source and silently runs OLD logic. Compare the two LIVE and LOUDLY surface a mismatch:
+#   - a prominent log line every run (durable nag) that names the exact remedy command, and
+#   - a one-shot desktop notification, throttled per drift sha so editing this file doesn't spam.
+# NEVER skips a spawn (owner 甲: a stale-but-running launcher beats a halted 接续 loop — a cold-submit
+# blast radius is a manual Enter, not data). Fully non-fatal: a missing source / sha tool just skips it.
+#
+# Replaces the OLD guard, which compared $0 against the LAST-SYNCED sha file (.auto-continue.canonical.sha)
+# — blind to "source moved ahead of runtime" (both stay equal until a sync), the exact bug owner hit. The
+# sha file is still written by `--sync-launcher` and read by audit-mandate-preflight.sh, so it is kept.
+HANDOFF_CANON_SRC="${HANDOFF_CANON_SRC:-$HOME/Projects/handoff-fanout/install/auto-continue.sh}"
+if [ -f "$HANDOFF_CANON_SRC" ]; then
     _self_sha="$("$HANDOFF_SHA256_CMD" "$0" 2>/dev/null | awk '{print $1}')"
-    _canon_sha="$(cat "$_CANON_SHA_FILE" 2>/dev/null)"
-    if [ -n "$_self_sha" ] && [ -n "$_canon_sha" ] && [ "$_self_sha" != "$_canon_sha" ]; then
-        log "⚠ auto-continue.sh drift: running $_self_sha != canonical $_canon_sha — run install.sh --sync-launcher"
+    _src_sha="$("$HANDOFF_SHA256_CMD" "$HANDOFF_CANON_SRC" 2>/dev/null | awk '{print $1}')"
+    if [ -n "$_self_sha" ] && [ -n "$_src_sha" ] && [ "$_self_sha" != "$_src_sha" ]; then
+        log "⚠⚠ DRIFT: running launcher ($_self_sha) != canonical source ($_src_sha @ $HANDOFF_CANON_SRC) — post-commit auto-sync did NOT deploy; 接续 continues on the current copy. Remedy: bash ~/Projects/handoff-fanout/install/install.sh --sync-launcher"
+        _drift_marker="$HANDOFF_ROOT/.auto-continue.drift-notified.$_src_sha"
+        if [ ! -f "$_drift_marker" ]; then
+            "$HANDOFF_OSASCRIPT_CMD" -e 'display notification "运行副本落后于源码 — 跑 install.sh --sync-launcher" with title "⚠ auto-continue 漂移"' >/dev/null 2>&1 || true
+            : > "$_drift_marker" 2>/dev/null || true
+        fi
     fi
 fi
 

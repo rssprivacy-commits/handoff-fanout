@@ -405,3 +405,80 @@ def test_cold_submit_resolves_symlinked_workspace_for_transcript(home, tmp_path)
     assert _run(env).returncode == 0
     assert _read(tmp_path / "key.log") == "k", "ONE Enter — growth detected through the symlink (no blind retry)"
     assert _ack(home, task, "submitted"), "the resolved-path slug must find the real transcript → submitted"
+
+
+# ----------------------------------------- startup drift guard: runtime-vs-source (甲 / 2026-06-05 owner B+C)
+#
+# The launchd-run copy ~/.local/bin/auto-continue.sh is a DEPLOYED COPY of the canonical source
+# install/auto-continue.sh, kept current by `install.sh --sync-launcher` (now auto-fired by the
+# post-commit hook). The OLD guard only compared the running copy against the LAST-SYNCED sha file, so
+# "source edited but runtime not yet synced" left both equal → no warning → stale launcher ran silently
+# (owner pain: cold-submit failed, manual Enter). The new guard compares the running copy ($0) against
+# the live canonical SOURCE and LOUDLY surfaces a mismatch — but NEVER skips a spawn (甲: stale-but-running
+# beats a halted 接续 loop). Fully non-fatal.
+
+
+def _other_source(tmp_path: Path) -> Path:
+    """A canonical-source stand-in whose content differs from SCRIPT → forces a drift mismatch."""
+    p = tmp_path / "canon-src.sh"
+    p.write_text("#!/bin/bash\n# a DIFFERENT canonical source than the running copy\nexit 0\n", encoding="utf-8")
+    return p
+
+
+def _run_guard_only(home: Path, tmp_path: Path, *, canon_src: str) -> subprocess.CompletedProcess:
+    """Run the launcher with spawning skipped so only the startup drift guard (+ overdue scan) executes."""
+    env = _env(home, tmp_path, front_window="irrelevant")
+    env["HANDOFF_SKIP_SPAWN"] = "1"
+    env["HANDOFF_CANON_SRC"] = canon_src
+    return _run(env)
+
+
+def test_drift_guard_detects_source_ahead_loud_log_and_notify(home, tmp_path):
+    """Running copy != canonical source → a LOUD drift line in the log + a desktop notification."""
+    src = _other_source(tmp_path)
+    r = _run_guard_only(home, tmp_path, canon_src=str(src))
+    assert r.returncode == 0
+    log = _log(home)
+    assert "DRIFT" in log, "a source-ahead mismatch must be loudly logged (not the old silent blind spot)"
+    assert "--sync-launcher" in log, "the log must tell the owner the exact remedy command"
+    osa = _read(tmp_path / "osa.log")
+    assert "display notification" in osa, "drift must fire a one-shot desktop notification"
+
+
+def test_drift_guard_silent_when_runtime_matches_source(home, tmp_path):
+    """Running copy == canonical source (point it at SCRIPT itself) → no drift warning at all."""
+    r = _run_guard_only(home, tmp_path, canon_src=str(SCRIPT))
+    assert r.returncode == 0
+    assert "DRIFT" not in _log(home), "identical content must never warn (no false positives in steady state)"
+    assert "display notification" not in _read(tmp_path / "osa.log")
+
+
+def test_drift_guard_nonfatal_when_source_missing(home, tmp_path):
+    """A missing canonical source must skip the check silently — never break the 接续 loop."""
+    r = _run_guard_only(home, tmp_path, canon_src=str(tmp_path / "nonexistent-source.sh"))
+    assert r.returncode == 0, "a missing source path is non-fatal"
+    assert "DRIFT" not in _log(home), "no source to compare → no (false) drift"
+
+
+def test_drift_guard_never_skips_spawn(home, tmp_path):
+    """Even under drift, the launcher must STILL consume the spawn (甲: stale-but-running, never halt)."""
+    task = "drift-warm"
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    _seed(home, ws, task, heartbeat=True)
+    env = _env(home, tmp_path, front_window=f"main.py — {ws.name}")
+    env["HANDOFF_CANON_SRC"] = str(_other_source(tmp_path))  # drift present
+    assert _run(env).returncode == 0
+    assert "DRIFT" in _log(home), "drift is surfaced…"
+    assert _ack(home, task, "submitted"), "…but the spawn is NOT skipped (接续 continues on the current copy)"
+
+
+def test_drift_guard_notification_throttled_once_per_sha(home, tmp_path):
+    """Persistent drift must NAG via the log every run but only notify ONCE per distinct drift sha
+    (so active editing of THIS file doesn't spam the desktop)."""
+    src = _other_source(tmp_path)
+    _run_guard_only(home, tmp_path, canon_src=str(src))
+    _run_guard_only(home, tmp_path, canon_src=str(src))  # same drift sha, second run
+    osa = _read(tmp_path / "osa.log")
+    assert osa.count("display notification") == 1, "notification is throttled to one per drift sha"
+    assert _log(home).count("DRIFT") >= 2, "the loud log line still fires every run (durable nag)"

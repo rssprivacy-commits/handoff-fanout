@@ -1,0 +1,44 @@
+#!/bin/bash
+# post-commit — auto-sync deployed runtime COPIES when their canonical source changed in this commit.
+# (甲 / 2026-06-05 owner ruling B+C — the B half. Paired with the startup drift guard in
+#  install/auto-continue.sh, which is the C backstop if this hook is ever uninstalled / fails.)
+#
+# Two runtime entries are deployed COPIES of files in this repo's install/ dir, kept current ONLY by a
+# manual `install.sh --sync-*`:
+#   install/auto-continue.sh  → ~/.local/bin/auto-continue.sh   (com.dharmaxis.auto-continue launcher)
+#   install/dump-handoff.py   → ~/.local/bin/dump-handoff.py    (v5.4 engine re-exec shim)
+# Forgetting the manual sync after a fix left the runtime stale → the launchd launcher ran OLD logic for
+# every spawn until someone remembered to sync (owner pain 2026-06-05: cold-submit failed, manual Enter).
+# This hook closes that gap: when a commit touches one of those canonical assets, fire the matching sync so
+# the runtime converges on the JUST-COMMITTED version. Deliberate-commit-gated (never deploys an
+# uncommitted WIP — preserving the intentional copy-not-symlink isolation) and idempotent.
+#
+# NON-FATAL by contract: a post-commit hook must never fail the commit (which already happened) — a sync
+# failure only warns with the manual remedy. Honors HANDOFF_INSTALL_SH (tests stub it so they never touch
+# ~/.local/bin or ~/.claude-handoff).
+set -u
+
+repo="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+[ -n "$repo" ] || exit 0
+installer="${HANDOFF_INSTALL_SH:-$repo/install/install.sh}"
+[ -f "$installer" ] || exit 0
+
+# Files changed in the just-made commit (HEAD). --root so the repo's very first (parentless) commit is
+# covered too; for a normal commit --root is a no-op (still diffs against the parent).
+changed="$(git diff-tree --root --no-commit-id --name-only -r HEAD 2>/dev/null)" || exit 0
+
+_sync() {  # $1 = path substring to match in the changed set, $2 = installer flag, $3 = human label
+    case "$changed" in
+        *"$1"*)
+            if bash "$installer" "$2" >/dev/null 2>&1; then
+                echo "handoff post-commit: auto-synced $3 ($2)" >&2
+            else
+                echo "⚠ handoff post-commit: $3 sync ($2) FAILED — run manually: bash $installer $2" >&2
+            fi ;;
+    esac
+}
+
+_sync "install/auto-continue.sh" "--sync-launcher" "auto-continue launcher"
+_sync "install/dump-handoff.py"  "--sync-dump"     "dump shim"
+
+exit 0
