@@ -355,66 +355,124 @@ worktree_transcript_lines() {
     echo "${total:-0}"
 }
 
-# Cold worktree submit with bounded, transcript-GATED retry (2026-06-03 owner-approved hardening).
-# The Claude extension cold-starts slower than the render wait, so a single Enter can be SWALLOWED
-# (input box not yet focused) → owner had to press Enter manually (observed: stage1-10d). Retry the
-# Enter — but ONLY while the worktree transcript has NOT grown (= prompt not yet submitted / session
-# not started). So a retry is the first REAL submit, NEVER a double-submit into an already-started-but-
-# slow session (closes Gemini R2 P0-1: the heartbeat was too late to gate this; transcript growth is the
-# fast, reliable signal). Each Enter is window-guarded (submit_enter_if_front_window_contains re-asserts
-# the task window is frontmost) → never fires onto a wrong window even on retry. rc: 0 = transcript grew
-# (submitted) / 2 = osascript keystroke genuinely errored (accessibility) / 1 = attempts exhausted.
+# Cold worktree submit — READINESS-GATED single Enter (2026-06-06 主人立法 + root-cause investigation).
+# ROOT CAUSE (probe + screenshots + failing logs, 2026-06-06): a fresh cold worktree window opens with keyboard
+# focus on the LEFT-sidebar Claude panel (or Welcome); `open URI` creates the prompt in the CENTER editor Claude
+# tab, which takes a VARIABLE time to render and grab focus from the sidebar. The OLD code pressed Enter at a FIXED
+# delay (0.5s) — a gamble that LOSES under load (~40% miss in tests): the Enter fires while focus is still on the
+# EMPTY sidebar input → nothing is submitted. A fixed time budget (5s / 8s / 0.5s — whatever) can NEVER reliably hit
+# the moment the center tab grabs focus, because that moment varies with render load. So we STOP guessing the time:
+# poll (READ-ONLY — proven not to move focus) until the FOCUSED element is the prompt-bearing Claude input (an
+# AXTextArea "Message input" whose value CONTAINS the task token = OUR pasted prompt landed AND focus is ON it, not
+# the empty/stale sidebar), and ONLY THEN press Enter — in the SAME osascript process (no event-loop yield between
+# the value read and the keystroke; the TOCTOU window is microseconds — narrowed to the physical limit, not provably
+# eliminated since `keystroke` targets whatever is focused at dispatch, codex). Fast when ready (sub-second), waits
+# out a slow render, and HONESTLY withholds (never a blind Enter
+# onto the sidebar / a wrong window) when readiness never arrives. This directly fixes the owner-observed "焦点跑侧栏".
+# Return codes (HONEST per-state acks): 0 = submitted (Enter on the verified prompt input + transcript grew) /
+# 3 = ALREADY-grew before our Enter (external/manual Enter started the session) → running, mark submitted (no
+# duplicate re-trigger) but NOT script-verified / 2 = osascript keystroke errored / 5 = readiness never arrived →
+# Enter WITHHELD (manual needed) / 1 = Enter sent on the verified input but transcript still did not grow (unexpected).
+# $3 = a PRE-OPEN baseline captured by the caller BEFORE the settle (so a manual Enter during the settle is caught as
+# already-grew rc=3, not missed → no `failed` mis-ack of a running session → no duplicate-window re-trigger).
 cold_submit_with_retry() {
-    local token="$1" ws="$2"
-    local attempts="${HANDOFF_COLD_SUBMIT_ATTEMPTS:-4}"
-    local per="${HANDOFF_COLD_SUBMIT_WAIT_SECS:-4}"   # fast retries (2026-06-05 owner: paste→Enter in ~1-2s,
-    # don't sit on one long wait → less chance a concurrent window steals front). 4×4s + 2s render + raises
-    # ≪ the 120s timeout wrapper. A real submit grows the transcript within ~1-2s, so 4s/attempt is ample.
-    local base i=1 w rc cur fw
-    base=$(worktree_transcript_lines "$ws")
-    # Per-attempt diagnostics (2026-06-05): the old loop logged NOTHING per attempt, so an ABORT couldn't
-    # be told apart — Enter SENT but transcript never grew (focus off the editor input) vs window MISMATCH
-    # (front window not the task window → no Enter sent). Log rc + the frontmost window name + base→current
-    # transcript lines so any future failure stays diagnosable.
-    log "COLD-SUBMIT-START: token=$token base_lines=$base attempts=$attempts per=${per}s ws=$ws"
-    while [ "$i" -le "$attempts" ]; do
-        # already submitted (a prior Enter took / transcript grew) → STOP, never double-submit
+    local token="$1" ws="$2" base="${3:-}"
+    local cur rc w verify ready_secs start deadline out laststate=""
+    [ -z "$base" ] && base=$(worktree_transcript_lines "$ws")   # fallback if no pre-settle baseline was passed
+    # both timeouts INTEGER only — a fractional value would break `[ -lt ]` (codex P2). Clamp junk → default, min 1.
+    verify="${HANDOFF_COLD_VERIFY_SECS:-6}"; case "$verify" in ''|*[!0-9]*) verify=6 ;; esac; [ "$verify" -lt 1 ] && verify=1
+    ready_secs="${HANDOFF_COLD_READY_SECS:-10}"; case "$ready_secs" in ''|*[!0-9]*) ready_secs=10 ;; esac; [ "$ready_secs" -lt 1 ] && ready_secs=1
+    log "COLD-SUBMIT-START: token=$token base_lines=$base ws=$ws ready≤${ready_secs}s verify=${verify}s (readiness-gated single Enter / 主人立法 2026-06-06)"
+    # READINESS-GATED atomic submit: assert (front window contains token) AND (focused element is a Claude "Message
+    # input" AXTextArea with a NON-EMPTY value = the prompt landed + focus is on THE prompt input), then keystroke —
+    # all one process. Echoes a diagnostic state so the poll can wait out the cold render. Token via argv (no injection).
+    local script='on run argv
+        set token to item 1 of argv
+        tell application "System Events"
+            set fa to name of first application process whose frontmost is true
+            if fa is not "Code" then return "nofront"
+            tell process "Code"
+                if (count of windows) is 0 then return "nowin"
+                -- EVERY AX read is missing-value-guarded BEFORE any string op (Gemini P0 2026-06-06): during the
+                -- sidebar→center focus transition, focus passes through nodes whose name/role/description is
+                -- `missing value`; an unguarded `contains`/`is not` on `missing value` THROWS (-1728) → osascript
+                -- exits 1 → bash `|| return 2` would ABORT the whole poll exactly when it should keep waiting.
+                set wname to ""
+                try
+                    set wname to name of front window
+                end try
+                if wname is missing value then set wname to ""
+                if wname does not contain token then return "mismatch"
+                set f to missing value
+                try
+                    set f to value of attribute "AXFocusedUIElement"
+                end try
+                if f is missing value then return "noelem"
+                set r to ""
+                try
+                    set r to (role of f)
+                end try
+                if r is missing value then set r to ""
+                if r is not "AXTextArea" then return "notinput"
+                set d to ""
+                try
+                    set d to (description of f)
+                end try
+                if d is missing value then set d to ""
+                if d does not contain "Message input" then return "notinput"
+                set v to ""
+                try
+                    set v to (value of f)
+                end try
+                if v is missing value then return "emptyinput"
+                if v is "" then return "emptyinput"
+                -- codex P1 2026-06-06: a NON-EMPTY value alone is too weak — the empty left-sidebar Claude input is
+                -- ALSO an AXTextArea "Message input", and could hold a stale draft. Require the focused input value
+                -- to CONTAIN the task token (the handoff prompt embeds the task id) → proves it is OUR center prompt
+                -- input, not a sidebar draft. (Falls through to wait/withhold when the right input is not focused.)
+                if v does not contain token then return "wronginput"
+                keystroke return
+                return "sent"
+            end tell
+        end tell
+    end run'
+    # WALL-CLOCK deadline (each poll ≈ osascript ~0.5s + 0.25s sleep, so step-counting would overshoot the timeout
+    # ~3× — a real clock keeps "ready ≤ ${ready_secs}s" honest). Found by live validation 2026-06-06.
+    start=$(/bin/date +%s); deadline=$((start + ready_secs))
+    while [ "$(/bin/date +%s)" -lt "$deadline" ]; do
+        # already-grew (manual/early Enter started the session before ours) → running, do not claim it (rc 3)
         cur=$(worktree_transcript_lines "$ws")
         if [ "$cur" -gt "$base" ]; then
-            log "COLD-SUBMIT: transcript grew ${base}→${cur} before attempt $i — already submitted, stop (no double-submit)"
+            log "COLD-SUBMIT: transcript already grew ${base}→${cur} before our Enter — external/manual Enter started the session (rc=3 submitted-external, NOT script-verified)"
+            return 3
+        fi
+        out=$("$HANDOFF_OSASCRIPT_CMD" -e "$script" "$token" 2>>"$LOG") || return 2
+        laststate="$out"
+        [ "$out" = "sent" ] && break
+        # mismatch = the task window is NOT frontmost (a concurrent window stole front) → AXRaise it back so the NEXT
+        # poll finds it frontmost (owner-endorsed "不置顶就让它置顶再 Enter"; AXRaise PRESERVES the editor input focus —
+        # proven live — so it never knocks focus onto the sidebar). Other not-ready states (noelem/notinput/empty/
+        # wronginput) just wait for the center Claude tab to grab focus.
+        [ "$out" = "mismatch" ] && raise_task_window "$token"
+        sleep 0.25
+    done
+    if [ "$out" != "sent" ]; then
+        log "COLD-SUBMIT: focus never settled on the prompt input within ${ready_secs}s (last=$laststate) — Enter WITHHELD, manual needed (rc=5)"
+        return 5
+    fi
+    log "COLD-SUBMIT: focus VERIFIED on the prompt input → bare Enter sent (ready after ~$(( $(/bin/date +%s) - start ))s) token=$token — verifying transcript growth (${verify}s)"
+    # Verify the Enter genuinely submitted: a real submit grows the worktree transcript within ~seconds. Only this
+    # (not "osascript exit 0", which merely proves the KEY was sent) lets the ack be truthful — never false "submitted".
+    w=0
+    while [ "$w" -lt "$verify" ]; do
+        cur=$(worktree_transcript_lines "$ws")
+        if [ "$cur" -gt "$base" ]; then
+            log "COLD-SUBMIT: transcript grew ${base}→${cur} after our Enter (submitted, auto-verified)"
             return 0
         fi
-        # Bare Enter — NO focus command (2026-06-05 owner-diagnosed; verified live). The URI paste already
-        # left keyboard focus ON the Claude editor input; the old claude-vscode.focus chord then GRABBED the
-        # EMPTY sidebar CC input → the Enter submitted nothing → ABORT (owner watched the left sidebar input
-        # highlight). do_focus=0 = front-window-guarded bare Enter. The front-window guard means we only
-        # press Enter when the TASK window is frontmost — never a stray Enter on a wrong/active project
-        # window. KEY correction: AXRaise itself does NOT break the editor focus (proven live: a backgrounded
-        # worktree window AXRaised back to front still submitted a bare Enter) — ONLY the focus chord did.
-        fw=$(frontmost_code_window_name)   # diagnostic: which Code window is actually frontmost now
-        submit_enter_if_front_window_contains "$token" 0; rc=$?   # do_focus=0: bare Enter, no focus chord
-        log "COLD-SUBMIT-ATTEMPT $i/$attempts: rc=$rc (0=sent/1=mismatch/2=osa-err) front_window='$fw' lines=$base"
-        if [ "$rc" = "2" ]; then return 2; fi   # accessibility/keystroke error — escalate, retry won't help
-        if [ "$rc" != "0" ]; then
-            # mismatch = the TASK window is NOT frontmost (a concurrent active window stole front) → NO Enter
-            # was sent. Bring the task window back to front, then the NEXT attempt finds it frontmost and
-            # bare-Enters. AXRaise PRESERVES the editor input focus (proven live) — it does not reset focus,
-            # the focus chord did. (Owner: "if it's not on top, let it be on top, then Enter.")
-            raise_task_window "$token"
-            sleep 1; i=$((i + 1)); continue
-        fi
-        w=0
-        while [ "$w" -lt "$per" ]; do
-            cur=$(worktree_transcript_lines "$ws")
-            if [ "$cur" -gt "$base" ]; then
-                log "COLD-SUBMIT: Enter landed on attempt $i — transcript grew ${base}→${cur} (submitted)"
-                return 0
-            fi
-            sleep 1; w=$((w + 1))
-        done
-        log "COLD-SUBMIT-ATTEMPT $i: Enter sent (rc=0) but transcript still $base after ${per}s — swallowed (paste not settled yet?) — retry bare Enter"
-        i=$((i + 1))
+        sleep 1; w=$((w + 1))
     done
+    log "COLD-SUBMIT: Enter sent on the VERIFIED prompt input but transcript NOT grown in ${verify}s — unexpected (rc=1)"
     return 1
 }
 
@@ -941,6 +999,12 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
             log "SUCCESS: spawned Claude tab in project=$PROJECT task=$TASK (archived: $TASK-$TS.txt)"
             write_ack "$PROJ_DIR" "$TASK" "spawned" "open URI success @ $TS"
             SPAWNED=$((SPAWNED + 1))
+            # PRE-SETTLE baseline (cold only): capture the worktree transcript line count BEFORE the 0.5s settle
+            # sleep, so a manual/early Enter DURING that settle is detected as already-grew (rc=3) — not missed
+            # (codex+Gemini dual-brain P0 2026-06-06: a base taken after the sleep would already include that growth →
+            # the running session mis-acked `failed` → duplicate-window re-trigger). 0/empty when not yet started (normal).
+            _COLD_BASE=""
+            [ "$COLD_WINDOW" = "1" ] && _COLD_BASE=$(worktree_transcript_lines "$WORKSPACE")
             # Step 3: auto-submit (Claude Code URI handler 仅粘贴 prompt 不自动发送 / Anthropic 安全设计)
             # 2026-05-28 codex audit blind-spot #4 修复:
             # 等 sleep 1.5 后必须验证 frontmost app 是 Code 才按 Enter
@@ -952,7 +1016,7 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
             # 真提交 ~1-2s 内 transcript 就增长；没增长(粘贴还没好/被抢前台)由 cold_submit_with_retry 的
             # 快速重试 + 「mismatch 则 AXRaise 抬回前台」兜底（AXRaise 不破坏输入框焦点，实测坐实）。
             if [ "$COLD_WINDOW" = "1" ]; then
-                sleep "${HANDOFF_COLD_RENDER_SECS:-2}"   # settle: 让 prompt 粘完 + 输入框聚焦; 无 raise/无 focus
+                sleep "${HANDOFF_COLD_RENDER_SECS:-0.5}"   # 主人立法 2026-06-06: 粘完 0.5s 直接 Enter, 之间无任何搅焦动作
             else
                 sleep 1.5
             fi
@@ -989,20 +1053,32 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
                 _submit_token="$TASK"
                 [ "$COLD_WINDOW" != "1" ] && _submit_token=$(basename "$WORKSPACE")
                 if [ "$COLD_WINDOW" = "1" ]; then
-                    cold_submit_with_retry "$_submit_token" "$WORKSPACE"
+                    cold_submit_with_retry "$_submit_token" "$WORKSPACE" "$_COLD_BASE"
                     case $? in
                         0)
-                            log "AUTO-SUBMIT: Enter + worktree-transcript verified (cold window) for project=$PROJECT task=$TASK"
-                            write_ack "$PROJ_DIR" "$TASK" "submitted" "Enter + worktree transcript growth verified (cold window)"
+                            log "AUTO-SUBMIT: Enter + worktree-transcript verified (cold window, auto) for project=$PROJECT task=$TASK"
+                            write_ack "$PROJ_DIR" "$TASK" "submitted" "Enter + worktree transcript growth verified (cold window, auto)"
+                            ;;
+                        3)
+                            # already-grew: an external/manual Enter started the session before ours. It IS running →
+                            # mark submitted (do NOT re-trigger a duplicate window) but HONEST it was not our auto-Enter.
+                            log "AUTO-SUBMIT: cold session already running via external/manual Enter (NOT script-verified) for project=$PROJECT task=$TASK"
+                            write_ack "$PROJ_DIR" "$TASK" "submitted" "external/manual Enter started the session before auto-submit — running, NOT script-verified (cold)"
                             ;;
                         2)
                             warn_accessibility_once
                             log "WARN: osascript keystroke failed despite accessibility preflight OK (transient / 权限 mid-run 撤销?) project=$PROJECT task=$TASK"
                             write_ack "$PROJ_DIR" "$TASK" "failed" "osascript keystroke failed post-preflight"
                             ;;
+                        5)
+                            # readiness never arrived: focus never settled on the prompt-bearing input within the
+                            # window → Enter WITHHELD (never a blind Enter onto the empty sidebar / a wrong window).
+                            log "ABORT-SUBMIT: cold window — focus never settled on the prompt input (the center Claude tab never grabbed focus from the sidebar in time) — Enter WITHHELD, tab 已开, 主人手动按一次 Enter. project=$PROJECT task=$TASK"
+                            write_ack "$PROJ_DIR" "$TASK" "failed" "readiness never arrived — Enter withheld, manual needed (cold)"
+                            ;;
                         *)
-                            log "ABORT-SUBMIT: cold window — ${HANDOFF_COLD_SUBMIT_ATTEMPTS:-3} Enter attempts, no transcript growth — tab 已开, 主人手动按一次 Enter. project=$PROJECT task=$TASK"
-                            write_ack "$PROJ_DIR" "$TASK" "failed" "no transcript growth after retries — manual Enter needed (cold worktree window?)"
+                            log "ABORT-SUBMIT: cold window — Enter sent on the VERIFIED prompt input but transcript did NOT grow (unexpected) — tab 已开, 主人手动按一次 Enter. project=$PROJECT task=$TASK"
+                            write_ack "$PROJ_DIR" "$TASK" "failed" "Enter on verified input but no transcript growth — manual Enter needed (cold)"
                             ;;
                     esac
                 elif [ "${HANDOFF_WARM_WINDOW_GUARD:-1}" = "0" ]; then

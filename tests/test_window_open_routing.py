@@ -56,7 +56,9 @@ def _seed(home: Path, ws: Path, task: str, *, heartbeat: bool = False) -> None:
 
 
 def _env(home: Path, tmp_path: Path, *, front_window: str,
-         grow_transcript: Path | None = None, grow_on_attempt: int | None = None) -> dict:
+         grow_transcript: Path | None = None, grow_on_attempt: int | None = None,
+         grow_after_open: str | None = None, ready_after: str | None = None,
+         wrong_ready: str | None = None) -> dict:
     stub = tmp_path / "stubs"
     stub.mkdir(exist_ok=True)
     code_sink = tmp_path / "code.log"
@@ -67,8 +69,13 @@ def _env(home: Path, tmp_path: Path, *, front_window: str,
     _w(stub / "lockprobe", "#!/bin/bash\necho unlocked\n")
     # code: record the FULL argv (so tests assert the flag: -n / -r / none) then exit 0
     _w(stub / "code", f'#!/bin/bash\nprintf "%s\\n" "$*" >> "{code_sink}"\nexit 0\n')
-    # open: record + succeed (spawns the Claude tab)
-    _w(stub / "open", f'#!/bin/bash\nprintf "%s\\n" "$*" >> "{open_sink}"\nexit 0\n')
+    # open: record + succeed (spawns the Claude tab). If _GROW_AFTER_OPEN is set, spawn a DELAYED background
+    # writer that grows the transcript that many seconds AFTER open (simulating a manual/early Enter landing
+    # DURING the settle, i.e. AFTER the pre-settle baseline is captured) → exercises the already-grew rc=3 path.
+    _w(stub / "open",
+       f'#!/bin/bash\nprintf "%s\\n" "$*" >> "{open_sink}"\n'
+       'if [ -n "$_GROW_AFTER_OPEN" ] && [ -n "$_GROW_TRANSCRIPT" ]; then '
+       '( sleep "$_GROW_AFTER_OPEN"; echo x >> "$_GROW_TRANSCRIPT" ) & fi\nexit 0\n')
     # osascript stub. Order matters — earlier cases win on scripts that contain several substrings:
     #   - atomic submit (`on run argv` … `keystroke return`): token is the LAST argv; emulate
     #     "front window contains token" → echo sent + record `k`, else echo mismatch (NO keystroke).
@@ -81,6 +88,26 @@ def _env(home: Path, tmp_path: Path, *, front_window: str,
         'printf "%s\\n" "$args" >> "$_OSA_SINK"\n'
         "case \"$args\" in\n"
         '  *"UI elements enabled"*) echo true ;;\n'
+        # readiness-gated cold submit (`on run argv` … `AXFocusedUIElement` … `Message input`): simulate the
+        # center Claude tab grabbing focus only after _READY_AFTER polls. token is the LAST argv.
+        '  *"AXFocusedUIElement"*)\n'
+        '      tok="${@: -1}"\n'
+        '      case "$_FRONT_WIN" in\n'
+        '        *"$tok"*)\n'
+        # _WRONG_READY: focused input is non-empty but its value lacks the task token (stale sidebar draft) →
+        # the real osascript returns "wronginput"; the gate must keep waiting / withhold, NEVER submit (codex P1).
+        '          if [ -n "$_WRONG_READY" ]; then echo wronginput;\n'
+        '          else\n'
+        '            p=$(cat "$_POLL_COUNT" 2>/dev/null || echo 0); p=$((p+1)); echo "$p" > "$_POLL_COUNT"\n'
+        '            if [ "$p" -ge "${_READY_AFTER:-1}" ]; then\n'
+        '              printf k >> "$_KEY_SINK"\n'
+        '              n=$(cat "$_SUBMIT_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$_SUBMIT_COUNT"\n'
+        '              if [ -n "$_GROW_ON_ATTEMPT" ] && [ "$n" -ge "$_GROW_ON_ATTEMPT" ]; then echo x >> "$_GROW_TRANSCRIPT"; fi\n'
+        '              echo sent\n'
+        '            else echo emptyinput; fi\n'
+        '          fi ;;\n'
+        '        *) echo mismatch ;;\n'
+        "      esac ;;\n"
         '  *"on run argv"*)\n'
         '      tok="${@: -1}"\n'
         '      case "$_FRONT_WIN" in\n'
@@ -116,18 +143,22 @@ def _env(home: Path, tmp_path: Path, *, front_window: str,
             "HANDOFF_COLD_RENDER_SECS": "0",
             "HANDOFF_WIN_FRONT_SECS": "2",
             "HANDOFF_WIN_FRONT_SECS_WARM": "1",
-            # cold transcript-gated retry (fast): 2 attempts × 1s wait; transcript root in tmp
+            # cold single-Enter verify (fast): transcript-growth verify timeout 1s; transcript root in tmp
             "HANDOFF_TRANSCRIPT_ROOT": str(tmp_path / "transcripts"),
-            "HANDOFF_COLD_SUBMIT_ATTEMPTS": "2",
-            "HANDOFF_COLD_SUBMIT_WAIT_SECS": "1",
+            "HANDOFF_COLD_VERIFY_SECS": "1",
+            "HANDOFF_COLD_READY_SECS": "2",  # readiness-gate poll timeout (8 × 0.25s) — keep tests fast
             "_FRONT_WIN": front_window,
             "_KEY_SINK": str(key_sink),
             "_CODE_SINK": str(code_sink),
             "_OPEN_SINK": str(open_sink),
             "_OSA_SINK": str(tmp_path / "osa.log"),
             "_SUBMIT_COUNT": str(tmp_path / "submit_count.txt"),
+            "_POLL_COUNT": str(tmp_path / "poll_count.txt"),
             "_GROW_TRANSCRIPT": str(grow_transcript) if grow_transcript else "",
             "_GROW_ON_ATTEMPT": str(grow_on_attempt) if grow_on_attempt else "",
+            "_GROW_AFTER_OPEN": str(grow_after_open) if grow_after_open else "",
+            "_READY_AFTER": str(ready_after) if ready_after else "",
+            "_WRONG_READY": str(wrong_ready) if wrong_ready else "",
         }
     )
     env.pop("HANDOFF_HOME", None)
@@ -263,28 +294,34 @@ def test_cold_submit_succeeds_first_try_no_double(home, tmp_path):
     assert _ack(home, task, "submitted")
 
 
-def test_cold_submit_retries_when_first_enter_swallowed(home, tmp_path):
-    """1st Enter swallowed (no growth) → 2nd Enter lands (growth) → submitted (transcript-gated retry)."""
-    task = "cold-retry"
+def test_cold_submit_single_enter_no_retry(home, tmp_path):
+    """主人立法 2026-06-06: cold submit sends EXACTLY ONE bare Enter — NO blind retry. The stub would only grow
+    the transcript on a (hypothetical) 2nd Enter, but only ONE Enter is ever sent → no growth → honest `failed`
+    (manual Enter needed); never a 2nd Enter, never a false `submitted`. (The old 4× retry produced FALSE-POSITIVE
+    acks: when an Enter hit the empty sidebar input the owner pressed Enter manually and the script credited its
+    own retry. Single Enter + transcript-verify removes that lie.)"""
+    task = "cold-noretry"
     ws = _cold_ws(tmp_path, task)
     _seed(home, ws, task)
     tr = _cold_transcript(tmp_path, ws)
     env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py",
-               grow_transcript=tr, grow_on_attempt=2)  # only the 2nd Enter grows the transcript
+               grow_transcript=tr, grow_on_attempt=2)  # would only grow on a 2nd Enter — which never fires
     assert _run(env).returncode == 0
-    assert _read(tmp_path / "key.log") == "kk", "two Enters — first swallowed, retry submitted"
-    assert _ack(home, task, "submitted")
+    assert _read(tmp_path / "key.log") == "k", "EXACTLY one Enter — no retry (主人立法: 单次 bare Enter)"
+    assert _ack(home, task, "failed"), "single Enter swallowed → honest failed (no false submitted)"
+    assert not _ack(home, task, "submitted")
 
 
-def test_cold_submit_exhausts_honestly_when_never_grows(home, tmp_path):
-    """All attempts swallowed (transcript never grows) → honest `failed` (manual Enter needed)."""
+def test_cold_submit_honest_failed_when_enter_swallowed(home, tmp_path):
+    """The single Enter is sent (window matched) but the transcript never grows (focus off the prompt input)
+    → honest `failed` (manual Enter needed), and exactly ONE Enter (no retry)."""
     task = "cold-exhaust"
     ws = _cold_ws(tmp_path, task)
     _seed(home, ws, task)
-    _cold_transcript(tmp_path, ws)  # dir exists, never grows → every Enter is swallowed
+    _cold_transcript(tmp_path, ws)  # dir exists, never grows → the Enter is swallowed
     env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py")  # grow_on_attempt=None
     assert _run(env).returncode == 0
-    assert _read(tmp_path / "key.log") == "kk", "both attempts sent Enter (window matched) but were swallowed"
+    assert _read(tmp_path / "key.log") == "k", "exactly ONE Enter sent (window matched) but swallowed — no retry"
     assert _ack(home, task, "failed")
     assert not _ack(home, task, "submitted")
 
@@ -345,39 +382,98 @@ def _log(home: Path) -> str:
     return _read(home / "auto-continue.log")
 
 
-def test_cold_submit_logs_per_attempt_when_enter_sent_but_swallowed(home, tmp_path):
-    """An Enter that is SENT (window matched) but never grows the transcript (paste not settled / input
-    not focused) must be logged distinctly per attempt — rc=0 + the frontmost window name — so a live
-    spawn can tell this apart from a window MISMATCH. (Per-attempt diagnostics, 2026-06-05.)"""
+def test_cold_submit_logs_readiness_verified_before_enter(home, tmp_path):
+    """The readiness gate logs that focus was VERIFIED on the prompt input BEFORE the Enter — so a live spawn can
+    see the Enter only ever fires on the prompt-bearing input (never a blind Enter). Here the input is ready
+    immediately but the (stub) transcript never grows → honest rc=1 'verified input but no growth' (an unexpected
+    edge), never a false 'submitted'."""
     task = "cold-diag-swallow"
     ws = _cold_ws(tmp_path, task)
     _seed(home, ws, task)
-    _cold_transcript(tmp_path, ws)  # never grows → every Enter swallowed
+    _cold_transcript(tmp_path, ws)  # never grows
     fw = f"demo · {task} [worktree] — x.py"
-    env = _env(home, tmp_path, front_window=fw)  # window matches token → rc=0 (sent)
+    env = _env(home, tmp_path, front_window=fw)  # window matches token; input ready (default _READY_AFTER=1)
     assert _run(env).returncode == 0
     log = _log(home)
     assert "COLD-SUBMIT-START:" in log, "must log the cold-submit start with base line count"
-    assert "COLD-SUBMIT-ATTEMPT 1/2: rc=0" in log, "a SENT Enter must be logged with rc=0 per attempt"
-    assert f"front_window='{fw}'" in log, "the frontmost window name must be captured for diagnosis"
-    assert "swallowed (paste not settled yet?)" in log, "a sent-but-no-growth must say so"
+    assert "focus VERIFIED on the prompt input" in log, "the Enter must only fire AFTER focus is verified on the prompt input"
+    assert "transcript NOT grown" in log, "a verified-but-no-growth must be logged honestly (rc=1)"
     assert _ack(home, task, "failed")
 
 
-def test_cold_submit_logs_mismatch_distinct_from_sent(home, tmp_path):
-    """A window MISMATCH (focus drift to a wrong window, NO Enter sent) must log rc=1 — distinct from the
-    rc=0 sent-but-swallowed case — so the two failure modes are never conflated in the log."""
+def test_cold_submit_withholds_enter_until_ready_then_times_out(home, tmp_path):
+    """When focus NEVER settles on the prompt input (here: the task window is never frontmost → the readiness gate
+    only ever sees a mismatch), NO Enter is ever sent and the gate honestly times out (rc=5, 'focus never settled')
+    — never a blind Enter onto the empty sidebar / a wrong window (the trust-preserving WITHHOLD)."""
     task = "cold-diag-mismatch"
     ws = _cold_ws(tmp_path, task)
     _seed(home, ws, task)
     _cold_transcript(tmp_path, ws)
-    env = _env(home, tmp_path, front_window="some-other-project — z.py")  # title lacks token → rc=1
+    env = _env(home, tmp_path, front_window="some-other-project — z.py")  # title lacks token → gate sees mismatch
     assert _run(env).returncode == 0
     log = _log(home)
-    assert "COLD-SUBMIT-ATTEMPT 1/2: rc=1" in log, "a withheld Enter (wrong window) must log rc=1 (mismatch)"
-    assert "rc=0" not in log, "a pure mismatch must never be logged as a sent (rc=0) attempt"
-    assert _read(tmp_path / "key.log") == "", "no Enter is sent on a mismatch"
+    assert "focus never settled on the prompt input" in log, "a never-ready submit must log rc=5 (Enter withheld)"
+    assert _read(tmp_path / "key.log") == "", "NO Enter is ever sent when readiness never arrives"
     assert _ack(home, task, "failed")
+
+
+def test_cold_submit_withholds_when_focused_input_lacks_task_token(home, tmp_path):
+    """codex P1 2026-06-06: a focused Claude 'Message input' with a NON-EMPTY value that does NOT contain the task
+    token (e.g. a stale left-sidebar draft) must NOT be treated as ready — `value is not ""` alone is too weak. The
+    real osascript returns 'wronginput'; the gate keeps waiting and honestly times out (rc=5, Enter WITHHELD), never
+    submitting into the wrong input."""
+    task = "cold-wronginput"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    _cold_transcript(tmp_path, ws)
+    env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py", wrong_ready="1")
+    assert _run(env).returncode == 0
+    assert _read(tmp_path / "key.log") == "", "NO Enter is sent when the focused input lacks the task token"
+    assert _ack(home, task, "failed")
+    log = _log(home)
+    assert "focus never settled on the prompt input" in log and "wronginput" in log, "must log the wronginput withhold (rc=5)"
+
+
+def test_cold_submit_waits_for_slow_render_then_submits(home, tmp_path):
+    """THE readiness gate's core value (replaces the flaky fixed-0.5s gamble that missed ~40% under load): the
+    center Claude tab grabs focus LATE (here only on the 4th poll ≈ 1s) — a fixed-delay Enter would fire into the
+    empty sidebar and MISS. The gate WAITS (read-only) until focus is verified on the prompt input, then sends
+    EXACTLY ONE Enter → submitted. No miss, no lie."""
+    task = "cold-slowrender"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    tr = _cold_transcript(tmp_path, ws)
+    env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py",
+               grow_transcript=tr, grow_on_attempt=1, ready_after="4")  # input focused only on the 4th poll
+    assert _run(env).returncode == 0
+    assert _read(tmp_path / "key.log") == "k", "EXACTLY one Enter — sent only once focus was verified ready"
+    assert _ack(home, task, "submitted"), "the gate waited out the slow render and submitted (no miss, no lie)"
+    assert not _ack(home, task, "failed")
+
+
+def test_cold_submit_already_grew_during_settle_acks_submitted_not_failed(home, tmp_path):
+    """codex+Gemini dual-brain P0 (2026-06-06): if a manual/early Enter STARTS the session DURING the settle
+    (transcript grows past the PRE-SETTLE baseline), the session IS running → ack `submitted` (so the control
+    plane never re-triggers a DUPLICATE window) — NOT `failed`. We send NO Enter (rc=3) and report it HONESTLY
+    as external (NOT script-verified). The baseline is captured BEFORE the settle, so the growth-during-settle
+    is detected (a baseline taken AFTER the settle would already include it → the bug this guards)."""
+    task = "cold-alreadygrew"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    tr = _cold_transcript(tmp_path, ws)  # transcript dir + session file
+    # `open` spawns a delayed writer that grows the transcript 0.3s after open (AFTER the pre-settle baseline);
+    # a 1s settle spans it → cold_submit's first already-grew check sees cur > base → rc=3. ready_after=99 keeps
+    # the readiness gate from firing its OWN Enter, so the ONLY growth is the external (manual) one → genuine rc=3.
+    env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py",
+               grow_transcript=tr, grow_after_open="0.3", ready_after="99")
+    env["HANDOFF_COLD_RENDER_SECS"] = "1"  # settle long enough to span the delayed (manual-Enter) growth
+    assert _run(env).returncode == 0
+    assert _read(tmp_path / "key.log") == "", "rc=3: NO Enter sent (session already started externally)"
+    assert _ack(home, task, "submitted"), "an already-running session must be acked submitted (no duplicate re-trigger)"
+    assert not _ack(home, task, "failed"), "must NOT mark a running session failed (the P0 state-mismatch this fixes)"
+    log = _log(home)
+    assert "rc=3" in log, "must log the already-grew (external) rc=3 detection"
+    assert "NOT script-verified" in log, "must be HONEST it was external, not our auto-Enter"
 
 
 def test_cold_submit_resolves_symlinked_workspace_for_transcript(home, tmp_path):
