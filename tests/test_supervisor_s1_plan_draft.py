@@ -231,6 +231,35 @@ def test_amend_allows_resupplying_the_same_oracle():
     assert new_locked.oracle_hash == sup.oracle_hash(oracle)
 
 
+def test_amend_refuses_to_introduce_oracle_into_oracleless_lock():  # s1-fix gemini P2
+    # A plan locked WITHOUT an oracle cannot gain one via an amendment: a
+    # PlanAmendment binds only the plan hash, so a newly-introduced oracle would be
+    # unattested (INV-9). The original guard only fired when an oracle was already
+    # bound, letting this slip through and be silently written.
+    locked = sup.approve_plan(_draft(), approver="owner", approved_at="t")  # no oracle
+    assert locked.oracle_hash is None
+    new_plan = _plan(objective="changed")
+    with pytest.raises(SchemaError, match="cannot introduce an oracle"):
+        sup.amend_locked_plan(
+            locked,
+            new_plan,
+            reason="r",
+            approver="owner",
+            approved_at="t2",
+            oracle=_oracle(version=2),  # smuggling an oracle in via amend
+        )
+
+
+def test_amend_without_oracle_on_oracleless_lock_stays_oracleless():
+    # the legitimate path: an oracle-less lock amended without an oracle stays
+    # oracle-less (no surprise binding appears).
+    locked = sup.approve_plan(_draft(), approver="owner", approved_at="t")
+    new_locked, _ = sup.amend_locked_plan(
+        locked, _plan(objective="changed"), reason="r", approver="owner", approved_at="t2"
+    )
+    assert new_locked.oracle_hash is None
+
+
 # --- verify_lock anti-drift --------------------------------------------------
 
 

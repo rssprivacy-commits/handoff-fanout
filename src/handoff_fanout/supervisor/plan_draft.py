@@ -176,9 +176,12 @@ def amend_locked_plan(
     frozen :class:`PlanAmendment` (the payload of a future ``plan_amended`` event).
 
     Guards: the plan identity (``plan_id``) is stable — a different id is a
-    different plan, not an amendment; and an amendment that does not actually change
-    the plan is rejected (a no-op amendment would forge an approval trail for
-    nothing).
+    different plan, not an amendment; an amendment that does not actually change the
+    plan is rejected (a no-op would forge an approval trail for nothing); and an
+    amendment **cannot touch the oracle** — a supplied ``oracle`` may only re-supply
+    the exact locked one (carrying its hash forward), never a different one and never
+    introduce one into a plan locked without an oracle (INV-9: an oracle change is its
+    own attested event, which S0 does not yet have).
     """
     if not reason:
         raise SchemaError("amend_locked_plan requires a reason")
@@ -190,17 +193,26 @@ def amend_locked_plan(
             f"(locked={locked.plan_id!r}, new={new_plan.plan_id!r}) — a new plan_id "
             "is a new plan, not an amendment"
         )
-    # R2 codex P2-7: do not smuggle an *oracle* change into a *plan* amendment. A
-    # PlanAmendment binds only the plan hash, so re-defining the oracle here would
-    # leave the oracle change unattested. S0 has no ``oracle_amended`` event yet, so
-    # a standalone/joint oracle change is out of S1 scope — the ``oracle`` arg may
-    # only re-supply the SAME oracle that was already locked (to carry its hash
-    # forward), never a different one.
-    if (
-        oracle is not None
-        and locked.oracle_hash is not None
-        and oracle_hash(oracle) != locked.oracle_hash
+    # R2 codex P2-7 + s1-fix codex/gemini P1: do not smuggle an *oracle* change into a
+    # *plan* amendment. A PlanAmendment binds only the plan hash, so any oracle delta
+    # here would be unattested (INV-9). S0 has no ``oracle_amended`` event yet, so a
+    # standalone/joint oracle change is out of S1 scope — the ``oracle`` arg may only
+    # re-supply the SAME oracle that was already locked (to carry its hash forward),
+    # never a different one, AND never *introduce* one into a plan that was locked
+    # without an oracle. The original guard only fired when ``locked.oracle_hash`` was
+    # already set, so introducing an oracle into an oracle-less lock slipped through
+    # and got silently written below (s1-fix gemini P2 / INV-9 rigor).
+    if oracle is not None and (
+        locked.oracle_hash is None or oracle_hash(oracle) != locked.oracle_hash
     ):
+        if locked.oracle_hash is None:
+            raise SchemaError(
+                "amend_locked_plan cannot introduce an oracle into a plan locked "
+                "without one — a plan amendment binds only the plan hash, so a "
+                "newly-supplied oracle would be unattested (INV-9). S0 has no "
+                "`oracle_amended` event; lock the oracle at approve time, or raise an "
+                "oracle amendment separately once that event is frozen."
+            )
         raise SchemaError(
             "amend_locked_plan: the supplied oracle differs from the locked oracle "
             "— a plan amendment cannot also change the oracle (S0 has no "
@@ -233,7 +245,11 @@ def amend_locked_plan(
         plan_hash=new_hash,
         approver=approver,
         approved_at=approved_at,
-        oracle_hash=oracle_hash(oracle) if oracle is not None else locked.oracle_hash,
+        # The oracle is unchanged by an amendment: the guard above guarantees a
+        # supplied ``oracle`` matches ``locked.oracle_hash`` (and an omitted one
+        # carries forward), so the locked hash is always the right value — written
+        # explicitly here so an amendment can never alter the oracle binding.
+        oracle_hash=locked.oracle_hash,
     )
     return new_locked, amendment
 

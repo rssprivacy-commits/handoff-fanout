@@ -17,12 +17,15 @@ Run (from the handoff-fanout worktree):
 from __future__ import annotations
 
 import json
+import subprocess
+import tempfile
 
 import pytest
 
 from handoff_fanout import supervisor as sup
 from handoff_fanout.supervisor import SchemaError
-from handoff_fanout.supervisor.oracle_runner import _decide
+from handoff_fanout.supervisor import oracle_runner as _orm
+from handoff_fanout.supervisor.oracle_runner import _CLEANUP_FAILURE_ID, _decide
 
 # --- helpers -----------------------------------------------------------------
 
@@ -600,3 +603,322 @@ def test_sandbox_custom_marker_is_project_agnostic():
     db._guard("hf_test_db", "hf_baseline")  # ok — matches custom marker
     with pytest.raises(sup.LiveDbError, match="must contain 'hf_test_'"):
         db._guard("sandbox_db", "hf_baseline")  # default marker no longer accepted
+
+
+# === s1-fix C′ hardening (中枢独立审 d31ea20 = RED/RED) ======================
+# The supervisor-coord's independent dual-brain audit (codex+gemini, no degrade)
+# found the C′ "never touches Live" red line punched through. These tests pin the
+# fixes: sanitized env on EVERY subprocess (no host PG*/cloud creds), a sandbox
+# HOME, a ``--`` argv terminator + strict db-name guard against option/conninfo
+# injection, cleanup-failure → UNKNOWN, and DB-bearing test/cmd cleanup.
+
+
+# --- P0-1/3: shell env strips host PG*/cloud creds + sandbox HOME -------------
+
+
+def test_shell_env_strips_pg_and_cloud_creds(tmp_path, monkeypatch):
+    # A shell=True oracle spec must NOT see PG* / DATABASE_URL / cloud creds — even
+    # though dropdb/psql legitimately use PG*, those come from the trusted sandbox_env
+    # injection, NEVER the host (C′; gemini P0 + codex P2-5, s1-fix extends to PG*).
+    for k in ("PGHOST", "PGUSER", "PGPASSWORD", "PGSERVICE", "PGDATABASE", "DATABASE_URL"):
+        monkeypatch.setenv(k, "live-secret")
+    ex = sup.SubprocessExecutor()
+    rt = _runtime(cwd=str(tmp_path))
+    spec = 'echo "[$PGHOST][$PGPASSWORD][$PGSERVICE][$PGDATABASE][$DATABASE_URL]"'
+    assert ex.execute(_crit("c", spec=spec), rt).stdout.strip() == "[][][][][]"
+
+
+def test_shell_home_is_sandbox_cwd_not_real_home(tmp_path, monkeypatch):
+    # HOME (and therefore ~) resolves into the disposable worktree, not the real home
+    # — so a shell spec can't read ~/.aws / ~/.ssh / ~/.pgpass via the ~ shortcut.
+    monkeypatch.setenv("HOME", "/Users/real-home-must-not-leak")
+    ex = sup.SubprocessExecutor()
+    rt = _runtime(cwd=str(tmp_path))
+    assert ex.execute(_crit("h", spec='echo "$HOME"'), rt).stdout.strip() == str(tmp_path)
+    assert ex.execute(_crit("t", spec="echo ~"), rt).stdout.strip() == str(tmp_path)
+
+
+def test_executor_injects_explicit_sandbox_pg_env(tmp_path, monkeypatch):
+    # The sandbox PG* a SQL criterion legitimately needs is INJECTED (trusted
+    # construction site), and is the only PG* the subprocess sees — a host PGHOST
+    # pointing at Live is overridden, not inherited.
+    monkeypatch.setenv("PGHOST", "live-host")
+    ex = sup.SubprocessExecutor(sandbox_env={"PGHOST": "127.0.0.1", "PGPORT": "5499"})
+    rt = _runtime(cwd=str(tmp_path))
+    out = ex.execute(_crit("c", spec='echo "[$PGHOST][$PGPORT]"'), rt).stdout.strip()
+    assert out == "[127.0.0.1][5499]"
+
+
+# --- P0-1/2: dropdb/createdb get a sanitized env + ``--`` terminator ----------
+
+
+def _capture_db_subprocess(monkeypatch):
+    """Capture argv + env of every ``subprocess.run`` the sandbox DB issues, without
+    spawning a real ``dropdb``/``createdb`` (so the test never touches a server)."""
+    calls: list[dict] = []
+
+    def fake_run(argv, **kw):
+        calls.append({"argv": list(argv), "env": kw.get("env")})
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(_orm.subprocess, "run", fake_run)
+    return calls
+
+
+def test_sandbox_dropdb_createdb_use_terminator_and_sanitized_env(monkeypatch):
+    # codex #2 + gemini P1: dropdb/createdb previously inherited the FULL host env
+    # (PGHOST/PGPASSWORD/DATABASE_URL) → a misconfigured host = dropping a Live DB.
+    for k in ("PGHOST", "PGPASSWORD", "PGSERVICE", "DATABASE_URL", "AWS_SECRET_ACCESS_KEY"):
+        monkeypatch.setenv(k, "live-secret")
+    calls = _capture_db_subprocess(monkeypatch)
+    sup.PsqlSandboxDb().recreate_from_template("sandbox_test", "sandbox_baseline")
+    # gemini P0: a ``--`` terminator means a forged name can never be read as a flag.
+    assert [c["argv"] for c in calls] == [
+        ["dropdb", "--if-exists", "--", "sandbox_test"],
+        ["createdb", "--template", "sandbox_baseline", "--", "sandbox_test"],
+    ]
+    for c in calls:
+        env = c["env"]
+        assert env is not None  # never None → never inherits the full host env
+        for leaked in (
+            "PGHOST",
+            "PGPASSWORD",
+            "PGSERVICE",
+            "DATABASE_URL",
+            "AWS_SECRET_ACCESS_KEY",
+        ):
+            assert leaked not in env  # host Live creds stripped (C′)
+        assert env["HOME"] == tempfile.gettempdir()  # HOME is a tmp dir, not real home
+
+
+def test_sandbox_injects_explicit_pg_env(monkeypatch):
+    monkeypatch.setenv("PGHOST", "live-host")  # host PGHOST must NOT win
+    calls = _capture_db_subprocess(monkeypatch)
+    sup.PsqlSandboxDb(env={"PGHOST": "sandbox-host", "PGPASSWORD": "sb"}).recreate_from_template(
+        "sandbox_test", "sandbox_baseline"
+    )
+    for c in calls:
+        assert c["env"]["PGHOST"] == "sandbox-host"  # explicit sandbox PG* injected
+        assert c["env"]["PGPASSWORD"] == "sb"
+
+
+# --- P0-2: strict db-name guard rejects option / conninfo injection -----------
+
+
+def test_guard_refuses_option_injection_db_name():
+    db = sup.PsqlSandboxDb()
+    # contains the 'sandbox' marker (so it would pass the allowlist), but dropdb would
+    # parse '--host=sandbox' as an option → must be refused as a non-plain name.
+    with pytest.raises(sup.LiveDbError, match="not a plain database name"):
+        db._guard("--host=sandbox", "sandbox_baseline")
+
+
+def test_guard_refuses_conninfo_keyword_db_name():
+    db = sup.PsqlSandboxDb()
+    with pytest.raises(sup.LiveDbError, match="not a plain database name"):
+        db._guard("service=sandbox", "sandbox_baseline")  # libpq conninfo shape
+
+
+def test_guard_refuses_equals_and_leading_dash():
+    db = sup.PsqlSandboxDb()
+    with pytest.raises(sup.LiveDbError, match="not a plain database name"):
+        db._guard("sandbox=x", "sandbox_baseline")
+    with pytest.raises(sup.LiveDbError, match="not a plain database name"):
+        db._guard("-sandbox", "sandbox_baseline")
+
+
+def test_guard_refuses_option_injection_template():
+    db = sup.PsqlSandboxDb()
+    with pytest.raises(sup.LiveDbError, match="not a plain database name"):
+        db._guard("sandbox_test", "--template-injection")
+
+
+def test_guard_still_allows_the_design_sandbox_label():
+    # the design's own ``sandbox:erp_test`` (a scheme-style label) stays valid.
+    sup.PsqlSandboxDb()._guard("sandbox:erp_test", "erp_baseline")  # no raise
+
+
+# --- P0-3 (psql path): runtime.db conninfo refused + non-interactive ----------
+
+
+def test_sql_executor_uses_sanitized_env_and_no_password_prompt(monkeypatch, tmp_path):
+    monkeypatch.setenv("PGPASSWORD", "live")
+    calls: list[dict] = []
+
+    def fake_run(argv, **kw):
+        calls.append({"argv": list(argv), "env": kw.get("env")})
+        return subprocess.CompletedProcess(argv, 0, "0\n", "")
+
+    monkeypatch.setattr(_orm.subprocess, "run", fake_run)
+    ex = sup.SubprocessExecutor(sandbox_env={"PGHOST": "sandbox-host"})
+    raw = ex.execute(
+        _crit("s", ctype=sup.OracleType.SQL, spec="select 0", expect="0"),
+        _sql_runtime(cwd=str(tmp_path)),
+    )
+    assert raw.stdout.strip() == "0"
+    env = calls[0]["env"]
+    assert env["PGHOST"] == "sandbox-host"  # injected sandbox knob
+    assert "PGPASSWORD" not in env  # host cred stripped
+    assert calls[0]["argv"][0] == "psql" and "-w" in calls[0]["argv"]  # never prompts
+
+
+def test_sql_executor_refuses_conninfo_runtime_db():
+    ex = sup.SubprocessExecutor()
+    # a runtime.db shaped like a libpq conninfo → could-not-evaluate (error→UNKNOWN),
+    # never a silent connect to wherever ``service=prod`` points.
+    raw = ex.execute(
+        _crit("s", ctype=sup.OracleType.SQL, spec="select 1", expect="1"),
+        _sql_runtime(db="service=prod"),
+    )
+    assert raw.error is not None and "non-plain runtime.db" in raw.error
+    assert _decide(_crit("s", ctype=sup.OracleType.SQL), raw)[0] is sup.OracleOutcome.UNKNOWN
+
+
+# --- P1-4: sandbox cleanup failure → UNKNOWN (never raise, never RED) ---------
+
+
+class _RaisingSandbox(sup.SandboxDb):
+    """Always raises in ``recreate_from_template`` (infra/guard failure simulation)."""
+
+    def __init__(self, exc):
+        self._exc = exc
+        self.calls = 0
+
+    def recreate_from_template(self, db, db_template):
+        self.calls += 1
+        raise self._exc
+
+
+class _FailOnNthSandbox(sup.SandboxDb):
+    """Succeeds until the ``fail_on``-th recreate, then raises (pre-retry failure)."""
+
+    def __init__(self, fail_on):
+        self._fail_on = fail_on
+        self.calls = 0
+
+    def recreate_from_template(self, db, db_template):
+        self.calls += 1
+        if self.calls == self._fail_on:
+            raise subprocess.CalledProcessError(1, ["createdb"])
+
+
+def test_run_cleanup_failure_is_unknown_not_raise():
+    crit = _crit("sq", ctype=sup.OracleType.SQL, spec="select 0", expect="0")
+    sandbox = _RaisingSandbox(subprocess.CalledProcessError(1, ["dropdb"]))
+    runner = sup.OracleRunner(
+        _oracle([crit], runtime=_sql_runtime()),
+        executor=_ScriptedExecutor({"sq": sup.RawExecution(stdout="0")}),
+        sandbox_db=sandbox,
+    )
+    res = runner.run(sup.OracleScope.AFFECTED)  # must NOT raise
+    assert res.outcome is sup.OracleOutcome.UNKNOWN
+    assert res.criteria[0].id == _CLEANUP_FAILURE_ID
+    # an UNKNOWN run escalates — the frozen S0 projection refuses it (no oracle_UNKNOWN)
+    with pytest.raises(SchemaError, match="UNKNOWN"):
+        res.to_oracle_checked("n")
+
+
+def test_run_cleanup_livedberror_is_unknown_and_names_cause():
+    crit = _crit("sq", ctype=sup.OracleType.SQL, spec="select 0", expect="0")
+    sandbox = _RaisingSandbox(sup.LiveDbError("refusing to drop-recreate a Live database: 'erp'"))
+    runner = sup.OracleRunner(
+        _oracle([crit], runtime=_sql_runtime()),
+        executor=_ScriptedExecutor({"sq": sup.RawExecution(stdout="0")}),
+        sandbox_db=sandbox,
+    )
+    res = runner.run(sup.OracleScope.AFFECTED)
+    assert res.outcome is sup.OracleOutcome.UNKNOWN
+    assert "LiveDbError" in res.criteria[0].detail and "Live database" in res.criteria[0].detail
+
+
+def test_milestone_cleanup_failure_keeps_milestone_attribution():
+    crit = _crit(
+        "m",
+        scope=sup.OracleScope.MILESTONE,
+        milestone="after-n2",
+        ctype=sup.OracleType.SQL,
+        spec="select 0",
+        expect="0",
+    )
+    sandbox = _RaisingSandbox(OSError("dropdb binary missing"))
+    runner = sup.OracleRunner(
+        _oracle([crit], runtime=_sql_runtime()),
+        executor=_ScriptedExecutor({"m": sup.RawExecution(stdout="0")}),
+        sandbox_db=sandbox,
+    )
+    res = runner.run(sup.OracleScope.MILESTONE, milestone="after-n2")
+    assert res.outcome is sup.OracleOutcome.UNKNOWN
+    assert res.milestone == "after-n2"  # the UNKNOWN is still attributed to the gate
+
+
+def test_retry_cleanup_failure_makes_criterion_unknown():
+    # run-level cleanup ok (call 1); the first attempt is RED; the pre-retry cleanup
+    # (call 2) fails → the criterion is UNKNOWN, not retried onto an unreset DB.
+    crit = _crit("sq", ctype=sup.OracleType.SQL, spec="select 0", expect="0", flaky=1)
+    sandbox = _FailOnNthSandbox(fail_on=2)
+    runner = sup.OracleRunner(
+        _oracle([crit], runtime=_sql_runtime()),
+        executor=_ScriptedExecutor(
+            {"sq": [sup.RawExecution(stdout="9"), sup.RawExecution(stdout="0")]}
+        ),
+        sandbox_db=sandbox,
+    )
+    res = runner.run(sup.OracleScope.AFFECTED)
+    assert res.outcome is sup.OracleOutcome.UNKNOWN
+    assert res.criteria[0].attempts == 2
+    assert "cleanup before retry" in res.criteria[0].detail
+
+
+# --- P1-5: DB-bearing test/cmd also trigger cleanup + retry rebuild -----------
+
+
+def test_db_bearing_test_criterion_triggers_cleanup():
+    # a DB-bearing runtime + a TEST criterion (runs as a shell command that can hit
+    # the DB) MUST reset the schema first, even though no criterion is type=SQL.
+    crit = _crit("t", ctype=sup.OracleType.TEST, expect="0")
+    sandbox = _RecordingSandbox()
+    runner = sup.OracleRunner(
+        _oracle([crit], runtime=_sql_runtime()),
+        executor=_ScriptedExecutor({"t": sup.RawExecution(exit_code=0)}),
+        sandbox_db=sandbox,
+    )
+    runner.run(sup.OracleScope.AFFECTED)
+    assert sandbox.calls == [("sandbox:erp_test", "erp_baseline")]
+
+
+def test_db_bearing_cmd_flaky_retry_recreates_db():
+    crit = _crit("c", ctype=sup.OracleType.CMD, expect="0", flaky=1)
+    sandbox = _RecordingSandbox()
+    runner = sup.OracleRunner(
+        _oracle([crit], runtime=_sql_runtime()),
+        executor=_ScriptedExecutor(
+            {"c": [sup.RawExecution(exit_code=1), sup.RawExecution(exit_code=0)]}
+        ),
+        sandbox_db=sandbox,
+    )
+    res = runner.run(sup.OracleScope.AFFECTED)
+    assert res.outcome is sup.OracleOutcome.GREEN
+    assert res.criteria[0].attempts == 2
+    assert len(sandbox.calls) == 2  # run-level + pre-retry, even for a cmd criterion
+
+
+def test_empty_scope_skips_cleanup_even_when_db_bearing():
+    # a DB-bearing runtime but the requested scope matches no criteria → nothing runs,
+    # so no surprise DB I/O (the recreate is skipped).
+    crit = _crit(
+        "m",
+        scope=sup.OracleScope.MILESTONE,
+        milestone="x",
+        ctype=sup.OracleType.SQL,
+        spec="select 0",
+        expect="0",
+    )
+    sandbox = _RecordingSandbox()
+    runner = sup.OracleRunner(
+        _oracle([crit], runtime=_sql_runtime()),
+        executor=_ScriptedExecutor({"m": sup.RawExecution(stdout="0")}),
+        sandbox_db=sandbox,
+    )
+    res = runner.run(sup.OracleScope.FINAL)  # no FINAL criteria
+    assert res.outcome is sup.OracleOutcome.GREEN  # vacuous
+    assert sandbox.calls == []

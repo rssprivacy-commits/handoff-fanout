@@ -36,11 +36,19 @@ tests never touch a real subprocess or DB:
   :class:`PsqlSandboxDb`), which clears schema pollution between runs so a half-
   migrated DB can never deadlock a retry (design §4.4 / §9, Round-2 red line).
 
-🔴 **C′ red line** (design §7 / §11): the runner is hermetic and never touches Live
-— :class:`PsqlSandboxDb` *refuses* to drop-recreate a database in
-:data:`LIVE_DB_DENYLIST` (or one equal to its own template). Honesty: ``network``
-denial is a *soft* control on a single machine (an env sentinel, design §7 "单机非
-硬沙箱"); output truncation here is not yet secret-redaction (that is slice S6).
+🔴 **C′ red line** (design §7 / §11): the runner is hermetic and must never touch
+Live. The soft-isolation layer (s1-fix hardening): every subprocess (shell / sql /
+``dropdb`` / ``createdb``) runs under a **sanitized allowlist env** with no host
+``PG*`` / ``DATABASE_URL`` / cloud creds and a sandbox ``HOME``
+(:func:`_sanitized_base_env`); :class:`PsqlSandboxDb` *refuses* a drop target that is
+not a plain identifier (:data:`_SAFE_DB_NAME` — no ``--host=`` / ``service=`` / flag
+injection), is on :data:`LIVE_DB_DENYLIST`, lacks the sandbox marker, or equals its
+template, and passes names after a ``--`` argv terminator. Honesty (design §7 "单机非
+硬沙箱"): this is the *soft* layer — it stops a *misconfigured / poisoned env* from
+reaching Live, but ``network=deny`` is an advisory sentinel (no enforced egress
+block) and a same-user ``shell=True`` spec can still read absolute paths / the
+network. Hard isolation (OS user / container / seccomp) is the §7 防恶意层, **not
+promised this slice**. Output truncation here is not yet secret-redaction (slice S6).
 
 The authoritative design is ``project-files/handoff/supervisor-orchestration-
 design.md`` (ERP repo) §4.4 / §12. Emitting :meth:`~OracleRunResult.to_oracle_checked`
@@ -54,7 +62,10 @@ import abc
 import dataclasses
 import enum
 import os
+import re
 import subprocess
+import tempfile
+from collections.abc import Mapping
 
 from ._base import Contract, SchemaError
 from .oracle import (
@@ -73,9 +84,65 @@ from .payloads import OracleChecked
 #: that is slice S6).
 _OUTPUT_MAX = 500
 
+#: Reserved criterion id for the synthetic UNKNOWN produced when sandbox DB cleanup
+#: fails (infra failure / C′ guard refusal → escalate, never a defect — s1-fix P1).
+#: The dunder marks it runner-internal, distinct from any owner-authored id.
+_CLEANUP_FAILURE_ID = "__sandbox_cleanup__"
+
 #: Severities that *gate* a node (mirrors the Verdict: P0/P1 are the redline). Lower
 #: severities are recorded but advisory.
 _REDLINE = (Severity.P0, Severity.P1)
+
+
+# --- C′ red line: sanitized subprocess env + strict sandbox-db naming ---------
+# (design §7 two-layer honesty: this is the *soft* default layer — env hygiene +
+# arg-injection-proof db ops + a fail-closed name guard. It shrinks the blast radius
+# of a poisoned oracle/runtime on a single same-user machine; it is NOT a hard
+# sandbox against a determined local attacker — that is the §7 防恶意层 / OS-level
+# isolation (independent user, read-only mount, container), explicitly *not promised*
+# this slice. The honesty is load-bearing: do not read "sanitized env + name guard"
+# as "cannot touch Live under any circumstance".)
+
+#: The ONLY host env vars any oracle subprocess (shell / sql / dropdb / createdb)
+#: inherits. A *closed* allowlist — nothing else from ``os.environ`` ever reaches a
+#: subprocess, so a worker-poisoned runtime / ``shell=True`` spec cannot read the
+#: supervisor's ``PG*`` / ``DATABASE_URL`` / ``AWS_*`` / cloud tokens and punch
+#: through the soft sandbox to Live data or creds (C′; R2 consensus gemini P0 + codex
+#: P2-5, extended by the s1-fix audit to cover ``dropdb``/``createdb`` too, which
+#: previously inherited the full host env). ``HOME`` is intentionally absent: it is
+#: set explicitly per call site to a sandbox path so a ``shell=True`` spec / libpq
+#: cannot reach ``~/.aws`` / ``~/.ssh`` / ``~/.pgpass`` / ``~/.pg_service.conf`` under
+#: the real home (s1-fix codex P0-3 / gemini P1 blast-radius shrink).
+_HOST_ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "TMPDIR", "TZ", "SHELL")
+
+
+def _sanitized_base_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The sanitized env shared by *every* oracle subprocess (C′).
+
+    Built from the closed :data:`_HOST_ENV_ALLOWLIST` (never the full
+    ``os.environ``), then overlaid with the supervisor-provided sandbox knobs
+    (``extra`` — e.g. a sandbox-only ``PGHOST`` / ``PGUSER`` / ``PGPASSWORD`` /
+    ``PGPASSFILE``). Those knobs come from the *trusted construction site* (whoever
+    builds the runner / executor / sandbox), **never** from the worker-controllable
+    oracle artefact — so a poisoned ``oracle.json`` / ``runtime`` cannot redirect a
+    subprocess to a Live server. ``HOME`` is deliberately absent (set per call site
+    to a sandbox path, never the real home)."""
+    env = {k: os.environ[k] for k in _HOST_ENV_ALLOWLIST if k in os.environ}
+    if extra:
+        env.update({str(k): str(v) for k, v in extra.items()})
+    return env
+
+
+#: A ``dropdb`` / ``createdb`` target (or template) must match this — a *plain*
+#: database identifier: a leading letter / digit / underscore (never ``-`` / ``=`` /
+#: a flag) followed only by ``[A-Za-z0-9_.:-]``. This refuses option injection
+#: (``--host=sandbox``, ``-h``), libpq conninfo forms (``service=...`` /
+#: ``host=... port=...``), and any ``=``- or whitespace-bearing string *before* the
+#: ``--`` argv terminator even applies — so a forged ``runtime.db`` can never be
+#: parsed as an option and drop the wrong DB (s1-fix: codex P0/#2 + gemini P0). ``:``
+#: stays allowed (the design's own ``sandbox:erp_test`` label); URI / path shapes are
+#: caught separately by :data:`_CONNSTRING_CHARS` for a clearer message.
+_SAFE_DB_NAME = re.compile(r"\A[A-Za-z0-9_][A-Za-z0-9_.:-]*\Z")
 
 
 class OracleOutcome(enum.StrEnum):
@@ -280,14 +347,25 @@ class OracleRunner:
 
     def run(self, scope: OracleScope, milestone: str | None = None) -> OracleRunResult:
         """Run every criterion of ``scope`` (filtered to ``milestone`` when given for
-        the MILESTONE scope) and return the aggregated result."""
+        the MILESTONE scope) and return the aggregated result.
+
+        A failure to *prepare* the run (sandbox DB cleanup raising — an infra failure,
+        or the C′ guard refusing a Live DB) is **never** a defect: it yields an
+        UNKNOWN run that escalates to a human, exactly like a per-criterion
+        could-not-evaluate (s1-fix codex/gemini P1; design §4.4 / §9). It is caught,
+        not re-raised, so a dirty / unreachable / mis-pointed sandbox DB cannot crash
+        the pure-script supervisor turn (§13).
+        """
         if scope is OracleScope.MILESTONE and milestone is None:
             raise SchemaError(
                 "OracleRunner.run(MILESTONE) requires a `milestone` id — a milestone "
                 "gate is attributable to exactly one milestone (design §4.4)"
             )
         selected = [c for c in self._oracle.criteria if self._matches(c, scope, milestone)]
-        self._cleanup_if_needed(selected)
+        try:
+            self._cleanup_if_needed(selected)
+        except (LiveDbError, subprocess.SubprocessError, OSError) as exc:
+            return self._cleanup_failure_result(scope, milestone, exc)
         results = [self.run_criterion(c) for c in selected]
         return OracleRunResult(
             oracle_version=self._oracle.oracle_version,
@@ -307,14 +385,26 @@ class OracleRunner:
         detail = ""
         while attempts < max_attempts:
             attempts += 1
-            # R2 gemini P2: a SQL retry must not run on the DB the failed attempt
-            # dirtied — that reproduces the §9 schema-pollution deadlock at the
-            # micro-retry level. The first attempt rides the run-level cleanup; a
-            # retry (attempt>1) recreates first. (Caveat: this resets DB state, so
-            # flaky_retries on SQL criteria that *chain* shared state is unsupported
-            # — each retry starts from the clean template.)
-            if attempts > 1 and criterion.type is OracleType.SQL:
-                self._cleanup_if_needed([criterion])
+            # R2 gemini P2 + s1-fix gemini P1: a retry must not run on the DB the
+            # failed attempt dirtied — that reproduces the §9 schema-pollution
+            # deadlock at the micro-retry level. The first attempt rides the run-level
+            # cleanup; a retry (attempt>1) recreates first. The rebuild is gated on
+            # the runtime being DB-bearing (inside ``_cleanup_if_needed``), NOT on the
+            # criterion type: a ``test`` / ``cmd`` is run as a shell command and can
+            # equally hit the DB (an integration test, a migration), so gating on
+            # ``OracleType.SQL`` left those retries running on a polluted DB. (Caveat:
+            # each retry restarts from the clean template, so flaky_retries on criteria
+            # that *chain* shared DB state is unsupported.) A cleanup that itself fails
+            # is an infra failure → UNKNOWN, never RED: don't retry onto a DB we could
+            # not reset (s1-fix P1; same escalate-not-autofix rule as the run level).
+            if attempts > 1:
+                try:
+                    self._cleanup_if_needed([criterion])
+                except (LiveDbError, subprocess.SubprocessError, OSError) as exc:
+                    outcome = OracleOutcome.UNKNOWN
+                    actual = ""
+                    detail = f"sandbox DB cleanup before retry {attempts} failed: {exc}"
+                    break
             raw = self._executor.execute(criterion, self._oracle.runtime)
             outcome, actual, detail = _decide(criterion, raw)
             if outcome is OracleOutcome.GREEN:
@@ -332,18 +422,61 @@ class OracleRunner:
         )
 
     def _cleanup_if_needed(self, selected: list[OracleCriterion]) -> None:
+        """Recreate the sandbox DB from its template before running ``selected`` when
+        the runtime is DB-bearing with drop-recreate cleanup.
+
+        s1-fix gemini/codex P1: the trigger is a **DB-bearing runtime**
+        (``cleanup=drop-recreate`` + ``db`` + ``db_template``), NOT "a SQL criterion
+        is present". A ``test`` / ``cmd`` criterion is run as a shell command and can
+        equally hit the DB (an integration test, a migration), so gating the recreate
+        on ``OracleType.SQL`` left those paths running on a DB a previous run polluted
+        and deadlocking a retry (§9 red line). An empty selection touches nothing, so
+        it skips the recreate — no point dropping a DB no criterion will use (and it
+        keeps a no-criteria scope from doing surprise DB I/O)."""
+        if not selected:
+            return
         runtime = self._oracle.runtime
-        has_sql = any(c.type is OracleType.SQL for c in selected)
         if (
-            has_sql
-            and runtime.cleanup is CleanupPolicy.DROP_RECREATE_FROM_TEMPLATE
+            runtime.cleanup is CleanupPolicy.DROP_RECREATE_FROM_TEMPLATE
             and runtime.db
             and runtime.db_template
         ):
-            # Recreate once before the SQL criteria so they share a clean schema
-            # state (criteria within a run intentionally share the DB; pollution
-            # from a *previous* run is what deadlocks a retry — design §9).
+            # Recreate once before the criteria so they share a clean schema state
+            # (criteria within a run intentionally share the DB; pollution from a
+            # *previous* run is what deadlocks a retry — design §9).
             self._sandbox_db.recreate_from_template(runtime.db, runtime.db_template)
+
+    def _cleanup_failure_result(
+        self, scope: OracleScope, milestone: str | None, exc: BaseException
+    ) -> OracleRunResult:
+        """Project an infra failure to *prepare* a run (sandbox cleanup raised) as a
+        whole-run **UNKNOWN** (s1-fix P1; never a defect — design §4.4 / §9).
+
+        Modelled as a single P0 synthetic criterion (id :data:`_CLEANUP_FAILURE_ID`)
+        so the rich result is self-consistent — ``aggregate_outcome`` derives UNKNOWN,
+        and :meth:`OracleRunResult.to_oracle_checked` *refuses* it (an UNKNOWN
+        escalates / ``NodeReason``, it does not spawn a Fixer; ``FixerTrigger`` has no
+        ``oracle_UNKNOWN``). The ``detail`` names the cause — including a C′
+        ``LiveDbError`` guard refusal — so the escalation surfaces *why* loudly to the
+        owner instead of being swallowed."""
+        crit = CriterionResult(
+            id=_CLEANUP_FAILURE_ID,
+            scope=scope,
+            type=OracleType.SQL,
+            severity=Severity.P0,
+            outcome=OracleOutcome.UNKNOWN,
+            attempts=1,
+            expect="sandbox DB recreated from template (clean state)",
+            actual="sandbox DB cleanup failed — run could not be prepared",
+            detail=f"{type(exc).__name__}: {exc}"[:_OUTPUT_MAX],
+        )
+        return OracleRunResult(
+            oracle_version=self._oracle.oracle_version,
+            scope=scope,
+            outcome=OracleOutcome.UNKNOWN,
+            criteria=[crit],
+            milestone=milestone if scope is OracleScope.MILESTONE else None,
+        )
 
     @staticmethod
     def _matches(c: OracleCriterion, scope: OracleScope, milestone: str | None) -> bool:
@@ -426,13 +559,37 @@ class SubprocessExecutor(CriterionExecutor):
     ``psql``, inside the oracle's hermetic runtime (cwd / venv / timeout / seeded /
     network-deny env sentinel).
 
-    The criterion ``spec`` is run with ``shell=True``. That is safe because the
-    oracle is an owner-approved, write-protected artefact (the §7 threat is a worker
-    poisoning the *environment*, not the oracle spec itself). Crucially the env is
-    built from an **allowlist** (:data:`_ENV_ALLOWLIST`), never inherited from the
-    host — so the oracle spec can't read ``DATABASE_URL`` / ``PG*`` / cloud creds and
-    punch through the soft sandbox (R2 consensus gemini P0 + codex P2-5 / C′).
+    The criterion ``spec`` is run with ``shell=True``. That is safe *only* in the
+    soft-isolation sense of design §7: the oracle is an owner-approved, write-
+    protected artefact (the §7 threat is a worker poisoning the *environment*, not
+    the oracle spec). Crucially the env is built from a **closed allowlist**
+    (:data:`_HOST_ENV_ALLOWLIST` via :func:`_sanitized_base_env`), never inherited
+    from the host — so the spec can't read ``DATABASE_URL`` / ``PG*`` / cloud creds
+    and punch through to Live (R2 gemini P0 + codex P2-5 / C′). ``HOME`` is pinned to
+    the sandbox ``cwd`` so ``~/.aws`` / ``~/.ssh`` / ``~/.pgpass`` resolve into the
+    disposable worktree, not the real home (s1-fix codex P0-3 blast-radius shrink).
+
+    🔴 §7 honesty (do not over-read): this is the *soft* layer. On a single same-user
+    machine a ``shell=True`` spec still has the user's uid — it can reach the network
+    (``HANDOFF_ORACLE_NETWORK=deny`` is an advisory env sentinel, not an enforced
+    egress block) and any file the user can read by absolute path. Hard isolation
+    (network namespace / seccomp / container / independent OS user) is the §7 防恶意层
+    and is **not promised this slice**. The env allowlist + sandbox ``HOME`` shrink the
+    blast radius of a *poisoned environment*; they are not a jail.
+
+    Sandbox connection knobs (a sandbox-only ``PGHOST`` / ``PGUSER`` / ``PGPASSWORD``
+    / ``PGPASSFILE`` for the ``psql`` path) are passed at construction via
+    ``sandbox_env`` — i.e. by the *trusted supervisor*, never carried on the worker-
+    controllable oracle runtime — and are the only ``PG*`` an oracle subprocess sees.
     """
+
+    def __init__(self, *, sandbox_env: Mapping[str, str] | None = None) -> None:
+        # Supervisor-provided sandbox knobs (e.g. sandbox-only PGHOST/PGUSER/
+        # PGPASSWORD). Trusted construction-site input — NOT from the worker-
+        # controllable oracle artefact — so a poisoned oracle.json can never redirect
+        # psql to a Live server. Empty by default: with no explicit PG*, libpq uses
+        # local defaults (unix socket / current user), the fail-closed sandbox posture.
+        self._sandbox_env = dict(sandbox_env or {})
 
     def execute(self, criterion: OracleCriterion, runtime: OracleRuntime) -> RawExecution:
         if criterion.type is OracleType.SQL:
@@ -461,7 +618,20 @@ class SubprocessExecutor(CriterionExecutor):
     def _run_sql(self, criterion: OracleCriterion, runtime: OracleRuntime) -> RawExecution:
         if not runtime.db:
             return RawExecution(error="SQL criterion but runtime.db is unset")
-        cmd = ["psql", "-d", runtime.db, "-tAX", "-c", criterion.spec]
+        # s1-fix codex #3 defense-in-depth: ``psql -d <db>`` accepts a libpq *conninfo*
+        # as well as a plain name, so a runtime.db like ``service=prod`` / ``host=live
+        # dbname=erp`` would connect somewhere other than the sandbox. runtime.db is
+        # owner-locked (INV-5, re-checked at the runner boundary), but reject a
+        # non-plain target anyway → could-not-evaluate (UNKNOWN), never a silent Live
+        # connect. ``-w`` forbids an interactive password prompt (a hermetic oracle
+        # must never block on stdin; with PG* sanitized out, a prompt would otherwise
+        # hang until timeout).
+        if not _SAFE_DB_NAME.match(runtime.db):
+            return RawExecution(
+                error=f"refusing a non-plain runtime.db for psql -d (conninfo / option "
+                f"injection): {runtime.db!r}"
+            )
+        cmd = ["psql", "-w", "-d", runtime.db, "-tAX", "-c", criterion.spec]
         try:
             proc = subprocess.run(
                 cmd,
@@ -481,20 +651,18 @@ class SubprocessExecutor(CriterionExecutor):
             )
         return RawExecution(exit_code=0, stdout=proc.stdout or "", stderr=proc.stderr or "")
 
-    #: The ONLY host env vars an oracle inherits. R2 consensus (gemini P0 + codex
-    #: P2-5): inheriting the supervisor's full ``os.environ`` would hand a
-    #: ``shell=True`` oracle spec ``DATABASE_URL`` / ``PG*`` / ``AWS_*`` / cloud
-    #: tokens — punching straight through the soft sandbox to Live data / creds (the
-    #: C′ red line). So the env is built from an allowlist, never inherited: the
-    #: oracle gets a clean shell + only its own ``HANDOFF_ORACLE_*`` knobs. Anything
-    #: a sandbox legitimately needs (e.g. a sandbox-only ``PGHOST``/``PGUSER``) must
-    #: be set explicitly on the runtime, never leaked from the host.
-    _ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "TZ", "SHELL")
-
-    @classmethod
-    def _build_env(cls, runtime: OracleRuntime) -> dict[str, str]:
-        env = {k: os.environ[k] for k in cls._ENV_ALLOWLIST if k in os.environ}
-        # Soft network control (design §7: single machine is not a hard sandbox).
+    def _build_env(self, runtime: OracleRuntime) -> dict[str, str]:
+        # Closed host allowlist + the trusted sandbox knobs (never the host's PG* /
+        # cloud creds — C′, see _sanitized_base_env / _HOST_ENV_ALLOWLIST).
+        env = _sanitized_base_env(self._sandbox_env)
+        # HOME → the sandbox worktree, NOT the host home: a shell=True spec resolving
+        # ``~/.aws`` / ``~/.ssh`` / ``~/.pgpass`` / ``~/.pg_service.conf`` lands inside
+        # the disposable worktree, not the user's real credential files (s1-fix codex
+        # P0-3). §7 honesty: soft on a single same-user machine — the spec can still
+        # read those files by absolute path; this only closes the ``~`` shortcut.
+        env["HOME"] = runtime.cwd
+        # Soft network control (design §7: single machine is not a hard sandbox — this
+        # is an advisory sentinel a cooperating spec may read, not an enforced block).
         env["HANDOFF_ORACLE_NETWORK"] = runtime.network.value
         env["HANDOFF_ORACLE_FIXTURE_VERSION"] = str(runtime.fixture_version)
         if runtime.seed is not None:
@@ -543,8 +711,14 @@ class PsqlSandboxDb(SandboxDb):
     """Default sandbox DB cleanup via ``dropdb``/``createdb --template`` — guarded so
     it can never touch a Live database (C′ red line, design §7 / §11).
 
-    Two layers, fail-closed (R2 hardening, both brains):
+    Layers, fail-closed (R2 + s1-fix hardening, both brains):
 
+    * **strict name shape** — ``db`` and ``db_template`` must be *plain* identifiers
+      (:data:`_SAFE_DB_NAME`): a leading letter/digit/underscore then only
+      ``[A-Za-z0-9_.:-]``. This refuses ``--host=sandbox`` / ``service=prod`` /
+      leading-``-`` / ``=``-bearing strings that would otherwise be parsed by
+      dropdb/createdb as an *option* or a libpq *conninfo* and hit a DB the guard
+      never checked (s1-fix codex #2 + gemini P0).
     * **positive allowlist** — the drop *target* (``db``) must contain
       ``sandbox_marker`` (normalized, default ``"sandbox"``). An un-marked name is
       refused, so the guard is project-agnostic instead of relying on an ERP-specific
@@ -552,11 +726,18 @@ class PsqlSandboxDb(SandboxDb):
     * **denylist + normalization** — defense-in-depth: known live names (normalized:
       stripped + casefolded, so ``"ERP"`` / ``" erp "`` are caught) and
       connection-string-shaped inputs are refused for both db and template.
+    * **arg-injection-proof exec** — ``dropdb``/``createdb`` get the name *after* a
+      ``--`` argv terminator and a **sanitized env** (no host ``PG*`` / cloud creds —
+      the previous code passed no ``env=`` and inherited them all). The sandbox PG*
+      is injected at construction (``env=``) by the trusted supervisor, never the
+      host (s1-fix codex #2 + gemini P1).
 
     The marker requirement is on the *drop target* only; the template is read by
-    ``createdb`` (never dropped), so it just has to pass the denylist + char checks.
-    Honesty (design §7): this is a soft, single-machine guard against mistakes/drift,
-    not a hard sandbox against a determined local attacker.
+    ``createdb`` (never dropped), so it just has to pass the name + denylist checks.
+    🔴 Honesty (design §7): this is a *soft*, single-machine guard against mistakes /
+    drift / a poisoned env, **not** a hard sandbox against a determined same-user
+    local attacker (that is the §7 防恶意层 — OS user isolation / container — not
+    promised this slice). Do not read these layers as "cannot ever touch Live".
     """
 
     def __init__(
@@ -565,11 +746,27 @@ class PsqlSandboxDb(SandboxDb):
         denylist: frozenset[str] = LIVE_DB_DENYLIST,
         extra_denied: tuple[str, ...] = (),
         sandbox_marker: str = DEFAULT_SANDBOX_MARKER,
+        env: Mapping[str, str] | None = None,
     ):
         self._denied = {self._normalize(d) for d in (set(denylist) | set(extra_denied))}
         self._marker = self._normalize(sandbox_marker)
         if not self._marker:
             raise LiveDbError("PsqlSandboxDb sandbox_marker must be non-empty (fail-closed)")
+        # dropdb/createdb must NOT inherit the host's PG* / cloud creds. s1-fix codex
+        # #2 + gemini P1: the previous code passed no ``env=`` at all, so a host
+        # ``PGHOST`` / ``PGPASSWORD`` / ``DATABASE_URL`` pointing at Live made these
+        # drop/create on the *Live* server — destroying a real DB on a mere
+        # misconfiguration, no attacker needed. Same sanitized env as the executor;
+        # any sandbox-only PG* is injected explicitly here by the trusted construction
+        # site (it must agree with the executor's ``sandbox_env`` so SQL criteria and
+        # cleanup hit the same sandbox server).
+        self._env = _sanitized_base_env(env)
+        # HOME → a tmp dir (never the real home) so libpq cannot read the real
+        # ``~/.pgpass`` / ``~/.pg_service.conf`` and auto-redirect dropdb/createdb. §7
+        # honesty: soft — with HOME *unset* libpq falls back to getpwuid → the real
+        # home, so pinning it is the hardening; a sandbox pgpass is supplied via an
+        # explicit ``PGPASSFILE`` in ``env``, never ambiently.
+        self._env.setdefault("HOME", tempfile.gettempdir())
 
     @staticmethod
     def _normalize(name: str) -> str:
@@ -577,9 +774,25 @@ class PsqlSandboxDb(SandboxDb):
 
     def recreate_from_template(self, db: str, db_template: str) -> None:
         self._guard(db, db_template)
-        subprocess.run(["dropdb", "--if-exists", db], check=True, capture_output=True, text=True)
+        # ``--`` terminates option parsing so a name that somehow passed the guard can
+        # never be read as a flag (defense in depth behind the strict name guard —
+        # s1-fix gemini P0 ``--host=`` injection). ``env=self._env`` keeps host Live
+        # creds out (codex #2). ``check=True`` raises on failure; the caller
+        # (:meth:`OracleRunner.run`) turns that into an UNKNOWN escalation (s1-fix P1),
+        # never a crash.
         subprocess.run(
-            ["createdb", db, "--template", db_template], check=True, capture_output=True, text=True
+            ["dropdb", "--if-exists", "--", db],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=self._env,
+        )
+        subprocess.run(
+            ["createdb", "--template", db_template, "--", db],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=self._env,
         )
 
     def _guard(self, db: str, db_template: str) -> None:
@@ -595,6 +808,20 @@ class PsqlSandboxDb(SandboxDb):
                 raise LiveDbError(
                     f"refusing a {label} that looks like a connection string / path "
                     f"(unsafe chars): {raw!r}"
+                )
+            # s1-fix codex #2 + gemini P0: a name that is not a *plain* identifier can
+            # be parsed by dropdb/createdb as an option or a libpq conninfo, dropping a
+            # DB other than the one the guard checked (e.g. ``--host=sandbox`` →
+            # ``--host`` + default DB; ``service=prod`` → a Live conninfo). The marker
+            # check would pass (the string still *contains* "sandbox"), so the strict
+            # shape check is the real defense — the ``--`` terminator is belt-and-
+            # suspenders on top. Refuses a leading ``-``, any ``=``, and anything
+            # outside ``[A-Za-z0-9_.:-]`` after the first char.
+            if not _SAFE_DB_NAME.match(raw):
+                raise LiveDbError(
+                    f"refusing a {label} that is not a plain database name "
+                    f"(option / conninfo injection — a leading '-', an '=', or "
+                    f"'--host='/'service=' shapes): {raw!r}"
                 )
         # Denylist (normalized) — defense-in-depth behind the allowlist.
         if nd in self._denied:
