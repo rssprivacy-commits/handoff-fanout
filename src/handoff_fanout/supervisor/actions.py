@@ -22,6 +22,7 @@ import dataclasses
 import enum
 
 from ._base import Contract, SchemaError
+from .events import Provenance
 
 
 class SideEffectKind(enum.StrEnum):
@@ -41,10 +42,12 @@ class SideEffect(Contract):
     """A non-pure effect a node may produce (design §4.5).
 
     ``compensation`` is how to undo it; ``needs_preauth`` flags an irreversible
-    effect that may not run without an :class:`Approval`. A SideEffect that is
-    neither sandboxed nor dry-run and has no compensation is, by construction, a
-    candidate for ``needs_preauth`` — but S0 only records the shape; the policy
-    that forces approval is S7.
+    effect that may not run without an :class:`Approval`. S0-fix P1-7 makes INV-6
+    a *schema-shape* fact: a SideEffect that is **neither sandboxed nor dry-run,
+    has no compensation, and does not require pre-auth** is an *unauthorized
+    irreversible* effect — it is rejected at construction (fail-closed), so the
+    shape can never even express "do an irreversible thing with no way back and no
+    approval".
     """
 
     kind: SideEffectKind
@@ -52,6 +55,22 @@ class SideEffect(Contract):
     dry_run: bool = False
     compensation: str | None = None
     needs_preauth: bool = False
+
+    def validate(self) -> None:
+        # INV-6: irreversible ⇒ compensable OR pre-authorized. A real (not
+        # sandboxed, not dry-run) effect with no compensation AND no pre-auth gate
+        # is exactly the unauthorized-irreversible combo the design forbids.
+        if (
+            not self.sandboxed
+            and not self.dry_run
+            and self.compensation is None
+            and not self.needs_preauth
+        ):
+            raise SchemaError(
+                "SideEffect is unauthorized-irreversible (INV-6): a non-sandboxed, "
+                "non-dry-run effect must have a `compensation` or set "
+                "`needs_preauth=True`"
+            )
 
 
 @dataclasses.dataclass
@@ -185,7 +204,9 @@ class DLQEntry(Contract):
     recommended: str
     worst_case: str
     options: list[str] = dataclasses.field(default_factory=list)
-    provenance: dict = dataclasses.field(default_factory=dict)
+    #: S0-fix P2-9: a typed :class:`Provenance` (was a bare untyped ``dict``), so
+    #: the DLQ entry's binding is recursively schema-validated, not free-form.
+    provenance: Provenance | None = None
 
     def validate(self) -> None:
         if not self.node:

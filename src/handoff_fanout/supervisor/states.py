@@ -49,13 +49,23 @@ dual-brain notes / S0 lesson; flagged because §5 is shorthand in places):
    (escalate human + alert). Consequently a Fixer is never spawned for UNKNOWN, so
    ``FixerTrigger`` (fixer.py) correctly has only VERDICT_RED / ORACLE_RED.
 
-5. **GAP-1/2/3 (surfaced, NOT silently fixed).** §5 / §6 imply behaviour the §4.2
-   contract cannot yet express; S0 records these in :data:`KNOWN_EVENT_GAPS`
-   rather than inventing events/edges. GAP-1: plan ``resume`` has no
-   ``global_resumed`` event. GAP-2: ``rolled_back`` has no defined node-state
-   effect (its *payload* is frozen, its transition is S7). GAP-3: a BLOCKED node
-   has no human-recovery-to-active edge (needs an override event in §4.2; S5).
-   Resolving any of these is a design-owner amendment, not an S0 fait accompli.
+5. **GAP-1/2/3 are now CLOSED (S0-fix, both brains: "surfacing a gap ≠ freezing
+   the contract").** The original S0 only *recorded* these in ``KNOWN_EVENT_GAPS``;
+   the S0-fix audit ruled they sit on S0's acceptance boundary (replay closure)
+   and froze them here. :data:`KNOWN_EVENT_GAPS` is now empty. The §4.2 event set
+   and the design doc §5 were amended to match.
+
+   * **GAP-1 (resume replay).** Added the ``global_resumed`` event (events.py) so
+     ``GLOBAL_PAUSED → RUNNING`` has a backing event. Without it a paused plan,
+     replayed from disk, deadlocks in GLOBAL_PAUSED forever (violating INV-3).
+   * **GAP-2 (rollback state effect).** ``rolled_back`` now drives a transition:
+     the rolled-back node returns to ``PENDING`` (re-do from base_ref); downstream
+     nodes become *derived-stale* (reconciliation #2) and re-validate via the
+     existing ``DONE → BLOCKED_BY_FIX`` edge — no separate cascade edges needed.
+   * **GAP-3 (human rescue).** Added the ``owner_override`` event + a
+     ``BLOCKED → {PENDING|DISPATCHED|AWAIT_APPROVAL}`` recovery edge (the legal
+     targets are the closed :class:`~handoff_fanout.supervisor.payloads.RecoveryTarget`
+     enum), so a DLQ'd node is no longer a dead node (INV-10 human-rescuable).
 
 This module defines the state machine + a closure self-check
 (:func:`validate_state_machine_closure`). It does NOT drive transitions — that is
@@ -69,6 +79,7 @@ import enum
 
 from ._base import SchemaError
 from .events import EventType
+from .payloads import RecoveryTarget
 
 
 class NodeState(enum.StrEnum):
@@ -237,6 +248,37 @@ _CORE_NODE_TRANSITIONS: tuple[Transition, ...] = (
     ),
 )
 
+# --- S0-fix GAP-2: rolled_back state effect (joint Git+DB rollback, §6.3) ------
+#: ``rolled_back`` undoes a *settled* node's committed work (git reset to base_ref
+#: + DB drop-recreate) and returns it to PENDING for re-do. Only settled states are
+#: rollback sources (in-flight DISPATCHED/AUDITING should be aborted/timed-out
+#: first). Downstream staleness is handled by the derived-stale DONE→BLOCKED_BY_FIX
+#: edge (reconciliation #2), so no extra cascade edges are needed.
+_ROLLBACK_TRANSITIONS: tuple[Transition, ...] = tuple(
+    Transition(
+        s,
+        NodeState.PENDING,
+        EventType.ROLLED_BACK,
+        "owner rollback-to: joint Git+DB rollback → redo from base_ref (§6.3)",
+    )
+    for s in (NodeState.DONE, NodeState.BLOCKED, NodeState.BLOCKED_BY_FIX)
+)
+
+# --- S0-fix GAP-3: owner override — human rescue of a BLOCKED (DLQ'd) node -----
+#: A human owner revives a BLOCKED node into one of the closed RecoveryTarget
+#: states (redo / force-run / re-gate). The `to` states are generated from the
+#: RecoveryTarget enum so the enum and the transition table can never drift
+#: (asserted by validate_state_machine_closure C8).
+_OWNER_OVERRIDE_TRANSITIONS: tuple[Transition, ...] = tuple(
+    Transition(
+        NodeState.BLOCKED,
+        NodeState(target.value),
+        EventType.OWNER_OVERRIDE,
+        f"owner override (handoff-cli): rescue BLOCKED node → {target.value} (INV-10)",
+    )
+    for target in sorted(RecoveryTarget, key=lambda x: x.value)
+)
+
 #: owner abort: every abortable state → CANCELLED (generated, not hand-listed).
 _ABORT_TRANSITIONS: tuple[Transition, ...] = tuple(
     Transition(s, NodeState.CANCELLED, EventType.NODE_CANCELLED, "owner abort cascade")
@@ -244,9 +286,16 @@ _ABORT_TRANSITIONS: tuple[Transition, ...] = tuple(
 )
 
 #: The full node-state transition table (§5). Frozen tuple = single source.
-NODE_TRANSITIONS: tuple[Transition, ...] = _CORE_NODE_TRANSITIONS + _ABORT_TRANSITIONS
+NODE_TRANSITIONS: tuple[Transition, ...] = (
+    _CORE_NODE_TRANSITIONS
+    + _ROLLBACK_TRANSITIONS
+    + _OWNER_OVERRIDE_TRANSITIONS
+    + _ABORT_TRANSITIONS
+)
 
-#: Plan-scoped transitions. GLOBAL_PAUSED → RUNNING has no backing event (GAP-1).
+#: Plan-scoped transitions. Both edges are now backed by an event (S0-fix GAP-1:
+#: GLOBAL_PAUSED → RUNNING is backed by ``global_resumed``, so a paused plan can be
+#: replayed back to RUNNING — INV-3).
 PLAN_TRANSITIONS: tuple[PlanTransition, ...] = (
     PlanTransition(
         PlanState.RUNNING,
@@ -257,8 +306,8 @@ PLAN_TRANSITIONS: tuple[PlanTransition, ...] = (
     PlanTransition(
         PlanState.GLOBAL_PAUSED,
         PlanState.RUNNING,
-        None,
-        "owner resume (GAP-1: no backing event in §4.2 22-event set)",
+        EventType.GLOBAL_RESUMED,
+        "owner/auto resume (S0-fix GAP-1: replayable resume event)",
     ),
 )
 
@@ -273,13 +322,16 @@ PLAN_LEVEL_EVENTS: frozenset[EventType] = frozenset(
         EventType.PLAN_CREATED,
         EventType.PLAN_AMENDED,
         EventType.GLOBAL_PAUSED,
+        EventType.GLOBAL_RESUMED,
         EventType.SNAPSHOT_TAKEN,
     }
 )
 
 #: Informational / sub-events recorded inside a node's lifecycle (audit/oracle
-#: sub-steps, fixer-internal, approval grant record, rollback/dlq/escalation
-#: records, context patches). They do not themselves move a node between states.
+#: sub-steps, fixer-internal, approval grant record, dlq/escalation records,
+#: context patches). They do not themselves move a node between states. NOTE:
+#: ``rolled_back`` was moved OUT of this group in the S0-fix — it now drives a
+#: node-state transition (GAP-2 closed), so it lives in NODE_STATE_EVENTS.
 INFORMATIONAL_EVENTS: frozenset[EventType] = frozenset(
     {
         EventType.AUDIT_STARTED,
@@ -289,7 +341,6 @@ INFORMATIONAL_EVENTS: frozenset[EventType] = frozenset(
         EventType.ESCALATED,
         EventType.APPROVAL_GRANTED,
         EventType.IRREVERSIBLE_EXECUTED,
-        EventType.ROLLED_BACK,
         EventType.DLQ_ENTERED,
     }
 )
@@ -297,56 +348,25 @@ INFORMATIONAL_EVENTS: frozenset[EventType] = frozenset(
 
 @dataclasses.dataclass(frozen=True)
 class EventGap:
-    """A §5 transition that lacks a backing event in the §4.2 22-event set.
+    """A §5 transition that lacks a backing event in the §4.2 event set.
 
     Surfaced, not silently fixed (design §12: S0 freezes the contract AND flags
-    where §4 / §5 disagree, so the owner resolves it via amendment)."""
+    where §4 / §5 disagree, so the owner resolves it via amendment). The S0-fix
+    kept this mechanism but resolved every gap, so the tuple below is now empty —
+    a future amendment that adds an unbacked transition would record it here."""
 
     where: str
     missing_event: str
     recommendation: str
 
 
-#: The surfaced §4↔§5 gaps — frozen + flagged, never silently fixed (design §12).
-#: Each is a place §5 / §6 implies behaviour the §4.2 contract cannot yet express;
-#: resolving them is a design-owner amendment, not an S0 fait accompli.
-KNOWN_EVENT_GAPS: tuple[EventGap, ...] = (
-    EventGap(
-        where="PlanState.GLOBAL_PAUSED -> PlanState.RUNNING (owner resume, §5)",
-        missing_event="global_resumed",
-        recommendation=(
-            "Add a `global_resumed` event to the §4.2 event set in a contract "
-            "amendment (or define resume as a `global_paused` payload toggle). "
-            "Until then PlanTransition.event is None for this edge."
-        ),
-    ),
-    # GAP-2 (R2 codex C-P1-6): rolled_back is in the event set, but §5 defines no
-    # node-state effect for it. §6.3's joint rollback resets a node to a base_ref +
-    # restores a DB snapshot — which node state results? S0 does not invent it.
-    EventGap(
-        where="rolled_back event (§4.2 / §6.3) has no defined node-state effect in §5",
-        missing_event="(state-effect of rolled_back, not a missing event name)",
-        recommendation=(
-            "Define rolled_back's deterministic reducer effect (which node state a "
-            "rolled-back node lands in, e.g. back to PENDING) in S7 (Git+DB joint "
-            "rollback). The RollbackRecord *payload* shape is frozen in payloads.py; "
-            "only its state transition is deferred."
-        ),
-    ),
-    # GAP-3 (R2 gemini G-P2-2): a BLOCKED node (in the DLQ) can only leave via
-    # owner abort → CANCELLED. §10's handoff-cli also offers resume / rollback-to,
-    # i.e. a human recovery back to an active state — but the §4.2 set has no
-    # human-override event for it. Surfaced for S5 (human-machine surface) / S7.
-    EventGap(
-        where="BLOCKED -> (active) human recovery edge (§10 handoff-cli resume/rollback-to)",
-        missing_event="escalation_resolved / owner_override_dispatch",
-        recommendation=(
-            "When C18 (handoff-cli, S5) lands, add an owner-override event + a "
-            "BLOCKED → DISPATCHED/PENDING recovery edge so a DLQ'd node can be "
-            "manually recovered. S0 keeps BLOCKED non-terminal only via abort."
-        ),
-    ),
-)
+#: The surfaced §4↔§5 gaps. **Empty** after the S0-fix: GAP-1 (resume),
+#: GAP-2 (rolled_back state effect), and GAP-3 (BLOCKED human recovery) were all
+#: closed by adding the ``global_resumed`` / ``owner_override`` events and the
+#: ``rolled_back`` / owner-override transitions (see the module docstring
+#: reconciliation #5). The closure check therefore now requires EVERY plan
+#: transition to carry a backing event (no documented-gap escape hatch in use).
+KNOWN_EVENT_GAPS: tuple[EventGap, ...] = ()
 
 
 def is_terminal(state: NodeState) -> bool:
@@ -385,7 +405,10 @@ def validate_state_machine_closure() -> None:
       C6 the event taxonomy partitions EventType exactly (disjoint + total) and
          NODE_STATE_EVENTS equals the events actually used in NODE_TRANSITIONS;
       C7 every plan transition endpoint is a real PlanState, and a plan
-         transition has a backing event unless it is a documented KNOWN gap.
+         transition has a backing event unless it is a documented KNOWN gap;
+      C8 (S0-fix GAP-3) every RecoveryTarget value is a real NodeState, and the
+         BLOCKED owner-override edges target EXACTLY the RecoveryTarget set (the
+         closed enum and the transition table cannot drift).
     """
     node_states = set(NodeState)
 
@@ -450,3 +473,21 @@ def validate_state_machine_closure() -> None:
                 )
         elif not isinstance(pt.event, EventType):
             raise SchemaError(f"C7 plan transition event not an EventType: {pt}")
+
+    # C8 (S0-fix GAP-3) — RecoveryTarget enum ↔ BLOCKED owner-override edges
+    state_values = {s.value for s in NodeState}
+    stray_targets = sorted({t.value for t in RecoveryTarget} - state_values)
+    if stray_targets:
+        raise SchemaError(f"C8 RecoveryTarget values are not all NodeStates: {stray_targets}")
+    override_targets = {
+        t.to
+        for t in NODE_TRANSITIONS
+        if t.frm is NodeState.BLOCKED and t.event is EventType.OWNER_OVERRIDE
+    }
+    expected_targets = {NodeState(t.value) for t in RecoveryTarget}
+    if override_targets != expected_targets:
+        raise SchemaError(
+            "C8 BLOCKED owner-override edges must target exactly the RecoveryTarget "
+            f"set: edges={sorted(s.value for s in override_targets)} "
+            f"expected={sorted(s.value for s in expected_targets)}"
+        )

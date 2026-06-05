@@ -68,15 +68,23 @@ class BindingTarget(enum.StrEnum):
 @dataclasses.dataclass
 class ProviderFindings(Contract):
     """Raw finding counts from one external brain. P0/P1 are the only severities
-    that drive the verdict (design §4.3 ``codex{status,p0,p1}``)."""
+    that drive the verdict (design §4.3 ``codex{status,p0,p1}``).
+
+    ``fingerprints`` (S0-fix P2-8) are optional per-finding identities (e.g. a hash
+    of ``file:line:rule``) so cross-provider P0/P1 de-duplication (§4.3) is
+    *auditable* — without finding ids the dedup count could not be verified."""
 
     status: ProviderStatus
     p0: int = 0
     p1: int = 0
+    fingerprints: list[str] = dataclasses.field(default_factory=list)
 
     def validate(self) -> None:
         if self.p0 < 0 or self.p1 < 0:
             raise SchemaError("ProviderFindings.p0/p1 must be >= 0")
+        dupes = sorted({f for f in self.fingerprints if self.fingerprints.count(f) > 1})
+        if dupes:
+            raise SchemaError(f"ProviderFindings.fingerprints has duplicates: {dupes}")
 
 
 @dataclasses.dataclass
@@ -101,6 +109,12 @@ class Verdict(Contract):
     binding_target: BindingTarget = BindingTarget.STAGED_DIFF_HASH
     degraded: bool = False
     attempts: int = 1
+    #: S0-fix P2-8: the cross-provider de-duplicated finding fingerprints that
+    #: drove this verdict (§4.3 "P0/P1 跨 provider 去重"). **Required (non-empty)
+    #: for a RED verdict** so the dedup is auditable; optional for GREEN/UNKNOWN
+    #: (no findings drove them). When non-empty it must be a dup-free subset of the
+    #: union of the two providers' fingerprints.
+    deduped_fingerprints: list[str] = dataclasses.field(default_factory=list)
 
     def _expected_verdict(self) -> VerdictValue:
         """The only verdict consistent with the findings (the frozen INV-2 rule)."""
@@ -127,6 +141,20 @@ class Verdict(Contract):
             )
         if self.attempts < 1:
             raise SchemaError("Verdict.attempts must be >= 1")
+        if self.deduped_fingerprints:
+            dupes = sorted(
+                {f for f in self.deduped_fingerprints if self.deduped_fingerprints.count(f) > 1}
+            )
+            if dupes:
+                raise SchemaError(f"Verdict.deduped_fingerprints has duplicates: {dupes}")
+            union = set(self.codex.fingerprints) | set(self.gemini.fingerprints)
+            stray = sorted(set(self.deduped_fingerprints) - union)
+            if stray:
+                raise SchemaError(
+                    "Verdict.deduped_fingerprints must be a subset of the union of "
+                    f"the two providers' fingerprints (stray: {stray}) — the dedup "
+                    "must trace to raw findings (INV-2 / §4.3)"
+                )
         expected = self._expected_verdict()
         if self.verdict is not expected:
             raise SchemaError(
@@ -135,4 +163,15 @@ class Verdict(Contract):
                 f"degraded={self.degraded}, "
                 f"codex={self.codex.status.value}/p0={self.codex.p0}/p1={self.codex.p1}, "
                 f"gemini={self.gemini.status.value}/p0={self.gemini.p0}/p1={self.gemini.p1}"
+            )
+        # S0-fix P2-8 (codex R2 escalation): a RED verdict MUST name the deduped
+        # findings that drove it — otherwise §4.3 cross-provider dedup is not
+        # auditable (a RED with zero finding ids cannot be verified). The subset
+        # check above then transitively requires the contributing providers to
+        # carry fingerprints.
+        if self.verdict is VerdictValue.RED and not self.deduped_fingerprints:
+            raise SchemaError(
+                "Verdict.verdict=RED requires non-empty deduped_fingerprints "
+                "(§4.3: the cross-provider P0/P1 dedup that drove RED must be "
+                "auditable to raw findings)"
             )

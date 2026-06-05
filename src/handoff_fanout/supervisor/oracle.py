@@ -60,8 +60,11 @@ class OracleRuntime(Contract):
     """The hermetic environment the oracle runs in (design §4.4 ``runtime``).
 
     ``network`` defaults to DENY and ``cleanup`` to drop-recreate-from-template:
-    the oracle is hermetic and never touches Live (design §C′). A criterion that
-    legitimately needs the network is a documented amendment, not a default.
+    the oracle is hermetic and never touches Live (design §C′ / §4.4 "network deny
+    / drop-recreate / 不碰 Live"). Relaxing isolation is **fail-closed** (S0-fix
+    P1-6, both brains): ``network=ALLOW`` or a DB-bearing ``cleanup=none`` is
+    rejected unless an explicit, owner-approved ``isolation_exemption`` reason is
+    set — non-isolation is never a silent default.
     """
 
     cwd: str
@@ -75,6 +78,10 @@ class OracleRuntime(Contract):
     time_freeze: str | None = None
     seed: int | None = None
     cleanup: CleanupPolicy = CleanupPolicy.DROP_RECREATE_FROM_TEMPLATE
+    #: Explicit owner-approved reason to relax isolation (network=allow or a
+    #: DB-bearing cleanup=none). Without it the relaxed config is rejected
+    #: (S0-fix P1-6: the §4.4 isolation red line is enforced, not advisory).
+    isolation_exemption: str | None = None
 
     def validate(self) -> None:
         if not self.cwd:
@@ -92,6 +99,26 @@ class OracleRuntime(Contract):
             raise SchemaError(
                 "OracleRuntime.cleanup=drop-recreate-from-template requires both "
                 "`db` and `db_template` (design §4.4 schema-pollution red line)"
+            )
+        # S0-fix P1-6: isolation is the default; a non-isolated runtime must carry
+        # an explicit, owner-approved exemption (fail-closed), faithfully bearing
+        # §4.4 "network deny / 不碰 Live".
+        if self.network is NetworkPolicy.ALLOW and not self.isolation_exemption:
+            raise SchemaError(
+                "OracleRuntime.network=allow requires a non-empty `isolation_exemption` "
+                "(S0-fix P1-6: the oracle is network-denied by default, §4.4 red line)"
+            )
+        # A DB-bearing runtime that does NOT drop-recreate leaks schema pollution
+        # across retries (the Round-2 deadlock). Allowed only with an exemption.
+        if (
+            self.db
+            and self.cleanup is not CleanupPolicy.DROP_RECREATE_FROM_TEMPLATE
+            and (not self.isolation_exemption)
+        ):
+            raise SchemaError(
+                "OracleRuntime declares a `db` but cleanup is not "
+                "drop-recreate-from-template and no `isolation_exemption` is set "
+                "(S0-fix P1-6: a DB-bearing oracle must reset schema between retries)"
             )
 
 

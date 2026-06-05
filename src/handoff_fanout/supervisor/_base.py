@@ -57,6 +57,26 @@ class SchemaError(ValueError):
     """
 
 
+def _assert_json_value(value: Any, *, field: str) -> None:
+    """Recursively assert ``value`` is a JSON primitive tree (str/int/float/bool/
+    None / list / str-keyed dict thereof). S0-fix P2-9: the only remaining bare
+    ``dict`` field is the open event ``payload`` (whose *contract* is validated
+    separately); this stops a non-serialisable object smuggling into it."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return
+    if isinstance(value, list):
+        for i, v in enumerate(value):
+            _assert_json_value(v, field=f"{field}[{i}]")
+        return
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if not isinstance(k, str):
+                raise SchemaError(f"field {field!r}: dict key {k!r} is not a string")
+            _assert_json_value(v, field=f"{field}.{k}")
+        return
+    raise SchemaError(f"field {field!r}: {type(value).__name__} is not JSON-serialisable")
+
+
 def _is_contract(tp: Any) -> bool:
     return isinstance(tp, type) and issubclass(tp, Contract)
 
@@ -92,6 +112,9 @@ def _coerce(value: Any, tp: Any, *, field: str) -> Any:
     if origin in (dict, dict):
         if not isinstance(value, dict):
             raise SchemaError(f"field {field!r}: expected dict, got {type(value).__name__}")
+        # The only bare dict field is the open event payload — keep it a dict, but
+        # fail-closed on non-JSON-primitive contents (S0-fix P2-9).
+        _assert_json_value(value, field=field)
         return dict(value)
 
     if _is_contract(tp):

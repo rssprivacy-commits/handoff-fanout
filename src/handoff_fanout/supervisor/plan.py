@@ -74,6 +74,22 @@ class Node(Contract):
         dupe_deps = sorted({d for d in self.deps if self.deps.count(d) > 1})
         if dupe_deps:
             raise SchemaError(f"Node {self.node_id!r} has duplicate deps: {dupe_deps}")
+        # S0-fix P1-7 (INV-6 consistency): the `reversible` flag and the declared
+        # side effects must agree, so the schema can't express an irreversible node
+        # whose effects the SideEffectRegistry can't see, or a "reversible" node
+        # that quietly performs a pre-auth-gated (irreversible) effect.
+        if any(se.needs_preauth for se in self.side_effects) and self.reversible:
+            raise SchemaError(
+                f"Node {self.node_id!r} is reversible=true but has a side effect with "
+                "needs_preauth=true (an approval-gated effect is irreversible — "
+                "set reversible=false)"
+            )
+        if not self.reversible and not self.side_effects:
+            raise SchemaError(
+                f"Node {self.node_id!r} is reversible=false but declares no side "
+                "effects — an irreversible node must declare its effect(s) so the "
+                "SideEffectRegistry can compensate them (INV-6)"
+            )
 
 
 @dataclasses.dataclass

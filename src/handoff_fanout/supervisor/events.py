@@ -26,11 +26,16 @@ SUPERVISOR_WRITER = "supervisor"
 
 
 class EventType(enum.StrEnum):
-    """The closed set of event types (design §4.2 "事件全集" — exactly 22).
+    """The closed set of event types (design §4.2 "事件全集" — exactly 24).
 
     No slice may invent an event type outside this set; a new orchestration fact
     is a new member here (a schema change, bumping ``SCHEMA_VERSION``), never an
     ad-hoc string.
+
+    S0-fix added two members to the original 22 to close GAP-1 / GAP-3:
+    ``global_resumed`` (so a paused plan can be replayed back to RUNNING — INV-3)
+    and ``owner_override`` (so a human can rescue a BLOCKED node — INV-10). The
+    §4.2 event set in the design doc was amended to match.
     """
 
     PLAN_CREATED = "plan_created"
@@ -54,6 +59,8 @@ class EventType(enum.StrEnum):
     ROLLED_BACK = "rolled_back"
     DLQ_ENTERED = "dlq_entered"
     GLOBAL_PAUSED = "global_paused"
+    GLOBAL_RESUMED = "global_resumed"  # S0-fix GAP-1: owner/auto resume (replayable)
+    OWNER_OVERRIDE = "owner_override"  # S0-fix GAP-3: human rescue of a BLOCKED node
     SNAPSHOT_TAKEN = "snapshot_taken"
 
 
@@ -101,6 +108,17 @@ class Event(Contract):
     provenance: Provenance | None = None
 
     def validate(self) -> None:
+        self._validate_envelope()
+        # S0-fix P0-3 (both brains): the single-writer entry must be fail-closed —
+        # the payload is validated against its frozen contract on EVERY construction
+        # path (direct + from_dict), so a malformed payload can never become a legal
+        # Event. The import is deferred to call-time to avoid the events↔event_payloads
+        # module-load cycle (by the time an Event is constructed, both are loaded).
+        from .event_payloads import validate_event_payload
+
+        validate_event_payload(self)
+
+    def _validate_envelope(self) -> None:
         if self.writer != SUPERVISOR_WRITER:
             raise SchemaError(
                 f"Event.writer must be {SUPERVISOR_WRITER!r} (INV-3 single writer), "

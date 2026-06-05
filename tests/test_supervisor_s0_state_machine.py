@@ -31,7 +31,8 @@ def test_closure_passes() -> None:
 def test_state_counts() -> None:
     assert len(list(NodeState)) == 10
     assert len(list(PlanState)) == 2
-    assert len(list(EventType)) == 22
+    # S0-fix added global_resumed (GAP-1) + owner_override (GAP-3) to the original 22.
+    assert len(list(EventType)) == 24
 
 
 def test_c1_every_transition_endpoint_is_nodestate() -> None:
@@ -81,17 +82,19 @@ def test_c6_node_state_events_match_used() -> None:
     assert used == st.NODE_STATE_EVENTS
 
 
-def test_c7_plan_transitions_endpoints_and_gap() -> None:
+def test_c7_plan_transitions_endpoints_and_backed() -> None:
     plan_states = set(PlanState)
     for pt in st.PLAN_TRANSITIONS:
         assert pt.frm in plan_states and pt.to in plan_states
-    # the resume edge is the documented gap (event is None)
+        # S0-fix GAP-1: every plan transition now carries a backing event (no gaps).
+        assert pt.event is not None
+    # the resume edge is now backed by global_resumed (was the GAP-1 None edge)
     resume = next(
         pt
         for pt in st.PLAN_TRANSITIONS
         if pt.frm is PlanState.GLOBAL_PAUSED and pt.to is PlanState.RUNNING
     )
-    assert resume.event is None
+    assert resume.event is EventType.GLOBAL_RESUMED
     pause = next(
         pt
         for pt in st.PLAN_TRANSITIONS
@@ -100,14 +103,52 @@ def test_c7_plan_transitions_endpoints_and_gap() -> None:
     assert pause.event is EventType.GLOBAL_PAUSED
 
 
-def test_known_gaps_documented() -> None:
-    assert len(st.KNOWN_EVENT_GAPS) == 3, "GAP-1 resume, GAP-2 rolled_back, GAP-3 BLOCKED recovery"
-    resume = st.KNOWN_EVENT_GAPS[0]
-    assert resume.missing_event == "global_resumed"
-    assert "GLOBAL_PAUSED" in resume.where and "RUNNING" in resume.where
-    wheres = " ".join(g.where for g in st.KNOWN_EVENT_GAPS)
-    assert "rolled_back" in wheres  # GAP-2
-    assert "BLOCKED" in wheres and "recovery" in wheres  # GAP-3
+def test_known_gaps_are_all_closed() -> None:
+    # S0-fix: GAP-1/2/3 are resolved, so the surfaced-gaps list is now empty.
+    assert st.KNOWN_EVENT_GAPS == ()
+
+
+def test_gap1_resume_is_replayable() -> None:
+    # GAP-1 closed: a paused plan can be replayed back to RUNNING via global_resumed.
+    assert EventType.GLOBAL_RESUMED in EventType
+    edge = next(
+        pt
+        for pt in st.PLAN_TRANSITIONS
+        if pt.frm is PlanState.GLOBAL_PAUSED and pt.to is PlanState.RUNNING
+    )
+    assert edge.event is EventType.GLOBAL_RESUMED
+
+
+def test_gap2_rolled_back_returns_node_to_pending() -> None:
+    # GAP-2 closed: rolled_back drives settled states back to PENDING (re-do).
+    rb = {t.frm for t in st.NODE_TRANSITIONS if t.event is EventType.ROLLED_BACK}
+    assert rb == {NodeState.DONE, NodeState.BLOCKED, NodeState.BLOCKED_BY_FIX}
+    assert all(
+        t.to is NodeState.PENDING for t in st.NODE_TRANSITIONS if t.event is EventType.ROLLED_BACK
+    )
+    # and rolled_back is no longer an informational event (it moves state now)
+    assert EventType.ROLLED_BACK not in st.INFORMATIONAL_EVENTS
+    assert EventType.ROLLED_BACK in st.NODE_STATE_EVENTS
+
+
+def test_gap3_blocked_owner_recovery() -> None:
+    # GAP-3 closed: a BLOCKED (DLQ'd) node can be rescued by an owner_override into
+    # exactly the RecoveryTarget set — it is no longer a dead node (INV-10).
+    from handoff_fanout.supervisor import RecoveryTarget
+
+    targets = {
+        t.to
+        for t in st.NODE_TRANSITIONS
+        if t.frm is NodeState.BLOCKED and t.event is EventType.OWNER_OVERRIDE
+    }
+    assert targets == {NodeState(rt.value) for rt in RecoveryTarget}
+    assert targets == {NodeState.PENDING, NodeState.DISPATCHED, NodeState.AWAIT_APPROVAL}
+
+
+def test_c8_recovery_target_matches_node_states() -> None:
+    from handoff_fanout.supervisor import RecoveryTarget
+
+    assert {rt.value for rt in RecoveryTarget} <= {s.value for s in NodeState}
 
 
 def test_unknown_verdict_routes_to_blocked_not_fixer() -> None:
@@ -166,6 +207,13 @@ CORE_EDGES = [
     (NodeState.TIMED_OUT, NodeState.DISPATCHED),
     (NodeState.TIMED_OUT, NodeState.BLOCKED),
     (NodeState.DONE, NodeState.BLOCKED_BY_FIX),
+    # S0-fix GAP-2: rolled_back → PENDING from settled states
+    (NodeState.DONE, NodeState.PENDING),
+    (NodeState.BLOCKED, NodeState.PENDING),
+    (NodeState.BLOCKED_BY_FIX, NodeState.PENDING),
+    # S0-fix GAP-3: owner_override rescue of a BLOCKED node
+    (NodeState.BLOCKED, NodeState.DISPATCHED),
+    (NodeState.BLOCKED, NodeState.AWAIT_APPROVAL),
 ]
 
 
@@ -219,7 +267,7 @@ def test_closure_catches_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_closure_catches_taxonomy_drift(monkeypatch: pytest.MonkeyPatch) -> None:
     # drop one event from the informational group → taxonomy no longer total (C6).
-    shrunk = frozenset(st.INFORMATIONAL_EVENTS - {EventType.ROLLED_BACK})
+    shrunk = frozenset(st.INFORMATIONAL_EVENTS - {EventType.DLQ_ENTERED})
     monkeypatch.setattr(st, "INFORMATIONAL_EVENTS", shrunk)
     with pytest.raises(SchemaError, match="taxonomy not total"):
         st.validate_state_machine_closure()
@@ -230,6 +278,34 @@ def test_closure_catches_node_event_mismatch(monkeypatch: pytest.MonkeyPatch) ->
     bogus = frozenset(st.NODE_STATE_EVENTS | {EventType.SNAPSHOT_TAKEN})
     monkeypatch.setattr(st, "NODE_STATE_EVENTS", bogus)
     with pytest.raises(SchemaError):
+        st.validate_state_machine_closure()
+
+
+def test_closure_catches_unbacked_plan_transition(monkeypatch: pytest.MonkeyPatch) -> None:
+    # S0-fix GAP-1: with no documented gaps, an event=None plan transition is illegal.
+    from handoff_fanout.supervisor import PlanTransition
+
+    broken = st.PLAN_TRANSITIONS + (
+        PlanTransition(PlanState.GLOBAL_PAUSED, PlanState.RUNNING, None, "smuggled gap"),
+    )
+    monkeypatch.setattr(st, "PLAN_TRANSITIONS", broken)
+    with pytest.raises(SchemaError):
+        st.validate_state_machine_closure()
+
+
+def test_closure_catches_owner_override_target_drift(monkeypatch: pytest.MonkeyPatch) -> None:
+    # C8: drop one BLOCKED owner-override edge → edges no longer match RecoveryTarget.
+    broken = tuple(
+        t
+        for t in st.NODE_TRANSITIONS
+        if not (
+            t.frm is NodeState.BLOCKED
+            and t.event is EventType.OWNER_OVERRIDE
+            and t.to is NodeState.DISPATCHED
+        )
+    )
+    monkeypatch.setattr(st, "NODE_TRANSITIONS", broken)
+    with pytest.raises(SchemaError, match="C8"):
         st.validate_state_machine_closure()
 
 

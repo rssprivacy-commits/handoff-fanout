@@ -28,9 +28,12 @@ VALID: dict[type, object] = {
         seq=0,
         ts="2026-06-06T00:00:00Z",
         plan_id="p1",
-        type=sup.EventType.PLAN_CREATED,
+        type=sup.EventType.NODE_ADVANCED,
         expected_prev_seq=-1,
         dedupe_key="d1",
+        # S0-fix P0-3: every event carries a frozen typed payload (NODE_ADVANCED →
+        # NodeAttempt) — an Event with the wrong/empty payload is now rejected.
+        payload={"node": "n1", "attempt": 1},
     ),
     sup.Node: sup.Node(node_id="n1", brief="b", base_ref="main"),
     sup.Plan: sup.Plan(
@@ -136,6 +139,38 @@ VALID: dict[type, object] = {
         patches=[sup.ContextPatchOp(op=sup.ContextPatchOpKind.UPSERT, key="k", value="v")]
     ),
     sup.RollbackRecord: sup.RollbackRecord(to_node="n0", to_commit="abc123"),
+    # --- S0-fix P0-1: formerly-open ("None") event payloads, now frozen ---------
+    sup.NodeAttempt: sup.NodeAttempt(node="n1", attempt=1),
+    sup.NodeReason: sup.NodeReason(node="n1", reason="verdict UNKNOWN: infra failure"),
+    sup.AuditDone: sup.AuditDone(
+        node="n1",
+        attempt=1,
+        verdict=sup.Verdict(
+            verdict=sup.VerdictValue.GREEN,
+            by="rule:any-p0p1",
+            codex=sup.ProviderFindings(status=sup.ProviderStatus.OK),
+            gemini=sup.ProviderFindings(status=sup.ProviderStatus.OK),
+            bound_to="diffhash",
+            findings_ref="/tmp/findings.json",
+        ),
+    ),
+    sup.OracleChecked: sup.OracleChecked(node="n1", scope=sup.OracleScope.AFFECTED, passed=True),
+    sup.FixerDone: sup.FixerDone(
+        fixer_id="f-n1-1", parent_node="n1", attempt=1, state=sup.FixerState.DONE
+    ),
+    sup.IrreversibleExecuted: sup.IrreversibleExecuted(
+        node="n1", side_effect=sup.SideEffect(kind=sup.SideEffectKind.DB_MIGRATION)
+    ),
+    sup.GlobalPaused: sup.GlobalPaused(reason="owner", actor="owner"),
+    sup.GlobalResumed: sup.GlobalResumed(actor="owner"),
+    sup.OwnerOverride: sup.OwnerOverride(
+        node="n1",
+        target_state=sup.RecoveryTarget.PENDING,
+        actor="owner",
+        reason="manually verified safe",
+        bound_hash="bh",
+    ),
+    sup.SnapshotTaken: sup.SnapshotTaken(through_seq=10, state_hash="h"),
 }
 
 
@@ -225,9 +260,10 @@ def test_event_cas_genesis_ok() -> None:
         seq=0,
         ts="t",
         plan_id="p1",
-        type=sup.EventType.PLAN_CREATED,
+        type=sup.EventType.NODE_ADVANCED,
         expected_prev_seq=-1,
         dedupe_key="d0",
+        payload={"node": "n1", "attempt": 1},
     )
 
 
@@ -263,14 +299,21 @@ def test_event_dedupe_key_required() -> None:
 
 
 def _verdict(value, codex_status, gemini_status, *, c_p0=0, c_p1=0, g_p0=0, g_p1=0, degraded=False):
+    # P2-8: a RED verdict must carry deduped fingerprints (auditable dedup); the
+    # contributing providers must then carry them too (subset check). Auto-fill so
+    # the verdict-consistency tests stay focused on the GREEN/RED/UNKNOWN rule.
+    cfp = ["c1"] if (c_p0 or c_p1) else []
+    gfp = ["g1"] if (g_p0 or g_p1) else []
+    deduped = (cfp + gfp) if value is sup.VerdictValue.RED else []
     return sup.Verdict(
         verdict=value,
         by="rule:any-p0p1",
-        codex=sup.ProviderFindings(status=codex_status, p0=c_p0, p1=c_p1),
-        gemini=sup.ProviderFindings(status=gemini_status, p0=g_p0, p1=g_p1),
+        codex=sup.ProviderFindings(status=codex_status, p0=c_p0, p1=c_p1, fingerprints=cfp),
+        gemini=sup.ProviderFindings(status=gemini_status, p0=g_p0, p1=g_p1, fingerprints=gfp),
         bound_to="diff",
         findings_ref="/tmp/f.json",
         degraded=degraded,
+        deduped_fingerprints=deduped,
     )
 
 
@@ -320,6 +363,29 @@ def test_verdict_unknown_required_when_degraded() -> None:
             c_p0=1,
             degraded=True,
         )
+
+
+def test_verdict_red_requires_deduped_fingerprints() -> None:
+    # P2-8 (codex R2): a RED verdict with no finding ids cannot be dedup-audited.
+    with pytest.raises(SchemaError):
+        sup.Verdict(
+            verdict=sup.VerdictValue.RED,
+            by="rule:any-p0p1",
+            codex=sup.ProviderFindings(status=sup.ProviderStatus.OK, p0=1),
+            gemini=sup.ProviderFindings(status=sup.ProviderStatus.OK),
+            bound_to="diff",
+            findings_ref="/tmp/f.json",
+        )
+    # with fingerprints it is legal
+    sup.Verdict(
+        verdict=sup.VerdictValue.RED,
+        by="rule:any-p0p1",
+        codex=sup.ProviderFindings(status=sup.ProviderStatus.OK, p0=1, fingerprints=["a"]),
+        gemini=sup.ProviderFindings(status=sup.ProviderStatus.OK),
+        bound_to="diff",
+        findings_ref="/tmp/f.json",
+        deduped_fingerprints=["a"],
+    )
 
 
 def test_verdict_by_must_be_a_known_deterministic_rule() -> None:
@@ -633,55 +699,255 @@ def test_context_patch_rejects_empty_and_dup_keys() -> None:
         sup.ContextPatch(patches=[op, op])
 
 
-def test_validate_event_payload_enforces_mapped_contract() -> None:
+# --- P0-1 + P0-3: every event has a frozen payload, enforced at construction ---
+
+
+def _mk_event(event_type: sup.EventType, payload: dict, **over) -> sup.Event:
+    base = dict(
+        schema_version=1,
+        event_id="e",
+        seq=0,
+        ts="t",
+        plan_id="p",
+        type=event_type,
+        expected_prev_seq=-1,
+        dedupe_key="d",
+        payload=payload,
+    )
+    base.update(over)
+    return sup.Event(**base)  # type: ignore[arg-type]
+
+
+def test_payload_map_has_no_open_payloads() -> None:
+    # P0-1 (both brains): the original S0 mapped 14 events to None ("留给以后那片").
+    # Every event must now map to a concrete contract — no None placeholders.
+    assert all(c is not None for c in sup.EVENT_PAYLOAD_CONTRACT.values())
+
+
+def test_every_event_constructs_with_its_valid_payload() -> None:
+    # For every EventType, the VALID fixture for its mapped contract is a legal
+    # payload (proves the frozen map + the fixtures are mutually consistent).
+    for et, contract in sup.EVENT_PAYLOAD_CONTRACT.items():
+        payload = VALID[contract].to_dict()  # type: ignore[attr-defined]
+        ev = _mk_event(et, payload)
+        assert ev.type is et
+
+
+def test_event_payload_enforced_at_construction() -> None:
+    # P0-3 (both brains): a malformed payload can no longer become a legal Event —
+    # validation fires during construction (not only via a separate function call).
     good = sup.ContextPatch(
         patches=[sup.ContextPatchOp(op=sup.ContextPatchOpKind.UPSERT, key="k", value="v")]
     ).to_dict()
-    ev = sup.Event(
-        schema_version=1,
-        event_id="e",
-        seq=0,
-        ts="t",
-        plan_id="p",
-        type=sup.EventType.CONTEXT_PATCHED,
-        expected_prev_seq=-1,
-        dedupe_key="d",
-        payload=good,
-    )
-    sup.validate_event_payload(ev)  # ok
+    ev = _mk_event(sup.EventType.CONTEXT_PATCHED, good)
+    sup.validate_event_payload(ev)  # idempotent re-check still passes
 
-    bad = sup.Event(
-        schema_version=1,
-        event_id="e",
-        seq=0,
-        ts="t",
-        plan_id="p",
-        type=sup.EventType.CONTEXT_PATCHED,
-        expected_prev_seq=-1,
-        dedupe_key="d",
-        payload={"patches": "not-a-list"},
-    )
     with pytest.raises(SchemaError):
-        sup.validate_event_payload(bad)
+        _mk_event(sup.EventType.CONTEXT_PATCHED, {"patches": "not-a-list"})
 
 
-def test_validate_event_payload_open_payload_is_free() -> None:
-    # snapshot_taken maps to None → any payload accepted
-    ev = sup.Event(
-        schema_version=1,
-        event_id="e",
-        seq=0,
-        ts="t",
-        plan_id="p",
-        type=sup.EventType.SNAPSHOT_TAKEN,
-        expected_prev_seq=-1,
-        dedupe_key="d",
-        payload={"anything": [1, 2, 3]},
-    )
-    sup.validate_event_payload(ev)  # no contract → no-op
+def test_event_empty_payload_rejected_for_required_contract() -> None:
+    # An event whose payload contract has required fields rejects an empty payload —
+    # this is the freeze: NODE_DISPATCHED can't carry "nothing" anymore.
+    with pytest.raises(SchemaError):
+        _mk_event(sup.EventType.NODE_DISPATCHED, {})
+    with pytest.raises(SchemaError):
+        _mk_event(sup.EventType.SNAPSHOT_TAKEN, {"anything": [1, 2, 3]})
+
+
+def test_event_wrong_payload_for_type_rejected() -> None:
+    # A NodeAttempt payload under a PLAN_CREATED event (expects a Plan) is rejected.
+    with pytest.raises(SchemaError):
+        _mk_event(sup.EventType.PLAN_CREATED, {"node": "n1", "attempt": 1})
+
+
+def test_event_payload_rejects_non_json_primitive() -> None:
+    # P2-9: the open wire payload dict is fail-closed on non-JSON contents.
+    with pytest.raises(SchemaError):
+        sup.Event.from_dict(
+            {
+                "schema_version": 1,
+                "event_id": "e",
+                "seq": 0,
+                "ts": "t",
+                "plan_id": "p",
+                "type": "snapshot_taken",
+                "expected_prev_seq": -1,
+                "dedupe_key": "d",
+                "payload": {"through_seq": 1, "state_hash": "h", "bad": {1: "int-key"}},
+            }
+        )
 
 
 def test_coerce_payload_returns_typed_contract() -> None:
     fixer = VALID[sup.Fixer].to_dict()  # type: ignore[attr-defined]
     obj = sup.coerce_payload(sup.EventType.FIXER_SPAWNED, fixer)
     assert isinstance(obj, sup.Fixer)
+
+
+# --- S0-fix new payload invariants -------------------------------------------
+
+
+def test_audit_done_carries_machine_verdict() -> None:
+    # gemini #4: audit_done binds the deterministic Verdict (INV-2) into the log.
+    with pytest.raises(SchemaError):
+        sup.AuditDone(node="", attempt=1, verdict=VALID[sup.Verdict])  # type: ignore[arg-type]
+    with pytest.raises(SchemaError):
+        sup.AuditDone(node="n1", attempt=0, verdict=VALID[sup.Verdict])  # type: ignore[arg-type]
+
+
+def test_oracle_checked_red_must_name_failures() -> None:
+    sup.OracleChecked(node="n1", scope=sup.OracleScope.FINAL, passed=True)
+    with pytest.raises(SchemaError):  # RED with no failed criteria
+        sup.OracleChecked(node="n1", scope=sup.OracleScope.FINAL, passed=False)
+    with pytest.raises(SchemaError):  # GREEN cannot list failures
+        sup.OracleChecked(
+            node="n1", scope=sup.OracleScope.FINAL, passed=True, failed_criteria=["o1"]
+        )
+    sup.OracleChecked(node="n1", scope=sup.OracleScope.FINAL, passed=False, failed_criteria=["o1"])
+
+
+def test_fixer_done_must_be_terminal() -> None:
+    sup.FixerDone(fixer_id="f", parent_node="n", attempt=1, state=sup.FixerState.DONE)
+    sup.FixerDone(fixer_id="f", parent_node="n", attempt=1, state=sup.FixerState.FAILED)
+    with pytest.raises(SchemaError):  # DISPATCHED is not a terminal fixer state
+        sup.FixerDone(fixer_id="f", parent_node="n", attempt=1, state=sup.FixerState.DISPATCHED)
+
+
+def test_global_paused_and_resumed_require_actor() -> None:
+    with pytest.raises(SchemaError):
+        sup.GlobalPaused(reason="owner", actor="")
+    with pytest.raises(SchemaError):
+        sup.GlobalPaused(reason="", actor="owner")
+    with pytest.raises(SchemaError):
+        sup.GlobalResumed(actor="")
+
+
+def test_owner_override_requires_bound_hash_and_legal_target() -> None:
+    sup.OwnerOverride(
+        node="n1",
+        target_state=sup.RecoveryTarget.DISPATCHED,
+        actor="owner",
+        reason="safe",
+        bound_hash="bh",
+    )
+    with pytest.raises(SchemaError):  # anti-replay bind required
+        sup.OwnerOverride(
+            node="n1",
+            target_state=sup.RecoveryTarget.PENDING,
+            actor="owner",
+            reason="r",
+            bound_hash="",
+        )
+    with pytest.raises(SchemaError):  # DONE is not a legal recovery target
+        sup.OwnerOverride.from_dict(
+            {
+                "node": "n1",
+                "target_state": "DONE",
+                "actor": "o",
+                "reason": "r",
+                "bound_hash": "bh",
+            }
+        )
+
+
+def test_recovery_target_values_are_node_states() -> None:
+    node_state_values = {s.value for s in sup.NodeState}
+    assert {t.value for t in sup.RecoveryTarget} <= node_state_values
+
+
+def test_side_effect_rejects_unauthorized_irreversible() -> None:
+    # P1-7 / INV-6: non-sandboxed, non-dry-run, no compensation, no preauth → reject.
+    with pytest.raises(SchemaError):
+        sup.SideEffect(
+            kind=sup.SideEffectKind.EXTERNAL_ACCOUNT,
+            sandboxed=False,
+            dry_run=False,
+            compensation=None,
+            needs_preauth=False,
+        )
+    # any one escape hatch makes it legal
+    sup.SideEffect(kind=sup.SideEffectKind.EXTERNAL_ACCOUNT, sandboxed=False, needs_preauth=True)
+    sup.SideEffect(kind=sup.SideEffectKind.EXTERNAL_ACCOUNT, sandboxed=False, compensation="refund")
+    sup.SideEffect(kind=sup.SideEffectKind.EXTERNAL_ACCOUNT, sandboxed=True)
+
+
+def test_node_reversible_side_effect_consistency() -> None:
+    preauth = sup.SideEffect(kind=sup.SideEffectKind.DB_MIGRATION, needs_preauth=True)
+    # a preauth (irreversible) effect on a reversible node is inconsistent
+    with pytest.raises(SchemaError):
+        sup.Node(node_id="n1", brief="b", base_ref="m", reversible=True, side_effects=[preauth])
+    # reversible=false with no declared side effects is inconsistent (INV-6)
+    with pytest.raises(SchemaError):
+        sup.Node(node_id="n1", brief="b", base_ref="m", reversible=False)
+    # consistent: irreversible node declaring its preauth effect
+    sup.Node(node_id="n1", brief="b", base_ref="m", reversible=False, side_effects=[preauth])
+
+
+def test_oracle_network_allow_requires_exemption() -> None:
+    # P1-6: network=allow is rejected unless an explicit isolation_exemption is set.
+    with pytest.raises(SchemaError):
+        sup.OracleRuntime(
+            cwd="/x",
+            db="sandbox:erp_test",
+            db_template="erp_baseline",
+            network=sup.NetworkPolicy.ALLOW,
+        )
+    sup.OracleRuntime(
+        cwd="/x",
+        db="sandbox:erp_test",
+        db_template="erp_baseline",
+        network=sup.NetworkPolicy.ALLOW,
+        isolation_exemption="owner-approved: needs live API in test #42",
+    )
+
+
+def test_oracle_db_bearing_cleanup_none_requires_exemption() -> None:
+    # P1-6: a DB-bearing runtime that does not drop-recreate leaks schema pollution.
+    with pytest.raises(SchemaError):
+        sup.OracleRuntime(cwd="/x", db="sandbox:erp_test", cleanup=sup.CleanupPolicy.NONE)
+    sup.OracleRuntime(
+        cwd="/x",
+        db="sandbox:erp_test",
+        cleanup=sup.CleanupPolicy.NONE,
+        isolation_exemption="read-only oracle, no schema writes",
+    )
+
+
+def test_verdict_deduped_fingerprints_must_subset_union() -> None:
+    # P2-8: the cross-provider deduped set must trace to the raw provider findings.
+    sup.Verdict(
+        verdict=sup.VerdictValue.RED,
+        by="rule:any-p0p1",
+        codex=sup.ProviderFindings(status=sup.ProviderStatus.OK, p0=1, fingerprints=["a", "b"]),
+        gemini=sup.ProviderFindings(status=sup.ProviderStatus.OK, p1=1, fingerprints=["b", "c"]),
+        bound_to="diff",
+        findings_ref="/tmp/f.json",
+        deduped_fingerprints=["a", "b", "c"],
+    )
+    with pytest.raises(SchemaError):  # 'z' is not in either provider's fingerprints
+        sup.Verdict(
+            verdict=sup.VerdictValue.RED,
+            by="rule:any-p0p1",
+            codex=sup.ProviderFindings(status=sup.ProviderStatus.OK, p0=1, fingerprints=["a"]),
+            gemini=sup.ProviderFindings(status=sup.ProviderStatus.OK),
+            bound_to="diff",
+            findings_ref="/tmp/f.json",
+            deduped_fingerprints=["a", "z"],
+        )
+
+
+def test_dlq_provenance_is_typed() -> None:
+    # P2-9: DLQEntry.provenance is a typed Provenance, not a free-form dict.
+    dlq = sup.DLQEntry(
+        node="n1",
+        reason="r",
+        impact="i",
+        recommended="rec",
+        worst_case="w",
+        options=["a"],
+        provenance=sup.Provenance(commit="abc"),
+    )
+    assert dlq.provenance is not None
+    rebuilt = sup.DLQEntry.from_dict(dlq.to_dict())
+    assert rebuilt == dlq

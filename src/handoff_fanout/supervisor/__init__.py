@@ -59,11 +59,22 @@ from .oracle import (
     Severity,
 )
 from .payloads import (
+    AuditDone,
     ContextPatch,
     ContextPatchOp,
     ContextPatchOpKind,
+    FixerDone,
+    GlobalPaused,
+    GlobalResumed,
+    IrreversibleExecuted,
+    NodeAttempt,
+    NodeReason,
+    OracleChecked,
+    OwnerOverride,
     PlanAmendment,
+    RecoveryTarget,
     RollbackRecord,
+    SnapshotTaken,
 )
 from .plan import MergePolicy, Node, NodeType, Plan, RiskTier, WorktreeMode
 from .states import (
@@ -121,6 +132,16 @@ ALL_CONTRACTS: tuple[type[Contract], ...] = (
     ContextPatchOp,
     ContextPatch,
     RollbackRecord,
+    NodeAttempt,
+    NodeReason,
+    AuditDone,
+    OracleChecked,
+    FixerDone,
+    IrreversibleExecuted,
+    GlobalPaused,
+    GlobalResumed,
+    OwnerOverride,
+    SnapshotTaken,
 )
 
 __all__ = [
@@ -139,6 +160,17 @@ __all__ = [
     "ContextPatchOp",
     "ContextPatchOpKind",
     "RollbackRecord",
+    "NodeAttempt",
+    "NodeReason",
+    "AuditDone",
+    "OracleChecked",
+    "FixerDone",
+    "IrreversibleExecuted",
+    "GlobalPaused",
+    "GlobalResumed",
+    "OwnerOverride",
+    "RecoveryTarget",
+    "SnapshotTaken",
     "EVENT_PAYLOAD_CONTRACT",
     "coerce_payload",
     "validate_event_payload",
