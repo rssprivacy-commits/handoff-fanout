@@ -58,6 +58,26 @@ from .oracle import (
     OracleType,
     Severity,
 )
+
+# --- slice S1 (Oracle execution + Plan draft/lock) ---------------------------
+# Additive: S1 imports the frozen S0 contracts above and adds the *runtime logic*
+# the S0 __init__ docstring deliberately left out ("oracle runner ... S1+"). It
+# does NOT modify any S0 shape or the ALL_CONTRACTS freeze below.
+from .oracle_runner import (
+    DEFAULT_SANDBOX_MARKER,
+    LIVE_DB_DENYLIST,
+    CriterionExecutor,
+    CriterionResult,
+    LiveDbError,
+    OracleOutcome,
+    OracleRunner,
+    OracleRunResult,
+    PsqlSandboxDb,
+    RawExecution,
+    SandboxDb,
+    SubprocessExecutor,
+    aggregate_outcome,
+)
 from .payloads import (
     AuditDone,
     ContextPatch,
@@ -77,6 +97,18 @@ from .payloads import (
     SnapshotTaken,
 )
 from .plan import MergePolicy, Node, NodeType, Plan, RiskTier, WorktreeMode
+from .plan_draft import (
+    LockedPlan,
+    PlanDraft,
+    amend_locked_plan,
+    approve_plan,
+    canonical_bytes,
+    draft_plan,
+    is_lock_valid,
+    oracle_hash,
+    plan_hash,
+    verify_lock,
+)
 from .states import (
     ABORTABLE_NODE_STATES,
     INFORMATIONAL_EVENTS,
@@ -142,6 +174,18 @@ ALL_CONTRACTS: tuple[type[Contract], ...] = (
     GlobalResumed,
     OwnerOverride,
     SnapshotTaken,
+)
+
+#: Concrete **S1** wire contracts (new in slice S1 — Oracle execution result +
+#: Plan draft/lock receipts). Kept separate from :data:`ALL_CONTRACTS` (the S0
+#: freeze) so the S0 registry is untouched, but round-trip-checked the same way by
+#: the S1 test-suite. ``OracleChecked`` is NOT here — it is a *frozen S0* payload
+#: (already in :data:`ALL_CONTRACTS`); S1 *projects* onto it, never redefines it.
+S1_CONTRACTS: tuple[type[Contract], ...] = (
+    CriterionResult,
+    OracleRunResult,
+    PlanDraft,
+    LockedPlan,
 )
 
 __all__ = [
@@ -231,4 +275,30 @@ __all__ = [
     "outgoing",
     "reachable_node_states",
     "validate_state_machine_closure",
+    # --- slice S1: Oracle execution (oracle_runner) ---
+    "OracleRunner",
+    "OracleRunResult",
+    "CriterionResult",
+    "OracleOutcome",
+    "aggregate_outcome",
+    "CriterionExecutor",
+    "SandboxDb",
+    "RawExecution",
+    "SubprocessExecutor",
+    "PsqlSandboxDb",
+    "LiveDbError",
+    "LIVE_DB_DENYLIST",
+    "DEFAULT_SANDBOX_MARKER",
+    # --- slice S1: Plan draft / lock (plan_draft) ---
+    "PlanDraft",
+    "LockedPlan",
+    "draft_plan",
+    "approve_plan",
+    "amend_locked_plan",
+    "verify_lock",
+    "is_lock_valid",
+    "plan_hash",
+    "oracle_hash",
+    "canonical_bytes",
+    "S1_CONTRACTS",
 ]
