@@ -209,10 +209,30 @@ def test_parse_non_evaluable_status_passthrough(status):
     assert pf.p0 == 0 and pf.fingerprints == []
 
 
-def test_parse_skips_non_dict_findings():
+def test_parse_non_dict_element_findings_is_parse_error():
+    # A list whose elements aren't finding dicts (the invoker extracted text but
+    # never parsed it into finding dicts) is unparseable raw — it must fail closed
+    # to PARSE_ERROR, never read as a clean zero-finding pass (false-GREEN, INV-2).
+    # Exercises the hand-built ProviderRun path that bypasses the adapter.
+    pf = sup.parse_provider_findings(_run(findings={"original_findings": ["P0: critical bug"]}))
+    assert pf.status is PARSE_ERROR
+    assert pf.p0 == 0 and pf.p1 == 0 and pf.fingerprints == []
+
+
+def test_parse_mixed_dict_and_non_dict_findings_is_parse_error():
+    # A mixed list (some dicts, some not) is still unparseable raw → fail-closed,
+    # NOT "ignore the strings and count the dicts" (which silently drops part of the
+    # raw and could read cleaner than reality).
     findings = {"original_findings": ["not a dict", {"severity": "P0", "file": "a.py"}]}
     pf = sup.parse_provider_findings(_run(findings=findings))
-    assert pf.p0 == 1  # the string entry is ignored, the real P0 counted
+    assert pf.status is PARSE_ERROR
+
+
+def test_parse_non_list_original_findings_still_parse_error():
+    # Control: original_findings that isn't a list at all stays PARSE_ERROR — the
+    # pre-existing fail-closed must not regress now that non-dict elements also fail.
+    pf = sup.parse_provider_findings(_run(findings={"original_findings": "P0: a string"}))
+    assert pf.status is PARSE_ERROR
 
 
 def test_parse_dedups_repeated_finding_within_provider():
@@ -254,6 +274,28 @@ def test_map_status():
     assert _map_status(RawBrainOutcome(ok=True, findings={"junk": 1})) is PARSE_ERROR
     # parse failure outranks a degraded-model signal (unusable raw, not just weak).
     assert _map_status(RawBrainOutcome(ok=True, degraded=True, findings=None)) is PARSE_ERROR
+
+
+def test_map_status_non_dict_findings_element_is_parse_error():
+    # original_findings is a list but holds a non-dict (text) element → unparseable
+    # raw, fail-closed to PARSE_ERROR *before* the retry layer (adapter path), so a
+    # transient garble is retried rather than accepted as a clean run (false-GREEN).
+    assert (
+        _map_status(RawBrainOutcome(ok=True, findings={"original_findings": ["P0: bug"]}))
+        is PARSE_ERROR
+    )
+    # a mixed list (one dict, one not) is equally unparseable
+    assert (
+        _map_status(
+            RawBrainOutcome(ok=True, findings={"original_findings": ["x", {"severity": "P0"}]})
+        )
+        is PARSE_ERROR
+    )
+    # control: an all-dict list is still parseable → OK, not over-rejected
+    assert (
+        _map_status(RawBrainOutcome(ok=True, findings={"original_findings": [{"severity": "P0"}]}))
+        is OK
+    )
 
 
 def test_adapter_marks_unparseable_ok_as_parse_error():
@@ -355,3 +397,29 @@ def test_verify_cross_provider_dedup_collapses_shared_finding():
     assert v.verdict is VerdictValue.RED
     # Both brains found the same identity → one deduped fingerprint.
     assert len(v.deduped_fingerprints) == 1
+
+
+def test_verify_non_dict_findings_never_green():
+    # The core false-GREEN (中枢 RED finding): one brain's findings list holds
+    # non-dict (text) elements while the other is clean. The non-dict raw is
+    # unparseable → PARSE_ERROR → UNKNOWN (escalate), NEVER read as a clean GREEN
+    # (INV-2: 不可解析 raw 必须 fail-closed). Exercises parse_provider_findings'
+    # defense inside verify_findings (a hand-built OK run that bypasses the adapter).
+    codex_run = _run("codex", OK, {"original_findings": ["P0: critical bug"]})
+    gemini_run = _run("gemini", OK, {"original_findings": []})
+    v = sup.verify_findings(codex_run, gemini_run, binding=_binding(), findings_ref="ref")
+    assert v.verdict is not VerdictValue.GREEN
+    assert v.verdict is VerdictValue.UNKNOWN
+
+
+def test_verify_mixed_dict_non_dict_findings_never_green():
+    # Same fail-closed for a mixed list — even though one element is a real P0 dict,
+    # the unparseable string element makes the whole run unparseable → UNKNOWN, not a
+    # verdict computed off a partially-dropped read.
+    codex_run = _run(
+        "codex", OK, {"original_findings": ["text", {"severity": "P0", "file": "a.py"}]}
+    )
+    gemini_run = _run("gemini", OK, {"original_findings": []})
+    v = sup.verify_findings(codex_run, gemini_run, binding=_binding(), findings_ref="ref")
+    assert v.verdict is not VerdictValue.GREEN
+    assert v.verdict is VerdictValue.UNKNOWN

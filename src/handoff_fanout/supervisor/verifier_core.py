@@ -187,14 +187,23 @@ BrainInvoker = Callable[["Binding"], RawBrainOutcome]
 
 
 def _findings_parseable(findings: dict | None) -> bool:
-    """True iff ``findings`` carries an ``original_findings`` list the verifier can
-    actually read. A claimed-OK run that fails this is unusable raw, so the adapter
-    marks it PARSE_ERROR **before** the retry layer (Codex R2 P1) — otherwise a
-    transient empty/garbled read (``findings=None`` / non-list) would look "clean"
-    to :func:`~handoff_fanout.supervisor.dual_brain.run_with_retry` (which only sees
+    """True iff ``findings`` carries an ``original_findings`` list **of finding
+    dicts** the verifier can actually read. A claimed-OK run that fails this is
+    unusable raw, so the adapter marks it PARSE_ERROR **before** the retry layer
+    (Codex R2 P1) — otherwise a transient empty/garbled read (``findings=None`` /
+    non-list, or a list holding non-dict elements the invoker extracted as text but
+    never parsed into finding dicts) would look "clean" to
+    :func:`~handoff_fanout.supervisor.dual_brain.run_with_retry` (which only sees
     ``status``), stop at attempt 1, and only become UNKNOWN at verdict time — never
-    retried, when a retry might have recovered a usable read."""
-    return isinstance(findings, dict) and isinstance(findings.get("original_findings"), list)
+    retried, when a retry might have recovered a usable read.
+
+    A list with **any** non-dict element is rejected here (not silently skipped): a
+    non-dict entry can't be counted as a finding, so silently dropping it would let
+    raw the verifier can't read pass as a clean zero-finding GREEN (false-GREEN,
+    violates INV-2 "不可解析 raw 必须 fail-closed")."""
+    if not (isinstance(findings, dict) and isinstance(findings.get("original_findings"), list)):
+        return False
+    return all(isinstance(item, dict) for item in findings["original_findings"])
 
 
 def _map_status(outcome: RawBrainOutcome) -> ProviderStatus:
@@ -290,9 +299,11 @@ def parse_provider_findings(run: ProviderRun) -> ProviderFindings:
     (read-only over the raw findings; INV-2).
 
     * UNAVAILABLE / PARSE_ERROR runs carry no trustworthy counts → status only.
-    * An OK/DEGRADED run whose ``findings`` has no ``original_findings`` list is
-      **downgraded to PARSE_ERROR** (fail-closed: an unparseable "OK" run must not
-      read as a clean zero-finding pass).
+    * An OK/DEGRADED run whose ``findings`` has no ``original_findings`` list — or
+      whose list holds **any** non-dict element (text the invoker never parsed into a
+      finding dict) — is **downgraded to PARSE_ERROR** (fail-closed: an unparseable
+      "OK" run must not read as a clean zero-finding pass, and non-dict entries must
+      not be silently dropped — both would be a false-GREEN, INV-2).
     * Otherwise count P0/P1 (an unrecognized/spoofed severity is fail-closed as a
       blocking P0, mirroring ``codex_audit.derive_verdict``) and fingerprint every
       blocking finding so a resulting RED is auditable. The **same** blocking
@@ -306,16 +317,20 @@ def parse_provider_findings(run: ProviderRun) -> ProviderFindings:
 
     raw = run.findings
     original = raw.get("original_findings") if isinstance(raw, dict) else None
-    if not isinstance(original, list):
+    if not isinstance(original, list) or not all(isinstance(item, dict) for item in original):
+        # Fail-closed: a missing/non-list findings list — OR a list holding any
+        # non-dict element (text the invoker never parsed into a finding dict) — is
+        # unparseable raw. It must NOT read as a clean zero-finding pass, nor be
+        # partially counted with the non-dict entries silently dropped (false-GREEN,
+        # INV-2). Mirrors :func:`_findings_parseable` so a hand-built ``ProviderRun``
+        # that bypasses an adapter is defended the same way.
         return ProviderFindings(status=ProviderStatus.PARSE_ERROR)
 
     p0 = 0
     p1 = 0
     fingerprints: list[str] = []
     seen: set[str] = set()
-    for idx, finding in enumerate(original):
-        if not isinstance(finding, dict):
-            continue
+    for idx, finding in enumerate(original):  # every element is a dict (checked above)
         sev = codex_audit.finding_identity(finding).get("severity", "")
         if sev == "P1":
             is_p0 = False
