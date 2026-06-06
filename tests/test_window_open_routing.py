@@ -58,12 +58,17 @@ def _seed(home: Path, ws: Path, task: str, *, heartbeat: bool = False) -> None:
 def _env(home: Path, tmp_path: Path, *, front_window: str,
          grow_transcript: Path | None = None, grow_on_attempt: int | None = None,
          grow_after_open: str | None = None, ready_after: str | None = None,
-         wrong_ready: str | None = None) -> dict:
+         wrong_ready: str | None = None, sidebar_sentinel: bool = True) -> dict:
     stub = tmp_path / "stubs"
     stub.mkdir(exist_ok=True)
     code_sink = tmp_path / "code.log"
     open_sink = tmp_path / "open.log"
     key_sink = tmp_path / "key.log"
+    sidebar_sink = tmp_path / "sidebar.log"  # records the single-pane close-sidebars chord (NOT key.log)
+    # The runtime fires the close-sidebars chord ONLY if the install sentinel exists (fail-safe gate).
+    # Default to present (most cold tests exercise the chord); the "not installed" test sets it False.
+    if sidebar_sentinel:
+        (home / ".singlepane-keybinding.installed").write_text("9\n", encoding="utf-8")
 
     # lock probe: always unlocked (the GUI path needs a confirmed-unlocked screen)
     _w(stub / "lockprobe", "#!/bin/bash\necho unlocked\n")
@@ -108,6 +113,17 @@ def _env(home: Path, tmp_path: Path, *, front_window: str,
         '          fi ;;\n'
         '        *) echo mismatch ;;\n'
         "      esac ;;\n"
+        # single-pane close-sidebars chord (marked HANDOFF-CLOSE-SIDEBARS): it ALSO contains "on run argv",
+        # so it MUST be matched BEFORE the submit case below. It is a GUARDED LAYOUT keystroke, NOT an Enter —
+        # record it to _SIDEBAR_SINK (never _KEY_SINK) when the front window matches the token, else mismatch.
+        '  *"HANDOFF-CLOSE-SIDEBARS"*)\n'
+        '      tok="${@: -1}"\n'
+        # models the REAL osascript guard: title must contain the EXACT fragment "<task> [worktree]"
+        # (so a prefix-collision like foo-1 vs "foo-10 [worktree]" is rejected).
+        '      case "$_FRONT_WIN" in\n'
+        '        *"$tok [worktree]"*) printf s >> "$_SIDEBAR_SINK"; echo sent ;;\n'
+        '        *) echo mismatch ;;\n'
+        "      esac ;;\n"
         '  *"on run argv"*)\n'
         '      tok="${@: -1}"\n'
         '      case "$_FRONT_WIN" in\n'
@@ -141,6 +157,7 @@ def _env(home: Path, tmp_path: Path, *, front_window: str,
             "HANDOFF_UNLOCK_ENABLED": "0",
             # keep the test fast: no lock probe (unlocked default), short waits, no cold render sleep
             "HANDOFF_COLD_RENDER_SECS": "0",
+            "HANDOFF_SIDEBAR_SETTLE_SECS": "0",  # no post-close layout-settle sleep in tests
             "HANDOFF_WIN_FRONT_SECS": "2",
             "HANDOFF_WIN_FRONT_SECS_WARM": "1",
             # cold single-Enter verify (fast): transcript-growth verify timeout 1s; transcript root in tmp
@@ -149,6 +166,7 @@ def _env(home: Path, tmp_path: Path, *, front_window: str,
             "HANDOFF_COLD_READY_SECS": "2",  # readiness-gate poll timeout (8 × 0.25s) — keep tests fast
             "_FRONT_WIN": front_window,
             "_KEY_SINK": str(key_sink),
+            "_SIDEBAR_SINK": str(sidebar_sink),
             "_CODE_SINK": str(code_sink),
             "_OPEN_SINK": str(open_sink),
             "_OSA_SINK": str(tmp_path / "osa.log"),
@@ -344,12 +362,13 @@ def test_cold_submit_monotonic_across_old_transcript_no_double(home, tmp_path):
 
 
 def test_cold_submit_uses_bare_enter_no_focus_chord(home, tmp_path):
-    """COLD submit must NOT run any focus chord before the Enter (2026-06-05 owner-diagnosed simplification,
-    verified 3/3 live). The URI paste already leaves keyboard focus ON the editor Claude input; raising the
-    window (AXRaise reset focus to the left sidebar/Explorer) + the claude-vscode.focus chord (grabbed the
-    empty sidebar CC) were superfluous actions that MOVED focus off the editor → the Enter submitted the
-    empty sidebar → ABORT. "Paste, then bare Enter" submits the editor input. So the focus chord (the
-    cmd+ctrl+option modifier keystroke) must NOT appear in the osascript log."""
+    """COLD submit must NOT run a FOCUS chord before the Enter (2026-06-05 owner-diagnosed simplification,
+    verified 3/3 live). The tombstoned claude-vscode.focus chord (+ AXRaise) MOVED focus off the editor onto
+    the empty sidebar → the Enter submitted nothing → ABORT. "Paste, then bare Enter" submits the editor input.
+    NOTE (2026-06-06 single-pane): the cold path now ALSO sends a guarded *close-sidebars* chord
+    (cmd+ctrl+alt+9) BEFORE the URI — it uses the same modifiers but is a LAYOUT keystroke, not a focus chord,
+    and is MARKED `HANDOFF-CLOSE-SIDEBARS`. Invariant: EVERY modifier-chord osascript is that marked
+    close-sidebars one (no unmarked focus chord may regress), and the submit itself is a bare Enter."""
     task = "cold-bare"
     ws = _cold_ws(tmp_path, task)
     _seed(home, ws, task)
@@ -358,9 +377,126 @@ def test_cold_submit_uses_bare_enter_no_focus_chord(home, tmp_path):
                grow_transcript=tr, grow_on_attempt=1)
     assert _run(env).returncode == 0
     osa = _read(tmp_path / "osa.log")
-    assert "command down, control down, option down" not in osa, "cold submit must NOT send a focus chord (bare Enter)"
+    chord = "command down, control down, option down"
+    # every cmd+ctrl+alt chord must be the MARKED close-sidebars layout keystroke — never an unmarked focus chord
+    assert osa.count(chord) == osa.count("HANDOFF-CLOSE-SIDEBARS"), \
+        "the only modifier-chord may be the marked close-sidebars one — no focus chord may regress"
+    assert osa.count(chord) >= 1, "the single-pane close-sidebars layout chord must run on the cold path"
     assert _read(tmp_path / "key.log") == "k", "exactly ONE bare Enter — transcript grew → submitted, no retry"
+    assert _read(tmp_path / "sidebar.log") == "s", "the close-sidebars chord fired exactly once (single-pane)"
     assert _ack(home, task, "submitted")
+
+
+# --------------------------------------------- single-pane: close side bars BEFORE the URI (2026-06-06)
+# Root-cause cold-submit fix (dual-brain codex+Gemini + owner ruling "消除墙 > 检测墙"): collapse the cold
+# worktree window to a single editor pane before the URI so there is no empty-Claude-sidebar "Message input"
+# competing for keyboard focus with the pasted prompt. Materially different from the tombstoned focus hack:
+# runs BEFORE the URI, idempotent close commands via a custom keybinding, NO claude-vscode.focus, NO AXRaise.
+
+
+def test_cold_closes_sidebars_before_uri_when_window_frontmost(home, tmp_path):
+    """On a cold worktree spawn the launcher fires the guarded close-sidebars chord once the task window is
+    frontmost (BEFORE the URI) → side bars collapse → no focus competitor → clean submit."""
+    task = "cold-singlepane"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    tr = _cold_transcript(tmp_path, ws)
+    env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py",
+               grow_transcript=tr, grow_on_attempt=1)
+    assert _run(env).returncode == 0
+    assert _read(tmp_path / "sidebar.log") == "s", "cold spawn must close the side bars (single-pane) before the URI"
+    assert "HANDOFF-CLOSE-SIDEBARS" in _read(tmp_path / "osa.log"), "the close-sidebars osascript marker must appear"
+    assert _read(tmp_path / "open.log") != "", "the URI must still be opened (after the close step)"
+    assert _ack(home, task, "submitted"), "with the competitor gone the submit succeeds"
+
+
+def test_cold_close_sidebars_guarded_when_task_window_not_frontmost(home, tmp_path):
+    """MULTI-WINDOW red line: the close-sidebars chord must NOT fire when the task window is not frontmost — else
+    it would close the OWNER's side bars on a wrong window. Guarded in one atomic osascript (same pattern as the
+    Enter): assert front window title contains the task token, THEN keystroke."""
+    task = "cold-sidebar-guard"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    _cold_transcript(tmp_path, ws)
+    env = _env(home, tmp_path, front_window="some-other-project — z.py")  # task window NOT frontmost
+    assert _run(env).returncode == 0
+    assert _read(tmp_path / "sidebar.log") == "", "close-sidebars must be WITHHELD when the task window isn't frontmost"
+    assert _read(tmp_path / "key.log") == "", "and the submit stays withheld too (no stray action on a wrong window)"
+    assert _ack(home, task, "failed")
+    assert not _ack(home, task, "submitted")
+
+
+def test_warm_path_does_not_close_sidebars(home, tmp_path):
+    """The close-sidebars step is COLD-ONLY: a warm main-repo spawn (reused window) must never close side bars."""
+    task = "warm-nosidebar"
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    _seed(home, ws, task, heartbeat=True)
+    env = _env(home, tmp_path, front_window=f"main.py — {ws.name}")
+    assert _run(env).returncode == 0
+    assert _read(tmp_path / "sidebar.log") == "", "warm path must NOT close side bars (cold-only single-pane fix)"
+    assert _ack(home, task, "submitted")
+
+
+def test_cold_no_chord_when_keybinding_not_installed_but_submit_still_works(home, tmp_path):
+    """FAIL-SAFE GATE (audit P1, codex): the close-sidebars chord fires ONLY if the install sentinel exists.
+    Without it (keybinding not installed, or cmd+ctrl+alt+9 bound elsewhere → install refused) the runtime must
+    NOT send a stray chord — and the readiness-gate must still submit normally (graceful degradation)."""
+    task = "cold-nosentinel"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    tr = _cold_transcript(tmp_path, ws)
+    env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py",
+               grow_transcript=tr, grow_on_attempt=1, sidebar_sentinel=False)  # NO sentinel
+    assert _run(env).returncode == 0
+    assert _read(tmp_path / "sidebar.log") == "", "no sentinel ⇒ NO close-sidebars chord (fail-safe; no stray keystroke)"
+    assert "keybinding not installed" in _log(home), "must log that the close was skipped for lack of the sentinel"
+    assert _read(tmp_path / "key.log") == "k", "the readiness-gate still submits normally (graceful degradation)"
+    assert _ack(home, task, "submitted")
+
+
+def test_cold_close_sidebars_withheld_when_title_lacks_worktree_marker(home, tmp_path):
+    """TIGHTENED GUARD (audit P1, codex): the close-sidebars chord requires the front window title to contain
+    the task token AND the `[worktree]` marker — so a stray window whose title merely contains the task-id
+    substring (but is not the cold worktree window) can never receive the chord."""
+    task = "cold-nomarker"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    tr = _cold_transcript(tmp_path, ws)
+    # front window contains the task token but NOT "[worktree]" → close-guard must reject it
+    env = _env(home, tmp_path, front_window=f"demo · {task} — x.py",
+               grow_transcript=tr, grow_on_attempt=1)
+    assert _run(env).returncode == 0
+    assert _read(tmp_path / "sidebar.log") == "", "close-sidebars must be WITHHELD when the title lacks [worktree]"
+
+
+def test_cold_no_chord_when_sentinel_empty_or_corrupt(home, tmp_path):
+    """FAIL-SAFE (R3 codex): a present-but-EMPTY/corrupt sentinel must yield NO valid key → the chord is SKIPPED
+    (it must NOT fall back to the default '9' and fire blindly). Readiness-gate still submits."""
+    task = "cold-corruptsentinel"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    tr = _cold_transcript(tmp_path, ws)
+    env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py",
+               grow_transcript=tr, grow_on_attempt=1, sidebar_sentinel=False)
+    (home / ".singlepane-keybinding.installed").write_text("   \n", encoding="utf-8")  # present but no valid key
+    assert _run(env).returncode == 0
+    assert _read(tmp_path / "sidebar.log") == "", "empty/corrupt sentinel ⇒ NO chord (never default to '9')"
+    assert "missing-or-invalid" in _log(home), "must log the missing-or-invalid sentinel skip"
+    assert _ack(home, task, "submitted"), "readiness-gate still submits (graceful)"
+
+
+def test_cold_close_sidebars_rejects_task_id_prefix_collision(home, tmp_path):
+    """TIGHTENED GUARD (R3 codex): another worktree window whose task id merely has THIS task as a prefix
+    (task 'foo-1' vs a 'foo-10 [worktree]' window) must NOT receive the chord — the guard matches the exact
+    fragment '<task> [worktree]'. (The Enter's own substring guard is pre-existing and out of scope here.)"""
+    task = "foo-1"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    _cold_transcript(tmp_path, ws)
+    env = _env(home, tmp_path, front_window="demo · foo-10 [worktree] — x.py")  # a DIFFERENT worktree's window
+    assert _run(env).returncode == 0
+    assert _read(tmp_path / "sidebar.log") == "", "prefix-collision window must NOT receive the close-sidebars chord"
 
 
 def test_warm_submit_does_not_run_focus_command(home, tmp_path):

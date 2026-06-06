@@ -12,4 +12,14 @@
 // ON the editor Claude input. "Paste, then Enter" — with NO AXRaise and NO focus command — submits
 // reliably. auto-continue.sh now uses a bare, front-window-guarded Enter (do_focus=0) on the cold path.
 // There is nothing to bind. Kept as a tombstone so a future session does not re-introduce the chord.
+//
+// 2026-06-06 — DO NOT CONFUSE WITH THE SANCTIONED SINGLE-PANE FIX. A different, dual-brain-vetted
+// (codex+Gemini) + owner-approved keybinding now lives in `install_keybinding.py` /
+// `install/keybindings-singlepane.json`: it binds `cmd+ctrl+alt+9` → runCommands[closeSidebar,
+// closeAuxiliaryBar] (NO `claude-vscode.focus`, NO AXRaise) and auto-continue.sh fires it
+// `close_sidebars_if_front_window_contains` BEFORE the URI to collapse the cold window to a single
+// editor pane. That is materially different from THIS tombstone: the failure here was the
+// `claude-vscode.focus` chord grabbing the empty sidebar AFTER the URI (+ AXRaise resetting focus),
+// not closing side bars per se. Closing side bars BEFORE the prompt exists, idempotently, with no
+// focus chord, is the "消除墙" fix — keep it, do not re-add `claude-vscode.focus`.
 []
