@@ -190,6 +190,34 @@ from .states import (
     reachable_node_states,
     validate_state_machine_closure,
 )
+
+# --- slice S4a (minimal auto-reaction kernel — advisory mode) -----------------
+# Additive: S4a imports the frozen S0 contracts + the S3 EventLog/AckInbox/Reducer/
+# Policy above and adds the auto-reaction round (SupervisorTick) that turns the S3
+# shadow ("只算不动") into a real "worker delivers → supervisor reacts" loop, on the
+# advisory rung (auto only internal-state advance; spawn/merge/oracle/approval are
+# surfaced + alerted, NEVER executed). It defines NO new *wire* contract — its runtime
+# objects (TickResult/Alert/AppliedDecision/Advisory/DeliverySignal) are kernel runtime
+# state, not S0 Contracts — so ALL_CONTRACTS / S1_CONTRACTS are untouched. It is isolated
+# under ``supervisor/`` and does not touch any running engine path (S4a 红线: 只增不改
+# 运行路径); it reuses only the S3 EventLog/AckInbox + the pure reduce/decide.
+from .supervisor_tick import (
+    Advisory,
+    AdvisoryClass,
+    Alert,
+    AlertKind,
+    AppliedDecision,
+    DeliveryDetector,
+    DeliverySignal,
+    PlanStatus,
+    SentinelWatch,
+    SupervisorTick,
+    TickError,
+    TickResult,
+    TickTrigger,
+    advisory_class,
+    assert_advisory_partition_total,
+)
 from .verdict import (
     KNOWN_VERDICT_RULES,
     RULE_PREFIX,
@@ -442,4 +470,20 @@ __all__ = [
     "ShadowStep",
     "ShadowMismatch",
     "compare_to_history",
+    # --- slice S4a: minimal auto-reaction kernel (advisory) ---
+    "SupervisorTick",
+    "TickResult",
+    "TickTrigger",
+    "TickError",
+    "AdvisoryClass",
+    "advisory_class",
+    "assert_advisory_partition_total",
+    "AlertKind",
+    "Alert",
+    "AppliedDecision",
+    "Advisory",
+    "PlanStatus",
+    "SentinelWatch",
+    "DeliverySignal",
+    "DeliveryDetector",
 ]
