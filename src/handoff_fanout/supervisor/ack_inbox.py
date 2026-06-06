@@ -23,6 +23,17 @@ live engine (S4) ``verdict_for`` runs the S2 VerdictComputer over the audit's ra
 findings, here in S3 they are injected so the translation is exercised without
 re-testing S2.
 
+**Callback-purity contract (P1-1 dedupe seam).** ``verdict_for`` / ``fixer_state_for``
+MUST be pure deterministic functions of their inputs (``ack`` / ``ack``+``fixer``) —
+which they are by INV-2/INV-3 (the verdict is a deterministic fold over raw findings).
+This is what makes an at-least-once *re-delivery* safe: a re-delivered audit/fixer
+signal is re-translated to a byte-identical event, so :meth:`EventLog.append_event`
+recognises it as a benign dedupe no-op (the deterministic event id / logical signature
+deliberately excludes the envelope ``ts``, so the SAME signal drained at a later turn
+is still the same logical event). A non-pure callback that recomputed a *different*
+body for the same ack would (correctly) be caught fail-closed as a dedupe collision —
+that is the INV-2 violation surfacing, not a re-delivery false-positive.
+
 A malformed signal is quarantined and **skipped** (not fail-closed-crash): one
 garbage worker signal must not deadlock the whole plan — the node simply looks
 unreported and the Sweeper times it out. (Contrast the EventLog, where a bad line in
@@ -35,6 +46,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import enum
+import hashlib
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -42,7 +54,7 @@ from pathlib import Path
 from ..atomic import atomic_replace
 from ._base import SchemaError
 from .actions import Ack
-from .event_log import AppendResult, EventLog
+from .event_log import AppendResult, DedupeCollisionError, EventLog
 from .events import EventType, Provenance
 from .fixer import FixerState
 from .payloads import AuditDone, FixerDone
@@ -100,16 +112,23 @@ class AckInbox:
         """Write one completion signal (used by workers/tests). The supervisor is the
         only reader; this never touches ``events.jsonl``."""
         self.dir.mkdir(parents=True, exist_ok=True)
-        # Deterministic, collision-resistant name from the signal's own identity — no
-        # clock/random (INV-1 reproducibility): kind + node + run_id + attempt.
-        fname = name or f"{kind.value}-{ack.node}-{ack.run_id}-{ack.attempt}.json"
-        path = self.dir / fname
         body = json.dumps(
             {"kind": kind.value, "ack": ack.to_dict()},
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
         )
+        # P2-b: the name names the logical event (kind+node+run_id+attempt) AND carries a
+        # short CONTENT hash that discriminates DIFFERENT bodies sharing that tuple. Without
+        # it, two *contradictory* signals (same dedupe tuple, divergent tree_oid/staged_diff)
+        # atomically overwrote each other on disk, so the supervisor only ever drained the
+        # last one and the EventLog dedupe-collision guard (P1-1) never saw the contradiction.
+        # A content hash (not a clock/uuid) keeps the name reproducible (INV-1): an IDENTICAL
+        # at-least-once re-delivery collapses to the SAME name (idempotent — no duplicate
+        # noise), while distinct bodies land in distinct files and both reach the drain.
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:12]
+        fname = name or f"{kind.value}-{ack.node}-{ack.run_id}-{ack.attempt}-{digest}.json"
+        path = self.dir / fname
         # R2 codex #3: write atomically (temp + fsync + rename) so a supervisor draining
         # mid-deposit never sees a truncated file → quarantines it → permanently loses a
         # valid completion signal. A reader sees either no file or the whole file.
@@ -187,11 +206,28 @@ class AckInbox:
                 node=ack.node,
                 reason=f"signal references unknown node {ack.node!r}",
             )
-        if kind is InboxSignalKind.WORKER:
-            return self._translate_worker(path, log, ts, kind, ack, node)
-        if kind is InboxSignalKind.AUDIT:
-            return self._translate_audit(path, log, ts, kind, ack, node, verdict_for)
-        return self._translate_fixer(path, log, ts, kind, ack, node, fixer_state_for)
+        try:
+            if kind is InboxSignalKind.WORKER:
+                return self._translate_worker(path, log, ts, kind, ack, node)
+            if kind is InboxSignalKind.AUDIT:
+                return self._translate_audit(path, log, ts, kind, ack, node, verdict_for)
+            return self._translate_fixer(path, log, ts, kind, ack, node, fixer_state_for)
+        except DedupeCollisionError as exc:
+            # P1-1: a contradictory second Ack for an already-recorded logical event (same
+            # dedupe_key, divergent body — a worker bug / replay). EventLog.append_event is
+            # the single dedupe+collision authority and fails it closed. At THIS untrusted-
+            # input seam we surface it as QUARANTINED (recorded with a reason, the opposite
+            # of silently swallowing it as a benign dedupe) rather than crash the whole drain
+            # — one buggy worker must not deadlock the plan (the AckInbox quarantine-and-skip
+            # philosophy; contrast the EventLog's OWN-log corruption, which fails-closed-crash).
+            return TranslationOutcome(
+                path=path,
+                disposition=TranslationDisposition.QUARANTINED,
+                kind=kind,
+                node=ack.node,
+                reason=f"dedupe collision — contradictory Ack for an existing logical event "
+                f"(fail-closed, not silently deduped): {exc}",
+            )
 
     # --- per-kind translation -----------------------------------------------
 
@@ -205,11 +241,17 @@ class AckInbox:
         node: NodeRuntime,
     ) -> TranslationOutcome:
         dedupe = f"worker_done:{ack.node}:{ack.attempt}"
-        if self._already(log, dedupe):
-            return self._deduped(path, kind, ack.node, EventType.WORKER_DONE, log, dedupe)
-        guard = self._fence(path, kind, ack, node, NodeState.DISPATCHED, "worker")
-        if guard is not None:
-            return guard
+        # P1-1: never short-circuit a dedupe hit by returning the existing event blindly —
+        # that bypasses the EventLog collision guard and silently swallows a contradictory
+        # re-delivery. The fence gates only a NEW signal (a genuine re-delivery whose node
+        # has already advanced past DISPATCHED must still dedupe, not be quarantined by the
+        # state check); the append ALWAYS flows through ``append_event`` — the sole dedupe+
+        # collision authority (same body → idempotent no-op; different body → raises
+        # DedupeCollisionError, caught in ``_process_one`` → quarantined, never swallowed).
+        if not self._already(log, dedupe):
+            guard = self._fence(path, kind, ack, node, NodeState.DISPATCHED, "worker")
+            if guard is not None:
+                return guard
         result = log.append_event(
             type=EventType.WORKER_DONE,
             payload=ack,
@@ -232,11 +274,13 @@ class AckInbox:
         verdict_for: VerdictFor | None,
     ) -> TranslationOutcome:
         dedupe = f"audit_done:{ack.node}:{ack.attempt}"
-        if self._already(log, dedupe):
-            return self._deduped(path, kind, ack.node, EventType.AUDIT_DONE, log, dedupe)
-        guard = self._fence(path, kind, ack, node, NodeState.AUDITING, "audit")
-        if guard is not None:
-            return guard
+        # P1-1 (see ``_translate_worker``): fence only a NEW signal, then route the append
+        # through ``append_event`` so a contradictory re-delivery collides fail-closed
+        # instead of being silently deduped.
+        if not self._already(log, dedupe):
+            guard = self._fence(path, kind, ack, node, NodeState.AUDITING, "audit")
+            if guard is not None:
+                return guard
         if verdict_for is None:
             return TranslationOutcome(
                 path=path,
@@ -279,27 +323,29 @@ class AckInbox:
                 reason=f"fixer signal for node {ack.node!r} with no active fixer",
             )
         dedupe = f"fixer_done:{fixer.fixer_id}"
-        if self._already(log, dedupe):
-            return self._deduped(path, kind, ack.node, EventType.FIXER_DONE, log, dedupe)
-        # Fence on the FIXER's attempt (its node lives in BLOCKED_BY_FIX while the fixer
-        # runs), not the node's dispatch attempt.
-        if ack.attempt != fixer.attempt:
-            return TranslationOutcome(
-                path=path,
-                disposition=TranslationDisposition.DROPPED_STALE,
-                kind=kind,
-                node=ack.node,
-                reason=f"fixer signal attempt {ack.attempt} != active fixer attempt "
-                f"{fixer.attempt} (fenced)",
-            )
-        if node.status is not NodeState.BLOCKED_BY_FIX:
-            return TranslationOutcome(
-                path=path,
-                disposition=TranslationDisposition.QUARANTINED,
-                kind=kind,
-                node=ack.node,
-                reason=f"fixer signal but node is {node.status.value}, not BLOCKED_BY_FIX",
-            )
+        # P1-1 (see ``_translate_worker``): fence only a NEW signal (a genuine re-delivery
+        # whose fixer already settled must dedupe, not be quarantined); the append always
+        # flows through ``append_event`` so a contradictory fixer Ack collides fail-closed.
+        if not self._already(log, dedupe):
+            # Fence on the FIXER's attempt (its node lives in BLOCKED_BY_FIX while the fixer
+            # runs), not the node's dispatch attempt.
+            if ack.attempt != fixer.attempt:
+                return TranslationOutcome(
+                    path=path,
+                    disposition=TranslationDisposition.DROPPED_STALE,
+                    kind=kind,
+                    node=ack.node,
+                    reason=f"fixer signal attempt {ack.attempt} != active fixer attempt "
+                    f"{fixer.attempt} (fenced)",
+                )
+            if node.status is not NodeState.BLOCKED_BY_FIX:
+                return TranslationOutcome(
+                    path=path,
+                    disposition=TranslationDisposition.QUARANTINED,
+                    kind=kind,
+                    node=ack.node,
+                    reason=f"fixer signal but node is {node.status.value}, not BLOCKED_BY_FIX",
+                )
         if fixer_state_for is None:
             return TranslationOutcome(
                 path=path,
@@ -331,26 +377,11 @@ class AckInbox:
 
     @staticmethod
     def _already(log: EventLog, dedupe_key: str) -> bool:
+        """Whether this dedupe_key is already in the log — used ONLY to decide whether to
+        run the new-signal fence (a re-delivery skips it). The dedupe DECISION itself
+        (idempotent no-op vs collision) is made authoritatively by ``EventLog.append_event``,
+        never here (P1-1: this must not become a second, collision-blind dedupe path)."""
         return any(e.dedupe_key == dedupe_key for e in log.read_all())
-
-    @staticmethod
-    def _deduped(
-        path: Path,
-        kind: InboxSignalKind,
-        node: str,
-        event_type: EventType,
-        log: EventLog,
-        dedupe_key: str,
-    ) -> TranslationOutcome:
-        existing = next(e for e in log.read_all() if e.dedupe_key == dedupe_key)
-        return TranslationOutcome(
-            path=path,
-            disposition=TranslationDisposition.DEDUPED,
-            kind=kind,
-            node=node,
-            event_type=event_type,
-            append=AppendResult(event=existing, appended=False, deduped=True),
-        )
 
     @staticmethod
     def _fence(

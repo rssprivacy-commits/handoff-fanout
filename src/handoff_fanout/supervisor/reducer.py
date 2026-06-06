@@ -118,11 +118,20 @@ class NodeRuntime:
     last_reason: str | None = None  # owner-facing block/cancel/escalate reason (INV-10)
 
     def _reset_attempt_fields(self) -> None:
-        """Clear per-attempt derived fields when a node (re)enters an active attempt."""
+        """Clear per-attempt derived fields when a node (re)enters an active attempt.
+
+        P2-a: ``fix_attempts`` is a per-attempt budget counter (consumed by the Fixers
+        spawned *for this attempt's output*), so it resets here too. The reset points are
+        exactly the fresh-attempt entries that already call this — a (re)dispatch (incl. a
+        timeout retry), a rollback→PENDING, and an owner_override→PENDING. Without it a node
+        that exhausted its fix budget then redoes from scratch would inherit an empty budget
+        and 暴毙 (BLOCK) on the first RED with no repair chance — the fix budget must track
+        the attempt, mirroring ``verdict``/``oracle``/``active_fixer``."""
         self.verdict = None
         self.oracle = None
         self.active_fixer = None
         self.audit_started = False
+        self.fix_attempts = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -499,6 +508,15 @@ def _h_global_resumed(state: SupervisorState, plan: Plan, node_ids: set[str], ev
 def _h_owner_override(state: SupervisorState, plan: Plan, node_ids: set[str], event: Event) -> None:
     payload: OwnerOverride = _payload(event, OwnerOverride)
     node = _node(state, node_ids, payload.node)
+    # P1-3 (moot): an owner_override can only target a closed ``RecoveryTarget``
+    # (PENDING / DISPATCHED / AWAIT_APPROVAL — redo / force-run / re-gate). DONE is NOT a
+    # RecoveryTarget, so ``payload.target_state`` cannot even carry it (the enum rejects
+    # "DONE" at from_dict), and there is no BLOCKED--owner_override-->DONE S0 edge for
+    # ``_transition`` to walk (states.py C8 asserts the override edges equal the
+    # RecoveryTarget set). Hence a "forced-DONE leaves an empty upstream_snapshot →
+    # REVALIDATE_STALE秒级回滚" defect is unreachable by construction — there is nothing to
+    # guard here, and the staleness-snapshot capture below stays exclusive to the genuine
+    # EVALUATING/BLOCKED_BY_FIX→DONE advance path (``_h_node_advanced``).
     target = NodeState(payload.target_state.value)
     _transition(node, EventType.OWNER_OVERRIDE, target)  # BLOCKED -> RecoveryTarget (GAP-3)
     node.last_reason = payload.reason

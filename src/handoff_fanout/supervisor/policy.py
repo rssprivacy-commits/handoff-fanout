@@ -39,6 +39,7 @@ import dataclasses
 import enum
 from typing import Any
 
+from .actions import Approval
 from .events import EventType
 from .fixer import FixerState, FixerTrigger
 from .oracle import OracleScope
@@ -181,7 +182,7 @@ def decide(
         spec = nodes_by_id.get(nid)
         if spec is None:  # pragma: no cover - reducer rejects unknown nodes upstream
             continue
-        decision = _decide_node(plan, state, spec, node, cfg)
+        decision = _decide_node(plan, state, spec, node, cfg, now)
         if decision is not None:
             decisions.append(decision)
 
@@ -198,6 +199,19 @@ def _timed_out(node: NodeRuntime, now: str, cfg: PolicyConfig) -> bool:
         return False
     elapsed = _elapsed_seconds(node.inflight_since_ts, now)
     return elapsed is not None and elapsed > cfg.timeout_s
+
+
+def _approval_valid(approval: Approval | None, now: str) -> bool:
+    """Whether an approval may gate dispatch of an irreversible node: it must be PRESENT
+    and not past its hard ``expires_at`` (§6.4 anti-replay — an expired approval is no
+    consent, like a stale one). Fail-closed: an unparseable expiry/now, or the exact expiry
+    instant (``now >= expires_at``), counts as NOT valid — an irreversible side effect must
+    never run on an approval whose freshness cannot be positively verified. ``now`` is the
+    injected logical clock (INV-3), so this stays time-free/deterministic."""
+    if approval is None:
+        return False
+    elapsed = _elapsed_seconds(approval.expires_at, now)  # (now - expires_at) seconds
+    return elapsed is not None and elapsed < 0
 
 
 def _forward_decisions(decisions: list[Decision]) -> list[Decision]:
@@ -220,6 +234,7 @@ def _decide_node(
     spec: Node,
     node: NodeRuntime,
     cfg: PolicyConfig,
+    now: str,
 ) -> Decision | None:
     """The single-node decision (§5 dispatch branch). Returns ``None`` when the node is
     waiting (deps unmet / work in flight / awaiting owner) — i.e. not actionable now."""
@@ -228,11 +243,14 @@ def _decide_node(
     if status is NodeState.PENDING:
         if not _deps_done(spec, state):
             return None  # waiting on upstream deps
-        if not spec.reversible and node.approval is None:
+        # P1-4: an irreversible node dispatches only behind a VALID approval — none, or an
+        # EXPIRED one, must re-request fresh consent (never dispatch on stale approval).
+        if not spec.reversible and not _approval_valid(node.approval, now):
             return Decision(
                 kind=DecisionKind.REQUEST_APPROVAL,
                 node=node.node_id,
-                reason="irreversible node requires owner approval before execution (§6.4)",
+                reason="irreversible node requires fresh owner approval before execution "
+                "(absent or expired — §6.4 anti-replay)",
             )
         return Decision(
             kind=DecisionKind.DISPATCH,
@@ -242,8 +260,11 @@ def _decide_node(
         )
 
     if status is NodeState.AWAIT_APPROVAL:
-        if node.approval is None:
-            return None  # waiting on owner approval
+        # P1-4: an expired approval is no consent — fail-closed by waiting for a fresh one
+        # (the gate previously dispatched the irreversible execution on ANY non-None
+        # approval, ignoring its hard expires_at → an expired approval still ran §6.4 work).
+        if not _approval_valid(node.approval, now):
+            return None  # waiting on (fresh) owner approval
         return Decision(
             kind=DecisionKind.DISPATCH,
             node=node.node_id,
@@ -265,7 +286,7 @@ def _decide_node(
         return _decide_evaluating(spec, node)
 
     if status is NodeState.BLOCKED_BY_FIX:
-        return _decide_blocked_by_fix(spec, node)
+        return _decide_blocked_by_fix(spec, node, now, cfg)
 
     if status is NodeState.TIMED_OUT:
         if node.attempt < cfg.max_dispatch_attempts:
@@ -337,14 +358,36 @@ def _decide_evaluating(spec: Node, node: NodeRuntime) -> Decision | None:
     )
 
 
-def _decide_blocked_by_fix(spec: Node, node: NodeRuntime) -> Decision | None:
+def _decide_blocked_by_fix(
+    spec: Node, node: NodeRuntime, now: str, cfg: PolicyConfig
+) -> Decision | None:
     """BLOCKED_BY_FIX: a Fixer is attached. Advance on a post-fix oracle GREEN; retry the
-    Fixer under cap; otherwise BLOCK→DLQ (§5)."""
+    Fixer under cap; otherwise BLOCK→DLQ (§5). Also reclaims a hung in-flight Fixer
+    (P1-2)."""
     fixer = node.active_fixer
     if fixer is None:  # pragma: no cover - BLOCKED_BY_FIX always has an active fixer
         return None
     if fixer.state in (FixerState.DISPATCHED, FixerState.AUDITING):
-        return None  # fixer in flight (Sweeper handles timeout)
+        # P1-2: reclaim a hung in-flight Fixer. The literal Sweeper (decide() step 1) only
+        # reaps DISPATCHED/AUDITING *node* states, so a Fixer that hangs (or whose worker
+        # dies) left this node BLOCKED_BY_FIX forever — the whole pipeline永久死锁. A Fixer
+        # past the in-flight budget (node.inflight_since_ts == the fixer_spawned ts) is
+        # treated as a FAILED Fixer and routed through the SAME budget rule: retry under the
+        # fix cap, else BLOCK→DLQ — both existing S0 edges, so no frozen BLOCKED_BY_FIX→
+        # TIMED_OUT state is invented. (Gated by GLOBAL_PAUSED via decide() step 2: a pause
+        # legitimately stops spawning a replacement Fixer, unlike the node-Sweeper which only
+        # marks a passive TIMED_OUT — reclaiming a Fixer means new/escalating work.)
+        if _timed_out(node, now, cfg):
+            # Trigger reuse is deliberate: a distinct TIMEOUT/INTERNAL_ERROR FixerTrigger
+            # would change the S0-frozen ``FixerTrigger`` enum (states.py reconciliation #4:
+            # only VERDICT_RED / ORACLE_RED), out of scope for this片. The owner-facing
+            # ``reason`` already names "exceeded budget" so the cause is not lost; a finer
+            # trigger taxonomy for metrics (timeout vs real oracle-RED) is a future S0
+            # amendment (报中枢), not a silent enum change here.
+            return _spawn_fixer_or_block(
+                spec, node, FixerTrigger.ORACLE_RED, f"fixer exceeded {cfg.timeout_s}s budget"
+            )
+        return None  # fixer genuinely in flight, within budget
     if fixer.state is FixerState.DONE:
         # Fixer succeeded → re-run the affected→milestone oracle before advancing.
         if node.oracle is None:
