@@ -32,8 +32,11 @@ mod = _load()
 
 @pytest.fixture(autouse=True)
 def _isolate_env(tmp_path, monkeypatch):
-    """CRITICAL: redirect the success-sentinel to tmp so install() never writes to the REAL
-    ~/.claude-handoff, and start each test from a clean HANDOFF_SIDEBAR_CLOSE_KEY (default 9)."""
+    """CRITICAL hermetic isolation: redirect BOTH the keybindings target AND the success-sentinel to tmp so
+    install() can NEVER touch the developer's REAL VS Code keybindings.json or ~/.claude-handoff — even a
+    test that (accidentally) calls install() with no explicit path. Also start from a clean default key.
+    (Tests that exercise the real default path delete HANDOFF_KEYBINDINGS_FILE themselves and only READ it.)"""
+    monkeypatch.setenv("HANDOFF_KEYBINDINGS_FILE", str(tmp_path / "default-keybindings.json"))
     monkeypatch.setenv("HANDOFF_SINGLEPANE_SENTINEL", str(tmp_path / "sentinel"))
     monkeypatch.delenv("HANDOFF_SIDEBAR_CLOSE_KEY", raising=False)
 
