@@ -492,13 +492,22 @@ def inject_vscode_workspace(source_workspace: Path, wt: Path, project: str, task
                     "settings": {
                         # ${...} are VS Code window-title variables (literal here; VS Code expands them).
                         "window.title": f"{project} · {task} [worktree]${{separator}}${{activeEditorShort}}",
-                        # Belt for the cold auto-submit focus fix (2026-06-05 / dual-brain codex+Gemini):
-                        # the URI opens the handoff prompt in the EDITOR Claude (primaryEditor.open), and
-                        # the focus chord routes through `claude-vscode.focus → editor.openLast`, which
-                        # opens the SIDEBAR Claude instead when `claudeCode.preferredLocation == "sidebar"`.
-                        # Pin it to "panel" so editor.openLast deterministically targets the editor Claude
-                        # that holds the prompt (the keybinding closes the sidebar; this guarantees the
-                        # reveal target even if the user's global config drifted to "sidebar").
+                        # SINGLE-PANE cold spawn (2026-06-06 / dual-brain codex+Gemini + owner ruling).
+                        # A fresh worktree window otherwise opens multi-pane (activity bar + Explorer +
+                        # an EMPTY Claude SIDEBAR "Message input"); that empty input grabs keyboard focus,
+                        # so the synthetic Enter races the URI-pasted CENTER prompt for focus (~40% miss
+                        # under load → readiness-gate honestly withholds → owner presses Enter manually).
+                        # Fix = collapse to a single editor pane so there is NO focus competitor.
+                        # Declarative half (zero-keystroke, the robust core both brains endorsed):
+                        #   - activityBar.location:hidden → removes the activity bar AND its Claude
+                        #     sidebar view, i.e. the empty "Message input" competitor. (The Explorer alone
+                        #     is an AXOutline, not an AXTextArea "Message input", so it never competes.)
+                        #   - startupEditor:none → no Welcome tab grabbing initial focus.
+                        # Runtime half (auto-continue.sh close_sidebars_if_front_window_contains) idempotently
+                        # closes BOTH side bars BEFORE the URI for a literal one-pane look. preferredLocation
+                        # stays "panel" (enum is only sidebar|panel; the URI opens Claude in the editor anyway).
+                        "workbench.activityBar.location": "hidden",
+                        "workbench.startupEditor": "none",
                         "claudeCode.preferredLocation": "panel",
                     },
                 },
