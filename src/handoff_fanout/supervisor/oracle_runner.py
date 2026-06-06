@@ -37,17 +37,22 @@ tests never touch a real subprocess or DB:
   migrated DB can never deadlock a retry (design §4.4 / §9, Round-2 red line).
 
 🔴 **C′ red line** (design §7 / §11): the runner is hermetic and must never touch
-Live. The soft-isolation layer (s1-fix hardening): every subprocess (shell / sql /
-``dropdb`` / ``createdb``) runs under a **sanitized allowlist env** with no host
-``PG*`` / ``DATABASE_URL`` / cloud creds and a sandbox ``HOME``
-(:func:`_sanitized_base_env`); :class:`PsqlSandboxDb` *refuses* a drop target that is
-not a plain identifier (:data:`_SAFE_DB_NAME` — no ``--host=`` / ``service=`` / flag
-injection), is on :data:`LIVE_DB_DENYLIST`, lacks the sandbox marker, or equals its
-template, and passes names after a ``--`` argv terminator. Honesty (design §7 "单机非
-硬沙箱"): this is the *soft* layer — it stops a *misconfigured / poisoned env* from
-reaching Live, but ``network=deny`` is an advisory sentinel (no enforced egress
-block) and a same-user ``shell=True`` spec can still read absolute paths / the
-network. Hard isolation (OS user / container / seccomp) is the §7 防恶意层, **not
+Live. The soft-isolation layer (s1-fix + s1-fix2 hardening): every subprocess (shell /
+sql / ``dropdb`` / ``createdb``) runs under a **sanitized allowlist env** with no host
+``PG*`` / ``DATABASE_URL`` / cloud creds and a sandbox ``HOME`` (:func:`_sanitized_base_env`),
+and is **fail-closed on the connection target** — a DB op (psql / dropdb / createdb)
+needs an explicitly-injected sandbox connection (:data:`_SANDBOX_CONN_KEYS`); with none
+it is refused, never sent to the ambient libpq default (s1-fix2 residual #1). The
+executor's sandbox ``HOME`` (= ``runtime.cwd``) is itself guarded against the real home /
+an ancestor of it (:func:`_sandbox_cwd_error`, s1-fix2 residual #3). :class:`PsqlSandboxDb`
+*refuses* a drop target **or template** that is not a plain identifier
+(:data:`_SAFE_DB_NAME` — no ``--host=`` / ``service=`` / flag injection), is on
+:data:`LIVE_DB_DENYLIST`, lacks the sandbox marker (both db and template — s1-fix2
+residual #2), or equals its template, and passes names after a ``--`` argv terminator.
+Honesty (design §7 "单机非硬沙箱"): this is the *soft* layer — it stops a *misconfigured /
+poisoned env* from reaching Live, but ``network=deny`` is an advisory sentinel (no
+enforced egress block) and a same-user ``shell=True`` spec can still read absolute paths /
+the network. Hard isolation (OS user / container / seccomp) is the §7 防恶意层, **not
 promised this slice**. Output truncation here is not yet secret-redaction (slice S6).
 
 The authoritative design is ``project-files/handoff/supervisor-orchestration-
@@ -115,6 +120,44 @@ _REDLINE = (Severity.P0, Severity.P1)
 #: the real home (s1-fix codex P0-3 / gemini P1 blast-radius shrink).
 _HOST_ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "TMPDIR", "TZ", "SHELL")
 
+#: Keys that must NEVER enter a subprocess env via the ``extra`` overlay, even from
+#: the trusted construction site (s1-fix2 hardening / defense-in-depth — the audit's
+#: non-blocking note). ``HOME`` is always set explicitly *per call site* to a sandbox
+#: path (the executor → ``runtime.cwd``; the sandbox DB → a tmp dir), so letting it
+#: ride in via ``extra`` would silently override that to an attacker/mis-config value
+#: and re-open the ``~/.aws`` / ``~/.pgpass`` leak. ``DATABASE_URL`` is a single-string
+#: conninfo that can embed a Live host + creds; the sandbox connection is expressed as
+#: discrete ``PG*`` knobs (which dropdb/createdb/psql consume), never a URL. **Trade-off
+#: recorded for the supervisor (s1-fix2):** the conn-target ``PG*`` keys
+#: (:data:`_SANDBOX_CONN_KEYS`) + ``PGUSER`` / ``PGPASSWORD`` / ``PGPASSFILE`` are *not*
+#: filtered — they ARE the sandbox-connection injection channel (Fix 2 requires the
+#: supervisor to inject them), so filtering them would break the legitimate sandbox
+#: redirect. The structural defense the note really wants (never wire ``extra`` from a
+#: worker-controllable ``oracle.json``) stays a construction-site contract; this filter
+#: only closes the two keys that have no legitimate ``extra`` use at all.
+_EXTRA_ENV_DENY = ("HOME", "DATABASE_URL")
+
+#: libpq connection-*target* env vars: one explicitly injected by the trusted
+#: supervisor pins WHERE a subprocess connects, so it is **required** before any real
+#: DB op (dropdb / createdb / psql) — fail-closed, never the ambient libpq default,
+#: which on a single machine could be a Live cluster (s1-fix2 codex residual #1; C′
+#: "绝不碰 Live"). Auth-only knobs (``PGUSER`` / ``PGPASSWORD`` / ``PGPASSFILE``) are
+#: deliberately *not* in this set: they authenticate but do not redirect the target
+#: away from the ambient default cluster, so on their own they do not satisfy the
+#: fail-closed bar. §7 honesty: this proves "the supervisor chose the target
+#: explicitly", not "the target is provably not Live" — that is the soft-isolation
+#: contract, not a hard guarantee. The strongest posture injects ``PGHOST`` + ``PGPORT``.
+_SANDBOX_CONN_KEYS = ("PGHOST", "PGHOSTADDR", "PGPORT", "PGSERVICE")
+
+
+def _has_sandbox_conn(extra: Mapping[str, str] | None) -> bool:
+    """True iff ``extra`` carries an explicit sandbox connection *target* (a non-empty
+    value for one of :data:`_SANDBOX_CONN_KEYS`). Used to fail-closed: a DB op with no
+    explicit target is refused rather than silently riding the ambient libpq default."""
+    if not extra:
+        return False
+    return any(k in extra and str(extra[k]).strip() for k in _SANDBOX_CONN_KEYS)
+
 
 def _sanitized_base_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     """The sanitized env shared by *every* oracle subprocess (C′).
@@ -125,12 +168,56 @@ def _sanitized_base_env(extra: Mapping[str, str] | None = None) -> dict[str, str
     ``PGPASSFILE``). Those knobs come from the *trusted construction site* (whoever
     builds the runner / executor / sandbox), **never** from the worker-controllable
     oracle artefact — so a poisoned ``oracle.json`` / ``runtime`` cannot redirect a
-    subprocess to a Live server. ``HOME`` is deliberately absent (set per call site
-    to a sandbox path, never the real home)."""
+    subprocess to a Live server. The :data:`_EXTRA_ENV_DENY` keys (``HOME`` /
+    ``DATABASE_URL``) are dropped from ``extra`` even from that trusted site
+    (defense-in-depth, s1-fix2): ``HOME`` is owned per call site, ``DATABASE_URL`` is a
+    Live-host-bearing conninfo with no legitimate ``extra`` use. ``HOME`` is otherwise
+    deliberately absent (set per call site to a sandbox path, never the real home)."""
     env = {k: os.environ[k] for k in _HOST_ENV_ALLOWLIST if k in os.environ}
     if extra:
-        env.update({str(k): str(v) for k, v in extra.items()})
+        env.update({str(k): str(v) for k, v in extra.items() if str(k) not in _EXTRA_ENV_DENY})
     return env
+
+
+def _sandbox_cwd_error(cwd: str) -> str | None:
+    """Fail-closed guard: refuse to use ``cwd`` as the executor's sandbox ``HOME``
+    unless it is plausibly a *disposable sandbox directory* (s1-fix2 codex residual #3).
+
+    Returns an error string (→ ``RawExecution(error=...)`` → could-not-evaluate /
+    UNKNOWN, never a silent run) or ``None`` when ``cwd`` is acceptable. Refuses:
+
+    * an empty or non-absolute path (a sandbox worktree is an absolute path);
+    * ``cwd`` that resolves to the user's **real home** or an **ancestor** of it (``/``
+      / ``/Users``) — setting ``HOME`` there re-opens the very ``~/.aws`` / ``~/.ssh`` /
+      ``~/.pgpass`` leak the sandbox ``HOME`` was meant to close (a *subdirectory* of
+      home — the real worktree case ``~/Projects/...-wt/<task>`` — is allowed);
+    * a path that is not an existing, writable directory.
+
+    §7 honesty: this is soft — a ``shell=True`` spec can still read absolute paths; the
+    guard only guarantees ``~`` cannot resolve into the real home and that ``HOME`` is a
+    real writable sandbox dir, not that the dir is unreachable to a determined attacker.
+    """
+    if not cwd:
+        return "refusing an empty runtime.cwd as sandbox HOME (fail-closed C′)"
+    if not os.path.isabs(cwd):
+        return f"refusing a non-absolute runtime.cwd as sandbox HOME: {cwd!r}"
+    real_cwd = os.path.realpath(cwd)
+    real_home = os.path.realpath(os.path.expanduser("~"))
+    if real_cwd == real_home:
+        return (
+            f"refusing runtime.cwd == the real home {real_home!r} as sandbox HOME "
+            "(HOME=real-home re-opens ~/.aws / ~/.pgpass — C′ fail-closed)"
+        )
+    if real_home.startswith(real_cwd.rstrip(os.sep) + os.sep):
+        return (
+            f"refusing runtime.cwd {real_cwd!r} that is an ancestor of the real home "
+            f"{real_home!r} as sandbox HOME (C′ fail-closed)"
+        )
+    if not os.path.isdir(real_cwd):
+        return f"refusing runtime.cwd that is not an existing directory: {cwd!r}"
+    if not os.access(real_cwd, os.W_OK):
+        return f"refusing a non-writable runtime.cwd as sandbox HOME: {cwd!r}"
+    return None
 
 
 #: A ``dropdb`` / ``createdb`` target (or template) must match this — a *plain*
@@ -587,11 +674,21 @@ class SubprocessExecutor(CriterionExecutor):
         # Supervisor-provided sandbox knobs (e.g. sandbox-only PGHOST/PGUSER/
         # PGPASSWORD). Trusted construction-site input — NOT from the worker-
         # controllable oracle artefact — so a poisoned oracle.json can never redirect
-        # psql to a Live server. Empty by default: with no explicit PG*, libpq uses
-        # local defaults (unix socket / current user), the fail-closed sandbox posture.
+        # psql to a Live server. s1-fix2 codex residual #1: an explicit connection
+        # *target* (PGHOST/PGPORT/...) is REQUIRED for the psql (SQL) path — with none,
+        # the run is refused (could-not-evaluate / UNKNOWN), NOT silently sent to the
+        # ambient libpq default (which on a single machine could be a Live cluster).
         self._sandbox_env = dict(sandbox_env or {})
+        self._has_sandbox_conn = _has_sandbox_conn(self._sandbox_env)
 
     def execute(self, criterion: OracleCriterion, runtime: OracleRuntime) -> RawExecution:
+        # s1-fix2 codex residual #3: HOME is pinned to runtime.cwd, so refuse a cwd that
+        # is the real home / an ancestor of it (HOME=real-home re-opens ~/.aws) or is not
+        # an existing writable sandbox dir — could-not-evaluate (UNKNOWN), never a run on
+        # an unsafe HOME. Guards BOTH the shell and the psql path (both set HOME=cwd).
+        cwd_err = _sandbox_cwd_error(runtime.cwd)
+        if cwd_err is not None:
+            return RawExecution(error=cwd_err)
         if criterion.type is OracleType.SQL:
             return self._run_sql(criterion, runtime)
         return self._run_shell(criterion, runtime)
@@ -630,6 +727,16 @@ class SubprocessExecutor(CriterionExecutor):
             return RawExecution(
                 error=f"refusing a non-plain runtime.db for psql -d (conninfo / option "
                 f"injection): {runtime.db!r}"
+            )
+        # s1-fix2 codex residual #1 (psql path): fail-closed — psql needs an explicitly
+        # injected sandbox connection *target* (PGHOST/PGPORT/...). With none, refuse
+        # (could-not-evaluate / UNKNOWN); do NOT run psql against the ambient libpq
+        # default, which on a single machine could be a Live cluster (C′ 绝不碰 Live).
+        if not self._has_sandbox_conn:
+            return RawExecution(
+                error="refusing to run psql without an explicit sandbox connection "
+                f"({'/'.join(_SANDBOX_CONN_KEYS)}) — fail-closed, never the ambient "
+                "libpq default (C′)"
             )
         cmd = ["psql", "-w", "-d", runtime.db, "-tAX", "-c", criterion.spec]
         try:
@@ -719,10 +826,13 @@ class PsqlSandboxDb(SandboxDb):
       leading-``-`` / ``=``-bearing strings that would otherwise be parsed by
       dropdb/createdb as an *option* or a libpq *conninfo* and hit a DB the guard
       never checked (s1-fix codex #2 + gemini P0).
-    * **positive allowlist** — the drop *target* (``db``) must contain
-      ``sandbox_marker`` (normalized, default ``"sandbox"``). An un-marked name is
-      refused, so the guard is project-agnostic instead of relying on an ERP-specific
-      denylist that silently no-ops elsewhere.
+    * **positive allowlist (both db AND template)** — the drop *target* (``db``) and
+      the ``db_template`` must each contain ``sandbox_marker`` (normalized, default
+      ``"sandbox"``). An un-marked name is refused, so the guard is project-agnostic
+      instead of relying on an ERP-specific denylist that silently no-ops elsewhere.
+      The template is included because ``createdb --template`` *connects to* it
+      (s1-fix2 codex residual #2): an un-marked plain template name would read a Live
+      DB even though it is never dropped.
     * **denylist + normalization** — defense-in-depth: known live names (normalized:
       stripped + casefolded, so ``"ERP"`` / ``" erp "`` are caught) and
       connection-string-shaped inputs are refused for both db and template.
@@ -731,9 +841,12 @@ class PsqlSandboxDb(SandboxDb):
       the previous code passed no ``env=`` and inherited them all). The sandbox PG*
       is injected at construction (``env=``) by the trusted supervisor, never the
       host (s1-fix codex #2 + gemini P1).
+    * **fail-closed connection (s1-fix2 codex residual #1)** — an explicit sandbox
+      connection *target* (one of :data:`_SANDBOX_CONN_KEYS`, injected via ``env=``)
+      is REQUIRED before any dropdb/createdb. With none, the op is refused
+      (``LiveDbError`` → run-level UNKNOWN escalation), never sent to the ambient
+      libpq default (which on a single machine could be a Live cluster).
 
-    The marker requirement is on the *drop target* only; the template is read by
-    ``createdb`` (never dropped), so it just has to pass the name + denylist checks.
     🔴 Honesty (design §7): this is a *soft*, single-machine guard against mistakes /
     drift / a poisoned env, **not** a hard sandbox against a determined same-user
     local attacker (that is the §7 防恶意层 — OS user isolation / container — not
@@ -752,6 +865,11 @@ class PsqlSandboxDb(SandboxDb):
         self._marker = self._normalize(sandbox_marker)
         if not self._marker:
             raise LiveDbError("PsqlSandboxDb sandbox_marker must be non-empty (fail-closed)")
+        # s1-fix2 codex residual #1: dropdb/createdb need an explicit sandbox connection
+        # *target* (PGHOST/PGPORT/...). Computed from the RAW env (before sanitize) so a
+        # later op can fail-closed if none was injected — never silently riding the
+        # ambient libpq default (which could be a Live cluster). C′ 绝不碰 Live.
+        self._has_sandbox_conn = _has_sandbox_conn(env)
         # dropdb/createdb must NOT inherit the host's PG* / cloud creds. s1-fix codex
         # #2 + gemini P1: the previous code passed no ``env=`` at all, so a host
         # ``PGHOST`` / ``PGPASSWORD`` / ``DATABASE_URL`` pointing at Live made these
@@ -766,7 +884,20 @@ class PsqlSandboxDb(SandboxDb):
         # honesty: soft — with HOME *unset* libpq falls back to getpwuid → the real
         # home, so pinning it is the hardening; a sandbox pgpass is supplied via an
         # explicit ``PGPASSFILE`` in ``env``, never ambiently.
-        self._env.setdefault("HOME", tempfile.gettempdir())
+        # s1-fix2 (codex R2 non-blocking, closed for symmetry with residual #3): validate
+        # the tmp HOME the SAME way the executor validates ``runtime.cwd`` — a host
+        # ``TMPDIR`` pathologically set to the real home would make ``gettempdir()`` return
+        # it, re-opening the very ``~/.pgpass`` leak. Reuse the cwd guard; fail-closed if
+        # the tmp dir is the real home / an ancestor (the "HOME never the real home"
+        # invariant must hold on BOTH the executor and the sandbox-DB subprocess path).
+        tmp_home = tempfile.gettempdir()
+        tmp_err = _sandbox_cwd_error(tmp_home)
+        if tmp_err is not None:
+            raise LiveDbError(
+                f"refusing an unsafe sandbox-DB HOME ({tmp_err}) — set TMPDIR to a real "
+                "temp directory, not the user's home (C′ fail-closed)"
+            )
+        self._env.setdefault("HOME", tmp_home)
 
     @staticmethod
     def _normalize(name: str) -> str:
@@ -774,6 +905,17 @@ class PsqlSandboxDb(SandboxDb):
 
     def recreate_from_template(self, db: str, db_template: str) -> None:
         self._guard(db, db_template)
+        # s1-fix2 codex residual #1: fail-closed BEFORE any dropdb/createdb — refuse if
+        # no explicit sandbox connection target was injected at construction, rather than
+        # dropping/creating against the ambient libpq default (which on a single machine
+        # could be a Live cluster). Raised here (not a silent no-op): OracleRunner.run
+        # catches LiveDbError → whole-run UNKNOWN escalation (s1-fix P1), never a crash.
+        if not self._has_sandbox_conn:
+            raise LiveDbError(
+                "refusing to dropdb/createdb without an explicit sandbox connection "
+                f"({'/'.join(_SANDBOX_CONN_KEYS)} injected at construction) — fail-closed, "
+                "never the ambient libpq default (C′ 绝不碰 Live)"
+            )
         # ``--`` terminates option parsing so a name that somehow passed the guard can
         # never be read as a flag (defense in depth behind the strict name guard —
         # s1-fix gemini P0 ``--host=`` injection). ``env=self._env`` keeps host Live
@@ -836,6 +978,17 @@ class PsqlSandboxDb(SandboxDb):
             raise LiveDbError(
                 f"refusing to drop-recreate {db!r}: a sandbox DB name must contain "
                 f"{self._marker!r} (allowlist, not just a denylist — C′ red line)"
+            )
+        # s1-fix2 codex residual #2 (symmetry): the TEMPLATE must also carry the sandbox
+        # marker. ``createdb --template <t>`` *connects to* the template DB to copy it, so
+        # an un-marked, non-denylisted plain name (e.g. ``prod_baseline``) would read a
+        # Live DB — "碰 Live" even though it is never dropped. Asymmetric marking (db only)
+        # left that hole; require it on both, fail-closed.
+        if self._marker not in nt:
+            raise LiveDbError(
+                f"refusing to use {db_template!r} as a template: a sandbox template name "
+                f"must contain {self._marker!r} (allowlist — createdb reads the template, "
+                "so an un-marked template would touch a Live DB; C′ red line)"
             )
         if nd == nt:
             raise LiveDbError(

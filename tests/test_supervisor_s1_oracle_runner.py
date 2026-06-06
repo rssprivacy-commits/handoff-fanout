@@ -44,7 +44,7 @@ def _sql_runtime(**kw):
     base = dict(
         cwd="/tmp/wt",
         db="sandbox:erp_test",
-        db_template="erp_baseline",
+        db_template="sandbox_baseline",  # s1-fix2: templates must also carry the marker
         cleanup=sup.CleanupPolicy.DROP_RECREATE_FROM_TEMPLATE,
     )
     base.update(kw)
@@ -294,7 +294,7 @@ def test_sql_run_triggers_sandbox_cleanup_once():
     )
     res = runner.run(sup.OracleScope.AFFECTED)
     assert res.outcome is sup.OracleOutcome.GREEN
-    assert sandbox.calls == [("sandbox:erp_test", "erp_baseline")]
+    assert sandbox.calls == [("sandbox:erp_test", "sandbox_baseline")]
 
 
 def test_cmd_only_run_does_not_clean_db():
@@ -430,12 +430,13 @@ def test_real_executor_bad_cwd_is_error_then_unknown(tmp_path):
     assert _decide(_crit("c", spec="true", expect="0"), raw)[0] is sup.OracleOutcome.UNKNOWN
 
 
-def test_real_executor_sql_without_db_is_error():
+def test_real_executor_sql_without_db_is_error(tmp_path):
     ex = sup.SubprocessExecutor()
-    # a SQL criterion run against a runtime with no db → executor error (not RED)
+    # a SQL criterion run against a runtime with no db → executor error (not RED).
+    # cwd is a real sandbox dir so the s1-fix2 cwd guard passes and we reach the db check.
     raw = ex.execute(
         _crit("s", ctype=sup.OracleType.SQL, spec="select 1", expect="1"),
-        _runtime(),  # no db
+        _runtime(cwd=str(tmp_path)),  # no db
     )
     assert raw.error is not None and "runtime.db is unset" in raw.error
 
@@ -600,9 +601,9 @@ def test_sandbox_refuses_whitespace_padded_name():
 
 def test_sandbox_custom_marker_is_project_agnostic():
     db = sup.PsqlSandboxDb(sandbox_marker="hf_test_")
-    db._guard("hf_test_db", "hf_baseline")  # ok — matches custom marker
+    db._guard("hf_test_db", "hf_test_baseline")  # ok — both carry the custom marker
     with pytest.raises(sup.LiveDbError, match="must contain 'hf_test_'"):
-        db._guard("sandbox_db", "hf_baseline")  # default marker no longer accepted
+        db._guard("sandbox_db", "hf_test_baseline")  # default marker no longer accepted
 
 
 # === s1-fix C′ hardening (中枢独立审 d31ea20 = RED/RED) ======================
@@ -671,7 +672,12 @@ def test_sandbox_dropdb_createdb_use_terminator_and_sanitized_env(monkeypatch):
     for k in ("PGHOST", "PGPASSWORD", "PGSERVICE", "DATABASE_URL", "AWS_SECRET_ACCESS_KEY"):
         monkeypatch.setenv(k, "live-secret")
     calls = _capture_db_subprocess(monkeypatch)
-    sup.PsqlSandboxDb().recreate_from_template("sandbox_test", "sandbox_baseline")
+    # s1-fix2: an explicit sandbox conn target (PGPORT here — pins the sandbox cluster
+    # port) is required now; it must NOT collide with the host PG* the test proves are
+    # stripped (PGHOST/PGPASSWORD/PGSERVICE stay out of the leaked-keys assertions).
+    sup.PsqlSandboxDb(env={"PGPORT": "5499"}).recreate_from_template(
+        "sandbox_test", "sandbox_baseline"
+    )
     # gemini P0: a ``--`` terminator means a forged name can never be read as a flag.
     assert [c["argv"] for c in calls] == [
         ["dropdb", "--if-exists", "--", "sandbox_test"],
@@ -734,8 +740,9 @@ def test_guard_refuses_option_injection_template():
 
 
 def test_guard_still_allows_the_design_sandbox_label():
-    # the design's own ``sandbox:erp_test`` (a scheme-style label) stays valid.
-    sup.PsqlSandboxDb()._guard("sandbox:erp_test", "erp_baseline")  # no raise
+    # the design's own ``sandbox:erp_test`` (a scheme-style label) stays valid as the
+    # drop target; the template must also carry the marker (s1-fix2 residual #2).
+    sup.PsqlSandboxDb()._guard("sandbox:erp_test", "sandbox_baseline")  # no raise
 
 
 # --- P0-3 (psql path): runtime.db conninfo refused + non-interactive ----------
@@ -762,13 +769,14 @@ def test_sql_executor_uses_sanitized_env_and_no_password_prompt(monkeypatch, tmp
     assert calls[0]["argv"][0] == "psql" and "-w" in calls[0]["argv"]  # never prompts
 
 
-def test_sql_executor_refuses_conninfo_runtime_db():
+def test_sql_executor_refuses_conninfo_runtime_db(tmp_path):
     ex = sup.SubprocessExecutor()
     # a runtime.db shaped like a libpq conninfo → could-not-evaluate (error→UNKNOWN),
-    # never a silent connect to wherever ``service=prod`` points.
+    # never a silent connect to wherever ``service=prod`` points. The non-plain-name
+    # refusal fires before the s1-fix2 conn check (a real cwd lets us reach it).
     raw = ex.execute(
         _crit("s", ctype=sup.OracleType.SQL, spec="select 1", expect="1"),
-        _sql_runtime(db="service=prod"),
+        _sql_runtime(db="service=prod", cwd=str(tmp_path)),
     )
     assert raw.error is not None and "non-plain runtime.db" in raw.error
     assert _decide(_crit("s", ctype=sup.OracleType.SQL), raw)[0] is sup.OracleOutcome.UNKNOWN
@@ -883,7 +891,7 @@ def test_db_bearing_test_criterion_triggers_cleanup():
         sandbox_db=sandbox,
     )
     runner.run(sup.OracleScope.AFFECTED)
-    assert sandbox.calls == [("sandbox:erp_test", "erp_baseline")]
+    assert sandbox.calls == [("sandbox:erp_test", "sandbox_baseline")]
 
 
 def test_db_bearing_cmd_flaky_retry_recreates_db():
@@ -922,3 +930,199 @@ def test_empty_scope_skips_cleanup_even_when_db_bearing():
     res = runner.run(sup.OracleScope.FINAL)  # no FINAL criteria
     assert res.outcome is sup.OracleOutcome.GREEN  # vacuous
     assert sandbox.calls == []
+
+
+# === s1-fix2 C′ residuals (中枢实地查代码坐实 / owner ruled RED — close them) ====
+# The supervisor-coord re-audited s1-fix (5c31858) and confirmed THREE C′ residuals
+# the soft-isolation layer left open; the owner ruled "close them now":
+#   #1 fail-closed connection — a DB op (dropdb/createdb/psql) needs an explicitly
+#      injected sandbox connection target, never the ambient libpq default.
+#   #2 db_template must ALSO carry the sandbox marker (symmetry) — createdb reads it.
+#   #3 runtime.cwd (the executor's sandbox HOME) must be a real sandbox dir, not the
+#      user's real home / an ancestor of it.
+# Each test below pins a *rejection* path and, where a real DB op would otherwise
+# fire, proves the subprocess is NEVER spawned (fail-closed → never touches Live).
+
+
+def _assert_no_subprocess(monkeypatch):
+    """Make any ``subprocess.run`` the sandbox DB / executor would issue an immediate
+    test failure — proving the fail-closed guard refuses BEFORE spawning dropdb /
+    createdb / psql (so a refused op never touches a real server)."""
+
+    def boom(argv, **kw):  # pragma: no cover - must never be reached
+        raise AssertionError(f"subprocess.run must NOT be called (fail-closed): {argv!r}")
+
+    monkeypatch.setattr(_orm.subprocess, "run", boom)
+
+
+# --- residual #2: db_template must carry the sandbox marker (symmetric) -------
+
+
+def test_guard_refuses_unmarked_template_even_if_not_denylisted():
+    db = sup.PsqlSandboxDb()
+    # "prod_baseline" is a plain, non-denylisted name — but it lacks the sandbox marker,
+    # so createdb --template would read a (possibly Live) DB. Symmetric with db: refuse.
+    with pytest.raises(sup.LiveDbError, match="template name .*must contain 'sandbox'"):
+        db._guard("sandbox_test", "prod_baseline")
+
+
+def test_recreate_refuses_unmarked_template_without_touching_server(monkeypatch):
+    # End-to-end: the refusal fires before ANY subprocess — createdb never reads the
+    # unmarked template (an explicit conn is present, so the ONLY reason to refuse is
+    # the template marker, proving residual #2 — not the conn guard).
+    _assert_no_subprocess(monkeypatch)
+    db = sup.PsqlSandboxDb(env={"PGPORT": "5499"})
+    with pytest.raises(sup.LiveDbError, match="template name .*must contain 'sandbox'"):
+        db.recreate_from_template("sandbox_test", "prod_baseline")
+
+
+# --- residual #1: fail-closed sandbox connection (dropdb/createdb/psql) -------
+
+
+def test_sandbox_db_refuses_dropdb_without_explicit_conn(monkeypatch):
+    # No explicit sandbox connection target injected → dropdb/createdb is REFUSED, never
+    # run against the ambient libpq default (which could be a Live cluster). Prove the
+    # subprocess is never spawned (the guard, valid names notwithstanding, fails closed).
+    _assert_no_subprocess(monkeypatch)
+    db = sup.PsqlSandboxDb()  # no env → no conn target
+    with pytest.raises(sup.LiveDbError, match="explicit sandbox connection"):
+        db.recreate_from_template("sandbox_test", "sandbox_baseline")
+
+
+def test_sandbox_db_auth_only_env_is_not_enough_conn(monkeypatch):
+    # PGUSER/PGPASSWORD authenticate but do not pin WHERE we connect — on their own they
+    # do not satisfy the fail-closed bar (the ambient default host is still used). Refuse.
+    _assert_no_subprocess(monkeypatch)
+    db = sup.PsqlSandboxDb(env={"PGUSER": "sb", "PGPASSWORD": "x"})
+    with pytest.raises(sup.LiveDbError, match="explicit sandbox connection"):
+        db.recreate_from_template("sandbox_test", "sandbox_baseline")
+
+
+def test_sandbox_db_proceeds_with_explicit_conn_target(monkeypatch):
+    # A connection TARGET key (PGPORT here) is enough to pass the fail-closed gate — the
+    # dropdb/createdb then actually run (faked). Positive contrast to the refusals above.
+    calls = _capture_db_subprocess(monkeypatch)
+    sup.PsqlSandboxDb(env={"PGPORT": "5499"}).recreate_from_template(
+        "sandbox_test", "sandbox_baseline"
+    )
+    assert [c["argv"][0] for c in calls] == ["dropdb", "createdb"]  # both ran
+
+
+def test_sql_executor_refuses_without_explicit_conn(monkeypatch, tmp_path):
+    # The psql path is fail-closed too: a valid sandbox db name but no injected conn
+    # target → could-not-evaluate (error → UNKNOWN), psql NEVER spawned.
+    _assert_no_subprocess(monkeypatch)
+    ex = sup.SubprocessExecutor()  # no sandbox_env → no conn target
+    raw = ex.execute(
+        _crit("s", ctype=sup.OracleType.SQL, spec="select 0", expect="0"),
+        _sql_runtime(cwd=str(tmp_path)),
+    )
+    assert raw.error is not None and "explicit sandbox connection" in raw.error
+    assert _decide(_crit("s", ctype=sup.OracleType.SQL), raw)[0] is sup.OracleOutcome.UNKNOWN
+
+
+def test_has_sandbox_conn_helper():
+    # target keys count; auth-only / blank / empty do not.
+    assert _orm._has_sandbox_conn({"PGHOST": "h"})
+    assert _orm._has_sandbox_conn({"PGPORT": "5499"})
+    assert _orm._has_sandbox_conn({"PGSERVICE": "sb"})
+    assert not _orm._has_sandbox_conn({"PGUSER": "u", "PGPASSWORD": "p"})
+    assert not _orm._has_sandbox_conn({"PGHOST": "  "})  # blank value
+    assert not _orm._has_sandbox_conn({})
+    assert not _orm._has_sandbox_conn(None)
+
+
+# --- residual #3: runtime.cwd (sandbox HOME) must be a real sandbox dir -------
+
+
+def test_sandbox_cwd_error_helper(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert _orm._sandbox_cwd_error("") is not None  # empty
+    assert "non-absolute" in _orm._sandbox_cwd_error("relative/dir")
+    assert "real home" in _orm._sandbox_cwd_error(str(tmp_path))  # cwd == home
+    assert "ancestor" in _orm._sandbox_cwd_error("/")  # root is an ancestor of home
+    nonexist = str(tmp_path / "nope")
+    assert "not an existing directory" in _orm._sandbox_cwd_error(nonexist)
+    sub = tmp_path / "wt"
+    sub.mkdir()
+    assert _orm._sandbox_cwd_error(str(sub)) is None  # a subdir of home IS a valid sandbox
+
+
+def test_shell_refuses_cwd_equal_real_home(tmp_path, monkeypatch):
+    # HOME=cwd=real-home would make ~ resolve into the real home → refuse (UNKNOWN), the
+    # exact C′ leak the sandbox HOME was meant to close.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ex = sup.SubprocessExecutor()
+    raw = ex.execute(_crit("c", spec="true", expect="0"), _runtime(cwd=str(tmp_path)))
+    assert raw.error is not None and "real home" in raw.error
+    assert _decide(_crit("c", spec="true", expect="0"), raw)[0] is sup.OracleOutcome.UNKNOWN
+
+
+def test_shell_refuses_cwd_ancestor_of_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    ex = sup.SubprocessExecutor()
+    # cwd=tmp_path is an ancestor of HOME=tmp_path/home → ~ still resolves under it.
+    raw = ex.execute(_crit("c", spec="true", expect="0"), _runtime(cwd=str(tmp_path)))
+    assert raw.error is not None and "ancestor" in raw.error
+
+
+def test_shell_accepts_sandbox_subdir_of_home(tmp_path, monkeypatch):
+    # the REAL worktree case: ~/Projects/...-wt/<task> is UNDER home but a valid sandbox.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    wt = tmp_path / "Projects" / "wt"
+    wt.mkdir(parents=True)
+    ex = sup.SubprocessExecutor()
+    raw = ex.execute(_crit("c", spec="true", expect="0"), _runtime(cwd=str(wt)))
+    assert raw.error is None and raw.exit_code == 0  # allowed → actually runs
+
+
+def test_sql_path_also_guards_cwd_without_touching_server(monkeypatch, tmp_path):
+    # the cwd guard runs in execute() before dispatch, so the SQL path is guarded too —
+    # and psql is never spawned (a conn IS injected, proving the refusal is the cwd, not
+    # the conn guard).
+    _assert_no_subprocess(monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ex = sup.SubprocessExecutor(sandbox_env={"PGHOST": "sandbox-host"})
+    raw = ex.execute(
+        _crit("s", ctype=sup.OracleType.SQL, spec="select 0", expect="0"),
+        _sql_runtime(cwd=str(tmp_path)),  # cwd == HOME == real home → refused
+    )
+    assert raw.error is not None and "real home" in raw.error
+
+
+# --- s1-fix2 R2 non-blocking follow-ups (codex suggestions, closed) -----------
+
+
+def test_extra_env_deny_filters_home_and_database_url():
+    # codex R2 #1 nail test: the _EXTRA_ENV_DENY hardening drops HOME / DATABASE_URL from
+    # the trusted ``extra`` overlay, but keeps the PG* conn knobs (the sandbox-injection
+    # channel). Pins the partial-filter trade-off so a future change can't silently widen it.
+    env = _orm._sanitized_base_env(
+        {
+            "HOME": "/evil/home",
+            "DATABASE_URL": "postgres://live/erp",
+            "PGHOST": "sb",
+            "PGPORT": "5499",
+        }
+    )
+    assert "HOME" not in env  # dropped — owned per call site
+    assert "DATABASE_URL" not in env  # dropped — Live-host-bearing conninfo
+    assert env["PGHOST"] == "sb" and env["PGPORT"] == "5499"  # conn channel preserved
+
+
+def test_sandbox_db_refuses_when_tmp_home_is_real_home(monkeypatch, tmp_path):
+    # codex R2 #2 (symmetric with residual #3): if TMPDIR makes gettempdir() the real
+    # home, the sandbox-DB HOME would re-open the ~/.pgpass leak. Fail-closed at
+    # construction — the "HOME never the real home" invariant holds on BOTH subprocess
+    # paths (executor cwd + sandbox-DB tmp).
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(_orm.tempfile, "gettempdir", lambda: str(tmp_path))
+    with pytest.raises(sup.LiveDbError, match="unsafe sandbox-DB HOME"):
+        sup.PsqlSandboxDb(env={"PGPORT": "5499"})
+    # a sane tmp dir (a real subdir, not home) constructs fine
+    safe_tmp = tmp_path / "tmp"
+    safe_tmp.mkdir()
+    monkeypatch.setattr(_orm.tempfile, "gettempdir", lambda: str(safe_tmp))
+    assert sup.PsqlSandboxDb(env={"PGPORT": "5499"}) is not None
