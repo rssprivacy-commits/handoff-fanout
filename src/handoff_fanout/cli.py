@@ -66,7 +66,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("sessions", help="Which sessions can I close? (visible window ∩ central done)")
     sub.add_parser("pause", help="Pause auto-continue (write STOP_AUTO sentinel; reversible)")
     sub.add_parser("resume", help="Resume auto-continue (remove STOP_AUTO sentinel)")
-    sub.add_parser("stop", help="Stop auto-continue (= pause; --permanent writes global done)")
+    sub.add_parser(
+        "stop",
+        help="Stop auto-continue (= pause; reversible — `touch ~/.claude-handoff/done` to "
+        "stop permanently)",
+    )
     sub.add_parser("approve", help="Approve a bound supervisor run's AWAIT_APPROVAL node")
     sub.add_parser("force-sync", help="Split-brain escape hatch: detach a run's DAG overlay")
     sub.add_parser("bind", help="Bridge: bind task ↔ supervisor run/node (overlay/approve entry)")

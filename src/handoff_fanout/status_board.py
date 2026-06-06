@@ -200,21 +200,40 @@ class TaskSnapshot:
     heartbeat_idle_s: int | None = None  # now - queue/<task>.heartbeat mtime (None = none)
     bound: bool = False  # has an attached supervisor DAG binding
 
+    def transcript_active(self, *, running_idle_s: int) -> bool:
+        """The Claude transcript (newest ``*.jsonl``) was touched within the running
+        window (``None`` idle = no transcript = not transcript-active)."""
+        return self.transcript_idle_s is not None and self.transcript_idle_s < running_idle_s
+
+    def heartbeat_active(self, *, running_idle_s: int) -> bool:
+        """The heartbeat sentinel (``queue/<task>.heartbeat``) was touched within the
+        running window. A worker in a **long operation** keeps touching its heartbeat
+        every ~60s even while its transcript sits idle >180s; a pure-script / non-Claude
+        worker has *only* a heartbeat (no JSONL at all). Either is alive (P1-3 gemini)."""
+        return self.heartbeat_idle_s is not None and self.heartbeat_idle_s < running_idle_s
+
+    def is_active(self, *, running_idle_s: int) -> bool:
+        """RUNNING liveness = transcript **or** heartbeat fresh (P1-3 gemini 韧性: a
+        long-operation worker — transcript idle but heartbeat new — and a pure-script
+        worker — heartbeat only — must NOT be misjudged 闲置)."""
+        return self.transcript_active(running_idle_s=running_idle_s) or self.heartbeat_active(
+            running_idle_s=running_idle_s
+        )
+
     def delivered(self, *, running_idle_s: int) -> bool:
         """The worker did its part: it wrote the explicit ``worker_reported`` sentinel
         (the primary, mandated-by-the-monitoring-protocol signal), OR (the fast fallback
         mirroring ``watch.sh``) its branch advanced past the integration base AND it has
-        gone quiet (idle ≥ ``running_idle_s`` — an *advanced-but-still-active* worker is
-        still RUNNING, not delivered; R2 codex #4). Delivery ≠ closable — the central
-        still owes a review until ``done``. ``running_idle_s`` is injected so the pure
-        classifier owns the threshold (the property cannot see config)."""
+        gone **fully quiet** — both transcript AND heartbeat silent (``not is_active``).
+        An *advanced-but-still-active* worker is still RUNNING, not delivered — incl. one
+        that only touches its heartbeat mid-long-operation (R2 codex #4 + P1-3 gemini: a
+        live heartbeat means the worker may still push more / not be done). Delivery ≠
+        closable — the central still owes a review until ``done``. ``running_idle_s`` is
+        injected so the pure classifier owns the threshold (the property cannot see
+        config)."""
         if self.worker_reported:
             return True
-        return (
-            bool(self.branch_advanced)
-            and self.transcript_idle_s is not None
-            and self.transcript_idle_s >= running_idle_s
-        )
+        return bool(self.branch_advanced) and not self.is_active(running_idle_s=running_idle_s)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -260,9 +279,26 @@ def _idle_seconds(mtime: float | None, now: float) -> int | None:
     return max(0, int(now - mtime))
 
 
+def _is_central(stem: str) -> bool:
+    """Whether a discovered stem is the **monitoring central itself** (``supervisor-coord*``),
+    not a business task. The central's own heartbeat (``queue/supervisor-coord-3.heartbeat``)
+    and ack sidecars (``ack/supervisor-coord-2.*``) live in the same ``queue/`` + ``ack/``
+    dirs as real tasks, so every discovery path would otherwise surface the central as a
+    phantom IDLE task on the owner board (P1-2 / INV-10「看得懂」: the supervisor must never
+    appear as one of the business windows the owner is asked to reason about). Its health is
+    shown separately on the dedicated health line (:func:`_central_health`).
+
+    Worker tasks are ``supervisor-s<N>...`` (e.g. ``supervisor-s5a-fix``) and stay; only the
+    coordinator's ``supervisor-coord*`` namespace is filtered (matches the design's reserved
+    central naming)."""
+    return stem.startswith("supervisor-coord")
+
+
 def discover_task_ids(layout: HandoffLayout) -> list[str]:
     """Every task with a footprint in the runtime: a ``queue/`` file, an ``ack/``
-    sidecar, or a ``worktrees/`` dir. Returns sorted, de-duplicated stems."""
+    sidecar, or a ``worktrees/`` dir. Returns sorted, de-duplicated stems — with the
+    monitoring central (:func:`_is_central`) filtered out of **all three** discovery
+    sources via a single sink filter (P1-2)."""
     ids: set[str] = set()
     if layout.queue_dir.is_dir():
         for p in layout.queue_dir.iterdir():
@@ -282,7 +318,9 @@ def discover_task_ids(layout: HandoffLayout) -> list[str]:
             if p.is_dir():
                 ids.add(p.name)
     ids.discard("")
-    return sorted(ids)
+    # Single sink filter covers all three sources at once (queue-suffix / ack-split /
+    # worktrees-dir) — no three-way drift (P1-2 中枢统一判断).
+    return sorted(t for t in ids if not _is_central(t))
 
 
 def scan_task(
@@ -434,7 +472,9 @@ def classify(
        stale delivery claim, but not a later ``done`` (the task was unblocked + finished).
     3. ``delivered`` (worker_reported, or branch-advanced + idle) → DELIVERED_AWAITING_
        REVIEW. Delivery ≠ closable: the central still owes a review/merge until ``done``.
-    4. transcript active within ``running_idle_s`` → RUNNING.
+    4. transcript **or** heartbeat active within ``running_idle_s`` → RUNNING (P1-3: a
+       long-operation worker keeps its heartbeat fresh while its transcript idles; a
+       pure-script worker has only a heartbeat — both are RUNNING, not 闲置).
     5. otherwise → IDLE (spawned/queued but quiet, or stalled — the watcher/Sweeper, not
        the board, decides a stall is a problem; S5a does not auto-escalate)."""
     cfg = config or StatusConfig()
@@ -448,7 +488,7 @@ def classify(
         return BusinessState.BLOCKED
     if snap.delivered(running_idle_s=cfg.running_idle_s):
         return BusinessState.DELIVERED_AWAITING_REVIEW
-    if snap.transcript_idle_s is not None and snap.transcript_idle_s < cfg.running_idle_s:
+    if snap.is_active(running_idle_s=cfg.running_idle_s):
         return BusinessState.RUNNING
     return BusinessState.IDLE
 
@@ -726,11 +766,14 @@ def load_overlay(binding: Binding, *, now: str) -> SupervisorOverlay:
     from handoff_fanout.supervisor.reducer import reduce
     from handoff_fanout.supervisor.states import NodeState
 
-    # R2 codex #6: the WHOLE projection — read + reduce + decide + _plan_status + node
-    # access — is fail-safe. A missing/corrupt/version-incompatible artefact (or a
-    # structural TypeError/AttributeError from a shape mismatch) degrades to an ``error``
-    # overlay; it NEVER crashes ``handoff status`` (脑裂: the board still shows the real
-    # runtime, the fact source).
+    # R2 codex #6 + P1-4 gemini: the WHOLE projection — read + reduce + decide +
+    # _plan_status + node access — is fail-safe. ANY exception (a missing/corrupt/
+    # version-incompatible artefact; a structural TypeError/AttributeError from a shape
+    # mismatch; OR a RuntimeError/IndexError/AssertionError thrown from deep inside
+    # reduce/decide) degrades to an ``error`` overlay; it NEVER crashes ``handoff status``.
+    # 脑裂铁律: the projection (a *side* view) blowing up must never take down the real-
+    # runtime main view (the fact source) — the owner must keep 可观可救 even with a
+    # broken overlay, so the catch here is deliberately total (``except Exception``).
     try:
         plan = Plan.from_dict(json.loads(Path(binding.plan_path).read_text(encoding="utf-8")))
         log = EventLog(binding.events_path, plan.plan_id)
@@ -768,7 +811,7 @@ def load_overlay(binding: Binding, *, now: str) -> SupervisorOverlay:
             next_steps=next_steps,
             last_seq=state.last_seq,
         )
-    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+    except Exception as exc:
         return SupervisorOverlay(
             task_id=binding.task_id,
             run_id=binding.run_id,
@@ -1092,14 +1135,23 @@ def render_sessions(
 
 def _git_runner(args: list[str], cwd: Path) -> str | None:
     """Local-only git (never a network op): run ``git <args>`` in ``cwd``; ``None`` on
-    failure. Used for the best-effort worktree-dirty check."""
+    failure. Used for the best-effort worktree-dirty / branch-advanced checks.
+
+    🔴 **P1-1 / C′「只读真实运行时」红线**: the board is a *safety-patrol entry point* —
+    it must leave **zero write side-effect** on a worker's live worktree. A bare ``git
+    status`` can refresh + write back the index and create ``.git/index.lock`` (a write +
+    a lock-race on the worker's active tree). So every status-probe git call here is made
+    strictly read-only with BOTH defences (双保险): ``--no-optional-locks`` (top-level flag
+    — never take the optional index lock) AND ``GIT_OPTIONAL_LOCKS=0`` in the env (the
+    same instruction via environment, covering any git op that consults the env)."""
     try:
         out = subprocess.run(
-            ["git", *args],
+            ["git", "--no-optional-locks", *args],
             cwd=str(cwd),
             capture_output=True,
             text=True,
             timeout=10,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
         )
     except (OSError, subprocess.SubprocessError):  # pragma: no cover - env dependent
         return None
@@ -1298,6 +1350,18 @@ def _cmd_approve(args: argparse.Namespace) -> int:
         )
     except ApproveError as exc:
         print(f"⛔ {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        # P2-6: a missing/corrupt plan.json or events.jsonl, a shape mismatch, or any
+        # reduce/decide failure deep inside ``approve_node`` (the same class P1-4 hardens
+        # for the overlay) must become a clear owner-facing refusal (exit 2), NOT a raw
+        # Python traceback. The owner's rescue command degrades, it never dies — the
+        # binding may point at a broken/missing artefact, which is operator-fixable.
+        print(
+            f"⛔ 无法读取/投影该 run 的 plan/events 产物（{type(exc).__name__}: {exc}）—"
+            " 绑定可能指向损坏或缺失的文件，请检查 bind 路径或重新 bind（不露 traceback）",
+            file=sys.stderr,
+        )
         return 2
     if result["deduped"]:
         print(f"ℹ️ approval 已存在（幂等去重）: 节点 {result['node']} seq {result['seq']}")

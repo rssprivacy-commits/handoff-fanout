@@ -12,6 +12,7 @@ Times / clocks are injected (the pure core never reads the wall clock — mirror
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 
@@ -734,3 +735,308 @@ class TestStructural:
             color=False,
         )
         assert "可能滞后" in text and "真实运行时为准" in text
+
+
+# =============================================================================
+# 11. S5a-fix regression — the 4 P1 + 2 P2 the central's dual-brain audit found
+# =============================================================================
+
+
+class _FakeProc:
+    def __init__(self, returncode: int = 0, stdout: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+class TestP1_1GitStrictlyReadOnly:
+    """P1-1 (codex / C′ 只读红线): every status-probe git call MUST be strictly read-only
+    — ``--no-optional-locks`` in argv AND ``GIT_OPTIONAL_LOCKS=0`` in env — so the patrol
+    leaves no index write / ``.git/index.lock`` race on a worker's live worktree."""
+
+    def _capture_git(self, monkeypatch):
+        seen: dict[str, Any] = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+            seen["env"] = kw.get("env")
+            return _FakeProc(returncode=0, stdout="")
+
+        monkeypatch.setattr(sb.subprocess, "run", fake_run)
+        return seen
+
+    def test_status_probe_uses_no_optional_locks_and_env(self, monkeypatch, tmp_path):
+        seen = self._capture_git(monkeypatch)
+        sb._git_runner(["status", "--porcelain"], tmp_path)
+        cmd = seen["cmd"]
+        assert cmd[0] == "git" and cmd[1] == "--no-optional-locks"
+        assert "status" in cmd and "--porcelain" in cmd
+        assert seen["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+
+    def test_rev_list_probe_also_read_only(self, monkeypatch, tmp_path):
+        # the flag/env are applied uniformly in _git_runner (covers rev-list too)
+        seen = self._capture_git(monkeypatch)
+        sb._git_runner(["rev-list", "--count", "origin/main..HEAD"], tmp_path)
+        assert "--no-optional-locks" in seen["cmd"]
+        assert seen["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+
+    def test_env_preserves_rest_of_environment(self, monkeypatch, tmp_path):
+        # GIT_OPTIONAL_LOCKS is *added* to a copy of os.environ, not a replacement
+        monkeypatch.setenv("HOME", "/some/home")
+        seen = self._capture_git(monkeypatch)
+        sb._git_runner(["status", "--porcelain"], tmp_path)
+        assert seen["env"].get("HOME") == "/some/home"
+        assert seen["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+
+    def test_scan_task_status_path_is_read_only(self, monkeypatch, tmp_path):
+        # end-to-end: scan_task → _git_runner argv for a present worktree is read-only
+        layout = _layout(tmp_path)
+        (layout.worktrees_dir / "t").mkdir(parents=True)
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            assert kw.get("env", {}).get("GIT_OPTIONAL_LOCKS") == "0"
+            return _FakeProc(returncode=0, stdout="0\n")
+
+        monkeypatch.setattr(sb.subprocess, "run", fake_run)
+        scan_task(layout, "t", now=NOW, git_runner=sb._git_runner)
+        assert calls, "scan_task should have probed git for a present worktree"
+        for cmd in calls:
+            assert cmd[:2] == ["git", "--no-optional-locks"]
+
+
+class TestP1_2CentralNotPhantomTask:
+    """P1-2 (两脑共识 / INV-10): the monitoring central (``supervisor-coord*``) must never
+    be discovered as a phantom business task — from ANY of the three discovery sources."""
+
+    def test_is_central_predicate(self):
+        assert sb._is_central("supervisor-coord-3") is True
+        assert sb._is_central("supervisor-coord-2") is True
+        # workers are supervisor-s<N>... — NOT filtered
+        assert sb._is_central("supervisor-s5a-fix") is False
+        assert sb._is_central("supervisor-s0-fix") is False
+        assert sb._is_central("opening-fe-be-fix") is False
+
+    def test_discover_excludes_central_queue_and_ack(self, tmp_path):
+        layout = _layout(tmp_path)
+        _touch(layout.queue_dir / "supervisor-coord-3.heartbeat")
+        _touch(layout.ack_dir / "supervisor-coord-3.submitted")
+        _touch(layout.ack_dir / "supervisor-coord-2.spawned")
+        _touch(layout.queue_dir / "real-task.md")
+        ids = discover_task_ids(layout)
+        assert "supervisor-coord-3" not in ids
+        assert "supervisor-coord-2" not in ids
+        assert "real-task" in ids
+
+    def test_discover_excludes_central_from_all_three_paths(self, tmp_path):
+        layout = _layout(tmp_path)
+        _touch(layout.queue_dir / "supervisor-coord-2.heartbeat")
+        _touch(layout.ack_dir / "supervisor-coord-2.spawned")
+        (layout.worktrees_dir / "supervisor-coord-2").mkdir(parents=True)
+        assert discover_task_ids(layout) == []
+
+    def test_worker_supervisor_s_task_kept(self, tmp_path):
+        # a real worker named supervisor-s5a-fix has a heartbeat too — it must stay
+        layout = _layout(tmp_path)
+        _touch(layout.queue_dir / "supervisor-s5a-fix.md")
+        _touch(layout.queue_dir / "supervisor-s5a-fix.heartbeat")
+        _touch(layout.ack_dir / "supervisor-s5a-fix.worker_reported")
+        assert discover_task_ids(layout) == ["supervisor-s5a-fix"]
+
+    def test_central_not_on_status_board(self, tmp_path, monkeypatch, capsys):
+        _no_external(monkeypatch)
+        layout = _layout(tmp_path)
+        _touch(layout.queue_dir / "supervisor-coord-3.heartbeat")
+        _touch(layout.ack_dir / "supervisor-coord-3.submitted")
+        _touch(layout.queue_dir / "real-task.md")
+        rc = sb.main(
+            ["status", "--root", str(layout.root), "--project", "erp-system", "--no-color"]
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "supervisor-coord-3" not in out
+        assert "real-task" in out
+
+
+class TestP1_3HeartbeatLiveness:
+    """P1-3 (gemini / 韧性): RUNNING / delivered must consider the heartbeat, not only the
+    transcript — a long-operation worker (transcript idle, heartbeat fresh) or a pure-script
+    worker (heartbeat only) must NOT be misjudged 闲置 / already-delivered."""
+
+    def test_fresh_heartbeat_with_idle_transcript_is_running(self):
+        # long operation: transcript idle >180s, heartbeat touched 10s ago → RUNNING
+        assert classify(_snap(transcript_idle_s=300, heartbeat_idle_s=10)) is BusinessState.RUNNING
+
+    def test_heartbeat_only_no_transcript_is_running(self):
+        # pure-script / non-Claude worker: no JSONL at all, only a heartbeat → RUNNING
+        assert classify(_snap(transcript_idle_s=None, heartbeat_idle_s=5)) is BusinessState.RUNNING
+
+    def test_both_idle_is_idle(self):
+        assert classify(_snap(transcript_idle_s=9000, heartbeat_idle_s=9000)) is BusinessState.IDLE
+
+    def test_stale_heartbeat_idle_transcript_is_idle(self):
+        # heartbeat present but also stale → IDLE (no longer alive)
+        assert classify(_snap(transcript_idle_s=None, heartbeat_idle_s=9000)) is BusinessState.IDLE
+
+    def test_delivered_blocked_by_fresh_heartbeat(self):
+        # branch advanced + transcript idle, BUT heartbeat still fresh → still RUNNING
+        # (the worker may push more — not delivered yet)
+        snap = _snap(branch_advanced=True, transcript_idle_s=300, heartbeat_idle_s=10)
+        assert snap.delivered(running_idle_s=180) is False
+        assert classify(snap) is BusinessState.RUNNING
+
+    def test_delivered_when_branch_advanced_and_both_quiet(self):
+        snap = _snap(branch_advanced=True, transcript_idle_s=300, heartbeat_idle_s=300)
+        assert snap.delivered(running_idle_s=180) is True
+        assert classify(snap) is BusinessState.DELIVERED_AWAITING_REVIEW
+
+    def test_worker_reported_still_delivered_regardless_of_heartbeat(self):
+        # explicit delivery sentinel wins even with a fresh heartbeat
+        snap = _snap(worker_reported=True, heartbeat_idle_s=5)
+        assert snap.delivered(running_idle_s=180) is True
+        assert classify(snap) is BusinessState.DELIVERED_AWAITING_REVIEW
+
+    def test_snapshot_liveness_helpers(self):
+        snap = _snap(transcript_idle_s=300, heartbeat_idle_s=10)
+        assert snap.transcript_active(running_idle_s=180) is False
+        assert snap.heartbeat_active(running_idle_s=180) is True
+        assert snap.is_active(running_idle_s=180) is True
+
+    def test_scan_task_collects_heartbeat_idle(self, tmp_path):
+        import os
+
+        layout = _layout(tmp_path)
+        hb = layout.queue_dir / "t.heartbeat"
+        _touch(hb)
+        os.utime(hb, (NOW - 12, NOW - 12))
+        s = scan_task(layout, "t", now=NOW)
+        assert s.heartbeat_idle_s == 12
+
+
+def _raise(exc: Exception):
+    def _boom(*_a, **_kw):
+        raise exc
+
+    return _boom
+
+
+class TestP1_4OverlayTotalFallback:
+    """P1-4 (gemini / 脑裂兜底): a broken supervisor projection (reduce/decide throwing
+    RuntimeError/IndexError/AssertionError — outside the old narrow catch set) must degrade
+    to an error overlay, NEVER crash ``handoff status`` (the real-runtime view must survive)."""
+
+    def test_reduce_runtime_error_degrades(self, tmp_path, monkeypatch):
+        plan_path, events_path = _seed_run(tmp_path)
+        import handoff_fanout.supervisor.reducer as reducer_mod
+
+        monkeypatch.setattr(reducer_mod, "reduce", _raise(RuntimeError("reduce blew up")))
+        ov = load_overlay(
+            _binding(plan_path=str(plan_path), events_path=str(events_path)),
+            now="2026-06-06T10:02:00",
+        )
+        assert ov.error is not None and "RuntimeError" in ov.error
+        assert ov.plan_status == "unknown" and ov.last_seq == -1
+
+    def test_decide_index_error_degrades(self, tmp_path, monkeypatch):
+        plan_path, events_path = _seed_run(tmp_path)
+        import handoff_fanout.supervisor.policy as policy_mod
+
+        monkeypatch.setattr(policy_mod, "decide", _raise(IndexError("decide blew up")))
+        ov = load_overlay(
+            _binding(plan_path=str(plan_path), events_path=str(events_path)),
+            now="2026-06-06T10:02:00",
+        )
+        assert ov.error is not None and "IndexError" in ov.error
+
+    def test_assertion_error_degrades(self, tmp_path, monkeypatch):
+        plan_path, events_path = _seed_run(tmp_path)
+        import handoff_fanout.supervisor.reducer as reducer_mod
+
+        monkeypatch.setattr(reducer_mod, "reduce", _raise(AssertionError("bad invariant")))
+        ov = load_overlay(
+            _binding(plan_path=str(plan_path), events_path=str(events_path)),
+            now="2026-06-06T10:02:00",
+        )
+        assert ov.error is not None and "AssertionError" in ov.error
+
+    def test_main_view_survives_broken_overlay(self, tmp_path, monkeypatch):
+        # 脑裂: a broken side-view overlay must not take down the main real-runtime view
+        plan_path, events_path = _seed_run(tmp_path)
+        import handoff_fanout.supervisor.reducer as reducer_mod
+
+        monkeypatch.setattr(reducer_mod, "reduce", _raise(RuntimeError("boom")))
+        ov = load_overlay(
+            _binding(plan_path=str(plan_path), events_path=str(events_path)),
+            now="2026-06-06T10:02:00",
+        )
+        text = sb.render_status(
+            [sb.BoardRow(_snap("real-task", blocked=True), BusinessState.BLOCKED, None)],
+            now_iso="2026-06-06T10:00:00",
+            project="erp-system",
+            overlays=[ov],
+            central_heartbeat_idle_s=None,
+            watcher_alive=None,
+            color=False,
+        )
+        assert "卡住需介入" in text and "real-task" in text  # main view intact
+        assert "无法投影" in text  # overlay degraded gracefully, still rendered
+
+
+class TestP2_5StopHelpAccurate:
+    """P2-5 (codex): the ``stop`` help must not claim ``--permanent``/global ``done`` support
+    (the implementation is a reversible pause alias)."""
+
+    def test_cli_stop_help_not_misleading(self, capsys):
+        from handoff_fanout import cli
+
+        with pytest.raises(SystemExit):
+            cli.main(["--help"])
+        out = capsys.readouterr().out
+        assert "--permanent writes global done" not in out
+        assert "reversible" in out  # the corrected, accurate guidance
+
+
+class TestP2_6ApproveBadArtefactNoTraceback:
+    """P2-6 (codex / gemini): ``approve`` on a binding pointing at a missing/corrupt
+    plan/events artefact must produce a clear owner-facing refusal (exit 2), not a raw
+    traceback."""
+
+    def test_approve_missing_artefact_clean_rejection(self, tmp_path, capsys):
+        layout = _layout(tmp_path)
+        store = BindingStore(layout.bindings_path)
+        store.put(
+            _binding(
+                task="task-bad",
+                plan_path=str(tmp_path / "nope.json"),
+                events_path=str(tmp_path / "no.jsonl"),
+            )
+        )
+        rc = sb.main(["approve", "task-bad", "--root", str(layout.root), "--project", "erp-system"])
+        err = capsys.readouterr().err
+        assert rc == 2
+        assert "无法读取" in err
+        assert "Traceback" not in err
+
+    def test_approve_corrupt_plan_clean_rejection(self, tmp_path, capsys):
+        layout = _layout(tmp_path)
+        bad_plan = tmp_path / "plan.json"
+        bad_plan.write_text("{ not valid json", encoding="utf-8")
+        events = tmp_path / "events.jsonl"
+        events.touch()
+        store = BindingStore(layout.bindings_path)
+        store.put(_binding(task="task-corrupt", plan_path=str(bad_plan), events_path=str(events)))
+        rc = sb.main(
+            ["approve", "task-corrupt", "--root", str(layout.root), "--project", "erp-system"]
+        )
+        err = capsys.readouterr().err
+        assert rc == 2 and "无法读取" in err and "Traceback" not in err
+
+    def test_approve_valid_still_works(self, tmp_path, capsys):
+        # the new broad catch must NOT swallow the happy path
+        layout = _layout(tmp_path)
+        plan_path, events_path = _seed_run(tmp_path)
+        store = BindingStore(layout.bindings_path)
+        store.put(_binding(task="task-ok", plan_path=str(plan_path), events_path=str(events_path)))
+        rc = sb.main(["approve", "task-ok", "--root", str(layout.root), "--project", "erp-system"])
+        out = capsys.readouterr().out
+        assert rc == 0 and "approval_granted" in out
