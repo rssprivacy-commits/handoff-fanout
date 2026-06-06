@@ -30,6 +30,24 @@ Quick map (design §4 / §5):
 from __future__ import annotations
 
 from ._base import SCHEMA_VERSION, Contract, SchemaError
+
+# --- slice S3 (EventLog single-writer + AckInbox + Reducer + Policy / shadow) --
+# Additive: S3 imports the frozen S0 contracts + S1/S2 logic above and adds the
+# event-sourced control core the design left to "S1+": the single-writer EventLog
+# (C2), the AckInbox translation seam (C2b), the pure Reducer (C3), and the
+# deterministic Policy + shadow watcher (C4). It defines NO new *wire* contract — its
+# runtime state (SupervisorState/NodeRuntime/Decision/ShadowStep) are reducer/policy
+# runtime objects, not S0 Contracts — so ALL_CONTRACTS / S1_CONTRACTS are untouched.
+# It is isolated under ``supervisor/`` and does not touch any running engine path
+# (S3 红线: 只增不改运行路径); it reuses only the leaf ``atomic`` helper for flock.
+from .ack_inbox import (
+    AckInbox,
+    FixerStateFor,
+    InboxSignalKind,
+    TranslationDisposition,
+    TranslationOutcome,
+    VerdictFor,
+)
 from .actions import (
     Ack,
     Action,
@@ -52,6 +70,16 @@ from .dual_brain import (
     DEFAULT_ATTEMPTS,
     run_dual_brain,
     run_with_retry,
+)
+from .event_log import (
+    AppendResult,
+    CASConflict,
+    DedupeCollisionError,
+    EventLog,
+    QuarantinedLogError,
+    build_event,
+    canonical_json,
+    derive_event_id,
 )
 from .event_payloads import (
     EVENT_PAYLOAD_CONTRACT,
@@ -121,6 +149,26 @@ from .plan_draft import (
     oracle_hash,
     plan_hash,
     verify_lock,
+)
+from .policy import (
+    Decision,
+    DecisionKind,
+    PolicyConfig,
+    ShadowMismatch,
+    ShadowReplay,
+    ShadowStep,
+    compare_to_history,
+    decide,
+    would_emit,
+)
+from .reducer import (
+    FixerRuntime,
+    NodeRuntime,
+    ReductionError,
+    SupervisorState,
+    is_stale,
+    reduce,
+    state_fingerprint,
 )
 from .states import (
     ABORTABLE_NODE_STATES,
@@ -360,4 +408,38 @@ __all__ = [
     "run_with_retry",
     "run_dual_brain",
     "DEFAULT_ATTEMPTS",
+    # --- slice S3: EventLog (C2) ---
+    "EventLog",
+    "AppendResult",
+    "CASConflict",
+    "DedupeCollisionError",
+    "QuarantinedLogError",
+    "build_event",
+    "derive_event_id",
+    "canonical_json",
+    # --- slice S3: AckInbox (C2b) ---
+    "AckInbox",
+    "InboxSignalKind",
+    "TranslationDisposition",
+    "TranslationOutcome",
+    "VerdictFor",
+    "FixerStateFor",
+    # --- slice S3: Reducer (C3) ---
+    "reduce",
+    "SupervisorState",
+    "NodeRuntime",
+    "FixerRuntime",
+    "ReductionError",
+    "state_fingerprint",
+    "is_stale",
+    # --- slice S3: Policy + shadow (C4) ---
+    "decide",
+    "Decision",
+    "DecisionKind",
+    "PolicyConfig",
+    "would_emit",
+    "ShadowReplay",
+    "ShadowStep",
+    "ShadowMismatch",
+    "compare_to_history",
 ]
