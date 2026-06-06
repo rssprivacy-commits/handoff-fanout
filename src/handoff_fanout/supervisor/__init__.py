@@ -40,6 +40,19 @@ from .actions import (
     SideEffect,
     SideEffectKind,
 )
+
+# --- slice S2 (Audit + Verdict core) -----------------------------------------
+# Additive: S2 imports the frozen S0 verdict contracts above + reuses the live
+# ``codex_audit`` *public* finding-identity helpers (never modifying them) to add
+# the deterministic verdict producer (C8), the provider-agnostic verifier core +
+# adapters, and the ≥3-retry dual-brain runner. It defines NO new wire contract —
+# its rich result IS the frozen S0 ``Verdict`` — so ALL_CONTRACTS / S1_CONTRACTS
+# are untouched.
+from .dual_brain import (
+    DEFAULT_ATTEMPTS,
+    run_dual_brain,
+    run_with_retry,
+)
 from .event_payloads import (
     EVENT_PAYLOAD_CONTRACT,
     assert_payload_map_total,
@@ -137,6 +150,28 @@ from .verdict import (
     ProviderStatus,
     Verdict,
     VerdictValue,
+)
+from .verdict_computer import (
+    VERDICT_RULE,
+    VerdictComputationError,
+    compute_verdict,
+    compute_verdict_value,
+    deduped_fingerprints,
+)
+from .verifier_core import (
+    AuditAdapter,
+    AuditProvider,
+    Binding,
+    BindingError,
+    BrainInvoker,
+    ProviderRun,
+    RawBrainOutcome,
+    codex_adapter,
+    gemini_adapter,
+    is_bound_to,
+    parse_provider_findings,
+    resolve_binding,
+    verify_findings,
 )
 
 #: Every concrete S0 wire contract (a :class:`Contract` subclass). Used by the
@@ -301,4 +336,28 @@ __all__ = [
     "oracle_hash",
     "canonical_bytes",
     "S1_CONTRACTS",
+    # --- slice S2: verdict computer (verdict_computer) ---
+    "compute_verdict",
+    "compute_verdict_value",
+    "deduped_fingerprints",
+    "VerdictComputationError",
+    "VERDICT_RULE",
+    # --- slice S2: verifier core + adapters (verifier_core) ---
+    "Binding",
+    "BindingError",
+    "resolve_binding",
+    "is_bound_to",
+    "ProviderRun",
+    "RawBrainOutcome",
+    "AuditProvider",
+    "AuditAdapter",
+    "BrainInvoker",
+    "codex_adapter",
+    "gemini_adapter",
+    "parse_provider_findings",
+    "verify_findings",
+    # --- slice S2: dual-brain retry runner (dual_brain) ---
+    "run_with_retry",
+    "run_dual_brain",
+    "DEFAULT_ATTEMPTS",
 ]
