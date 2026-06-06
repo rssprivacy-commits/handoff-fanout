@@ -198,6 +198,9 @@ class TaskSnapshot:
     branch_advanced: bool | None = None  # handoff/<task> pushed past base (None = unknown)
     transcript_idle_s: int | None = None  # now - newest *.jsonl mtime (None = no transcript)
     heartbeat_idle_s: int | None = None  # now - queue/<task>.heartbeat mtime (None = none)
+    suspected_529_idle_s: int | None = (
+        None  # now - queue/<task>.529-suspected mtime (None = absent)
+    )
     bound: bool = False  # has an attached supervisor DAG binding
 
     def transcript_active(self, *, running_idle_s: int) -> bool:
@@ -235,6 +238,22 @@ class TaskSnapshot:
             return True
         return bool(self.branch_advanced) and not self.is_active(running_idle_s=running_idle_s)
 
+    def recent_activity_idle_s(self) -> int | None:
+        """How long since the **most recent** sign of activity for this task — the smallest
+        idle among transcript / heartbeat / the 529-suspected sidecar (each = ``now - mtime``,
+        so the smallest is the most recently touched). ``None`` only if the task has no idle
+        signal at all. Used by the display-side 久死 (dead-task) noise filter
+        (:func:`is_stale_heuristic_blocked`): a task only counts as 陈旧 when *every* footprint
+        — including a **freshly-stamped** 529 sidecar — is older than the threshold, so a 529
+        the watchdog only just flagged stays in the actionable 卡住 bucket (P1-3 / dual-brain
+        consensus: ``min(transcript_idle, heartbeat_idle, suspected_529_idle)``)."""
+        candidates = [
+            x
+            for x in (self.transcript_idle_s, self.heartbeat_idle_s, self.suspected_529_idle_s)
+            if x is not None
+        ]
+        return min(candidates) if candidates else None
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "task_id": self.task_id,
@@ -253,6 +272,7 @@ class TaskSnapshot:
             "branch_advanced": self.branch_advanced,
             "transcript_idle_s": self.transcript_idle_s,
             "heartbeat_idle_s": self.heartbeat_idle_s,
+            "suspected_529_idle_s": self.suspected_529_idle_s,
             "bound": self.bound,
         }
 
@@ -367,6 +387,17 @@ def scan_task(
         except OSError:  # pragma: no cover - stat race
             heartbeat_mtime = None
     heartbeat_idle = _idle_seconds(heartbeat_mtime, now)
+    # The .529-suspected sidecar's age (mtime) is the watchdog's heuristic "I flagged a
+    # stall at this time" timestamp; the display-side 久死 filter uses it (with transcript /
+    # heartbeat) so a freshly-flagged 529 stays actionable while a days-old one drops off the
+    # header alarm (single stat → both presence + age, no double-stat).
+    suspected_529_file = q / f"{task}.529-suspected"
+    suspected_529_mtime: float | None = None
+    if suspected_529_file.is_file():
+        try:
+            suspected_529_mtime = suspected_529_file.stat().st_mtime
+        except OSError:  # pragma: no cover - stat race
+            suspected_529_mtime = None
     return TaskSnapshot(
         task_id=task,
         has_brief=(q / f"{task}.md").is_file(),
@@ -374,7 +405,7 @@ def scan_task(
         done=(q / f"{task}.done").is_file(),
         blocked=(q / f"{task}.BLOCKED.md").is_file(),
         failed=(a / f"{task}.failed").is_file(),
-        suspected_529=(q / f"{task}.529-suspected").is_file(),
+        suspected_529=suspected_529_file.is_file(),
         worker_reported=(a / f"{task}.worker_reported").is_file(),
         spawned=(a / f"{task}.spawned").is_file(),
         submitted=(a / f"{task}.submitted").is_file(),
@@ -384,6 +415,7 @@ def scan_task(
         branch_advanced=branch_advanced,
         transcript_idle_s=transcript_idle,
         heartbeat_idle_s=heartbeat_idle,
+        suspected_529_idle_s=_idle_seconds(suspected_529_mtime, now),
         bound=task in set(bound_tasks),
     )
 
@@ -451,6 +483,13 @@ class StatusConfig:
     running_idle_s: int = 180
     #: A central heartbeat idler beyond this is flagged unhealthy on the board.
     heartbeat_unhealthy_s: int = 70
+    #: A BLOCKED task whose only signal is a heuristic 529 and whose most-recent activity
+    #: (transcript / heartbeat / 529-sidecar) is older than this is display-side 陈旧 (久死):
+    #: kept visible (INV-10) but moved out of the header 卡住 alarm count. Default 12h
+    #: (dual-brain consensus: tolerate the owner's sleep / timezone before archiving a real
+    #: stall, while still clearing 50000s+ dead-task noise; never applies to explicit
+    #: BLOCKED.md / failed). Configurable so the threshold is not hard-coded.
+    stale_idle_s: int = 43200
 
 
 def classify(
@@ -462,21 +501,33 @@ def classify(
     """Map one raw :class:`TaskSnapshot` to a :class:`BusinessState` — **pure** (no I/O,
     no clock; idle seconds arrive pre-computed in the snapshot).
 
-    Precedence (a terminal / urgent fact dominates a stale leftover sidecar):
+    Precedence — **explicit / factual signals dominate the heuristic 529 guess**
+    (cand-20260606-s5adog1 / dual-brain consensus: a watchdog stall *guess* must never
+    outrank a worker's explicit delivery, a real branch advance, or current liveness):
 
     1. ``done`` → DONE, refined to DELIVERED_CLOSABLE iff a window is still visible
        (``window_visible`` is *injected* by the board layer from osascript — the pure
        core never queries it). A done task whose window is gone is just history (DONE);
        a done task whose window is still open is the actionable "close this" bucket.
-    2. ``blocked`` / ``failed`` / ``529-suspected`` → BLOCKED (needs owner). Beats a
-       stale delivery claim, but not a later ``done`` (the task was unblocked + finished).
+    2. ``blocked`` (BLOCKED.md) / ``failed`` → BLOCKED (needs owner). These are **explicit**
+       worker-raised signals ("I am stuck" / spawn failed); they beat a delivery claim
+       (fail-safe: a task that both reported delivery AND wrote BLOCKED.md still needs a
+       human), but not a later ``done`` (the task was unblocked + finished).
     3. ``delivered`` (worker_reported, or branch-advanced + idle) → DELIVERED_AWAITING_
-       REVIEW. Delivery ≠ closable: the central still owes a review/merge until ``done``.
+       REVIEW. An explicit delivery beats a stale heuristic 529 (the core noise fix);
+       delivery ≠ closable: the central still owes a review/merge until ``done``.
     4. transcript **or** heartbeat active within ``running_idle_s`` → RUNNING (P1-3: a
        long-operation worker keeps its heartbeat fresh while its transcript idles; a
-       pure-script worker has only a heartbeat — both are RUNNING, not 闲置).
-    5. otherwise → IDLE (spawned/queued but quiet, or stalled — the watcher/Sweeper, not
-       the board, decides a stall is a problem; S5a does not auto-escalate)."""
+       pure-script worker has only a heartbeat — both are RUNNING, not 闲置). A currently-
+       live task with a stale 529 sidecar has **recovered** — current liveness beats the
+       old guess, so it is RUNNING, not BLOCKED.
+    5. ``529-suspected`` → BLOCKED — the **heuristic** stall guess, the weakest alert: it
+       only stands when there is no terminal/explicit/delivery/liveness signal above it (a
+       genuinely 529-frozen task has a stale transcript AND heartbeat, so it falls through
+       to here). The display-side 久死 filter (:func:`is_stale_heuristic_blocked`) further
+       splits a *days-old* 529-only BLOCKED out of the header alarm.
+    6. otherwise → IDLE (spawned/queued but quiet — the watcher/Sweeper, not the board,
+       decides a stall is a problem; S5a does not auto-escalate)."""
     cfg = config or StatusConfig()
     if snap.done:
         # DELIVERED_CLOSABLE (已交付可关) reuses the SAME strict, conservative closable
@@ -484,13 +535,58 @@ def classify(
         # never disagree — a done-but-dirty / window-unknown task shows DONE, not "可关").
         closable, _ = _closable_reason(snap, window_visible)
         return BusinessState.DELIVERED_CLOSABLE if closable else BusinessState.DONE
-    if snap.blocked or snap.failed or snap.suspected_529:
+    if snap.blocked or snap.failed:
+        # Explicit, worker-raised signals only (NOT the heuristic 529) — a self-reported
+        # block / spawn failure is strong evidence the owner must act, and beats a delivery
+        # claim (fail-safe). The 529 guess is demoted below delivery + liveness (step 5).
         return BusinessState.BLOCKED
     if snap.delivered(running_idle_s=cfg.running_idle_s):
         return BusinessState.DELIVERED_AWAITING_REVIEW
     if snap.is_active(running_idle_s=cfg.running_idle_s):
         return BusinessState.RUNNING
+    if snap.suspected_529:
+        # Heuristic stall guess — weakest alert. Reached only when nothing above fired:
+        # no done, no explicit block/fail, not delivered, not currently active. A real
+        # 529 freeze lands here (stale transcript + heartbeat); a recovered/delivered task
+        # never does (it exited at step 3/4) — killing the "already-delivered shows 卡住"
+        # noise without losing a genuine stall.
+        return BusinessState.BLOCKED
     return BusinessState.IDLE
+
+
+def is_stale_heuristic_blocked(
+    snap: TaskSnapshot,
+    state: BusinessState,
+    *,
+    config: StatusConfig | None = None,
+) -> bool:
+    """Whether a BLOCKED row is a **days-old, heuristic-only** stall that should be moved
+    out of the owner's header 卡住 alarm into a dim 陈旧/疑似久死 partition — **pure**, and
+    a strictly **display-side read** decision (cand-20260606-s5adog1 part B). It NEVER hides
+    the task (INV-10 可观可救 — the row is still rendered, just de-emphasised + uncounted)
+    and NEVER writes/deletes a sidecar (pruning the 529 file is ``handoff prune``'s job).
+
+    A row qualifies ONLY when ALL hold (dual-brain consensus):
+
+    * it is :attr:`BusinessState.BLOCKED`;
+    * the block is **not** explicit — no ``BLOCKED.md`` and no ``failed``. An explicit
+      worker-raised signal is an emergency stop and is **never** archived by age, however
+      old (it always stays in the actionable 卡住 bucket);
+    * a heuristic ``529-suspected`` sidecar is present (defensive: after the classify
+      reorder this is the only remaining route to a non-explicit BLOCKED, but assert it);
+    * its most-recent activity (:meth:`TaskSnapshot.recent_activity_idle_s`) is older than
+      ``config.stale_idle_s`` — a freshly-flagged 529 (sidecar just stamped) is *not* stale
+      and stays actionable.
+    """
+    if state is not BusinessState.BLOCKED:
+        return False
+    if snap.blocked or snap.failed:  # explicit signal → never aged out, regardless of age
+        return False
+    if not snap.suspected_529:  # only a heuristic-529 BLOCKED can be 陈旧
+        return False
+    cfg = config or StatusConfig()
+    idle = snap.recent_activity_idle_s()
+    return idle is not None and idle >= cfg.stale_idle_s
 
 
 # =============================================================================
@@ -1034,19 +1130,39 @@ def render_status(
         BusinessState.IDLE: _DIM,
         BusinessState.DONE: _DIM,
     }
+    # Display-side 久死 split (cand-20260606-s5adog1 part B): a days-old, heuristic-529-only
+    # BLOCKED row is moved OUT of the header 卡住 alarm into a dim 陈旧 partition — kept
+    # visible (INV-10), never pruned. The header 卡住 count = only 近期可行动 BLOCKED rows.
+    stale_blocked = [
+        r
+        for r in by_state[BusinessState.BLOCKED]
+        if is_stale_heuristic_blocked(r.snap, r.state, config=cfg)
+    ]
+    actionable_blocked = [
+        r
+        for r in by_state[BusinessState.BLOCKED]
+        if not is_stale_heuristic_blocked(r.snap, r.state, config=cfg)
+    ]
+
     closable_n = len(by_state[BusinessState.DELIVERED_CLOSABLE])
-    blocked_n = len(by_state[BusinessState.BLOCKED])
+    blocked_n = len(actionable_blocked)
     review_n = len(by_state[BusinessState.DELIVERED_AWAITING_REVIEW])
-    lines.append(
+    summary = (
         f"   摘要: 🔴卡住 {blocked_n} · 🟡待审 {review_n} · 🟢可关 {closable_n} · "
         f"运行 {len(by_state[BusinessState.RUNNING])} · "
         f"闲置 {len(by_state[BusinessState.IDLE])} · "
         f"完成 {len(by_state[BusinessState.DONE])}"
     )
+    if stale_blocked:
+        # surfaced, never silently dropped (禁止静默降级): the owner sees the stale count.
+        summary += f" · 🗄陈旧 {len(stale_blocked)}"
+    lines.append(summary)
     lines.append("")
 
     for st in BUSINESS_ORDER:
-        group = by_state[st]
+        # the BLOCKED group renders only its 近期可行动 rows; 陈旧 rows go to their own dim
+        # partition below (the other states are unaffected).
+        group = actionable_blocked if st is BusinessState.BLOCKED else by_state[st]
         if not group:
             continue
         head = _color(f"{BUSINESS_LABEL[st]}（{len(group)}）", state_color[st], enabled=c)
@@ -1055,6 +1171,22 @@ def render_status(
             chips = _detail_chips(r.snap)
             suffix = _color(f"   {chips}", _DIM, enabled=c) if chips else ""
             lines.append(f"  • {r.snap.task_id}{suffix}")
+        lines.append("")
+
+    if stale_blocked:
+        lines.append(_color(f"陈旧/疑似久死（{len(stale_blocked)}）", _DIM, enabled=c))
+        lines.append(
+            _color(
+                f"  （仅陈旧启发式 529、idle ≥ {cfg.stale_idle_s}s 且无显式求救 — 已移出头部"
+                "卡住计数，仍可观/可救/可收尾；清理走 handoff prune）",
+                _DIM,
+                enabled=c,
+            )
+        )
+        for r in sorted(stale_blocked, key=lambda x: x.snap.task_id):
+            chips = _detail_chips(r.snap)
+            suffix = _color(f"   {chips}", _DIM, enabled=c) if chips else ""
+            lines.append(_color(f"  • {r.snap.task_id}{suffix}", _DIM, enabled=c))
         lines.append("")
 
     if overlays:
@@ -1229,6 +1361,10 @@ def _cmd_status(args: argparse.Namespace) -> int:
                     **r.snap.to_dict(),
                     "business_state": r.state.value,
                     "window_visible": r.window_visible,
+                    # display-side 久死 marker (part B): True = days-old heuristic-529-only
+                    # BLOCKED, excluded from the header 卡住 alarm but still listed. A machine
+                    # consumer counts actionable 卡住 as business_state=="blocked" and !stale.
+                    "stale": is_stale_heuristic_blocked(r.snap, r.state, config=config),
                 }
                 for r in rows
             ],

@@ -12,6 +12,8 @@ Times / clocks are injected (the pure core never reads the wall clock — mirror
 from __future__ import annotations
 
 import json
+import os
+import time
 from typing import Any
 
 import pytest
@@ -28,6 +30,7 @@ from handoff_fanout.status_board import (
     assess_closable,
     classify,
     discover_task_ids,
+    is_stale_heuristic_blocked,
     load_overlay,
     query_visible_tasks,
     scan_all,
@@ -1040,3 +1043,284 @@ class TestP2_6ApproveBadArtefactNoTraceback:
         rc = sb.main(["approve", "task-ok", "--root", str(layout.root), "--project", "erp-system"])
         out = capsys.readouterr().out
         assert rc == 0 and "approval_granted" in out
+
+
+# =============================================================================
+# 12. cand-20260606-s5adog1 — 「卡住」桶噪音降噪
+#     Part A: explicit / factual signals dominate the heuristic 529 guess.
+#     Part B: display-side 久死 (dead-task) staleness filter (read-only, never prune).
+#     Settled by codex+gemini full-power consensus (no degradation) before coding.
+# =============================================================================
+
+
+class TestPartAExplicitBeatsHeuristic529:
+    """Part A precedence reorder: worker_reported / branch-advance / current liveness all
+    beat a stale heuristic 529; only a 529 with NO explicit/delivery/liveness signal above
+    it is BLOCKED. Preserves every prior contract (529-only→BLOCKED, BLOCKED.md beats
+    delivery, worker_reported→delivered, delivered beats running)."""
+
+    def test_worker_reported_with_stale_529_is_delivered_not_blocked(self):
+        # THE core noise fix: a delivered worker with a leftover 529 sidecar → 待审, not 卡住
+        assert (
+            classify(_snap(worker_reported=True, suspected_529=True, suspected_529_idle_s=500))
+            is BusinessState.DELIVERED_AWAITING_REVIEW
+        )
+
+    def test_branch_advanced_quiet_with_stale_529_is_delivered(self):
+        assert (
+            classify(
+                _snap(
+                    branch_advanced=True,
+                    transcript_idle_s=300,
+                    suspected_529=True,
+                    suspected_529_idle_s=300,
+                )
+            )
+            is BusinessState.DELIVERED_AWAITING_REVIEW
+        )
+
+    def test_active_transcript_with_529_is_running_recovered(self):
+        # a currently-live task with a stale 529 has recovered → RUNNING, not BLOCKED
+        assert (
+            classify(_snap(transcript_idle_s=5, suspected_529=True, suspected_529_idle_s=99999))
+            is BusinessState.RUNNING
+        )
+
+    def test_active_heartbeat_only_with_529_is_running(self):
+        # heartbeat-only liveness (long-op / pure-script worker) also wins over 529
+        assert (
+            classify(_snap(heartbeat_idle_s=5, suspected_529=True, suspected_529_idle_s=99999))
+            is BusinessState.RUNNING
+        )
+
+    def test_529_only_quiet_is_still_blocked(self):
+        # the genuine-stall case is preserved: 529 + no explicit/delivery/liveness → BLOCKED
+        assert classify(_snap(suspected_529=True)) is BusinessState.BLOCKED
+
+    def test_real_freeze_stale_transcript_and_heartbeat_is_blocked(self):
+        # a real 529 freeze (stale transcript AND heartbeat) still lands in BLOCKED
+        assert (
+            classify(_snap(suspected_529=True, transcript_idle_s=9000, heartbeat_idle_s=9000))
+            is BusinessState.BLOCKED
+        )
+
+    def test_failed_with_worker_reported_is_blocked(self):
+        # explicit failure beats a delivery claim (fail-safe), regardless of 529
+        assert classify(_snap(failed=True, worker_reported=True)) is BusinessState.BLOCKED
+        assert (
+            classify(_snap(failed=True, worker_reported=True, suspected_529=True))
+            is BusinessState.BLOCKED
+        )
+
+    def test_blocked_md_with_worker_reported_and_529_is_blocked(self):
+        # the explicit BLOCKED.md (worker shouting for help) beats delivery + 529 — fail-safe
+        # (preserves test_blocked_beats_delivered_claim semantics)
+        assert (
+            classify(_snap(blocked=True, worker_reported=True, suspected_529=True))
+            is BusinessState.BLOCKED
+        )
+
+    def test_done_beats_529(self):
+        # done is the terminal close — a stale 529 never resurrects it
+        assert classify(_snap(done=True, suspected_529=True)) is BusinessState.DONE
+        assert (
+            classify(_snap(done=True, suspected_529=True), window_visible=True)
+            is BusinessState.DELIVERED_CLOSABLE
+        )
+
+
+class TestRecentActivityIdle:
+    """The 'time since most recent footprint activity' age signal feeding the 久死 filter."""
+
+    def test_min_of_three_signals(self):
+        snap = _snap(transcript_idle_s=100, heartbeat_idle_s=20, suspected_529_idle_s=999)
+        assert snap.recent_activity_idle_s() == 20
+
+    def test_ignores_none(self):
+        snap = _snap(transcript_idle_s=None, heartbeat_idle_s=None, suspected_529_idle_s=42)
+        assert snap.recent_activity_idle_s() == 42
+
+    def test_all_none_is_none(self):
+        assert _snap().recent_activity_idle_s() is None
+
+
+class TestPartBStaleness:
+    """Part B is_stale_heuristic_blocked: only a days-old, heuristic-529-only BLOCKED is
+    'stale' (display-side archived); explicit BLOCKED.md/failed are NEVER aged out."""
+
+    def test_old_529_only_blocked_is_stale(self):
+        snap = _snap(suspected_529=True, suspected_529_idle_s=50000, heartbeat_idle_s=50000)
+        assert classify(snap) is BusinessState.BLOCKED
+        assert is_stale_heuristic_blocked(snap, BusinessState.BLOCKED) is True
+
+    def test_fresh_529_is_not_stale(self):
+        # a 529 the watchdog only just flagged stays actionable (recent_activity_idle small)
+        snap = _snap(suspected_529=True, suspected_529_idle_s=120)
+        assert is_stale_heuristic_blocked(snap, BusinessState.BLOCKED) is False
+
+    def test_explicit_blocked_md_never_stale_even_if_old(self):
+        # an explicit emergency stop is never archived by age (急停按钮永不降噪)
+        snap = _snap(
+            blocked=True, suspected_529=True, heartbeat_idle_s=99999, suspected_529_idle_s=99999
+        )
+        assert classify(snap) is BusinessState.BLOCKED
+        assert is_stale_heuristic_blocked(snap, BusinessState.BLOCKED) is False
+
+    def test_explicit_failed_never_stale_even_if_old(self):
+        snap = _snap(
+            failed=True, suspected_529=True, heartbeat_idle_s=99999, suspected_529_idle_s=99999
+        )
+        assert is_stale_heuristic_blocked(snap, BusinessState.BLOCKED) is False
+
+    def test_non_blocked_state_never_stale(self):
+        assert is_stale_heuristic_blocked(_snap(done=True), BusinessState.DONE) is False
+        assert (
+            is_stale_heuristic_blocked(
+                _snap(worker_reported=True), BusinessState.DELIVERED_AWAITING_REVIEW
+            )
+            is False
+        )
+
+    def test_blocked_without_529_not_stale(self):
+        # defensive: a BLOCKED with no 529 sidecar can't be the heuristic-only dead task
+        snap = _snap(blocked=True, heartbeat_idle_s=99999)
+        assert is_stale_heuristic_blocked(snap, BusinessState.BLOCKED) is False
+
+    def test_threshold_configurable(self):
+        snap = _snap(suspected_529=True, suspected_529_idle_s=10000)
+        # default 12h (43200) → 10000s is NOT stale
+        assert is_stale_heuristic_blocked(snap, BusinessState.BLOCKED) is False
+        # tighten threshold to 1h → now stale
+        assert (
+            is_stale_heuristic_blocked(
+                snap, BusinessState.BLOCKED, config=StatusConfig(stale_idle_s=3600)
+            )
+            is True
+        )
+
+    def test_no_age_signal_conservatively_not_stale(self):
+        # a 529 with no idle signal at all → unknown age → conservatively NOT stale
+        assert is_stale_heuristic_blocked(_snap(suspected_529=True), BusinessState.BLOCKED) is False
+
+
+class TestScanReads529Idle:
+    def test_scan_reads_529_sidecar_age(self, tmp_path):
+        layout = _layout(tmp_path)
+        sidecar = layout.queue_dir / "t.529-suspected"
+        _touch(sidecar)
+        os.utime(sidecar, (NOW - 50000, NOW - 50000))
+        s = scan_task(layout, "t", now=NOW)
+        assert s.suspected_529 is True
+        assert s.suspected_529_idle_s == 50000
+
+    def test_scan_no_529_sidecar_is_none(self, tmp_path):
+        layout = _layout(tmp_path)
+        _touch(layout.queue_dir / "t.md")
+        s = scan_task(layout, "t", now=NOW)
+        assert s.suspected_529 is False
+        assert s.suspected_529_idle_s is None
+
+
+class TestRenderStaleSplit:
+    """Part B render: header 卡住 count = only 近期可行动; 久死 rows go to a dim partition
+    (still visible — INV-10 — never hidden), and the dropped count is surfaced (禁止静默降级)."""
+
+    def _row(self, task, **kw):
+        snap = _snap(task=task, **kw)
+        return sb.BoardRow(snap, classify(snap), None)
+
+    def test_stale_excluded_from_header_and_in_own_partition(self):
+        rows = [
+            self._row("recent-stall", suspected_529=True, suspected_529_idle_s=120),
+            self._row(
+                "dead-1", suspected_529=True, suspected_529_idle_s=50000, heartbeat_idle_s=50000
+            ),
+            self._row(
+                "dead-2", suspected_529=True, suspected_529_idle_s=80000, heartbeat_idle_s=80000
+            ),
+        ]
+        text = sb.render_status(
+            rows,
+            now_iso="t",
+            project="erp-system",
+            central_heartbeat_idle_s=None,
+            watcher_alive=None,
+            color=False,
+        )
+        # header counts only the 1 recent actionable stall; the 2 dead are surfaced as 陈旧
+        assert "🔴卡住 1" in text
+        assert "🗄陈旧 2" in text
+        # the dim partition exists and lists the dead tasks; the recent one stays in 卡住需介入
+        assert "陈旧/疑似久死（2）" in text
+        assert "recent-stall" in text and "dead-1" in text and "dead-2" in text
+
+    def test_explicit_blocked_md_stays_actionable_even_if_old(self):
+        rows = [
+            self._row(
+                "help-me",
+                blocked=True,
+                suspected_529=True,
+                heartbeat_idle_s=99999,
+                suspected_529_idle_s=99999,
+            )
+        ]
+        text = sb.render_status(
+            rows,
+            now_iso="t",
+            project="erp-system",
+            central_heartbeat_idle_s=None,
+            watcher_alive=None,
+            color=False,
+        )
+        assert "🔴卡住 1" in text
+        assert "陈旧/疑似久死" not in text  # explicit signal never archived
+
+    def test_no_stale_no_partition_or_count(self):
+        rows = [self._row("x", blocked=True)]
+        text = sb.render_status(
+            rows,
+            now_iso="t",
+            project="erp-system",
+            central_heartbeat_idle_s=None,
+            watcher_alive=None,
+            color=False,
+        )
+        assert "🗄陈旧" not in text
+        assert "陈旧/疑似久死" not in text
+
+
+class TestPartBClosableNotLoosened:
+    """Part B must NOT touch the conservative closable predicate — it stays strict
+    (done ∩ visible window ∩ clean worktree); staleness is BLOCKED-bucket-only."""
+
+    def test_closable_predicate_unchanged_dirty_unknown(self, tmp_path):
+        # done + window visible but dirty-unknown worktree → still NOT closable (unchanged)
+        v = assess_closable(
+            _snap(done=True, worktree_present=True, worktree_dirty=None), window_visible=True
+        )
+        assert v.closable is False
+
+    def test_closable_still_requires_done_and_window(self, tmp_path):
+        v = assess_closable(_snap(done=True, worktree_dirty=False), window_visible=True)
+        assert v.closable is True
+        # not-done is never closable, staleness or not
+        assert assess_closable(_snap(suspected_529=True), window_visible=True).closable is False
+
+
+class TestCliJsonStaleField:
+    def test_json_marks_stale_rows(self, tmp_path, monkeypatch, capsys):
+        _no_external(monkeypatch)
+        layout = _layout(tmp_path)
+        # a days-old 529-only dead task (uses the real wall clock in the CLI path)
+        dead = layout.queue_dir / "dead.529-suspected"
+        _touch(dead)
+        os.utime(dead, (time.time() - 50000, time.time() - 50000))
+        # a freshly-flagged 529 (actionable)
+        _touch(layout.queue_dir / "recent.529-suspected")
+        rc = sb.main(["status", "--root", str(layout.root), "--project", "erp-system", "--json"])
+        out = capsys.readouterr().out
+        assert rc == 0
+        payload = json.loads(out)
+        by_id = {r["task_id"]: r for r in payload["rows"]}
+        assert by_id["dead"]["business_state"] == "blocked" and by_id["dead"]["stale"] is True
+        assert by_id["recent"]["business_state"] == "blocked" and by_id["recent"]["stale"] is False
