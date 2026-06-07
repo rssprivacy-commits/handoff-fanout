@@ -172,3 +172,136 @@ async function tryClose(deps: CloseDeps, tabs: TabLike[]): Promise<boolean> {
 function base(reason: CloseReason, ok: boolean): CloseResult {
   return { ok, reason, closedCount: 0, skippedDirty: 0, retried: false };
 }
+
+// ── Single-pane (close side bars natively) — 2026-06-06 ───────────────────────
+// The cold-spawn launcher wants a freshly spawned worktree window to end up as a
+// SINGLE editor pane (no left/right side bars). Earlier launcher attempts sent
+// OS-level keystrokes (Cmd+B, then a custom cmd+ctrl+alt+9 chord via osascript)
+// which were fragile: option-mutated characters, a keybindings.json dependency,
+// toggle state (a toggle REOPENS an already-closed bar), and keyboard-focus races
+// (the Claude chat input could swallow the key). The robust mechanism is to call
+// VS Code's OWN explicit close commands from the extension host — no keystroke, no
+// keybinding, cannot be eaten by a focused text input, idempotent. The launcher
+// fires `vscode://dharmaxis.handoff-helper/singlepane?task_id=<task>` AFTER the
+// prompt tab is open + submitted, so whatever the Claude URI re-opened (the chat
+// side bar) is closed last.
+export const SINGLEPANE_PATH = "/singlepane";
+
+export function isSinglePanePath(path: string): boolean {
+  return path === SINGLEPANE_PATH;
+}
+
+// EXPLICIT (not toggle) close commands — idempotent: an already-closed bar stays
+// closed, never reopens. closeSidebar = primary side bar; closeAuxiliaryBar =
+// secondary/auxiliary side bar. Together they cover both, regardless of which is
+// on the left/right (layout-independent).
+export const SINGLEPANE_COMMANDS = [
+  "workbench.action.closeSidebar",
+  "workbench.action.closeAuxiliaryBar",
+] as const;
+
+export interface SinglePaneDeps {
+  /** fsPath of the active window's .code-workspace file, or undefined. */
+  workspaceFile: () => string | undefined;
+  /** Run a VS Code command (injected for testability). */
+  executeCommand: (command: string) => Promise<unknown>;
+  /** Structured log sink. */
+  log: (msg: string) => void;
+}
+
+export type SinglePaneReason =
+  | "closed"
+  | "missing-task"
+  | "wrong-window"
+  | "command-failed";
+
+export interface SinglePaneResult {
+  ok: boolean;
+  reason: SinglePaneReason;
+  ran: number;
+}
+
+// Guard: only collapse side bars on a HANDOFF WORKTREE window — one whose
+// workspace file is a `.handoff.code-workspace` (the engine-injected cold-spawn
+// workspace). A stray vscode:// from anywhere else, or one that lands on the
+// owner's normal window, is rejected — so this can never collapse side bars on a
+// window the owner is actively using (multi-window red line).
+export function isHandoffWorktreeWorkspace(workspaceFile: string | undefined): boolean {
+  return (
+    typeof workspaceFile === "string" &&
+    workspaceFile.endsWith(".handoff.code-workspace")
+  );
+}
+
+export async function handleSinglePane(
+  params: HandoffCloseParams,
+  deps: SinglePaneDeps,
+): Promise<SinglePaneResult> {
+  if (!params.task) {
+    deps.log("[handoff-helper] singlepane reject: missing task");
+    return { ok: false, reason: "missing-task", ran: 0 };
+  }
+  const wf = deps.workspaceFile();
+  if (!isHandoffWorktreeWorkspace(wf)) {
+    deps.log(
+      `[handoff-helper] singlepane reject: active window is not a handoff worktree (workspaceFile=${wf ?? "none"}) task=${params.task}`,
+    );
+    return { ok: false, reason: "wrong-window", ran: 0 };
+  }
+  let ran = 0;
+  try {
+    for (const cmd of SINGLEPANE_COMMANDS) {
+      await deps.executeCommand(cmd);
+      ran += 1;
+    }
+  } catch (err) {
+    deps.log(`[handoff-helper] singlepane command failed after ran=${ran}: ${String(err)}`);
+    return { ok: false, reason: "command-failed", ran };
+  }
+  deps.log(
+    `[handoff-helper] singlepane closed side bars (ran=${ran}) task=${params.task} workspace=${wf}`,
+  );
+  return { ok: true, reason: "closed", ran };
+}
+
+// ── Single-pane on STARTUP (window load) — 2026-06-06 ─────────────────────────
+// Owner complaint: closing the side bars only AFTER the submit makes the spawned window stay 3-column for too
+// long ("等那么久干嘛"). Fix (codex+gemini dual-brain audit → owner chose this): when a HANDOFF WORKTREE window
+// finishes loading (the extension activates on `onStartupFinished`), collapse the side bars immediately — so the
+// window becomes single-pane on load instead of after the readiness-gate. No launcher timing, window-local, uses
+// VS Code's own commands. Same `.handoff.code-workspace` guard so it never touches the owner's normal windows.
+export interface StartupDeps {
+  /** fsPath of the active window's .code-workspace file, or undefined. */
+  workspaceFile: () => string | undefined;
+  /** Run a VS Code command (injected for testability). */
+  executeCommand: (command: string) => Promise<unknown>;
+  /** Structured log sink. */
+  log: (msg: string) => void;
+}
+
+export type StartupReason = "closed" | "not-handoff-worktree" | "command-failed";
+
+export interface StartupResult {
+  ran: boolean;
+  reason: StartupReason;
+}
+
+export async function runStartupSinglePane(deps: StartupDeps): Promise<StartupResult> {
+  const wf = deps.workspaceFile();
+  if (!isHandoffWorktreeWorkspace(wf)) {
+    deps.log(
+      `[handoff-helper] startup: not a handoff worktree (workspaceFile=${wf ?? "none"}) — skip single-pane`,
+    );
+    return { ran: false, reason: "not-handoff-worktree" };
+  }
+  try {
+    for (const cmd of SINGLEPANE_COMMANDS) {
+      await deps.executeCommand(cmd);
+    }
+  } catch (err) {
+    deps.log(`[handoff-helper] startup single-pane command failed: ${String(err)}`);
+    return { ran: false, reason: "command-failed" };
+  }
+  deps.log(`[handoff-helper] startup: closed side bars (single-pane) for handoff worktree ${wf}`);
+  return { ran: true, reason: "closed" };
+}

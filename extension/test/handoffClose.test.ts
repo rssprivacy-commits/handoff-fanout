@@ -1,11 +1,18 @@
 import * as assert from "assert";
 import {
   CloseDeps,
+  SINGLEPANE_COMMANDS,
+  SinglePaneDeps,
+  StartupDeps,
   TabLike,
   handleHandoffClose,
+  handleSinglePane,
   isClosePath,
+  isHandoffWorktreeWorkspace,
+  isSinglePanePath,
   isValidNonce,
   parseQuery,
+  runStartupSinglePane,
 } from "../src/handoffClose";
 
 const VALID_NONCE = "0123456789abcdef"; // 16 hex chars, mirrors secrets.token_hex(8)
@@ -224,5 +231,146 @@ describe("handleHandoffClose", () => {
     assert.strictEqual(res.reason, "nothing-to-close");
     assert.strictEqual(res.skippedDirty, 1);
     assert.strictEqual(calls.closeCount, 0);
+  });
+});
+
+// ── single-pane (close side bars natively) ────────────────────────────────────
+
+const HANDOFF_WS = "/Users/me/.../worktrees/t1/.handoff.code-workspace";
+
+interface SPCalls {
+  commands: string[];
+  logs: string[];
+}
+
+function makeSinglePaneDeps(opts: {
+  workspaceFile?: string | undefined;
+  failOn?: string; // command name that throws
+}): { deps: SinglePaneDeps; calls: SPCalls } {
+  const calls: SPCalls = { commands: [], logs: [] };
+  const deps: SinglePaneDeps = {
+    workspaceFile: () => opts.workspaceFile,
+    executeCommand: async (command) => {
+      calls.commands.push(command);
+      if (opts.failOn && command === opts.failOn) {
+        throw new Error("simulated command failure");
+      }
+      return undefined;
+    },
+    log: (msg) => calls.logs.push(msg),
+  };
+  return { deps, calls };
+}
+
+describe("isSinglePanePath / isHandoffWorktreeWorkspace", () => {
+  it("accepts only /singlepane", () => {
+    assert.strictEqual(isSinglePanePath("/singlepane"), true);
+    assert.strictEqual(isSinglePanePath("/autoclose"), false);
+    assert.strictEqual(isSinglePanePath("/open"), false);
+  });
+  it("recognizes a .handoff.code-workspace file, rejects others/undefined", () => {
+    assert.strictEqual(isHandoffWorktreeWorkspace(HANDOFF_WS), true);
+    assert.strictEqual(isHandoffWorktreeWorkspace("/Users/me/proj/normal.code-workspace"), false);
+    assert.strictEqual(isHandoffWorktreeWorkspace(undefined), false);
+  });
+});
+
+describe("handleSinglePane", () => {
+  it("success: runs closeSidebar then closeAuxiliaryBar in order on a handoff worktree window", async () => {
+    const { deps, calls } = makeSinglePaneDeps({ workspaceFile: HANDOFF_WS });
+    const res = await handleSinglePane({ task: "t1", nonce: null, project: null }, deps);
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.reason, "closed");
+    assert.strictEqual(res.ran, 2);
+    assert.deepStrictEqual(calls.commands, [...SINGLEPANE_COMMANDS]);
+  });
+
+  it("wrong-window: a normal (non-handoff) workspace is rejected, no commands run", async () => {
+    const { deps, calls } = makeSinglePaneDeps({
+      workspaceFile: "/Users/me/proj/normal.code-workspace",
+    });
+    const res = await handleSinglePane({ task: "t1", nonce: null, project: null }, deps);
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.reason, "wrong-window");
+    assert.strictEqual(res.ran, 0);
+    assert.strictEqual(calls.commands.length, 0);
+  });
+
+  it("wrong-window: no workspace file (single folder / empty) is rejected", async () => {
+    const { deps, calls } = makeSinglePaneDeps({ workspaceFile: undefined });
+    const res = await handleSinglePane({ task: "t1", nonce: null, project: null }, deps);
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.reason, "wrong-window");
+    assert.strictEqual(calls.commands.length, 0);
+  });
+
+  it("missing-task: rejected before any command", async () => {
+    const { deps, calls } = makeSinglePaneDeps({ workspaceFile: HANDOFF_WS });
+    const res = await handleSinglePane({ task: null, nonce: null, project: null }, deps);
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.reason, "missing-task");
+    assert.strictEqual(calls.commands.length, 0);
+  });
+
+  it("command-failed: a throwing executeCommand is reported, ran reflects progress", async () => {
+    const { deps, calls } = makeSinglePaneDeps({
+      workspaceFile: HANDOFF_WS,
+      failOn: "workbench.action.closeAuxiliaryBar",
+    });
+    const res = await handleSinglePane({ task: "t1", nonce: null, project: null }, deps);
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.reason, "command-failed");
+    assert.strictEqual(res.ran, 1); // closeSidebar ran, closeAuxiliaryBar threw
+    assert.deepStrictEqual(calls.commands, [...SINGLEPANE_COMMANDS]);
+  });
+});
+
+describe("runStartupSinglePane (onStartupFinished)", () => {
+  function makeStartupDeps(opts: { workspaceFile?: string | undefined; failOn?: string }): {
+    deps: StartupDeps;
+    calls: SPCalls;
+  } {
+    const calls: SPCalls = { commands: [], logs: [] };
+    const deps: StartupDeps = {
+      workspaceFile: () => opts.workspaceFile,
+      executeCommand: async (command) => {
+        calls.commands.push(command);
+        if (opts.failOn && command === opts.failOn) throw new Error("simulated startup command failure");
+        return undefined;
+      },
+      log: (msg) => calls.logs.push(msg),
+    };
+    return { deps, calls };
+  }
+
+  it("handoff worktree window: closes both side bars on startup", async () => {
+    const { deps, calls } = makeStartupDeps({ workspaceFile: HANDOFF_WS });
+    const res = await runStartupSinglePane(deps);
+    assert.strictEqual(res.ran, true);
+    assert.strictEqual(res.reason, "closed");
+    assert.deepStrictEqual(calls.commands, [...SINGLEPANE_COMMANDS]);
+  });
+
+  it("normal (non-handoff) window: does nothing on startup", async () => {
+    const { deps, calls } = makeStartupDeps({ workspaceFile: "/Users/me/proj/normal.code-workspace" });
+    const res = await runStartupSinglePane(deps);
+    assert.strictEqual(res.ran, false);
+    assert.strictEqual(res.reason, "not-handoff-worktree");
+    assert.strictEqual(calls.commands.length, 0);
+  });
+
+  it("no workspace file (single folder / empty window): does nothing", async () => {
+    const { deps, calls } = makeStartupDeps({ workspaceFile: undefined });
+    const res = await runStartupSinglePane(deps);
+    assert.strictEqual(res.ran, false);
+    assert.strictEqual(res.reason, "not-handoff-worktree");
+    assert.strictEqual(calls.commands.length, 0);
+  });
+
+  it("command failure on startup is reported, not thrown", async () => {
+    const { deps } = makeStartupDeps({ workspaceFile: HANDOFF_WS, failOn: "workbench.action.closeSidebar" });
+    const res = await runStartupSinglePane(deps);
+    assert.strictEqual(res.ran, false);
+    assert.strictEqual(res.reason, "command-failed");
   });
 });

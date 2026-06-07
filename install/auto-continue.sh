@@ -325,58 +325,40 @@ submit_enter_if_front_window_contains() {
     return 1
 }
 
-# Collapse BOTH side bars on a COLD worktree window BEFORE the URI opens the prompt, so the window
-# becomes a single editor pane → there is NO empty Claude SIDEBAR "Message input" to steal keyboard
-# focus from the URI-pasted CENTER prompt (root-cause cold-submit fix 2026-06-06 / dual-brain
-# codex+Gemini + owner ruling: "消除墙 > 检测墙"). This is MATERIALLY DIFFERENT from the tombstoned
-# focus hack (install/keybindings-claude-focus.json — do not re-introduce it):
-#   - runs BEFORE the URI exists → there is no prompt to mis-focus (the tombstone focused AFTER the URI);
-#   - sends IDEMPOTENT close commands (closeSidebar/closeAuxiliaryBar via a custom keybinding) — NOT the
-#     stateful Cmd+B / Cmd+Alt+B toggles, which could OPEN a closed bar;
-#   - NO claude-vscode.focus chord and NO AXRaise (those two were the actual diagnosed culprits).
-# Window-guarded in ONE atomic osascript (same TOCTOU-safe pattern as the Enter): assert frontmost
-# app=Code AND the front window title contains the task token, THEN send the chord — so a stray
-# keystroke can never close the OWNER's side bars on a wrong window (multi-window red line). Best-effort:
-# if the custom keybinding is not installed the chord is a harmless no-op (side bars stay open) and the
-# readiness-gate still guards the submit → graceful degradation, no regression. HANDOFF_SIDEBAR_CLOSE_KEY
-# (default 9) MUST match the installed keybinding `cmd+ctrl+alt+<key>` → runCommands[closeSidebar,
-# closeAuxiliaryBar] (install/keybindings-singlepane.json, merged by install.sh).
-# Returns: 0 = chord sent | 1 = guard failed (task window not frontmost) | 2 = osascript errored.
+# Collapse BOTH side bars on a COLD worktree window so it becomes a single editor pane (owner's "默认只有
+# 中间栏"). 2026-06-06 / owner chose the NATIVE-EXTENSION path over keystrokes.
+#
+# EVOLUTION (why this is now a URI to our extension, not a keystroke):
+#   v0 custom cmd+ctrl+alt+9 chord via `keystroke "9" using {option down}` — FAILED: osascript `keystroke` of a
+#      DIGIT under option sends the option-MUTATED character (e.g. "≈"), not a clean key, so VS Code never matched
+#      the binding. (Not a webview swallow — the Claude webview only eats Escape; VS Code forwards webview keydown.)
+#   v1 built-in Cmd+B / Cmd+Alt+B toggles — FAILED: a toggle REOPENS an already-closed bar (state-fragile), and
+#      the cold-spawn URI re-opens the chat side bar, so closing before it never survived.
+#   v2 key code 25 (= physical "9") firing the cmd+ctrl+alt+9 keybinding's explicit closeSidebar/closeAuxiliaryBar
+#      — worked, but still depended on a keybindings.json entry + osascript Accessibility + the right window being
+#      frontmost for the key to land + could be eaten by a focused text input.
+#   v3 (CURRENT) the handoff-helper VS Code extension calls VS Code's OWN closeSidebar + closeAuxiliaryBar
+#      NATIVELY. The launcher just opens vscode://dharmaxis.handoff-helper/singlepane?task_id=<task>. Benefits:
+#      no keystroke (cannot be eaten by a focused input / no character mutation), no keybindings.json dependency,
+#      no toggle state (explicit idempotent close), layout-independent (primary + secondary), and a BUILT-IN guard
+#      — the extension closes side bars ONLY when the active window's workspace is a `.handoff.code-workspace`
+#      (a cold-spawn worktree), so it can never collapse a side bar on the owner's normal window (multi-window
+#      red line). The CALLER fires it AFTER the prompt tab is open + submitted, so whatever the Claude URI
+#      re-opened (the chat side bar) is closed LAST → single editor pane.
+# 🔴 "dispatched" ≠ "actually closed" — only a real-machine VISUAL check confirms single-pane (lesson 2026-06-06:
+# a prior false-positive log fooled both me and the dual-brain). The log below says DISPATCHED, never "closed".
+# Returns: 0 = singlepane URI dispatched | 2 = open failed.
 close_sidebars_if_front_window_contains() {
-    local token="$1" out key
-    key="${HANDOFF_SIDEBAR_CLOSE_KEY:-9}"
-    case "$key" in [0-9A-Za-z]) : ;; *) key=9 ;; esac   # single alnum only (no AppleScript injection)
-    out=$("$HANDOFF_OSASCRIPT_CMD" -e "on run argv
-        -- HANDOFF-CLOSE-SIDEBARS — single-pane: close primary+secondary side bars BEFORE the URI.
-        -- This is NOT a focus chord (the tombstoned claude-vscode.focus hack); it just collapses
-        -- the layout so the URI prompt has no empty-Claude-sidebar focus competitor. The marker
-        -- lets the test harness tell this guarded layout keystroke apart from a submit Enter.
-        set token to item 1 of argv
-        tell application \"System Events\"
-            set fa to name of first application process whose frontmost is true
-            if fa is not \"Code\" then return \"nofront\"
-            tell process \"Code\"
-                if (count of windows) is 0 then return \"nowin\"
-                set wn to \"\"
-                try
-                    set wn to name of front window
-                end try
-                -- tightened guard (R2+R3 codex): require the EXACT cold-spawn fragment \"<task> [worktree]\".
-                -- The title is always \"<project> · <task> [worktree] …\" (inject_vscode_workspace), so this
-                -- rejects a stray window that merely CONTAINS the task-id substring AND another worktree whose
-                -- task id merely has this one as a prefix (e.g. task \"foo-1\" vs a \"foo-10 [worktree]\" window).
-                if wn does not contain (token & \" [worktree]\") then return \"mismatch\"
-                keystroke \"$key\" using {command down, control down, option down}
-                return \"sent\"
-            end tell
-        end tell
-    end run" "$token" 2>>"$LOG") || return 2
-    if [ "$out" = "sent" ]; then
-        log "COLD-SIDEBAR: closed side bars (guarded chord cmd+ctrl+alt+$key) before URI — single-pane (token=$token)"
+    local token="$1"
+    # Native close via the handoff-helper extension (dharmaxis.handoff-helper). task_id is the kebab-case task id
+    # (URL-safe). The extension guards on .handoff.code-workspace, so a stray dispatch onto a wrong window is a
+    # no-op there — and we only call this on the cold worktree path, after the submit.
+    if "$HANDOFF_OPEN_CMD" "vscode://dharmaxis.handoff-helper/singlepane?task_id=$token" 2>>"$LOG"; then
+        log "COLD-SIDEBAR: DISPATCHED native closeSidebar+closeAuxiliaryBar via handoff-helper extension (singlepane URI, token=$token) — note: DISPATCHED ≠ confirmed-closed (verify visually)"
         return 0
     fi
-    log "COLD-SIDEBAR: side-bar close SKIPPED (state=$out — not frontmost/guard) — best-effort; readiness-gate still guards submit (token=$token)"
-    return 1
+    log "COLD-SIDEBAR: singlepane URI open FAILED (token=$token) — best-effort; readiness-gate still guarded the submit"
+    return 2
 }
 
 # Worktree session transcript line count — the cold-submit "prompt actually submitted" signal
@@ -1040,32 +1022,8 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
                     # else the URI/Enter could still target a wrong window; R2 codex). Best-effort.
                     raise_task_window "$TASK"; wait_target_window_frontmost "$TASK" 2
                 fi
-                # SINGLE-PANE (2026-06-06 / dual-brain codex+Gemini + owner): collapse BOTH side bars
-                # NOW — BEFORE the URI opens the prompt — so the prompt has no empty-Claude-sidebar
-                # focus competitor (the cold-submit root cause). Guarded (only acts when THIS task
-                # window is frontmost) + idempotent. Cold worktree path only.
-                # FAIL-SAFE GATE (R2 codex P1): only send the chord if our keybinding was actually installed
-                # (sentinel written by install_keybinding.py on success). No sentinel → skip → never send a
-                # stray cmd+ctrl+alt+<key> that could trigger SOMEONE ELSE's binding; the readiness-gate still
-                # guards the submit. The sentinel holds the installed key, so a re-key stays in sync.
-                # Resolve the chord key from the install sentinel (the source of truth for what is bound).
-                # An explicit, valid env override wins. If the sentinel is missing / empty / corrupt → NO
-                # valid key → SKIP the chord entirely (R3 codex: never default to "9" and fire blindly onto
-                # whatever cmd+ctrl+alt+9 happens to be bound to). The readiness-gate still guards the submit.
-                _SB_SENTINEL="$HANDOFF_ROOT/.singlepane-keybinding.installed"
-                _SB_KEY=""
-                if [ -f "$_SB_SENTINEL" ]; then
-                    IFS= read -r _SB_RAW < "$_SB_SENTINEL" 2>/dev/null || _SB_RAW=""
-                    _SB_KEY=$(printf '%s' "$_SB_RAW" | /usr/bin/tr -dc '0-9A-Za-z' | /usr/bin/cut -c1)
-                fi
-                case "${HANDOFF_SIDEBAR_CLOSE_KEY:-}" in [0-9A-Za-z]) _SB_KEY="$HANDOFF_SIDEBAR_CLOSE_KEY" ;; esac
-                if [ -n "$_SB_KEY" ]; then
-                    HANDOFF_SIDEBAR_CLOSE_KEY="$_SB_KEY"
-                    close_sidebars_if_front_window_contains "$TASK"
-                    sleep "${HANDOFF_SIDEBAR_SETTLE_SECS:-0.3}"   # let the layout collapse before the URI
-                else
-                    log "COLD-SIDEBAR: keybinding not installed / sentinel missing-or-invalid ($_SB_SENTINEL) — single-pane close skipped; readiness-gate still guards submit (token=$TASK)"
-                fi
+                # SINGLE-PANE: the side-bar close moved to AFTER the URI + submit (see the cold submit block
+                # below). Closing BEFORE the URI did not survive — the URI re-opens the Claude chat side bar.
             else
                 "$CODE_BIN" "$OPEN_TARGET" 2>>"$LOG" || log "WARN: code $OPEN_TARGET failed (continue with open)"
                 wait_code_frontmost "${HANDOFF_WIN_FRONT_SECS_WARM:-3}" || sleep 0.4  # frontmost or floor
@@ -1161,6 +1119,13 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
                             write_ack "$PROJ_DIR" "$TASK" "failed" "Enter on verified input but no transcript growth — manual Enter needed (cold)"
                             ;;
                     esac
+                    # SINGLE-PANE (2026-06-06 v4 / owner chose codex's onStartupFinished after a dual-brain audit):
+                    # the close is NO LONGER fired here. Doing it after the submit made the window stay 3-column
+                    # for too long ("等那么久干嘛"). Instead the handoff-helper extension (v0.3.0) collapses the
+                    # side bars on `onStartupFinished` — i.e. as soon as the worktree window LOADS, guarded to
+                    # `.handoff.code-workspace`. The launcher's `close_sidebars_if_front_window_contains` (the
+                    # /singlepane URI) is kept defined as a FALLBACK only — re-enable it here (right after the URI)
+                    # if a real spawn is ever observed to re-open a side bar after startup (codex: "only if observed").
                 elif [ "${HANDOFF_WARM_WINDOW_GUARD:-1}" = "0" ]; then
                     # warm escape-hatch: legacy app-level Enter (custom window.title without folder name)
                     if "$HANDOFF_OSASCRIPT_CMD" -e 'tell application "System Events" to tell process "Code" to keystroke return' 2>>"$LOG"; then

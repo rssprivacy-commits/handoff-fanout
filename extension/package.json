@@ -1,8 +1,8 @@
 {
   "name": "handoff-helper",
   "displayName": "DHARMAXIS Handoff Helper",
-  "description": "Auto-closes a stale Claude Code tab after a handoff hands off to a freshly spawned tab. Driven by a URI invoked from the launchd watcher.",
-  "version": "0.1.0",
+  "description": "Handoff helper for cold-spawned Claude Code worktree windows: collapses the side bars to a single editor pane natively (closeSidebar + closeAuxiliaryBar) via a URI from the launcher. (Also retains a dormant legacy autoclose route.)",
+  "version": "0.3.0",
   "publisher": "dharmaxis",
   "license": "MIT",
   "engines": {
@@ -18,7 +18,8 @@
   },
   "main": "./dist/extension.js",
   "activationEvents": [
-    "onUri"
+    "onUri",
+    "onStartupFinished"
   ],
   "contributes": {},
   "scripts": {
