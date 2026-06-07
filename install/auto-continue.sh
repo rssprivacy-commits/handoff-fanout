@@ -80,6 +80,42 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"
 }
 
+# ── per-segment spawn timing (2026-06-07 spawn-speedup task) ──────────────────────────────
+# A single cold spawn can run tens of seconds because each osascript "System Events" query can
+# BLOCK for seconds while a freshly-opened VS Code window renders (the AX tree of a mid-launch
+# Code process is slow to enumerate), and the cost varies wildly run-to-run — so a single
+# measurement misleads (observed: the SAME code, ~38s one spawn vs ~14s the next). These marks
+# make every real spawn SELF-REPORT where the wall-clock went (one `PERF[...]` line per segment),
+# so timing is measured from the real deployment path itself, never guessed. Cheap: one date(1)
+# fork + one log line per segment; no osascript. `date +%s%N` is nanosecond-real on this box.
+_PERF_LAST=0
+# epoch milliseconds. ROBUST against a /bin/date without %N (R2 codex): %N IS supported on this box
+# (macOS 26 → true ns), but if a date(1) ever returns the literal "…N" suffix, feeding it to `$(( ))`
+# would error/spam stderr — and instrumentation must NEVER misbehave (it runs on every spawn, set -u is
+# on). So validate: non-numeric → fall back to second precision ×1000.
+_perf_ms() {
+    local ns; ns=$(/bin/date +%s%N 2>/dev/null)
+    case "$ns" in
+        ''|*[!0-9]*) echo $(( $(/bin/date +%s) * 1000 )) ;;
+        *) echo $(( ns / 1000000 )) ;;
+    esac
+}
+_perf_reset() { _PERF_LAST=$(_perf_ms); }
+_perf_mark() {  # _perf_mark <task> <label> — log ms since the previous mark/reset, advance the cursor
+    local now; now=$(_perf_ms)
+    log "PERF[$1]: $2 $((now - _PERF_LAST))ms"
+    _PERF_LAST=$now
+}
+# Time a single command, log its PERF segment, and PRESERVE its exit code so it stays usable inside
+# if/elif (the spawn flow uses screen_is_locked / accessibility_trusted / is_frontmost_code as guards —
+# short-circuit semantics are kept: a wrapped guard only runs when its elif is reached, exactly as before).
+_perf_call() {  # _perf_call <task> <label> <cmd> [args...]
+    local task="$1" label="$2"; shift 2
+    "$@"; local r=$?
+    _perf_mark "$task" "$label"
+    return $r
+}
+
 # Drift guard (甲 / 2026-06-05 owner ruling B+C — backstop to the post-commit auto-sync). The launchd
 # copy ~/.local/bin/auto-continue.sh is a DEPLOYED COPY of the canonical SOURCE install/auto-continue.sh,
 # normally kept current by the post-commit hook's `install.sh --sync-launcher`. If that auto-sync ever
@@ -251,15 +287,30 @@ target_window_frontmost() {
 }
 
 # Poll until THE task window is frontmost (cold spawn render+focus), up to <secs> (default 8). 0=ready.
-# 0.2s step (focus/render usually settles in 10s–100s of ms; R2: a 1s step wastes up to ~0.9s/iter).
+# WALL-CLOCK budget (2026-06-07 spawn-speedup): each poll runs `target_window_frontmost`, an osascript
+# that DURING a cold window render can block for SECONDS (System Events enumerating the AX tree of a
+# mid-launch Code window). The old step-counting (attempts = secs×5, sleep 0.2) only counted the 0.2s
+# sleeps and IGNORED that per-iter osascript cost, so a nominal "3s" overshot to ~16s wall-clock when the
+# title never matched (measured: sp-deploy2 spawn 2026-06-07 — code-n→URI took +16s). A real /bin/date
+# deadline keeps "<secs>s" honest (same fix already proven in cold_submit_with_retry). The DESIGNED
+# behaviour is unchanged: on timeout the caller AXRaises the task window + opens the URI into the
+# frontmost (= just-opened worktree) window anyway, and the Enter is still readiness-gated downstream —
+# so restoring the intended budget does not weaken the multi-window focus guarantee, it only stops the
+# overshoot. Poll-FIRST (below) guarantees ≥1 target_window_frontmost check before the deadline is honoured.
 wait_target_window_frontmost() {
-    local task="$1" i=0 attempts=$(( ${2:-8} * 5 ))
-    while [ "$i" -lt "$attempts" ]; do
+    local task="$1" secs="${2:-8}" deadline_ms
+    # MILLISECOND deadline (R2 codex+Gemini): a /bin/date +%s second-clock truncates — captured at X.99s it
+    # rolls to X+1 one tick later, shrinking a 3s budget to ~2s and risking ZERO polls for a tiny budget.
+    # _perf_ms is ms-precise + robust. Poll-FIRST so target_window_frontmost ALWAYS runs at least once before
+    # the deadline is honoured (preserves the pre-fix step-counter's "≥1 check" invariant even when secs=0 /
+    # the budget is already elapsed) — a stray Enter is still gated downstream, but the URI should land on the
+    # task window whenever it is reachable within the budget.
+    deadline_ms=$(( $(_perf_ms) + secs * 1000 ))
+    while :; do
         target_window_frontmost "$task" && return 0
+        [ "$(_perf_ms)" -ge "$deadline_ms" ] && return 1
         sleep 0.2
-        i=$((i + 1))
     done
-    return 1
 }
 
 # Poll until the Code *app* is frontmost (warm reuse path), up to <secs> (default 3). 0=ready.
@@ -981,6 +1032,7 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
         rm -f "$QUEUE/$TASK.deferred" 2>/dev/null
 
         log "TRIGGER: project=$PROJECT task=$TASK workspace=$WORKSPACE"
+        _perf_reset   # start the per-segment spawn clock (PERF[...] lines from here to COLD-SUBMIT)
 
         # Step 1: activate the project window (跨项目 routing 核心)
         # worktree spawn-UX fix (2026-06-03): ONLY a per-session worktree spawn (workspace under
@@ -1010,23 +1062,27 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
         if [ -n "$WORKSPACE" ] && [ -d "$WORKSPACE" ]; then
             if [ "$COLD_WINDOW" = "1" ]; then
                 "$CODE_BIN" -n "$OPEN_TARGET" 2>>"$LOG" || log "WARN: code -n $OPEN_TARGET failed (continue with open)"
+                _perf_mark "$TASK" "code-n"
                 # Wait for the fresh window to render + take focus (title carries the task id) BEFORE
                 # `open URI`, so the Claude tab lands in THIS window — not a stale/other Code window.
                 # `code -n` makes the new window frontmost almost immediately, so the title-match
-                # normally hits in ~1-2s. TIMEOUT capped at 3s (2026-06-05 owner: "too long"): each poll
-                # runs an osascript (~0.6s/iter), so an 8s nominal timeout was ~24s WALL-CLOCK if the
-                # title never matched. 3s caps that; on timeout we open the URI anyway (the URI lands in
-                # the frontmost window = the just-opened worktree window) + the fallback AXRaise nudges it.
+                # normally hits in ~1-2s. TIMEOUT capped at 3s (2026-06-05 owner: "too long"). The wait is
+                # now a true /bin/date wall clock (was step-counting that overshot to ~16s — see
+                # wait_target_window_frontmost). On timeout we open the URI anyway (the URI lands in the
+                # frontmost window = the just-opened worktree window) + the fallback AXRaise nudges it.
                 if ! wait_target_window_frontmost "$TASK" "${HANDOFF_WIN_FRONT_SECS:-3}"; then
                     # fallback: AXRaise THE task window, then re-wait for IT (not merely the Code app —
                     # else the URI/Enter could still target a wrong window; R2 codex). Best-effort.
+                    log "PERF[$TASK]: wait-frontmost TIMED OUT (${HANDOFF_WIN_FRONT_SECS:-3}s) → AXRaise fallback"
                     raise_task_window "$TASK"; wait_target_window_frontmost "$TASK" 2
                 fi
+                _perf_mark "$TASK" "wait-frontmost"
                 # SINGLE-PANE: the side-bar close moved to AFTER the URI + submit (see the cold submit block
                 # below). Closing BEFORE the URI did not survive — the URI re-opens the Claude chat side bar.
             else
                 "$CODE_BIN" "$OPEN_TARGET" 2>>"$LOG" || log "WARN: code $OPEN_TARGET failed (continue with open)"
                 wait_code_frontmost "${HANDOFF_WIN_FRONT_SECS_WARM:-3}" || sleep 0.4  # frontmost or floor
+                _perf_mark "$TASK" "wait-frontmost-warm"
             fi
         else
             log "WARN: WORKSPACE empty/invalid ($WORKSPACE), falling back to frontmost"
@@ -1037,12 +1093,14 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
             log "SUCCESS: spawned Claude tab in project=$PROJECT task=$TASK (archived: $TASK-$TS.txt)"
             write_ack "$PROJ_DIR" "$TASK" "spawned" "open URI success @ $TS"
             SPAWNED=$((SPAWNED + 1))
+            _perf_mark "$TASK" "open-uri"
             # PRE-SETTLE baseline (cold only): capture the worktree transcript line count BEFORE the 0.5s settle
             # sleep, so a manual/early Enter DURING that settle is detected as already-grew (rc=3) — not missed
             # (codex+Gemini dual-brain P0 2026-06-06: a base taken after the sleep would already include that growth →
             # the running session mis-acked `failed` → duplicate-window re-trigger). 0/empty when not yet started (normal).
             _COLD_BASE=""
             [ "$COLD_WINDOW" = "1" ] && _COLD_BASE=$(worktree_transcript_lines "$WORKSPACE")
+            [ "$COLD_WINDOW" = "1" ] && _perf_mark "$TASK" "transcript-baseline"
             # Step 3: auto-submit (Claude Code URI handler 仅粘贴 prompt 不自动发送 / Anthropic 安全设计)
             # 2026-05-28 codex audit blind-spot #4 修复:
             # 等 sleep 1.5 后必须验证 frontmost app 是 Code 才按 Enter
@@ -1058,11 +1116,15 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
             else
                 sleep 1.5
             fi
+            _perf_mark "$TASK" "settle-sleep"
             # Three-state (lock-probe P0-1): only a CONFIRMED-unlocked screen (rc=1)
             # may receive the synthetic Enter. rc=0 (re-locked mid-window) OR rc=2
             # (UNKNOWN — Quartz probe timeout/error) ⇒ abort the submit; a keystroke
             # into a locked/indeterminate screen is forbidden + a silent no-op.
-            screen_is_locked; _SRC=$?
+            # _perf_call times each preflight probe while preserving its exit code + short-circuit:
+            # accessibility_trusted runs only when the screen is unlocked, is_frontmost_code only when
+            # accessibility is trusted — exactly as the bare elif chain did (the 2026-06-07 +20s suspects).
+            _perf_call "$TASK" "screen-is-locked" screen_is_locked; _SRC=$?
             if [ "$_SRC" != "1" ]; then
                 # P1-6: screen re-locked (or lock state unconfirmable) during the
                 # unlock→submit window. Abort the submit; the tab is open but
@@ -1074,13 +1136,22 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
                 # and mark deferred. The already-open tab stays for audit.
                 mv "$LAUNCHED_FILE" "$URI_FILE" 2>/dev/null
                 defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "re-locked-before-submit"
-            elif ! accessibility_trusted; then
+            elif ! _perf_call "$TASK" "accessibility-trusted" accessibility_trusted; then
                 # Skip the doomed keystroke entirely — it would just log a WARN
                 # and leave the tab un-submitted. Surface it loudly instead.
                 warn_accessibility_once
                 log "ABORT-SUBMIT: Accessibility 权限缺失 — Enter 未按 (tab 已开, 需手动按一次). project=$PROJECT task=$TASK"
                 write_ack "$PROJ_DIR" "$TASK" "failed" "accessibility-missing: 需手动按 Enter (System Settings → 辅助功能)"
-            elif is_frontmost_code; then
+            elif [ "$COLD_WINDOW" = "1" ] || _perf_call "$TASK" "is-frontmost-code" is_frontmost_code; then
+                # +20s fix (2026-06-07 spawn-speedup): for the COLD path, SHORT-CIRCUIT past is_frontmost_code.
+                # PERF instrumentation proved is_frontmost_code (app==Code only) BLOCKED ~10s under cold window
+                # render — yet it is REDUNDANT for cold: cold_submit_with_retry's atomic poll is a STRICTLY
+                # STRONGER gate (it asserts, in ONE osascript before the keystroke, that the front WINDOW title
+                # AND the focused Claude input value both carry the task token — so a stray Enter still can never
+                # land on a wrong window; the multi-window red line is held by the stronger check, not weakened).
+                # The `[ "$COLD_WINDOW" = "1" ] ||` short-circuits so the osascript is NEVER run on the cold path;
+                # WARM still evaluates is_frontmost_code unchanged (its `else` not-frontmost abort below applies to
+                # warm only — a cold not-frontmost case is handled by cold_submit_with_retry's rc=5 withhold).
                 # Window-guarded submit. token = task id (cold worktree, .code-workspace title) |
                 # workspace name (warm, default title rootName). The window guard (one osascript asserts
                 # app=Code AND front window title contains token, then keystroke in the SAME process)

@@ -58,17 +58,12 @@ def _seed(home: Path, ws: Path, task: str, *, heartbeat: bool = False) -> None:
 def _env(home: Path, tmp_path: Path, *, front_window: str,
          grow_transcript: Path | None = None, grow_on_attempt: int | None = None,
          grow_after_open: str | None = None, ready_after: str | None = None,
-         wrong_ready: str | None = None, sidebar_sentinel: bool = True) -> dict:
+         wrong_ready: str | None = None, osa_sleep: str | None = None) -> dict:
     stub = tmp_path / "stubs"
     stub.mkdir(exist_ok=True)
     code_sink = tmp_path / "code.log"
     open_sink = tmp_path / "open.log"
     key_sink = tmp_path / "key.log"
-    sidebar_sink = tmp_path / "sidebar.log"  # records the single-pane close-sidebars chord (NOT key.log)
-    # The runtime fires the close-sidebars chord ONLY if the install sentinel exists (fail-safe gate).
-    # Default to present (most cold tests exercise the chord); the "not installed" test sets it False.
-    if sidebar_sentinel:
-        (home / ".singlepane-keybinding.installed").write_text("9\n", encoding="utf-8")
 
     # lock probe: always unlocked (the GUI path needs a confirmed-unlocked screen)
     _w(stub / "lockprobe", "#!/bin/bash\necho unlocked\n")
@@ -91,6 +86,10 @@ def _env(home: Path, tmp_path: Path, *, front_window: str,
         stub / "osascript",
         "#!/bin/bash\nargs=\"$*\"\n"
         'printf "%s\\n" "$args" >> "$_OSA_SINK"\n'
+        # optional per-call delay — simulates the render-contention slowdown where a System Events query
+        # blocks for seconds while a freshly-opened VS Code window renders (the 2026-06-07 spawn-speedup
+        # root cause). Used to prove wait_target_window_frontmost honours a WALL-CLOCK budget (not step-count).
+        '[ -n "$_OSA_SLEEP" ] && sleep "$_OSA_SLEEP"\n'
         "case \"$args\" in\n"
         '  *"UI elements enabled"*) echo true ;;\n'
         # readiness-gated cold submit (`on run argv` … `AXFocusedUIElement` … `Message input`): simulate the
@@ -111,17 +110,6 @@ def _env(home: Path, tmp_path: Path, *, front_window: str,
         '              echo sent\n'
         '            else echo emptyinput; fi\n'
         '          fi ;;\n'
-        '        *) echo mismatch ;;\n'
-        "      esac ;;\n"
-        # single-pane close-sidebars chord (marked HANDOFF-CLOSE-SIDEBARS): it ALSO contains "on run argv",
-        # so it MUST be matched BEFORE the submit case below. It is a GUARDED LAYOUT keystroke, NOT an Enter —
-        # record it to _SIDEBAR_SINK (never _KEY_SINK) when the front window matches the token, else mismatch.
-        '  *"HANDOFF-CLOSE-SIDEBARS"*)\n'
-        '      tok="${@: -1}"\n'
-        # models the REAL osascript guard: title must contain the EXACT fragment "<task> [worktree]"
-        # (so a prefix-collision like foo-1 vs "foo-10 [worktree]" is rejected).
-        '      case "$_FRONT_WIN" in\n'
-        '        *"$tok [worktree]"*) printf s >> "$_SIDEBAR_SINK"; echo sent ;;\n'
         '        *) echo mismatch ;;\n'
         "      esac ;;\n"
         '  *"on run argv"*)\n'
@@ -165,8 +153,8 @@ def _env(home: Path, tmp_path: Path, *, front_window: str,
             "HANDOFF_COLD_VERIFY_SECS": "1",
             "HANDOFF_COLD_READY_SECS": "2",  # readiness-gate poll timeout (8 × 0.25s) — keep tests fast
             "_FRONT_WIN": front_window,
+            "_OSA_SLEEP": str(osa_sleep) if osa_sleep else "",
             "_KEY_SINK": str(key_sink),
-            "_SIDEBAR_SINK": str(sidebar_sink),
             "_CODE_SINK": str(code_sink),
             "_OPEN_SINK": str(open_sink),
             "_OSA_SINK": str(tmp_path / "osa.log"),
@@ -451,6 +439,68 @@ def test_cold_submit_withholds_when_focused_input_lacks_task_token(home, tmp_pat
     assert _ack(home, task, "failed")
     log = _log(home)
     assert "focus never settled on the prompt input" in log and "wronginput" in log, "must log the wronginput withhold (rc=5)"
+
+
+# --------------------------------------------------------------------------- spawn-speedup (2026-06-07)
+
+
+def test_wait_target_window_frontmost_respects_wall_clock_budget(home, tmp_path):
+    """wait_target_window_frontmost must honour a /bin/date WALL-CLOCK budget, NOT step-count
+    (attempts = secs×5, sleep 0.2) which IGNORED the per-iter osascript cost and overshot ~3-5× under
+    render contention (a nominal 3s ran ~16s — observed: the sp-deploy2 spawn 2026-06-07). Drive each
+    osascript ~0.5s + a front window that NEVER matches the task → the wait times out, AXRaises, and
+    re-waits. Assert the launcher's OWN measured `wait-frontmost` PERF segment stays within the budget
+    (primary ≈2s + fallback ≈2s + one in-flight osascript ≈ ~5s), well below the old step-count overshoot
+    (~14s at 0.5s/call). This is the regression guard against silently reverting to step-counting."""
+    task = "cold-wallclock"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    _cold_transcript(tmp_path, ws)  # never grows (no Enter ever lands — window never matches)
+    env = _env(home, tmp_path, front_window="some-other-project — z.py", osa_sleep="0.5")
+    assert _run(env).returncode == 0
+    log = _log(home)
+    m = re.search(r"PERF\[" + re.escape(task) + r"\]: wait-frontmost (\d+)ms", log)
+    assert m, "wait-frontmost PERF segment must be emitted (instrumentation present)"
+    waited_ms = int(m.group(1))
+    assert waited_ms < 10000, (
+        f"wait-frontmost took {waited_ms}ms — the /bin/date wall-clock budget (≈2s+2s+1 in-flight) was "
+        "breached; the step-counting overshoot (~14s at 0.5s/call) has regressed"
+    )
+    assert "TIMED OUT" in log, "the never-match path must hit the timeout + AXRaise fallback"
+
+
+def test_cold_path_skips_redundant_is_frontmost_code(home, tmp_path):
+    """+20s fix: the COLD path must NOT call is_frontmost_code — it is redundant with cold_submit_with_retry's
+    STRONGER atomic gate (front-window title + focused-input value both carry the task token) and BLOCKED ~10s
+    under cold render. The PERF line for it must be ABSENT on a cold spawn, and the cold submit still proceeds
+    via the readiness gate (one Enter, transcript grows → submitted)."""
+    task = "cold-skipfront"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    tr = _cold_transcript(tmp_path, ws)
+    env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py",
+               grow_transcript=tr, grow_on_attempt=1)
+    assert _run(env).returncode == 0
+    log = _log(home)
+    assert f"PERF[{task}]: is-frontmost-code" not in log, (
+        "cold path must SKIP the redundant is_frontmost_code osascript (short-circuited by COLD_WINDOW=1)"
+    )
+    assert _read(tmp_path / "key.log") == "k", "cold submit still proceeds via the readiness gate (one Enter)"
+    assert _ack(home, task, "submitted")
+
+
+def test_warm_path_still_runs_is_frontmost_code(home, tmp_path):
+    """The +20s short-circuit is COLD-only: the warm path must STILL evaluate is_frontmost_code (its `else`
+    not-frontmost abort depends on it). Assert the warm spawn emits the is-frontmost-code PERF line + submits."""
+    task = "warm-front"
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    _seed(home, ws, task)
+    env = _env(home, tmp_path, front_window=ws.name)  # warm token = basename(WORKSPACE) = "repo"
+    assert _run(env).returncode == 0
+    log = _log(home)
+    assert f"PERF[{task}]: is-frontmost-code" in log, "warm path must still run (and time) is_frontmost_code"
+    assert _read(tmp_path / "key.log") == "k", "warm submit fires its single window-guarded Enter"
 
 
 def test_cold_submit_waits_for_slow_render_then_submits(home, tmp_path):

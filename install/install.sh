@@ -28,8 +28,6 @@
 #                     (keeps the com.dharmaxis.auto-continue runtime copy canonical)
 #   --sync-dump       push canonical dump-handoff.py re-exec shim → ~/.local/bin
 #                     + record sha (routes the global dump entry to the v5.4 engine)
-#   --sync-keybinding (re)install ONLY the single-pane VS Code keybinding, then exit
-#   --no-keybinding   skip the single-pane keybinding install (step 6)
 #   -h | --help       show this message
 
 set -euo pipefail
@@ -43,8 +41,6 @@ INSTALL_EXTENSION=1
 UNINSTALL=0
 DO_SYNC_LAUNCHER=0
 DO_SYNC_DUMP=0
-DO_SYNC_KEYBINDING=0
-INSTALL_KEYBINDING=1
 REPO_URL="https://github.com/rssprivacy-commits/handoff-fanout.git"
 
 usage() {
@@ -61,8 +57,6 @@ while [[ $# -gt 0 ]]; do
         --uninstall)   UNINSTALL=1; shift ;;
         --sync-launcher) DO_SYNC_LAUNCHER=1; shift ;;
         --sync-dump)   DO_SYNC_DUMP=1; shift ;;
-        --sync-keybinding) DO_SYNC_KEYBINDING=1; shift ;;
-        --no-keybinding) INSTALL_KEYBINDING=0; shift ;;
         -h|--help)     usage; exit 0 ;;
         *)             echo "Unknown arg: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -136,16 +130,6 @@ if [[ $DO_SYNC_DUMP -eq 1 ]]; then
         echo "✗ dump shim sync verify FAILED" >&2; exit 1
     fi
     exit 0
-fi
-
-# ─── --sync-keybinding : (re)install ONLY the single-pane VS Code keybinding ──
-# Standalone path so the keybinding can be refreshed without a full install (idempotent +
-# preservative — appends to the user's keybindings.json, never reformats it).
-if [[ $DO_SYNC_KEYBINDING -eq 1 ]]; then
-    PYBIN="$(command -v python3 || true)"; [[ -z "$PYBIN" && -x /usr/bin/python3 ]] && PYBIN=/usr/bin/python3
-    if [[ -z "$PYBIN" ]]; then echo "❌ no python3 for keybinding install" >&2; exit 1; fi
-    "$PYBIN" "$ASSET_DIR/install_keybinding.py"
-    exit $?
 fi
 
 # ─── uninstall path ─────────────────────────────────────────────────────────
@@ -277,21 +261,11 @@ if [[ $INSTALL_EXTENSION -eq 1 ]]; then
     fi
 fi
 
-# ─── 6. VS Code single-pane keybinding (close side bars before the cold-spawn URI) ──
-# Binds cmd+ctrl+alt+9 → runCommands[closeSidebar, closeAuxiliaryBar] so auto-continue.sh collapses a
-# cold worktree window to a single editor pane (removing the empty-Claude-sidebar focus competitor that
-# caused ~40% of cold auto-submits to miss). Idempotent + preservative (appends to the user's
-# keybindings.json, never reformats it). NON-FATAL: on failure the close-chord is a harmless no-op and
-# the readiness-gate still guards the submit. --no-keybinding skips this.
-if [[ $INSTALL_KEYBINDING -eq 1 ]]; then
-    PYBIN="$(command -v python3 || true)"; [[ -z "$PYBIN" && -x /usr/bin/python3 ]] && PYBIN=/usr/bin/python3
-    if [[ -n "$PYBIN" ]]; then
-        "$PYBIN" "$ASSET_DIR/install_keybinding.py" \
-            || echo "  ⚠ keybinding install failed (non-fatal; close-chord no-op, readiness-gate still guards)"
-    else
-        echo "⊘ single-pane keybinding skipped (no python3)"
-    fi
-fi
+# NOTE (2026-06-07): the old "step 6 — VS Code single-pane keybinding" (cmd+ctrl+alt+9 →
+# closeSidebar/closeAuxiliaryBar via install_keybinding.py) was REMOVED. Single-pane is now done
+# natively by the dharmaxis.handoff-helper extension on `onStartupFinished`, guarded to
+# `.handoff.code-workspace` windows — no keybinding / osascript chord needed. See the extension
+# (extension/) and lesson-singlepane-spawn-saga-2026-06-07.
 
 # ─── final summary ──────────────────────────────────────────────────────────
 cat <<DONE
