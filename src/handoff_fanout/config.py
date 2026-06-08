@@ -43,6 +43,13 @@ class HookSpec:
     name: str
     command: list[str]
     regex: str | None = None
+    # Project slugs this baseline hook applies to. EMPTY = all projects (legacy /
+    # byte-identical). A project-SPECIFIC hook (e.g. ERP's ``docker compose exec api
+    # alembic current``, which only makes sense in the ERP repo) MUST list its project
+    # here so it does not run for — and leak its output into — sibling projects' dumps,
+    # because a single ``$HANDOFF_HOME/config.json`` is shared by every project. Mirrors
+    # ``PreflightSpec.projects``.
+    projects: tuple[str, ...] = ()
 
 
 @dataclass
@@ -54,6 +61,11 @@ class RoadmapSpec:
     max_sections: int = 2
     max_chars_per_section: int = 1200
     fallback_tail_chars: int = 3000
+    # Project slugs this roadmap applies to. EMPTY = all projects (legacy). A
+    # project-SPECIFIC roadmap (e.g. ERP's accounting roadmap) MUST list its project so
+    # its phase excerpts are not injected into sibling projects' handoff prompts. Mirrors
+    # ``PreflightSpec.projects`` / ``HookSpec.projects``.
+    projects: tuple[str, ...] = ()
 
 
 @dataclass
@@ -92,11 +104,30 @@ class PreflightSpec:
 class Config:
     home: Path = field(default_factory=lambda: Path(DEFAULT_HOME).expanduser())
     inject_blocks: list[str] = field(default_factory=list)
+    # Per-project inject blocks (additive, default empty = no-op for legacy configs).
+    # ``inject_blocks`` are TRULY GLOBAL (every project's prompt). A block that is
+    # project-SPECIFIC (e.g. ERP's accounting red lines) belongs under its slug here so
+    # it is NOT leaked into sibling projects' agent sessions. The effective set for a
+    # dump is ``inject_blocks_for(project)`` = global ``inject_blocks`` + this slug's list.
+    # Chosen as an additive dict (over making ``inject_blocks`` entries str|object) so the
+    # existing ``inject_blocks`` field semantics — and every caller/test that constructs
+    # ``Config(inject_blocks=[...])`` — are byte-identical untouched.
+    project_inject_blocks: dict[str, list[str]] = field(default_factory=dict)
     baseline_hooks: list[HookSpec] = field(default_factory=list)
     dump_preflight_commands: list[PreflightSpec] = field(default_factory=list)
     roadmap: RoadmapSpec = field(default_factory=RoadmapSpec)
     uri_template: str = DEFAULT_URI_TEMPLATE
     workspace_root: Path = field(default_factory=lambda: Path(DEFAULT_WORKSPACE_ROOT).expanduser())
+    # ── Single-pane (non-worktree) spawn windows (opt-in / default OFF) ────────────
+    # Projects listed here get a default single-EDITOR-PANE VS Code window on spawn WITHOUT
+    # git-worktree isolation: the dump generates an out-of-tree ``.handoff.code-workspace``
+    # (folders→the real project dir; window.title carries the task) + a ``queue/<task>.singlepane``
+    # sidecar; the watchdog opens that file so the handoff-helper extension collapses the side
+    # bars on load. Fail-OPEN parse (a degenerate value → empty list = no project opts in = the
+    # safe default — unlike the security mandate, an accidental empty here just means "no single
+    # pane", never a leak). Distinct from ``worktree_projects`` (which gives single-pane AND git
+    # isolation but imposes the merge-back protocol — too heavy for a non-technical owner's Node app).
+    singlepane_projects: list[str] = field(default_factory=list)
     # Opt-in codex-audit repo-identity allowlist (Phase D P1 hardening). When the
     # ``audit_code_repos`` KEY is present, the audit gate accepts a cross-repo
     # ``code_repo`` ONLY if its realpath matches one of these (realpath-normalized)
@@ -156,6 +187,17 @@ class Config:
     worktree_default_branch: str | None = None  # explicit integration-branch override
     worktree_projects: list[str] = field(default_factory=list)
 
+    def inject_blocks_for(self, project: str) -> list[str]:
+        """Effective inject blocks for ``project`` = global + this project's blocks.
+
+        Global ``inject_blocks`` apply to EVERY project; ``project_inject_blocks[project]``
+        only to that one. Order: global first, then project-specific (so a project's own
+        blocks read last in the prompt). A project with no specific blocks gets only the
+        global set — byte-identical to the pre-gating behaviour when ``inject_blocks`` held
+        the (then-global) blocks.
+        """
+        return list(self.inject_blocks) + list(self.project_inject_blocks.get(project, []))
+
     def queue_dir(self, project: str) -> Path:
         return self.home / project / "queue"
 
@@ -201,6 +243,7 @@ def _from_dict(data: dict, home: Path) -> Config:
         fallback_tail_chars=int(
             roadmap_data.get("fallback_tail_chars", RoadmapSpec.fallback_tail_chars)
         ),
+        projects=tuple(str(s) for s in (roadmap_data.get("projects", ()) or ()) if s),
     )
     hooks_raw = data.get("baseline_hooks", []) or []
     baseline_hooks = [
@@ -208,6 +251,7 @@ def _from_dict(data: dict, home: Path) -> Config:
             name=h["name"],
             command=list(h["command"]),
             regex=h.get("regex"),
+            projects=tuple(str(s) for s in (h.get("projects", ()) or ()) if s),
         )
         for h in hooks_raw
     ]
@@ -228,11 +272,24 @@ def _from_dict(data: dict, home: Path) -> Config:
     return Config(
         home=home,
         inject_blocks=list(data.get("inject_blocks", []) or []),
+        project_inject_blocks=_parse_project_inject_blocks(data),
         baseline_hooks=baseline_hooks,
         dump_preflight_commands=dump_preflight_commands,
         roadmap=roadmap,
         uri_template=data.get("uri_template", DEFAULT_URI_TEMPLATE),
         workspace_root=Path(workspace_root_raw).expanduser(),
+        # Guard ``isinstance(list)`` FIRST (like worktree_projects): a bare-string typo
+        # ``"wilde-hexe"`` must NOT iterate into chars ``['w','i',...]`` (the mandate-parser
+        # footgun). Any non-list → [] = no project opts in (fail-open, safe default).
+        singlepane_projects=(
+            [
+                str(p)
+                for p in data.get("singlepane_projects")
+                if isinstance(p, str) and p
+            ]
+            if isinstance(data.get("singlepane_projects"), list)
+            else []
+        ),
         audit_code_repos=[
             str(r) for r in (data.get("audit_code_repos", []) or []) if isinstance(r, str) and r
         ],
@@ -246,6 +303,31 @@ def _from_dict(data: dict, home: Path) -> Config:
         **_parse_mandate_projects(data),
         **_parse_worktree(data),
     )
+
+
+def _parse_project_inject_blocks(data: dict) -> dict[str, list[str]]:
+    """Parse ``project_inject_blocks`` (``{slug: [block, ...]}``), defensively.
+
+    Only a dict maps to gated blocks; any non-dict (absent / typo / list) yields ``{}``
+    (= no project-specific blocks = byte-identical legacy behaviour). Within it, only
+    string slugs with a list of non-empty string blocks survive — a degenerate entry is
+    dropped, never crashes the load (config parse failures silently fall back to defaults,
+    so a hard raise here could strip a project's blocks repo-wide). FAIL-SAFE: a bad shape
+    simply means "no extra blocks", it can never inject the WRONG project's blocks.
+    """
+    raw = data.get("project_inject_blocks")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, list[str]] = {}
+    for slug, blocks in raw.items():
+        if not isinstance(slug, str) or not slug:
+            continue
+        if not isinstance(blocks, list):
+            continue
+        cleaned = [str(b) for b in blocks if isinstance(b, str) and b.strip()]
+        if cleaned:
+            out[slug] = cleaned
+    return out
 
 
 def _parse_worktree(data: dict) -> dict:

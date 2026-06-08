@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.0] — 2026-06-08
+
+MINOR — **per-project gating of ALL injection vectors** (closes a cross-project leak) +
+**`singlepane_projects`** (default single-editor-pane spawn windows WITHOUT git-worktree
+isolation). A single `$HANDOFF_HOME/config.json` is shared by every project, so anything
+project-specific must be project-scoped or it leaks into sibling agent sessions. **Not
+published to PyPI** (single-user editable install runs the live source); repo hygiene tag only.
+
+### Fixed
+- **Cross-project injection leak (P0).** `inject_blocks`, `roadmap`, and `baseline_hooks`
+  were injected into EVERY project's handoff prompt with no project gate — so one project's
+  accounting red lines + roadmap + DB-migration hook leaked verbatim into an unrelated
+  project's agent session (observed in the wild). All three are now project-gateable,
+  mirroring the existing `PreflightSpec.projects` pattern (EMPTY/absent = all projects =
+  byte-identical legacy). (`tests/test_project_gated_inject.py`)
+
+### Added
+- **`config.project_inject_blocks`** (`{slug: [block,...]}`) + **`Config.inject_blocks_for(project)`**
+  = global `inject_blocks` + the project's own blocks. Additive (the `inject_blocks` field is
+  untouched), so every `Config(inject_blocks=[...])` caller/test is unchanged. Degenerate
+  shapes fail-safe to `{}` (never inject the WRONG project's blocks).
+- **`projects` field on `HookSpec` and `RoadmapSpec`** + a REQUIRED `project` arg on
+  `dump.detect_baseline()` / `dump.get_roadmap_excerpt()` (keyword-only / fail-LOUD so a
+  missed call-site can't silently run another project's hook).
+- **`config.singlepane_projects`** + **`dump.maybe_write_singlepane_sidecar()`**: a listed
+  project's spawn generates an OUT-OF-TREE `.handoff.code-workspace` (folders → the real
+  repo; `window.title` carries the task) + a `queue/<task>.singlepane` sidecar. The watchdog
+  opens it cold-style (`code -n`) so the handoff-helper extension collapses the side bars on
+  load (single pane), while the agent works in the real repo (no isolation, today's
+  concurrency) and the warm window-guarded Enter (token = task) submits. Distinct from
+  `worktree_projects` (which couples single-pane to git isolation + a merge-back protocol).
+  Covers single-task, open-batch sub-task, and fan-in spawns. Fail-OPEN parse (a degenerate
+  value = no project opts in). (`tests/test_singlepane_sidecar.py`)
+
 ## [1.10.0] — 2026-06-01
 
 MINOR — generic project-scoped **`dump_preflight_commands`** gate. A project may

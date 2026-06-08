@@ -1049,6 +1049,27 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
                 if [ -n "$_cws" ] && [ -f "$_cws" ]; then OPEN_TARGET="$_cws"; fi
                 ;;
         esac
+        # SINGLE-PANE (non-worktree / 2026-06-08 dual-brain codex+Gemini → owner ruling S): a project
+        # opted into config `singlepane_projects` gets a DEFAULT single-editor-pane window WITHOUT
+        # git-worktree isolation. The dump wrote a sidecar `$QUEUE/$TASK.singlepane` holding the path of
+        # an OUT-OF-TREE generated `.handoff.code-workspace` (folders→the real project dir; window.title
+        # carries the task). We open THAT (cold-style `code -n`, so the handoff-helper extension collapses
+        # the side bars on load — it guards on the `.handoff.code-workspace` suffix) but keep WORKSPACE =
+        # the real repo and SUBMIT via the WARM window-guarded single Enter (token=task), NOT the worktree
+        # transcript-retry — the main tree's transcript is shared across windows so a sibling's growth could
+        # falsely confirm a submit (codex). Worktree (COLD_WINDOW) wins if a project is somehow in both.
+        SINGLEPANE_WINDOW=0
+        if [ "$COLD_WINDOW" != "1" ]; then
+            _sp_sidecar="$QUEUE/$TASK.singlepane"
+            if [ -f "$_sp_sidecar" ]; then
+                _sp_target=$(/bin/cat "$_sp_sidecar" 2>/dev/null)
+                if [ -n "$_sp_target" ] && [ -f "$_sp_target" ]; then
+                    OPEN_TARGET="$_sp_target"; SINGLEPANE_WINDOW=1
+                else
+                    log "SINGLEPANE: sidecar present but workspace file missing ($_sp_target) — warm fallback. task=$TASK"
+                fi
+            fi
+        fi
         # code-r-clobber fix (2026-06-03 / dual-brain codex+Gemini / owner ruling: 分治).
         # The pre-existing `code -r` ("reuse window") FORCE-replaces the last-active window when
         # OPEN_TARGET isn't already open — so a background spawn for project B silently clobbered the
@@ -1060,7 +1081,9 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
         #   warm (main repo): no flag = reuse the project window if already open, else new window;
         #                     under the default openFoldersInNewWindow it never replaces a folder-window.
         if [ -n "$WORKSPACE" ] && [ -d "$WORKSPACE" ]; then
-            if [ "$COLD_WINDOW" = "1" ]; then
+            if [ "$COLD_WINDOW" = "1" ] || [ "$SINGLEPANE_WINDOW" = "1" ]; then
+                # `-n` forces a NEW dedicated window opening OPEN_TARGET (worktree's, or the singlepane
+                # generated .handoff.code-workspace) — never reuses/clobbers the owner's window.
                 "$CODE_BIN" -n "$OPEN_TARGET" 2>>"$LOG" || log "WARN: code -n $OPEN_TARGET failed (continue with open)"
                 _perf_mark "$TASK" "code-n"
                 # Wait for the fresh window to render + take focus (title carries the task id) BEFORE
@@ -1160,7 +1183,11 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
                 # on stage1-10d); WARM submits once (window already rendered). Warm escape hatch
                 # HANDOFF_WARM_WINDOW_GUARD=0 → app-level Enter for a custom window.title without rootName.
                 _submit_token="$TASK"
-                [ "$COLD_WINDOW" != "1" ] && _submit_token=$(basename "$WORKSPACE")
+                if [ "$SINGLEPANE_WINDOW" = "1" ]; then
+                    _submit_token="$TASK"   # singlepane: the generated workspace window.title carries the task
+                elif [ "$COLD_WINDOW" != "1" ]; then
+                    _submit_token=$(basename "$WORKSPACE")   # warm: window.title rootName = the folder basename
+                fi
                 if [ "$COLD_WINDOW" = "1" ]; then
                     cold_submit_with_retry "$_submit_token" "$WORKSPACE" "$_COLD_BASE"
                     case $? in

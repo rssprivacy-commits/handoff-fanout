@@ -272,7 +272,7 @@ def _dump_degraded_fan_in(
     queue_dir = cfg.queue_dir(project)
     queue_dir.mkdir(parents=True, exist_ok=True)
     batch_dir = handoff_root() / project / "batches" / batch_id
-    baseline = dump.detect_baseline(workspace, cfg=cfg)
+    baseline = dump.detect_baseline(workspace, cfg=cfg, project=project)
 
     dump.write_role_env(
         batch_dir / "fan-in.env",
@@ -288,7 +288,7 @@ def _dump_degraded_fan_in(
         done_files=done,
         blocked_files=blocked,
         baseline=baseline,
-        inject_blocks=cfg.inject_blocks,
+        inject_blocks=cfg.inject_blocks_for(project),
         handoff_home=cfg.home,
         degraded=True,
         missing=missing,
