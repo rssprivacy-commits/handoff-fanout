@@ -385,7 +385,11 @@ def count_global_active_tabs() -> int:
 # ─── baseline detection (extensible via config.baseline_hooks) ──────────────
 
 
-def detect_baseline(workspace: Path, cfg: _config.Config | None = None) -> dict:
+def detect_baseline(workspace: Path, cfg: _config.Config | None = None, *, project: str) -> dict:
+    # ``project`` is keyword-only + REQUIRED (not Optional-default) on purpose: a baseline
+    # hook can be project-scoped (``HookSpec.projects``), so a caller that forgot to pass
+    # the project must fail LOUD, not silently run an ERP-only hook (``docker compose exec
+    # api alembic current``) against — and leak its output into — a sibling project's dump.
     git_head = run(["git", "rev-parse", "--short", "HEAD"], workspace)
     last_3_commits = run(["git", "log", "--oneline", "-3"], workspace)
     branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], workspace)
@@ -397,6 +401,10 @@ def detect_baseline(workspace: Path, cfg: _config.Config | None = None) -> dict:
     if cfg is None:
         cfg = _config.load()
     for hook in cfg.baseline_hooks:
+        # Project gate (mirror PreflightSpec): EMPTY ``projects`` = all projects (legacy);
+        # a non-empty list runs the hook ONLY for the listed projects.
+        if hook.projects and project not in hook.projects:
+            continue
         raw = run(hook.command, workspace)
         if hook.regex:
             m = re.search(hook.regex, raw)
@@ -406,8 +414,12 @@ def detect_baseline(workspace: Path, cfg: _config.Config | None = None) -> dict:
     return baseline
 
 
-def get_roadmap_excerpt(cfg: _config.Config) -> str:
+def get_roadmap_excerpt(cfg: _config.Config, project: str) -> str:
     rm = cfg.roadmap
+    # Project gate: a roadmap scoped to other projects (e.g. ERP's accounting roadmap) is
+    # NOT excerpted into this project's prompt. EMPTY ``projects`` = all (legacy).
+    if rm.projects and project not in rm.projects:
+        return "(no roadmap configured for this project)"
     if not rm.path:
         return "(no roadmap configured; set roadmap.path in config.json)"
     path = Path(rm.path).expanduser()
@@ -422,6 +434,68 @@ def get_roadmap_excerpt(cfg: _config.Config) -> str:
         slice_ = matches[-rm.max_sections :]
         return "\n\n".join(m.group(0)[: rm.max_chars_per_section] for m in slice_)
     return content[-rm.fallback_tail_chars :]
+
+
+# ─── single-pane (non-worktree) spawn workspace ─────────────────────────────
+
+
+def maybe_write_singlepane_sidecar(
+    cfg: _config.Config,
+    project: str,
+    task: str,
+    workspace: Path,
+    queue_dir: Path,
+    *,
+    worktree_active: bool,
+) -> None:
+    """Single-pane (non-worktree) spawn: if ``project`` opts in via ``singlepane_projects``
+    and this is NOT a worktree spawn, generate an OUT-OF-TREE ``.handoff.code-workspace``
+    (``folders`` → the real ``workspace``; ``window.title`` carries ``task``) under
+    ``$HANDOFF_HOME/<project>/singlepane/`` and drop a ``queue/<task>.singlepane`` sidecar
+    holding its path. The watchdog opens THAT file (cold-style ``code -n``) so the
+    handoff-helper extension collapses both side bars on load (single editor pane) — guarded
+    by the ``.handoff.code-workspace`` suffix — while the agent still works in the real repo
+    (no isolation, today's concurrency). It is written OUT-OF-TREE (not in the repo) so it
+    never dirties the working tree.
+
+    Cleanup/no-op otherwise: a project that does NOT opt in, or a worktree spawn (which has
+    its own ``.handoff.code-workspace`` and wins), gets the sidecar REMOVED so a stale opt-in
+    can't linger across a config flip-off. Best-effort — an OSError never bricks the dump
+    (single-pane is UX polish; the warm submit still works without it)."""
+    sidecar = queue_dir / f"{task}.singlepane"
+    if worktree_active or project not in cfg.singlepane_projects:
+        sidecar.unlink(missing_ok=True)
+        return
+    try:
+        sp_dir = cfg.home / project / "singlepane"
+        sp_dir.mkdir(parents=True, exist_ok=True)
+        ws_file = sp_dir / f"{task}.handoff.code-workspace"
+        ws_file.write_text(
+            json.dumps(
+                {
+                    "folders": [{"path": str(workspace)}],
+                    "settings": {
+                        # ${...} are VS Code window-title variables (literal here; VS Code expands them).
+                        # The task token in the title is what the watchdog's window-guarded submit matches.
+                        "window.title": (
+                            f"{project} · {task} [singlepane]${{separator}}${{activeEditorShort}}"
+                        ),
+                        # Same declarative single-pane settings the worktree workspace uses (see
+                        # worktree.write_workspace_file): hide the activity bar (removes the empty
+                        # Claude sidebar focus competitor) + no Welcome tab.
+                        "workbench.activityBar.location": "hidden",
+                        "workbench.startupEditor": "none",
+                        "claudeCode.preferredLocation": "panel",
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        sidecar.write_text(str(ws_file), encoding="utf-8")
+    except OSError as e:
+        print(f"[dump] (non-fatal) could not write singlepane workspace: {e}")
+        sidecar.unlink(missing_ok=True)
 
 
 # ─── role.env writing (used by sub-task / fan-in handoffs) ──────────────────
@@ -485,7 +559,7 @@ def write_active_dump(
     old_head: str | None = None,
     worktree_info: dict | None = None,
 ) -> int:
-    roadmap_excerpt = get_roadmap_excerpt(cfg)
+    roadmap_excerpt = get_roadmap_excerpt(cfg, project)
     # ``workspace`` is the successor's tree (a worktree under isolation, else the
     # source tree); ``source_workspace`` is the closing session's tree used only for
     # the old_ready predecessor anchor (R1-C1). Default to identity for legacy callers.
@@ -502,7 +576,7 @@ def write_active_dump(
         tests=tests,
         baseline=baseline,
         roadmap_excerpt=roadmap_excerpt,
-        inject_blocks=cfg.inject_blocks,
+        inject_blocks=cfg.inject_blocks_for(project),
         handoff_home=cfg.home,
         handoff_md_path=md_path,
         worktree_info=worktree_info,
@@ -624,6 +698,20 @@ def write_active_dump(
             )
         except OSError as e:
             print(f"[dump] (non-fatal) could not write .worktree sidecar: {e}")
+
+    # Single-pane (non-worktree) spawn workspace + sidecar (before the .uri publish, same
+    # ordering rule as the other sidecars). Skipped when this is a CREATED worktree (the
+    # worktree has its own .handoff.code-workspace and wins).
+    maybe_write_singlepane_sidecar(
+        cfg,
+        project,
+        task,
+        workspace,
+        queue_dir,
+        worktree_active=bool(
+            worktree_info and worktree_info.get("status") == _worktree.ST_CREATED
+        ),
+    )
 
     _maybe_pbcopy(handoff_content)
 
@@ -848,8 +936,8 @@ def handle_open_batch(
     )
     print(f"[open-batch] {batch_dir}/manifest.json written")
 
-    baseline = detect_baseline(workspace, cfg=cfg)
-    roadmap_excerpt = get_roadmap_excerpt(cfg)
+    baseline = detect_baseline(workspace, cfg=cfg, project=project)
+    roadmap_excerpt = get_roadmap_excerpt(cfg, project)
 
     for idx, st in enumerate(sub_tasks):
         sub_id = st["id"]
@@ -870,7 +958,7 @@ def handle_open_batch(
             file_ownership=st["file_ownership"],
             baseline=baseline,
             roadmap_excerpt=roadmap_excerpt,
-            inject_blocks=cfg.inject_blocks,
+            inject_blocks=cfg.inject_blocks_for(project),
             handoff_home=cfg.home,
             git_guard_path=git_guard_dir(),
         )
@@ -889,6 +977,11 @@ def handle_open_batch(
         if not env_path.exists():
             raise SystemExit(f"❌ env vanished mid-spawn ({sub_id}): {env_path}")
 
+        # Single-pane (non-worktree): open-batch sub-tasks run on the main repo (codex R2),
+        # so they qualify for the single-pane window like the single-task path.
+        maybe_write_singlepane_sidecar(
+            cfg, project, sub_id, workspace, queue_dir, worktree_active=False
+        )
         uri = build_uri(cfg, project, sub_id)
         # Launcher-visible trigger — atomic_replace (see the .md note above).
         atomic.atomic_replace(
@@ -944,7 +1037,7 @@ def trigger_fan_in_if_ready(
         return False
 
     print(f"[trigger-fan-in] ✅ batch {batch_id} complete, dumping fan-in")
-    baseline = detect_baseline(workspace, cfg=cfg)
+    baseline = detect_baseline(workspace, cfg=cfg, project=project)
     fan_in_task = manifest["fan_in_task"]
 
     write_role_env(batch_dir / "fan-in.env", HANDOFF_ROLE_FAN_IN, batch_id, workspace)
@@ -956,13 +1049,16 @@ def trigger_fan_in_if_ready(
         done_files=done_set,
         blocked_files=blocked_set,
         baseline=baseline,
-        inject_blocks=cfg.inject_blocks,
+        inject_blocks=cfg.inject_blocks_for(project),
         handoff_home=cfg.home,
     )
     # Launcher-visible fan-in description + trigger: atomic_replace, not
     # write_with_fsync (same torn-read rationale as the single-task path).
     atomic.atomic_replace(queue_dir / f"{fan_in_task}.md", content)
 
+    maybe_write_singlepane_sidecar(
+        cfg, project, fan_in_task, workspace, queue_dir, worktree_active=False
+    )
     uri = build_uri(cfg, project, fan_in_task)
     atomic.atomic_replace(
         queue_dir / f"{fan_in_task}.uri",
@@ -1449,11 +1545,11 @@ def main(argv: list[str] | None = None) -> int:
         if worktree_info and worktree_info.get("status") == _worktree.ST_CREATED:
             old_head = _worktree.head_sha(source_workspace)
 
-    baseline = detect_baseline(spawn_workspace, cfg=cfg)
+    baseline = detect_baseline(spawn_workspace, cfg=cfg, project=project)
     print(f"[dump] HEAD={baseline['git_head']}")
 
     if args.dry_run:
-        roadmap_excerpt = get_roadmap_excerpt(cfg)
+        roadmap_excerpt = get_roadmap_excerpt(cfg, project)
         md_path = queue_dir / f"{args.task}.md"
         content = templates.build_handoff_md(
             task=args.task,
@@ -1464,7 +1560,7 @@ def main(argv: list[str] | None = None) -> int:
             tests=args.tests or None,
             baseline=baseline,
             roadmap_excerpt=roadmap_excerpt,
-            inject_blocks=cfg.inject_blocks,
+            inject_blocks=cfg.inject_blocks_for(project),
             handoff_home=cfg.home,
             handoff_md_path=md_path,
             worktree_info=worktree_info,

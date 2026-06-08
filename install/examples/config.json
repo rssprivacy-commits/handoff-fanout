@@ -1,32 +1,46 @@
 {
-  "_comment": "handoff-fanout config (referenced from $HANDOFF_HOME/config.json). Drop unused keys; all fields are optional with safe defaults.",
+  "_comment": "handoff-fanout config (referenced from $HANDOFF_HOME/config.json). Drop unused keys; all fields are optional with safe defaults. A SINGLE $HANDOFF_HOME/config.json is SHARED by every project under that home — so anything PROJECT-SPECIFIC (a project's red lines, its roadmap, a repo-bound baseline hook) MUST be project-scoped (see project_inject_blocks / the per-hook+roadmap `projects` field) or it leaks into every sibling project's agent session.",
 
 
+  "_inject_blocks_comment": "TRULY GLOBAL blocks injected into EVERY project's handoff prompt. Put project-specific red lines in project_inject_blocks, NOT here.",
   "inject_blocks": [
-    "## Project red lines (example)\n- never edit src/legacy/ without an ADR\n- treasury operations must go through journal_service.post_entry()"
+    "## Global red line (example, applies to all projects)\n- never force-push a shared branch without the owner's go-ahead"
   ],
+
+  "_project_inject_blocks_comment": "Per-project inject blocks: {slug: [block, ...]}. Injected ONLY into that project's prompts (additive to the global inject_blocks). This is where a project's OWN red lines belong so they never leak into siblings.",
+  "project_inject_blocks": {
+    "my-repo": [
+      "## my-repo red lines (example, project-scoped)\n- never edit src/legacy/ without an ADR\n- treasury operations must go through journal_service.post_entry()"
+    ]
+  },
 
   "baseline_hooks": [
     {
-      "_comment": "Each hook runs in the workspace dir; the captured output is added to the handoff baseline block. `regex` is optional — when set, the first match group is stored.",
+      "_comment": "Each hook runs in the workspace dir; the captured output is added to the handoff baseline block. `regex` is optional — when set, the first match group is stored. `projects` scopes the hook: EMPTY/absent = all projects; a non-empty list runs it ONLY for those projects (a repo-bound command like `alembic current` belongs scoped so it never runs in a sibling's workspace).",
       "name": "Alembic",
       "command": ["alembic", "current"],
-      "regex": "([a-z0-9_]+)\\s*\\(head\\)"
+      "regex": "([a-z0-9_]+)\\s*\\(head\\)",
+      "projects": ["my-repo"]
     },
     {
+      "_comment": "A generic, project-agnostic hook leaves `projects` absent so it applies everywhere.",
       "name": "PythonVersion",
       "command": ["python3", "-V"]
     }
   ],
 
   "roadmap": {
-    "_comment": "Optional file whose phase sections are excerpted into the handoff prompt.",
+    "_comment": "Optional file whose phase sections are excerpted into the handoff prompt. `projects` scopes it: EMPTY/absent = all projects; a non-empty list excerpts it ONLY into those projects' prompts (a project's own roadmap must be scoped so it does not bleed into siblings).",
     "path": "~/Projects/my-repo/project-files/roadmap.md",
     "section_regex": "#### Phase[^\\n]*\\n(.*?)(?=\\n#### |\\Z)",
     "max_sections": 2,
     "max_chars_per_section": 1200,
-    "fallback_tail_chars": 3000
+    "fallback_tail_chars": 3000,
+    "projects": ["my-repo"]
   },
+
+  "_singlepane_projects_comment": "Projects whose cold-spawned VS Code window should open as a single editor pane (no side bars) WITHOUT git-worktree isolation. The watchdog generates an out-of-tree .handoff.code-workspace (folder = the real project dir, window.title carries the task) and opens it; the handoff-helper extension collapses the side bars on load (it guards on the .handoff.code-workspace suffix). EMPTY/absent = no project opts in (legacy / byte-identical).",
+  "singlepane_projects": ["my-repo"],
 
   "_mandate_projects_comment": "Optional v5.4 mandate roll-out allowlist (must be a NON-EMPTY list of slugs). The global dump entry re-execs the engine, so the global HANDOFF_RETRO_MANDATE / HANDOFF_AUDIT_MANDATE env would enforce on EVERY project's active dump. List only projects ready for the precheck + --retro-evidence flow; unlisted siblings take the legacy (no-gate) path. FAIL-CLOSED: every degenerate shape — key absent, [], a bare string typo, all-invalid entries — enforces EVERYWHERE (an accidental empty never silently disables the mandate). To genuinely disable, unset the env mandate, not this key. An explicit --retro-evidence or HANDOFF_RETRO_BYPASS always runs the gate regardless.",
   "mandate_projects": ["my-repo"],
