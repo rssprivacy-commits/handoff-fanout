@@ -128,6 +128,22 @@ class Config:
     # pane", never a leak). Distinct from ``worktree_projects`` (which gives single-pane AND git
     # isolation but imposes the merge-back protocol — too heavy for a non-technical owner's Node app).
     singlepane_projects: list[str] = field(default_factory=list)
+    # ── Unified spawn-window mechanism (default ON / killable) ────────────────────
+    # Global kill-switch for the unified spawn-window mechanism (dedicated
+    # ``.handoff.code-workspace`` + ``code -n`` + spawn_nonce title gate). Default ON;
+    # ``false`` routes spawns down the legacy fallback path (design §8). Named
+    # ``unified_spawn_enabled`` (NOT ``singlepane.enabled``) to avoid confusion with the
+    # *isolation* mode also called "singlepane" (design §2.1 naming fix).
+    unified_spawn_enabled: bool = True
+    # Per-project worker isolation mode — an EXPLICIT, auditable choice, NEVER guessed
+    # (design §2.2 R2r2-S). ``{slug: "worktree" | "singlepane"}``. A project absent from
+    # this map ⇒ ``worker_isolation_for`` returns ``None`` ⇒ the CALLER must fail closed
+    # (no silent default to either mode — picking wrong = parallel clobber OR broken
+    # isolation). Only the two known modes survive parsing; a typo'd / non-string value is
+    # dropped (→ None → caller fail-closed) so a config slip can't route a spawn down an
+    # unrecognized path. Distinct from the legacy ``worktree_projects`` /
+    # ``singlepane_projects`` lists (which this consolidates as spawns migrate).
+    worker_isolation: dict[str, str] = field(default_factory=dict)
     # Opt-in codex-audit repo-identity allowlist (Phase D P1 hardening). When the
     # ``audit_code_repos`` KEY is present, the audit gate accepts a cross-repo
     # ``code_repo`` ONLY if its realpath matches one of these (realpath-normalized)
@@ -197,6 +213,14 @@ class Config:
         the (then-global) blocks.
         """
         return list(self.inject_blocks) + list(self.project_inject_blocks.get(project, []))
+
+    def worker_isolation_for(self, project: str) -> str | None:
+        """Explicit worker isolation mode for ``project``, or ``None`` if unset.
+
+        ``None`` means the caller MUST fail closed (design §2.2 / §8: never guess an
+        isolation mode — the wrong one is a parallel-clobber or broken-isolation bug).
+        """
+        return self.worker_isolation.get(project)
 
     def queue_dir(self, project: str) -> Path:
         return self.home / project / "queue"
@@ -290,6 +314,8 @@ def _from_dict(data: dict, home: Path) -> Config:
             if isinstance(data.get("singlepane_projects"), list)
             else []
         ),
+        unified_spawn_enabled=bool(data.get("unified_spawn_enabled", True)),
+        worker_isolation=_parse_worker_isolation(data),
         audit_code_repos=[
             str(r) for r in (data.get("audit_code_repos", []) or []) if isinstance(r, str) and r
         ],
@@ -327,6 +353,31 @@ def _parse_project_inject_blocks(data: dict) -> dict[str, list[str]]:
         cleaned = [str(b) for b in blocks if isinstance(b, str) and b.strip()]
         if cleaned:
             out[slug] = cleaned
+    return out
+
+
+_VALID_ISOLATION_MODES = ("worktree", "singlepane")
+
+
+def _parse_worker_isolation(data: dict) -> dict[str, str]:
+    """Parse ``worker_isolation`` (``{slug: "worktree"|"singlepane"}``), defensively.
+
+    Mirrors ``_parse_project_inject_blocks``: only a dict maps to gated values; any
+    non-dict (absent / typo / list) yields ``{}``. Within it, only string slugs whose
+    value is one of the two KNOWN isolation modes survive — a typo'd mode (``"worktre"``)
+    or a non-string value is dropped, so ``worker_isolation_for`` returns ``None`` and the
+    caller fails closed (design §2.2 no-guess). A bad shape can never route a spawn down an
+    unrecognized isolation path.
+    """
+    raw = data.get("worker_isolation")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for slug, mode in raw.items():
+        if not isinstance(slug, str) or not slug:
+            continue
+        if isinstance(mode, str) and mode in _VALID_ISOLATION_MODES:
+            out[slug] = mode
     return out
 
 
