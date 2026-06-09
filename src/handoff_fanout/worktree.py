@@ -391,6 +391,12 @@ class WorktreeResult:
     # bare folder) so the window has an identifiable title + inherited ``.vscode`` →
     # fixes "新窗口认不出项目" + the bare-folder cold-start that swallowed the auto-submit Enter.
     vscode_workspace_file: str | None = None
+    # p6a-fix1 MUST 2: True iff ``created`` ADOPTED an existing clean+published worktree
+    # (the dual-brain P1 idempotent-reuse branch) rather than creating one THIS call. A
+    # caller rolling back a later publish failure must only remove a worktree it actually
+    # created (``reused=False``) — a reused one may belong to another live session /
+    # the previous relay leg, and removing it is data loss.
+    reused: bool = False
 
     @property
     def is_blocked(self) -> bool:
@@ -777,6 +783,7 @@ def create_worktree(
                     "reused an existing clean+published worktree at the same base",
                 ],
                 vscode_workspace_file=vws,
+                reused=True,  # p6a-fix1 MUST 2: adopted, NOT created — never rollback-remove
             )
         # Otherwise the worktree is stale (base advanced) → drop + recreate.
         if existing["exists"]:

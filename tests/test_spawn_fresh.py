@@ -378,6 +378,33 @@ def test_worktree_partial_failure_rolls_back(tmp_path, monkeypatch):
     assert not (home / PROJECT / "worktrees" / TASK).exists()
 
 
+def test_worktree_reuse_publish_failure_does_not_remove_worktree(tmp_path, monkeypatch):
+    """MUST 2 (p6a-fix1): a publish failure on a REUSED worktree (not created by this spawn —
+    it may belong to another live session / the previous relay leg) must roll back ONLY this
+    spawn's sidecar/.uri, NEVER remove the worktree itself (data-loss class)."""
+    home = _home(tmp_path, monkeypatch)
+    _, ws = _bare_and_clone(tmp_path)
+
+    # 1st spawn creates the worktree + publishes fine.
+    assert spawn.main(_argv(isolation="worktree", workspace=ws)) == 0
+    wt_dir = home / PROJECT / "worktrees" / TASK
+    assert wt_dir.is_dir()
+
+    # 2nd spawn for the SAME task REUSES that clean+published worktree; its publish fails.
+    def boom(*a, **k):
+        raise RuntimeError("simulated publish failure")
+
+    monkeypatch.setattr(spawn, "_write_uri", boom)
+    rc = spawn.main(_argv(isolation="worktree", workspace=ws))
+    assert rc == 2
+    # this spawn's partial intent is rolled back …
+    qd = home / PROJECT / "queue"
+    assert not (qd / f"{TASK}.uri").exists()
+    assert not (qd / f"{TASK}.singlepane").exists()
+    # … but the REUSED worktree (not ours to destroy) survives.
+    assert wt_dir.is_dir()
+
+
 # ─── arg validation ─────────────────────────────────────────────────────────
 
 

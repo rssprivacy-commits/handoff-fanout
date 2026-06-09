@@ -261,9 +261,14 @@ def _spawn_worktree(
         )
         _write_uri(queue_dir, task, workspace=wt, uri=uri)  # WORKSPACE=worktree dir ⇒ COLD path
     except Exception as e:
-        _err(f"worktree publish failed ({e}); rolling back the created worktree + partial intent")
+        _err(f"worktree publish failed ({e}); rolling back partial intent")
         _rollback(queue_dir, task)
-        _remove_worktree_best_effort(cfg, src, project, task, result)
+        # MUST 2 (p6a-fix1): only remove a worktree THIS call created. A reused one
+        # (create_worktree's idempotent-adoption branch) may belong to another live
+        # session / the previous relay leg — removing it would be data loss; we roll
+        # back only our own sidecar/.uri above and leave the worktree untouched.
+        if not result.reused:
+            _remove_worktree_best_effort(cfg, src, project, task, result)
         return EXIT_FAIL_CLOSED
     print(f"[spawn] ✅ worktree intent for {project}/{task} on {result.branch} (nonce {nonce})")
     return EXIT_OK
