@@ -211,6 +211,80 @@ def test_brief_path_referenced_in_prompt(tmp_path, monkeypatch):
     assert str(brief) in prompt
 
 
+# ─── singlepane concurrency hard-REJECT (design §5.4 / p6a-fix1 MUST 3) ─────
+
+
+def test_singlepane_second_worker_same_project_rejected(tmp_path, monkeypatch):
+    """MUST 3: `handoff spawn --isolation singlepane` is a public entry that bypasses dump's
+    Task5.1 guard. Two singlepane workers on one project = two windows landing in the SAME
+    real repo (index.lock clashes / overwrites). Design §5.4: the second dispatch is hard
+    REJECTED (rc 2, no .uri) — never a soft 'it shouldn't be concurrent' assumption."""
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    assert spawn.main(_argv(task="wh-first", isolation="singlepane", workspace=repo)) == 0
+
+    rc = spawn.main(_argv(task="wh-second", isolation="singlepane", workspace=repo))
+    assert rc == 2
+    qd = home / PROJECT / "queue"
+    assert not (qd / "wh-second.uri").exists()
+    assert not (qd / "wh-second.singlepane").exists()
+    # the first worker's intent is untouched
+    assert (qd / "wh-first.uri").exists()
+
+
+def test_singlepane_lock_held_rejected(tmp_path, monkeypatch):
+    """MUST 3: a concurrent spawn holding the project .spawn.lock (same lock dump Task5.1 /
+    autoclose use) must hard-reject the second singlepane producer — rc 2, no .uri."""
+    from handoff_fanout.spawn_lock import project_spawn_lock
+
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    with project_spawn_lock(PROJECT, root=home):
+        rc = spawn.main(_argv(isolation="singlepane", workspace=repo))
+    assert rc == 2
+    assert not (home / PROJECT / "queue" / f"{TASK}.uri").exists()
+
+
+def test_singlepane_terminal_task_frees_pane(tmp_path, monkeypatch):
+    """A terminal predecessor (.done) no longer holds the pane — the successor may spawn."""
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    assert spawn.main(_argv(task="wh-first", isolation="singlepane", workspace=repo)) == 0
+    (home / PROJECT / "queue" / "wh-first.done").write_text("done\n")
+
+    assert spawn.main(_argv(task="wh-second", isolation="singlepane", workspace=repo)) == 0
+    assert (home / PROJECT / "queue" / "wh-second.uri").exists()
+
+
+def test_singlepane_same_task_respawn_not_self_rejected(tmp_path, monkeypatch):
+    """A same-task re-spawn (retry) must not reject itself off its own previous intent."""
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    assert spawn.main(_argv(isolation="singlepane", workspace=repo)) == 0
+    assert spawn.main(_argv(isolation="singlepane", workspace=repo)) == 0
+    assert (home / PROJECT / "queue" / f"{TASK}.uri").exists()
+
+
+def test_singlepane_succession_exempt_from_worker_guard(tmp_path, monkeypatch):
+    """supervisor_succession REPLACES its predecessor window (design §6) — mirroring dump's
+    singlepane_worker_guard, the active-worker REJECT applies to worker dispatches only."""
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    assert spawn.main(_argv(task="wh-worker", isolation="singlepane", workspace=repo)) == 0
+
+    rc = spawn.main(
+        _argv(
+            task="wh-succession",
+            isolation="singlepane",
+            workspace=repo,
+            role="supervisor_succession",
+            predecessor_nonce="0123456789abcdef",
+        )
+    )
+    assert rc == 0
+    assert (home / PROJECT / "queue" / "wh-succession.uri").exists()
+
+
 # ─── worktree path ──────────────────────────────────────────────────────────
 
 

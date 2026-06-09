@@ -47,6 +47,7 @@ from handoff_fanout import atomic
 from handoff_fanout import config as _config
 from handoff_fanout import spawn_nonce as _spawn_nonce
 from handoff_fanout import worktree as _worktree
+from handoff_fanout.spawn_lock import LockHeld, project_spawn_lock
 
 # Kebab-case identity (same shape as dump.TASK_ID_RE / handoff_precheck.TASK_ID_RE — the engine's
 # established slug contract; kept local so spawn never imports dump).
@@ -188,7 +189,89 @@ def _remove_worktree_best_effort(
 # ─── per-isolation orchestration ───────────────────────────────────────────────
 
 
+def _active_singlepane_worker(cfg: _config.Config, project: str, *, exclude_task: str) -> str | None:
+    """task_id of an existing ACTIVE singlepane worker for ``project`` other than
+    ``exclude_task``, else ``None``.
+
+    Active = a ``queue/<task>.singlepane`` sidecar whose ``<task>.uri`` is present and
+    NON-terminal (no ``.done`` / ``.BLOCKED.md``) — the same deterministic file-based
+    "pane held" signal ``dump``'s Task5.1 guard reads. ``exclude_task`` keeps a same-task
+    re-spawn (retry) from rejecting itself. Deliberately authored here against that
+    contract rather than imported from ``dump`` (see the module docstring's shared-module
+    extraction note)."""
+    queue = cfg.queue_dir(project)
+    if not queue.exists():
+        return None
+    for sidecar in sorted(queue.glob("*.singlepane")):
+        other = sidecar.stem
+        if other == exclude_task:
+            continue
+        if not (queue / f"{other}.uri").exists():
+            continue  # no pending spawn → pane not held by it
+        if (queue / f"{other}.done").exists() or (queue / f"{other}.BLOCKED.md").exists():
+            continue  # terminal → pane free
+        return other
+    return None
+
+
 def _spawn_singlepane(
+    *, cfg, project, task, role, src, nonce, close_policy, predecessor_nonce, prompt_text, queue_dir
+) -> int:
+    """Gate + produce. MUST 3 (p6a-fix1 / design §5.4): ``handoff spawn`` is a PUBLIC entry
+    that bypasses ``dump``'s Task5.1 singlepane guard, so it must carry its own hard REJECT:
+    two concurrent singlepane workers on one project = two windows landing in the SAME real
+    repo (index.lock clashes / overwrites). The check + the whole produce run under the SAME
+    project ``.spawn.lock`` dump/autoclose use (``spawn_lock`` is a standalone shared module;
+    ``dump`` itself stays untouched), so a concurrent worker #2 cannot slip its artifacts in
+    between our check and publish — fail-closed, never 'it shouldn't be concurrent'.
+    ``supervisor_succession`` is exempt from the active-worker REJECT (it REPLACES its
+    predecessor window, design §6 — mirrors ``dump.singlepane_worker_guard``)."""
+    if role != ROLE_WORKER:
+        return _produce_singlepane(
+            cfg=cfg,
+            project=project,
+            task=task,
+            role=role,
+            src=src,
+            nonce=nonce,
+            close_policy=close_policy,
+            predecessor_nonce=predecessor_nonce,
+            prompt_text=prompt_text,
+            queue_dir=queue_dir,
+        )
+    try:
+        with project_spawn_lock(project, root=cfg.home):
+            holder = _active_singlepane_worker(cfg, project, exclude_task=task)
+            if holder is not None:
+                _err(
+                    f"singlepane project {project!r}: worker spawn for {task!r} REJECTED — "
+                    f"pane held by active worker {holder!r}. A singlepane project may have "
+                    "only ONE active worker; wait for it to finish (its task → done/blocked) "
+                    "before spawning here (design §5.4: never spawn concurrently into the "
+                    "same real repo)"
+                )
+                return EXIT_FAIL_CLOSED
+            return _produce_singlepane(
+                cfg=cfg,
+                project=project,
+                task=task,
+                role=role,
+                src=src,
+                nonce=nonce,
+                close_policy=close_policy,
+                predecessor_nonce=predecessor_nonce,
+                prompt_text=prompt_text,
+                queue_dir=queue_dir,
+            )
+    except LockHeld as e:
+        _err(
+            f"singlepane project {project!r}: worker spawn for {task!r} REJECTED — "
+            f"a concurrent spawn holds the project lock ({e}); retry after it settles"
+        )
+        return EXIT_FAIL_CLOSED
+
+
+def _produce_singlepane(
     *, cfg, project, task, role, src, nonce, close_policy, predecessor_nonce, prompt_text, queue_dir
 ) -> int:
     sp_dir = cfg.home / project / "singlepane"
