@@ -378,6 +378,54 @@ def test_worktree_partial_failure_rolls_back(tmp_path, monkeypatch):
     assert not (home / PROJECT / "worktrees" / TASK).exists()
 
 
+def test_worktree_reuse_refreshes_nonce_title(tmp_path, monkeypatch):
+    """MUST 1 (p6a-fix1): re-spawning the same task adopts the existing clean+published
+    worktree — whose ``.handoff.code-workspace`` still carries the PREVIOUS spawn's nonce.
+    The delivery contract is 'title carries THIS spawn's nonce' (design §4 atomic landing
+    gate: the nonce is unguessable, the task token is not), so the reuse path must rewrite
+    the engine-generated workspace title with the CURRENT nonce."""
+    home = _home(tmp_path, monkeypatch)
+    _, ws = _bare_and_clone(tmp_path)
+    nonce1, nonce2 = "1111aaaa1111aaaa", "2222bbbb2222bbbb"
+    nonces = iter([nonce1, nonce2])
+    monkeypatch.setattr(_spawn_nonce, "new_nonce", lambda: next(nonces))
+
+    assert spawn.main(_argv(isolation="worktree", workspace=ws)) == 0
+    cws = home / PROJECT / "worktrees" / TASK / ".handoff.code-workspace"
+    assert nonce1 in json.loads(cws.read_text())["settings"]["window.title"]
+
+    # 2nd spawn REUSES the worktree → the title must now carry nonce2, not the stale nonce1.
+    assert spawn.main(_argv(isolation="worktree", workspace=ws)) == 0
+    title = json.loads(cws.read_text())["settings"]["window.title"]
+    assert nonce2 in title
+    assert nonce1 not in title
+    # and the published artifacts agree with the workspace title (no mismatch possible)
+    assert _sidecar(home)["spawn_nonce"] == nonce2
+
+
+def test_worktree_tracked_user_workspace_fails_closed(tmp_path, monkeypatch):
+    """MUST 1 (p6a-fix1, fail-closed leg): a USER-tracked .handoff.code-workspace is never
+    overwritten — but then the title cannot carry this spawn's nonce, so producing an intent
+    would bake in a title↔sidecar nonce mismatch. The spawn must fail closed (rc 2, no .uri)."""
+    home = _home(tmp_path, monkeypatch)
+    _, ws = _bare_and_clone(tmp_path)
+    # the user tracked their own .handoff.code-workspace into the repo
+    (ws / ".handoff.code-workspace").write_text(json.dumps({"folders": [{"path": "."}]}))
+    _run(["git", "add", "."], ws)
+    _run(["git", "commit", "-qm", "user tracks a workspace file"], ws)
+    _run(["git", "push", "-q", "origin", "main"], ws)
+
+    rc = spawn.main(_argv(isolation="worktree", workspace=ws))
+    assert rc == 2
+    qd = home / PROJECT / "queue"
+    assert not (qd / f"{TASK}.uri").exists()
+    assert not (qd / f"{TASK}.singlepane").exists()
+    # the user's tracked file content was respected (never overwritten) in the worktree, if any
+    wt_dir = home / PROJECT / "worktrees" / TASK
+    if (wt_dir / ".handoff.code-workspace").exists():
+        assert "window.title" not in (wt_dir / ".handoff.code-workspace").read_text()
+
+
 def test_worktree_reuse_publish_failure_does_not_remove_worktree(tmp_path, monkeypatch):
     """MUST 2 (p6a-fix1): a publish failure on a REUSED worktree (not created by this spawn —
     it may belong to another live session / the previous relay leg) must roll back ONLY this

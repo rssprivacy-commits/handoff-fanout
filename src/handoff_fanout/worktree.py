@@ -551,7 +551,24 @@ def inject_vscode_workspace(
         # has one.
         ws_file = wt / WORKTREE_VSCODE_FILE
         if ws_file.exists():
-            return str(ws_file)  # respect a pre-existing (tracked/user) file; never overwrite.
+            if spawn_nonce is None:
+                # legacy (``dump``) callers: BYTE-IDENTICAL pre-Phase-6a behavior —
+                # respect a pre-existing (tracked/user) file; never overwrite.
+                return str(ws_file)
+            # p6a-fix1 MUST 1: a REUSED worktree still holds the previous spawn's workspace
+            # file, whose title carries the STALE nonce — but the delivery contract is
+            # "title carries THIS spawn's nonce" (design §4: the nonce is the unguessable
+            # landing gate; the task token is not). The engine's OWN generated file is
+            # safely rewritten below with the current title; a USER-tracked file is never
+            # overwritten — then the title cannot carry this nonce, so return None and let
+            # the spawn caller fail closed instead of producing a title↔sidecar mismatch.
+            # ``ls-files --error-unmatch`` rc: 0=tracked (user content), 1=untracked (the
+            # engine wrote it post-checkout; is_dirty discounts it). Any other rc (no git /
+            # timeout) is INDETERMINATE → treat as user content (never risk an overwrite).
+            rc_tracked, _, _ = _git(["ls-files", "--error-unmatch", "--", WORKTREE_VSCODE_FILE], wt)
+            if rc_tracked != 1:
+                return None
+            # fall through: rewrite the engine-generated file with the current nonce title.
         # Phase 6a: bind the unguessable nonce into the title when a fresh-spawn supplies one
         # (project·task·role·nonce via title_for + the [worktree] marker). Legacy ``dump`` callers
         # pass spawn_nonce=None → the BYTE-IDENTICAL pre-Phase-6a title (project · task [worktree]…).

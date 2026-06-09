@@ -246,7 +246,20 @@ def _spawn_worktree(
     # The worktree's own .handoff.code-workspace (nonce title) is the open target the watchdog
     # `find`s; the sidecar's workspace field is informational on this path, but try_autoclose reads
     # role/predecessor_nonce from the sidecar so we still write it.
-    cws = result.vscode_workspace_file or str(wt / _worktree.WORKTREE_VSCODE_FILE)
+    cws = result.vscode_workspace_file
+    if cws is None:
+        # MUST 1 (p6a-fix1): inject_vscode_workspace could not bind THIS spawn's nonce into
+        # the workspace title (a user-tracked .handoff.code-workspace it must not overwrite,
+        # or the write failed). Publishing anyway would bake a title↔sidecar nonce mismatch
+        # into the intent — fail closed instead (and reclaim the worktree only if WE made it).
+        _err(
+            "worktree workspace title cannot carry this spawn's nonce (pre-existing "
+            "user-tracked .handoff.code-workspace, or workspace write failure) — "
+            "refusing to produce a mismatched intent"
+        )
+        if not result.reused:
+            _remove_worktree_best_effort(cfg, src, project, task, result)
+        return EXIT_FAIL_CLOSED
     uri = _build_uri(cfg, prompt_text)
     try:
         _write_sidecar(
