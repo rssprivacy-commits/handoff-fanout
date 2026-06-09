@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -306,15 +307,11 @@ def _from_dict(data: dict, home: Path) -> Config:
         # ``"wilde-hexe"`` must NOT iterate into chars ``['w','i',...]`` (the mandate-parser
         # footgun). Any non-list → [] = no project opts in (fail-open, safe default).
         singlepane_projects=(
-            [
-                str(p)
-                for p in data.get("singlepane_projects")
-                if isinstance(p, str) and p
-            ]
+            [str(p) for p in data.get("singlepane_projects") if isinstance(p, str) and p]
             if isinstance(data.get("singlepane_projects"), list)
             else []
         ),
-        unified_spawn_enabled=bool(data.get("unified_spawn_enabled", True)),
+        unified_spawn_enabled=_parse_unified_spawn_enabled(data),
         worker_isolation=_parse_worker_isolation(data),
         audit_code_repos=[
             str(r) for r in (data.get("audit_code_repos", []) or []) if isinstance(r, str) and r
@@ -354,6 +351,50 @@ def _parse_project_inject_blocks(data: dict) -> dict[str, list[str]]:
         if cleaned:
             out[slug] = cleaned
     return out
+
+
+# Recognised string spellings of the unified-spawn kill-switch (case-insensitive,
+# whitespace-trimmed). Anything outside these → loud warn + feature default (ON).
+_FALSEY_STR = frozenset({"false", "0", "no", "off", "n", "f", ""})
+_TRUTHY_STR = frozenset({"true", "1", "yes", "on", "y", "t"})
+
+
+def _parse_unified_spawn_enabled(data: dict) -> bool:
+    """Parse the unified-spawn kill-switch WITHOUT the ``bool()`` footgun.
+
+    ``bool("false")`` is ``True`` — so the old ``bool(data.get("unified_spawn_enabled",
+    True))`` left the feature ENABLED when an owner typed the JSON string ``"false"`` to
+    KILL it: a SILENT fail-OPEN of a safety kill-switch (禁止静默降级). Here:
+
+    * key absent OR JSON ``null`` → feature default (ON) — "unset" means "use default".
+    * a real JSON bool (``true`` / ``false``) → honoured verbatim.
+    * a number (``0`` → off, non-zero → on).
+    * a recognised string (``"false"`` / ``"0"`` / ``"off"`` / ``"true"`` / …) →
+      interpreted, so the kill-switch actually works as the owner intended.
+    * anything genuinely unrecognised (a typo like ``"banana"``, a list, …) → feature
+      default (ON) but a LOUD stderr warn — never a silent mis-parse.
+    """
+    if "unified_spawn_enabled" not in data:
+        return True
+    raw = data.get("unified_spawn_enabled")
+    if raw is None:  # explicit JSON null → treat like unset (use default)
+        return True
+    if isinstance(raw, bool):  # MUST precede int — bool is a subclass of int
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in _FALSEY_STR:
+            return False
+        if s in _TRUTHY_STR:
+            return True
+    print(
+        f"⚠️  unified_spawn_enabled: unrecognized value {raw!r}; defaulting to enabled "
+        "(True). Use a JSON boolean (true/false).",
+        file=sys.stderr,
+    )
+    return True
 
 
 _VALID_ISOLATION_MODES = ("worktree", "singlepane")

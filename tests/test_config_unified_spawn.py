@@ -13,6 +13,43 @@ def test_unified_spawn_default_is_on_when_absent(tmp_path):
     assert cfg.unified_spawn_enabled is True
 
 
+def test_unified_spawn_string_false_is_disabled(tmp_path):
+    # The footgun: bool("false") is True. A JSON STRING "false" is an owner trying to
+    # KILL the feature — it MUST resolve to False, never silently stay enabled.
+    (tmp_path / "config.json").write_text('{"unified_spawn_enabled": "false"}')
+    cfg = C.load(home=tmp_path)
+    assert cfg.unified_spawn_enabled is False
+
+
+def test_unified_spawn_zero_is_disabled(tmp_path):
+    (tmp_path / "config.json").write_text('{"unified_spawn_enabled": 0}')
+    cfg = C.load(home=tmp_path)
+    assert cfg.unified_spawn_enabled is False
+
+
+def test_unified_spawn_string_truthy_is_enabled(tmp_path):
+    (tmp_path / "config.json").write_text('{"unified_spawn_enabled": "true"}')
+    cfg = C.load(home=tmp_path)
+    assert cfg.unified_spawn_enabled is True
+
+
+def test_unified_spawn_null_defaults_on_silently(tmp_path, capsys):
+    # JSON null == "unset" → feature default (ON), and NOT a mis-parse → no warn noise.
+    (tmp_path / "config.json").write_text('{"unified_spawn_enabled": null}')
+    cfg = C.load(home=tmp_path)
+    assert cfg.unified_spawn_enabled is True
+    assert capsys.readouterr().err == ""
+
+
+def test_unified_spawn_garbage_defaults_on_with_loud_warn(tmp_path, capsys):
+    # Genuinely unrecognised value → default ON, but LOUD (non-silent) so the owner
+    # learns their kill-switch value was ignored.
+    (tmp_path / "config.json").write_text('{"unified_spawn_enabled": "banana"}')
+    cfg = C.load(home=tmp_path)
+    assert cfg.unified_spawn_enabled is True
+    assert "unified_spawn_enabled" in capsys.readouterr().err
+
+
 def test_worker_isolation_explicit_no_guess(tmp_path):
     (tmp_path / "config.json").write_text(
         '{"worker_isolation": {"erp":"worktree","wilde-hexe":"singlepane"}}'
