@@ -242,18 +242,55 @@ def home_dir() -> Path:
 
 
 def load(home: Path | None = None) -> Config:
-    """Load config from ``home/config.json`` (or defaults if absent/invalid)."""
+    """Load config from ``home/config.json``.
+
+    Sentinel fail-closed contract (design §7 / Task 5.2). Three distinct outcomes:
+
+    * **ABSENT** (no file) → feature defaults. This is the clean out-of-the-box state:
+      "unset" means "use the default", so the unified spawn-window mechanism stays ON.
+    * **PRESENT + readable + valid JSON** → parsed verbatim.
+    * **PRESENT but UNTRUSTWORTHY** (unreadable / permission-denied / corrupt JSON) → we
+      cannot trust ANY read, so the unified-spawn kill-switch fails CLOSED
+      (``unified_spawn_enabled=False``) + a LOUD warn — we must NOT silently drive the new
+      spawn mechanism off a config we couldn't parse (禁止静默降级). Every OTHER field's
+      empty-default is already its safe floor (no opt-in lists, worktree off), so a corrupt
+      config can never silently opt a project into anything either.
+
+    ``read_text`` (not ``exists()`` + read) collapses the absent check and the read into one
+    operation: ``FileNotFoundError`` ⇒ absent (defaults ON); any other ``OSError`` ⇒
+    present-but-unreadable (fail closed) — no TOCTOU between the two.
+    """
     if home is None:
         home = home_dir()
     cfg_path = home / CONFIG_FILENAME
-    if not cfg_path.exists():
-        return Config(home=home)
     try:
         raw = cfg_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return Config(home=home)  # absent → out-of-the-box defaults (unified spawn ON)
+    except OSError as e:
+        return _fail_closed_config(home, cfg_path, e)  # present but unreadable
+    try:
         data = json.loads(raw)
-    except (OSError, json.JSONDecodeError):
-        return Config(home=home)
+    except json.JSONDecodeError as e:
+        return _fail_closed_config(home, cfg_path, e)  # present but corrupt
     return _from_dict(data, home=home)
+
+
+def _fail_closed_config(home: Path, cfg_path: Path, err: Exception) -> Config:
+    """A present-but-untrustworthy config: warn loudly, fail the unified-spawn switch CLOSED.
+
+    Returns an all-defaults ``Config`` EXCEPT ``unified_spawn_enabled=False`` (don't force
+    the new mechanism off a config we couldn't read/parse). The warn is non-silent so the
+    owner learns their spawn config is broken and the engine degraded to the legacy path.
+    """
+    print(
+        f"⚠️  config at {cfg_path} unreadable/corrupt ({type(err).__name__}: {err}); "
+        "failing CLOSED — unified_spawn_enabled=False (legacy fallback). The unified "
+        "spawn-window mechanism will NOT auto-run off an untrusted config; fix "
+        "config.json to re-enable.",
+        file=sys.stderr,
+    )
+    return Config(home=home, unified_spawn_enabled=False)
 
 
 def _from_dict(data: dict, home: Path) -> Config:

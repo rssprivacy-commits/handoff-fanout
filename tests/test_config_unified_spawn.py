@@ -82,3 +82,50 @@ def test_worker_isolation_non_dict_is_empty(tmp_path):
     (tmp_path / "config.json").write_text('{"worker_isolation": "erp"}')
     cfg = C.load(home=tmp_path)
     assert cfg.worker_isolation_for("erp") is None
+
+
+# ─── Task 5.2 / design §7: sentinel (config) fail-closed for unified_spawn ────
+# Distinct branches: a config that can't be TRUSTED (corrupt / unreadable) must NOT
+# silently drive the new spawn mechanism — it fails CLOSED (unified_spawn=False). An
+# ABSENT config is a different case: the clean out-of-the-box state → feature default ON.
+
+
+def test_unified_spawn_fail_closed_on_corrupt_json(tmp_path, capsys):
+    # 损坏 branch: config PRESENT but invalid JSON → we can't read the kill-switch →
+    # fail CLOSED (False = don't force the new mechanism), NOT the bool-default ON.
+    (tmp_path / "config.json").write_text("{ this is : not valid json ,,, ")
+    cfg = C.load(home=tmp_path)
+    assert cfg.unified_spawn_enabled is False
+    # Non-silent: the owner must learn the config couldn't be parsed (禁止静默降级).
+    assert "unreadable/corrupt" in capsys.readouterr().err
+
+
+def test_unified_spawn_fail_closed_on_unreadable_config(tmp_path, capsys):
+    # 权限异常 / 读取失败 branch: config path PRESENT but unreadable (OSError). A directory
+    # at the config path makes read_text raise IsADirectoryError ⊂ OSError — a portable
+    # stand-in for a permission-denied / corrupt-on-disk read (no chmod-as-root flakiness).
+    (tmp_path / "config.json").mkdir()
+    cfg = C.load(home=tmp_path)
+    assert cfg.unified_spawn_enabled is False
+    assert "unreadable/corrupt" in capsys.readouterr().err
+
+
+def test_unified_spawn_default_on_when_config_file_absent(tmp_path, capsys):
+    # Boundary: ABSENT config (no file) is NOT fail-closed — it's the clean default
+    # state → feature default ON, silently (no warn). This is what distinguishes
+    # "unset, use default" from "present but untrustworthy → fail closed".
+    cfg = C.load(home=tmp_path)  # no config.json written
+    assert cfg.unified_spawn_enabled is True
+    assert capsys.readouterr().err == ""
+
+
+def test_corrupt_config_other_fields_stay_safe_default(tmp_path):
+    # Fail-closed Config still yields the safe empty defaults for every OTHER field, so a
+    # corrupt config can never silently OPT a project into worktree / singlepane / a mode.
+    (tmp_path / "config.json").write_text("totally not json")
+    cfg = C.load(home=tmp_path)
+    assert cfg.unified_spawn_enabled is False
+    assert cfg.singlepane_projects == []
+    assert cfg.worker_isolation == {}
+    assert cfg.worktree_mode == "off"
+    assert cfg.worker_isolation_for("anything") is None

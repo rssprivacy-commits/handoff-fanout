@@ -292,6 +292,45 @@ def test_no_sidecar_skips_silently(home, stubbed_env):
     assert "task_id" not in _open_log(stubbed_env)
 
 
+# ─── sentinel fail-closed (Task 5.2 / design §7): corrupt sidecar JSON → no close ─
+
+
+def test_corrupt_sidecar_json_fails_closed_no_close(home, stubbed_env):
+    """The 损坏 branch for the autoclose read point: a ``queue/<task>.singlepane`` sidecar
+    that EXISTS but holds CORRUPT JSON (truncated / disk garbage) → ``json_get`` can't
+    extract a ``role`` → role != supervisor_succession → fail-closed SILENT skip. The pane
+    keeps; no helper URI fires; no done/failed marker (a valid sidecar may land later)."""
+    evidence = _make_evidence(home)
+    _write_old_ready(home, TASK, evidence)
+    _touch_submitted(home, TASK)
+    # Corrupt sidecar: not parseable JSON, no readable "role" field.
+    (home / PROJECT / "queue" / f"{TASK}.singlepane").write_text(
+        '{"workspace":"/x","ro\x00\x00 TRUNCATED-CORRUPT', encoding="utf-8"
+    )
+
+    _run_script(stubbed_env)
+    ack = home / PROJECT / "ack"
+    assert not (ack / f"{TASK}.autoclose_done").exists()  # never closed
+    assert not (ack / f"{TASK}.autoclose_failed.txt").exists()  # silent skip, not a failure
+    assert "task_id" not in _open_log(stubbed_env)  # no URI emitted
+
+
+def test_corrupt_sidecar_role_present_but_garbage_value_no_close(home, stubbed_env):
+    """Even when the corrupt sidecar happens to contain a ``role`` token, a garbage value
+    (not exactly ``supervisor_succession``) must fail closed — never coerced into a close."""
+    evidence = _make_evidence(home)
+    _write_old_ready(home, TASK, evidence)
+    _touch_submitted(home, TASK)
+    (home / PROJECT / "queue" / f"{TASK}.singlepane").write_text(
+        '{"role": "supervisor_succ\x00GARBAGE', encoding="utf-8"
+    )
+
+    _run_script(stubbed_env)
+    ack = home / PROJECT / "ack"
+    assert not (ack / f"{TASK}.autoclose_done").exists()
+    assert "task_id" not in _open_log(stubbed_env)
+
+
 # ─── role gate: succession with a malformed predecessor_nonce → reject ───────
 
 
