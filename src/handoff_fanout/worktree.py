@@ -25,6 +25,7 @@ computes + logs what WOULD happen and mutates nothing (truly read-only).
 from __future__ import annotations
 
 import argparse
+import enum
 import json
 import os
 import shutil
@@ -58,6 +59,50 @@ ST_REPORT = "report"  # report-only — computed, nothing mutated, spawn on shar
 ST_CREATED = "created"  # worktree created — spawn isolated
 ST_DEGRADED = "degraded"  # environmental unavailability — spawn on shared tree + loud warn
 ST_BLOCKED = "blocked"  # unsafe (unpublished work / dirty collision) — caller must BLOCK
+
+
+# ─── worker worktree lifecycle state machine (design §5.2/§5.3) ───────────────
+
+
+class WorktreeState(enum.Enum):
+    """Lifecycle of a per-session worker worktree (design §5.2).
+
+    ``creating → active → awaiting-merge → merged | abandoned``. Only the TERMINAL
+    states (``MERGED`` = work handed back / merged, ``ABANDONED`` = discarded) are
+    ever eligible for orphan reclaim. ``CREATING`` (mid-spawn), ``ACTIVE`` (a session
+    is working in it), and ``AWAITING_MERGE`` (closed but the business merge-back
+    layer hasn't merged yet) are NEVER reclaimed by low-level GC — touching them
+    would race a live session or destroy un-merged work (§5.3). The string values are
+    persisted in sidecars/markers, so they must stay stable.
+    """
+
+    CREATING = "creating"
+    ACTIVE = "active"
+    AWAITING_MERGE = "awaiting-merge"
+    MERGED = "merged"
+    ABANDONED = "abandoned"
+
+
+# Terminal states whose worktree the low-level reclaimer may drop (work is already
+# handed back or explicitly discarded). Kept as a set so the gate reads declaratively
+# and a future state addition can't silently become "reclaimable" by omission.
+_RECLAIMABLE_STATES = frozenset({WorktreeState.MERGED, WorktreeState.ABANDONED})
+
+
+def is_reclaimable_orphan(
+    *, proc_alive: bool, in_pending_queue: bool, state: WorktreeState
+) -> bool:
+    """True iff a worktree is a reclaimable orphan — ALL three conditions hold (§5.3).
+
+    Orphan = ① owner session process is dead (judged by transcript-mtime, NOT
+    heartbeat — design §5.3) ∧ ② its ``task_id`` is not in the pending/inflight queue
+    ∧ ③ state ∈ {``MERGED``, ``ABANDONED``} (work handed back / discarded). Any single
+    condition failing → NOT reclaimable: a live process, a queued task, or an
+    ``ACTIVE``/``AWAITING_MERGE`` worktree all belong to a running session or the
+    business merge-back layer and must be left untouched (fail-closed — the cost of a
+    false-positive reclaim is destroyed work, so the AND is intentional).
+    """
+    return (not proc_alive) and (not in_pending_queue) and (state in _RECLAIMABLE_STATES)
 
 
 # ─── git helpers ─────────────────────────────────────────────────────────────
