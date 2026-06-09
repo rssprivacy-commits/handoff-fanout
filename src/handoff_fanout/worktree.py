@@ -799,6 +799,115 @@ def create_worktree(
     )
 
 
+# ─── branch-conflict reclaim / fail-closed (design §5.2 / R2r2-R1) ────────────
+
+
+class WorktreeConflict(Exception):
+    """A worktree/branch collision that is NOT a reclaimable orphan — fail-closed.
+
+    ``git worktree add`` collided with an existing ``<prefix><task>`` branch/worktree
+    that is still live / in-flight / awaiting-merge, so reclaiming it would clobber a
+    running session's work. The caller must surface this (ack + reason) and let the
+    supervisor pick a fresh ``task_id`` or intervene — never silently reuse a dirty /
+    active orphan, and never hang (design §5.2).
+    """
+
+
+class WorktreeAddError(Exception):
+    """``git worktree add`` failed for a NON-collision (environmental) reason — e.g.
+    an unresolvable base ref, an unwritable parent, or a rebuild that still fails.
+
+    Distinct from :class:`WorktreeConflict` so the caller can degrade (fall back to the
+    shared tree) rather than treat it as a fatal name clash.
+    """
+
+
+# Substrings git emits when ``worktree add`` collides with an existing branch / worktree
+# / path. Matched case-insensitively. Anything NOT matching is an environmental failure.
+_WORKTREE_CONFLICT_MARKERS = (
+    "already exists",
+    "already used by worktree",
+    "already checked out",
+    "already registered",
+    "is already used by",
+)
+
+
+def _is_worktree_conflict(stderr: str) -> bool:
+    low = stderr.lower()
+    return any(m in low for m in _WORKTREE_CONFLICT_MARKERS)
+
+
+def add_worktree_or_reclaim_orphan(
+    *,
+    source_workspace: Path,
+    wt: Path,
+    branch: str,
+    base_ref: str,
+    proc_alive: bool,
+    in_pending_queue: bool,
+    state: WorktreeState,
+    timeout: float = 60.0,
+) -> None:
+    """``git worktree add -b <branch> <wt> <base_ref>``; on a branch/worktree-exists
+    collision, reclaim the old one IFF it is a confirmed orphan (§5.3) then rebuild,
+    else fail-closed (design §5.2 / R2r2-R1).
+
+    Outcomes:
+      * add succeeds (no collision)                       → returns None.
+      * collision AND ``is_reclaimable_orphan(...)``      → drop the orphan worktree +
+        branch, rebuild from ``base_ref``; returns None.
+      * collision AND NOT a reclaimable orphan            → raise :class:`WorktreeConflict`
+        (live / queued / awaiting-merge — real work; never silently reused).
+      * NON-collision (environmental) failure / rebuild   → raise :class:`WorktreeAddError`
+        (caller degrades to the shared tree instead of treating it as a name clash).
+
+    The orphan reclaim force-removes the worktree + deletes the branch — SAFE only
+    because :func:`is_reclaimable_orphan` proved all three conditions (dead process,
+    not queued, terminal state): there is no live writer and the work was already
+    handed back / discarded. This function deliberately takes the three orphan
+    conditions as inputs (rather than computing them) — determining process liveness
+    (transcript-mtime) and persisted state is the spawn-intent / business merge-back
+    layer's job; this is the §5.2 state-machine interface they call.
+    """
+
+    def _add() -> tuple[int, str, str]:
+        return _git(["worktree", "add", "-b", branch, str(wt), base_ref], source_workspace, timeout=timeout)
+
+    rc, _out, err = _add()
+    if rc == 0:
+        return
+    if not _is_worktree_conflict(err):
+        raise WorktreeAddError(f"git worktree add failed (non-collision): {err[:200]}")
+
+    # Branch/worktree already exists. Reclaim ONLY a confirmed orphan; otherwise
+    # fail-closed (a live / queued / awaiting-merge collision is genuine work).
+    if not is_reclaimable_orphan(
+        proc_alive=proc_alive, in_pending_queue=in_pending_queue, state=state
+    ):
+        raise WorktreeConflict(
+            f"worktree/branch {branch!r} exists and is NOT a reclaimable orphan "
+            f"(proc_alive={proc_alive}, in_pending_queue={in_pending_queue}, "
+            f"state={state.value}); fail-closed — pick a fresh task_id or resolve manually"
+        )
+
+    # Confirmed orphan → drop the old worktree + branch, then rebuild. The worktree dir
+    # may be gone (branch-only collision) → remove/prune are best-effort; ``branch -D``
+    # is what clears a lingering ref. A force remove is safe here (orphan proven dead +
+    # terminal). Clear any non-registered leftover dir so the rebuild's path is free.
+    _git(["worktree", "remove", "--force", str(wt)], source_workspace)
+    _git(["worktree", "prune"], source_workspace)
+    _git(["branch", "-D", branch], source_workspace)
+    if wt.exists():
+        shutil.rmtree(wt, ignore_errors=True)
+
+    rc2, _out2, err2 = _add()
+    if rc2 != 0:
+        raise WorktreeAddError(
+            f"rebuild after reclaiming orphan {branch!r} failed: {err2[:200]}"
+        )
+
+
 # ─── removal / GC ────────────────────────────────────────────────────────────
 
 
