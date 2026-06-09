@@ -932,7 +932,9 @@ def add_worktree_or_reclaim_orphan(
     """
 
     def _add() -> tuple[int, str, str]:
-        return _git(["worktree", "add", "-b", branch, str(wt), base_ref], source_workspace, timeout=timeout)
+        return _git(
+            ["worktree", "add", "-b", branch, str(wt), base_ref], source_workspace, timeout=timeout
+        )
 
     rc, _out, err = _add()
     if rc == 0:
@@ -963,9 +965,7 @@ def add_worktree_or_reclaim_orphan(
 
     rc2, _out2, err2 = _add()
     if rc2 != 0:
-        raise WorktreeAddError(
-            f"rebuild after reclaiming orphan {branch!r} failed: {err2[:200]}"
-        )
+        raise WorktreeAddError(f"rebuild after reclaiming orphan {branch!r} failed: {err2[:200]}")
 
 
 # ─── removal / GC ────────────────────────────────────────────────────────────

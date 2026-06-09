@@ -548,9 +548,7 @@ def test_succession_without_predecessor_nonce_fails_closed(tmp_path, monkeypatch
     would be unactionable. Fail closed."""
     home = _home(tmp_path, monkeypatch)
     repo = _plain_repo(tmp_path)
-    rc = spawn.main(
-        _argv(isolation="singlepane", workspace=repo, role="supervisor_succession")
-    )
+    rc = spawn.main(_argv(isolation="singlepane", workspace=repo, role="supervisor_succession"))
     assert rc == 2
     assert not (home / PROJECT / "queue" / f"{TASK}.uri").exists()
 

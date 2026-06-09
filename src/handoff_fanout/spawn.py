@@ -201,7 +201,9 @@ def _remove_worktree_best_effort(
 # ─── per-isolation orchestration ───────────────────────────────────────────────
 
 
-def _active_singlepane_worker(cfg: _config.Config, project: str, *, exclude_task: str) -> str | None:
+def _active_singlepane_worker(
+    cfg: _config.Config, project: str, *, exclude_task: str
+) -> str | None:
     """task_id of an existing ACTIVE singlepane worker for ``project`` other than
     ``exclude_task``, else ``None``.
 
@@ -420,8 +422,10 @@ def run_spawn(
     # SHOULD (p6a-fix1): a succession's whole purpose is closing its predecessor window;
     # without that window's nonce it cannot be identified → the intent is unactionable.
     if role == ROLE_SUCCESSION and predecessor_nonce is None:
-        _err("role=supervisor_succession requires --predecessor-nonce (the nonce of the "
-             "predecessor window it closes)")
+        _err(
+            "role=supervisor_succession requires --predecessor-nonce (the nonce of the "
+            "predecessor window it closes)"
+        )
         return EXIT_FAIL_CLOSED
 
     cfg = _config.load()
