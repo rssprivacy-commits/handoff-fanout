@@ -2131,6 +2131,13 @@ def main_audit_close(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--status", default="active", help="dump status (active|done|blocked)")
     ap.add_argument("--tests", default=None, help="forwarded to dump --tests")
+    # §五·2 (2026-06-09): the ERP coordinator spawn path closes via audit-close, not bare dump.
+    # Forward --coordinator to the inner dump so the spawned 中枢 worktree window is red-topped.
+    ap.add_argument(
+        "--coordinator",
+        action="store_true",
+        help="forward to dump: red-top the spawned worktree window (supervisor center / 中枢)",
+    )
     # retro evidence phase status (forwarded to precheck-style build)
     ap.add_argument("--phase0-status", action="append", default=[])
     ap.add_argument("--phase1-status", action="append", default=[])
@@ -2292,6 +2299,8 @@ def main_audit_close(argv: list[str] | None = None) -> int:
             ]
             if args.tests:
                 dump_argv += ["--tests", args.tests]
+            if args.coordinator:
+                dump_argv.append("--coordinator")  # §五·2: red-top the spawned 中枢 worktree window
             return dump.main(dump_argv)
     except atomic.LockAcquisitionError:
         sys.stderr.write(f"ERR-LOCKED audit-close-lock-held: {locks_root}\n")
