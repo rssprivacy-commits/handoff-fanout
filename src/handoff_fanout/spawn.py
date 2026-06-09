@@ -315,7 +315,50 @@ def _produce_singlepane(
     return EXIT_OK
 
 
+# Bounded wait for the project spawn lock on the WORKTREE path (Phase 7 fix). Parallel
+# worktree workers are LEGITIMATE (design §2.2) — but truly concurrent spawns mutate the
+# SAME source repo (`git fetch` tracking refs / `git worktree add -b` writing upstream
+# config into .git/config), and git's own lock files turn that into spurious
+# "could not lock config file" fail-closes. So unlike singlepane (§5.4 immediate
+# REJECT), worktree spawns QUEUE on the same project `.spawn.lock` — aligned with the
+# wait's order of magnitude with the lock TTL (a crashed holder is stale-broken anyway).
+_WORKTREE_LOCK_WAIT = 120.0
+
+
 def _spawn_worktree(
+    *, cfg, project, task, role, src, nonce, close_policy, predecessor_nonce, prompt_text, queue_dir
+) -> int:
+    """Serialize create+publish under the project spawn lock (one critical section).
+
+    Besides the git-level serialization above, holding the lock across the sidecar/.uri
+    publish keeps the watchdog's try_autoclose contract honest: its critical section
+    reads sidecars under this same lock assuming every sidecar WRITER holds it too
+    (R2 lock-order TOCTOU fix) — which was true for dump's and spawn's singlepane
+    paths but not, before this, for the worktree path."""
+    try:
+        with project_spawn_lock(project, root=cfg.home, wait=_WORKTREE_LOCK_WAIT):
+            return _produce_worktree(
+                cfg=cfg,
+                project=project,
+                task=task,
+                role=role,
+                src=src,
+                nonce=nonce,
+                close_policy=close_policy,
+                predecessor_nonce=predecessor_nonce,
+                prompt_text=prompt_text,
+                queue_dir=queue_dir,
+            )
+    except LockHeld as e:
+        _err(
+            f"worktree project {project!r}: spawn for {task!r} REJECTED — the project "
+            f"spawn lock stayed held past the {_WORKTREE_LOCK_WAIT:.0f}s wait ({e}); "
+            "retry after the concurrent spawn/autoclose settles"
+        )
+        return EXIT_FAIL_CLOSED
+
+
+def _produce_worktree(
     *, cfg, project, task, role, src, nonce, close_policy, predecessor_nonce, prompt_text, queue_dir
 ) -> int:
     result = _worktree.create_worktree(

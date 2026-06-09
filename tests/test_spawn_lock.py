@@ -63,6 +63,55 @@ def test_concurrent_stale_break_no_crash(tmp_path, monkeypatch):
         pass
 
 
+def test_wait_zero_default_is_nonblocking(tmp_path):
+    # The default (wait=0) keeps the original semantics: a held lock raises
+    # IMMEDIATELY (this is what the singlepane §5.4 hard-REJECT relies on).
+    t0 = time.monotonic()
+    with (
+        project_spawn_lock("erp", root=tmp_path, ttl=60),
+        pytest.raises(LockHeld),
+        project_spawn_lock("erp", root=tmp_path, ttl=60),
+    ):
+        pass
+    assert time.monotonic() - t0 < 1.0
+
+
+def test_wait_acquires_after_holder_releases(tmp_path):
+    # Phase 7 concurrency fix: a worktree spawn WAITS for a concurrent same-project
+    # spawn (parallel workers are legitimate, design §2.2) instead of rejecting.
+    # The holder releases shortly; the waiter must then acquire, not raise.
+    import threading
+
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def holder() -> None:
+        with project_spawn_lock("erp", root=tmp_path, ttl=60):
+            acquired.set()
+            release.wait(10)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    assert acquired.wait(10)
+    threading.Timer(0.3, release.set).start()
+    with project_spawn_lock("erp", root=tmp_path, ttl=60, wait=10.0):
+        pass  # acquired after the holder released — no LockHeld
+    t.join(10)
+
+
+def test_wait_bounded_gives_up_with_lockheld(tmp_path):
+    # The wait is BOUNDED: a holder that never releases within the budget yields a
+    # clean LockHeld (fail-closed), never an unbounded block.
+    with project_spawn_lock("erp", root=tmp_path, ttl=60):
+        t0 = time.monotonic()
+        with (
+            pytest.raises(LockHeld),
+            project_spawn_lock("erp", root=tmp_path, ttl=60, wait=0.3),
+        ):
+            pass
+        assert 0.25 <= time.monotonic() - t0 < 5.0
+
+
 def test_stale_break_bounded_no_livelock(tmp_path, monkeypatch):
     # A pathological rival that re-creates a STALE lock after EVERY break would spin
     # the retry loop forever without a bound. max_stale_breaks caps it: after N break

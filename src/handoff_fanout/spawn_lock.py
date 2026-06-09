@@ -21,10 +21,27 @@ class LockHeld(Exception): ...
 
 
 @contextlib.contextmanager
-def project_spawn_lock(project: str, *, root: Path, ttl: float = 120.0, max_stale_breaks: int = 5):
+def project_spawn_lock(
+    project: str,
+    *,
+    root: Path,
+    ttl: float = 120.0,
+    max_stale_breaks: int = 5,
+    wait: float = 0.0,
+    poll: float = 0.05,
+):
+    """``wait`` (Phase 7 concurrency fix): seconds to WAIT for a genuinely-held lock
+    before giving up with ``LockHeld``. The default ``0.0`` keeps the original
+    non-blocking semantics — the singlepane §5.4 hard-REJECT and the watchdog's
+    skip-on-contention both depend on an immediate raise. A POSITIVE wait is for
+    callers whose concurrency is LEGITIMATE and must queue rather than reject —
+    parallel worktree workers (design §2.2) serialize their shared-source-repo git
+    mutations here. The wait is bounded (never blocks forever) and polls; a stale
+    (TTL-expired) lock is still broken immediately regardless of ``wait``."""
     lockdir = Path(root) / project / ".spawn.lock"
     lockdir.parent.mkdir(parents=True, exist_ok=True)
     stale_breaks = 0
+    deadline = time.monotonic() + wait
     while True:
         try:
             lockdir.mkdir()  # atomic acquire
@@ -40,6 +57,9 @@ def project_spawn_lock(project: str, *, root: Path, ttl: float = 120.0, max_stal
                 # crash). Does not count as a stale-break.
                 continue
             if age < ttl:
+                if time.monotonic() < deadline:
+                    time.sleep(poll)  # within the wait budget — poll, don't reject
+                    continue
                 # Genuinely held — OR a rival WON the stale-break race and now owns a
                 # FRESH lock. Either way this is a deliberate signal, not an
                 # error-in-handler: suppress the FileExistsError chain.
