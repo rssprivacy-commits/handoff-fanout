@@ -4,6 +4,12 @@ Owner ruling S (2026-06-08): deliver a default single-editor-pane VS Code window
 opted-in project WITHOUT git-worktree isolation. The dump generates an OUT-OF-TREE
 ``.handoff.code-workspace`` (so it never dirties the repo) + a ``queue/<task>.singlepane``
 sidecar the watchdog opens; the handoff-helper extension collapses the side bars on load.
+
+Phase 2 (2026-06-09 spawn-window-unify R2 M1/M4): the ``window.title`` now binds
+``project·task·role·spawn_nonce`` (via ``spawn_nonce.title_for``) so the watchdog can ATOMICALLY
+prove the front window is the exact one we launched, and the sidecar is now **JSON** (breaking
+migration from the old plain-path text) carrying ``role``/``close_policy``/``spawn_nonce``/
+``predecessor_nonce`` for the watchdog read side + role-gated autoclose.
 """
 
 from __future__ import annotations
@@ -13,6 +19,9 @@ from pathlib import Path
 
 from handoff_fanout import config as _config
 from handoff_fanout import dump
+
+# A fixed, unmistakable nonce for the assertions (real spawns use spawn_nonce.new_nonce()).
+_NONCE = "deadbeefcafef00d"
 
 
 def _cfg(home: Path, singlepane: list[str]) -> _config.Config:
@@ -27,12 +36,21 @@ def test_optin_writes_sidecar_and_out_of_tree_workspace(tmp_path: Path) -> None:
     real_repo.mkdir()
 
     dump.maybe_write_singlepane_sidecar(
-        cfg, "wilde-hexe", "wh-foo", real_repo, qd, worktree_active=False
+        cfg,
+        "wilde-hexe",
+        "wh-foo",
+        real_repo,
+        qd,
+        worktree_active=False,
+        role="worker",
+        close_policy="keep",
+        spawn_nonce=_NONCE,
     )
 
     sidecar = qd / "wh-foo.singlepane"
     assert sidecar.exists()
-    ws_file = Path(sidecar.read_text())
+    meta = json.loads(sidecar.read_text())  # JSON sidecar now (was plain path)
+    ws_file = Path(meta["workspace"])
     # OUT-OF-TREE: lives under $HANDOFF_HOME/<project>/singlepane, NOT in the repo tree.
     assert ws_file.parent == tmp_path / "wilde-hexe" / "singlepane"
     assert real_repo not in ws_file.parents
@@ -42,6 +60,16 @@ def test_optin_writes_sidecar_and_out_of_tree_workspace(tmp_path: Path) -> None:
     assert spec["folders"] == [{"path": str(real_repo)}]  # window opens the REAL repo
     assert "wh-foo" in spec["settings"]["window.title"]  # task token for the submit guard
     assert spec["settings"]["workbench.activityBar.location"] == "hidden"  # single pane
+    # P0 THIN workspace: settings carry ONLY window.title + the single-pane UX keys — never a
+    # coordinator/inject config block (per-project gating must stay in the repo's own .vscode so
+    # v1.12.0 gating still governs it). Lock the exact key set so a regression can't smuggle one in.
+    assert set(spec) == {"folders", "settings"}
+    assert set(spec["settings"]) == {
+        "window.title",
+        "workbench.activityBar.location",
+        "workbench.startupEditor",
+        "claudeCode.preferredLocation",
+    }
 
 
 def test_worktree_active_removes_sidecar(tmp_path: Path) -> None:
@@ -52,7 +80,15 @@ def test_worktree_active_removes_sidecar(tmp_path: Path) -> None:
     sidecar = qd / "wh-foo.singlepane"
     sidecar.write_text("stale")  # pretend a prior run left one
     dump.maybe_write_singlepane_sidecar(
-        cfg, "wilde-hexe", "wh-foo", tmp_path, qd, worktree_active=True
+        cfg,
+        "wilde-hexe",
+        "wh-foo",
+        tmp_path,
+        qd,
+        worktree_active=True,
+        role="worker",
+        close_policy="keep",
+        spawn_nonce=_NONCE,
     )
     assert not sidecar.exists()
 
@@ -64,7 +100,15 @@ def test_non_optin_project_no_sidecar_and_cleans_stale(tmp_path: Path) -> None:
     sidecar = qd / "erp-bar.singlepane"
     sidecar.write_text("stale-optin")  # a config flip-off must clean this up
     dump.maybe_write_singlepane_sidecar(
-        cfg, "erp-system", "erp-bar", tmp_path, qd, worktree_active=False
+        cfg,
+        "erp-system",
+        "erp-bar",
+        tmp_path,
+        qd,
+        worktree_active=False,
+        role="worker",
+        close_policy="keep",
+        spawn_nonce=_NONCE,
     )
     assert not sidecar.exists()
 
@@ -76,3 +120,63 @@ def test_singlepane_projects_fail_open_on_degenerate(tmp_path: Path) -> None:
     assert _config._from_dict(
         {"singlepane_projects": ["wilde-hexe", "", "x"]}, home=tmp_path
     ).singlepane_projects == ["wilde-hexe", "x"]
+
+
+def test_sidecar_json_carries_nonce_role(tmp_path: Path) -> None:
+    """The sidecar is JSON now (breaking migration from plain-path): it carries the role,
+    close_policy, spawn_nonce + predecessor_nonce the watchdog read side / role-gated autoclose
+    need — not just the bare workspace path."""
+    cfg = _cfg(tmp_path, ["wilde-hexe"])
+    qd = tmp_path / "wilde-hexe" / "queue"
+    qd.mkdir(parents=True)
+    real_repo = tmp_path / "repo"
+    real_repo.mkdir()
+
+    dump.maybe_write_singlepane_sidecar(
+        cfg,
+        "wilde-hexe",
+        "wh-foo",
+        real_repo,
+        qd,
+        worktree_active=False,
+        role="worker",
+        close_policy="keep",
+        spawn_nonce=_NONCE,
+    )
+
+    meta = json.loads((qd / "wh-foo.singlepane").read_text())
+    assert meta["role"] == "worker"
+    assert meta["close_policy"] == "keep"
+    assert meta["spawn_nonce"] == _NONCE
+    assert meta["predecessor_nonce"] is None  # a worker spawn has no predecessor to close
+    assert Path(meta["workspace"]).name.endswith(".handoff.code-workspace")
+
+
+def test_title_carries_nonce(tmp_path: Path) -> None:
+    """window.title binds project·task·role·nonce so the watchdog can ATOMICALLY match the front
+    window by the unguessable spawn_nonce (osascript substring `contains`), while KEEPING the task
+    token for backward-compat with the existing task-match submit guard."""
+    cfg = _cfg(tmp_path, ["wilde-hexe"])
+    qd = tmp_path / "wilde-hexe" / "queue"
+    qd.mkdir(parents=True)
+    real_repo = tmp_path / "repo"
+    real_repo.mkdir()
+
+    dump.maybe_write_singlepane_sidecar(
+        cfg,
+        "wilde-hexe",
+        "wh-foo",
+        real_repo,
+        qd,
+        worktree_active=False,
+        role="worker",
+        close_policy="keep",
+        spawn_nonce=_NONCE,
+    )
+
+    ws_file = Path(json.loads((qd / "wh-foo.singlepane").read_text())["workspace"])
+    title = json.loads(ws_file.read_text())["settings"]["window.title"]
+    assert _NONCE in title  # nonce — the strong atomic gate
+    assert "worker" in title  # role
+    assert "wilde-hexe" in title  # project
+    assert "wh-foo" in title  # task token (backward-compat with the task-match submit guard)

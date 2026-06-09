@@ -34,6 +34,7 @@ from pathlib import Path
 
 from handoff_fanout import atomic, retro_gate, templates
 from handoff_fanout import config as _config
+from handoff_fanout import spawn_nonce as _spawn_nonce
 from handoff_fanout import worktree as _worktree
 from handoff_fanout.git_guard import git_guard_dir
 from handoff_fanout.handoff_precheck import (
@@ -447,16 +448,29 @@ def maybe_write_singlepane_sidecar(
     queue_dir: Path,
     *,
     worktree_active: bool,
+    role: str,
+    close_policy: str,
+    spawn_nonce: str,
+    predecessor_nonce: str | None = None,
 ) -> None:
     """Single-pane (non-worktree) spawn: if ``project`` opts in via ``singlepane_projects``
     and this is NOT a worktree spawn, generate an OUT-OF-TREE ``.handoff.code-workspace``
-    (``folders`` → the real ``workspace``; ``window.title`` carries ``task``) under
-    ``$HANDOFF_HOME/<project>/singlepane/`` and drop a ``queue/<task>.singlepane`` sidecar
-    holding its path. The watchdog opens THAT file (cold-style ``code -n``) so the
-    handoff-helper extension collapses both side bars on load (single editor pane) — guarded
-    by the ``.handoff.code-workspace`` suffix — while the agent still works in the real repo
-    (no isolation, today's concurrency). It is written OUT-OF-TREE (not in the repo) so it
-    never dirties the working tree.
+    (``folders`` → the real ``workspace``; ``window.title`` binds ``project·task·role·spawn_nonce``)
+    under ``$HANDOFF_HOME/<project>/singlepane/`` and drop a ``queue/<task>.singlepane`` JSON
+    sidecar. The watchdog opens the workspace file (cold-style ``code -n``) so the handoff-helper
+    extension collapses both side bars on load (single editor pane) — guarded by the
+    ``.handoff.code-workspace`` suffix — while the agent still works in the real repo (no isolation,
+    today's concurrency). It is written OUT-OF-TREE (not in the repo) so it never dirties the tree.
+
+    Phase 2 (spawn-window-unify R2 M1/M4): the ``window.title`` carries the unguessable
+    ``spawn_nonce`` (via ``spawn_nonce.title_for``) so the watchdog can ATOMICALLY prove the front
+    window is the exact one we launched (kills focus-drift TOCTOU) — substring ``contains`` in
+    osascript. The task token is KEPT in the title for backward-compat with the existing task-match
+    submit guard. The sidecar is now **JSON** (breaking migration from the old plain-path text):
+    ``{workspace, role, close_policy, spawn_nonce, predecessor_nonce}`` — the watchdog reads
+    ``workspace`` (open target) + ``spawn_nonce`` (atomic title gate), and ``role``/``close_policy``/
+    ``predecessor_nonce`` drive role-gated autoclose downstream. The write + watchdog read + tests
+    migrate together (the read side cannot ``cat`` a path out of JSON).
 
     Cleanup/no-op otherwise: a project that does NOT opt in, or a worktree spawn (which has
     its own ``.handoff.code-workspace`` and wins), gets the sidecar REMOVED so a stale opt-in
@@ -475,14 +489,21 @@ def maybe_write_singlepane_sidecar(
                 {
                     "folders": [{"path": str(workspace)}],
                     "settings": {
-                        # ${...} are VS Code window-title variables (literal here; VS Code expands them).
-                        # The task token in the title is what the watchdog's window-guarded submit matches.
+                        # project·task·role·nonce via the Phase-1 title_for so the watchdog can match
+                        # the front window by the unguessable spawn_nonce (osascript substring `contains`,
+                        # kills focus-drift TOCTOU). KEEP the task token (backward-compat task-match) + the
+                        # [singlepane] marker + the VS Code ${activeEditorShort} display variable (literal
+                        # here; VS Code expands ${...} at runtime).
                         "window.title": (
-                            f"{project} · {task} [singlepane]${{separator}}${{activeEditorShort}}"
+                            _spawn_nonce.title_for(
+                                project=project, task_id=task, role=role, nonce=spawn_nonce
+                            )
+                            + " [singlepane]${separator}${activeEditorShort}"
                         ),
                         # Same declarative single-pane settings the worktree workspace uses (see
                         # worktree.write_workspace_file): hide the activity bar (removes the empty
-                        # Claude sidebar focus competitor) + no Welcome tab.
+                        # Claude sidebar focus competitor) + no Welcome tab. P0 THIN workspace — these
+                        # UX keys only, never a coordinator/inject config block.
                         "workbench.activityBar.location": "hidden",
                         "workbench.startupEditor": "none",
                         "claudeCode.preferredLocation": "panel",
@@ -492,7 +513,21 @@ def maybe_write_singlepane_sidecar(
             ),
             encoding="utf-8",
         )
-        sidecar.write_text(str(ws_file), encoding="utf-8")
+        # JSON sidecar (breaking migration from the old plain-path text): watchdog reads `workspace`
+        # (open target) + `spawn_nonce` (atomic title gate); role/close_policy/predecessor_nonce feed
+        # role-gated autoclose (worker → keep / supervisor_succession → close_predecessor).
+        sidecar.write_text(
+            json.dumps(
+                {
+                    "workspace": str(ws_file),
+                    "role": role,
+                    "close_policy": close_policy,
+                    "spawn_nonce": spawn_nonce,
+                    "predecessor_nonce": predecessor_nonce,
+                }
+            ),
+            encoding="utf-8",
+        )
     except OSError as e:
         print(f"[dump] (non-fatal) could not write singlepane workspace: {e}")
         sidecar.unlink(missing_ok=True)
@@ -711,6 +746,9 @@ def write_active_dump(
         worktree_active=bool(
             worktree_info and worktree_info.get("status") == _worktree.ST_CREATED
         ),
+        role="worker",
+        close_policy="keep",
+        spawn_nonce=_spawn_nonce.new_nonce(),
     )
 
     _maybe_pbcopy(handoff_content)
@@ -980,7 +1018,15 @@ def handle_open_batch(
         # Single-pane (non-worktree): open-batch sub-tasks run on the main repo (codex R2),
         # so they qualify for the single-pane window like the single-task path.
         maybe_write_singlepane_sidecar(
-            cfg, project, sub_id, workspace, queue_dir, worktree_active=False
+            cfg,
+            project,
+            sub_id,
+            workspace,
+            queue_dir,
+            worktree_active=False,
+            role="worker",
+            close_policy="keep",
+            spawn_nonce=_spawn_nonce.new_nonce(),
         )
         uri = build_uri(cfg, project, sub_id)
         # Launcher-visible trigger — atomic_replace (see the .md note above).
@@ -1057,7 +1103,15 @@ def trigger_fan_in_if_ready(
     atomic.atomic_replace(queue_dir / f"{fan_in_task}.md", content)
 
     maybe_write_singlepane_sidecar(
-        cfg, project, fan_in_task, workspace, queue_dir, worktree_active=False
+        cfg,
+        project,
+        fan_in_task,
+        workspace,
+        queue_dir,
+        worktree_active=False,
+        role="worker",
+        close_policy="keep",
+        spawn_nonce=_spawn_nonce.new_nonce(),
     )
     uri = build_uri(cfg, project, fan_in_task)
     atomic.atomic_replace(
