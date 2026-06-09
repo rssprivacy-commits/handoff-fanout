@@ -1524,6 +1524,9 @@ def resolve_spawn_workspace(
         task=args.task,
         cfg=cfg,
         mode=mode,
+        # §五·2 (2026-06-09 owner立法): a 中枢 dump red-tops its worktree window. getattr keeps
+        # batch / fan-in / legacy callers (whose args lack --coordinator) working unchanged.
+        is_coordinator=getattr(args, "coordinator", False),
     )
     if result.is_blocked:
         head = _worktree.head_sha(source_workspace) or "(unknown)"
@@ -1628,6 +1631,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-dedupe",
         action="store_true",
         help="(deprecated, ignored) task IDs are exact under v5.4; no timestamp suffix",
+    )
+    # §五·2 (2026-06-09 owner立法 / handoff-fanout 派窗路径红顶普适化): mark the spawned session as a
+    # supervisor center (中枢). Its isolated worktree's .handoff.code-workspace gets a red title bar +
+    # 🧭中枢· prefix (byte-parity with dx-spawn-session.sh --coordinator) so the owner can't misclose
+    # the 中枢 among many windows. Effective only on the worktree-isolation active path; a no-op for
+    # non-中枢 dumps (byte-identical legacy behavior).
+    ap.add_argument(
+        "--coordinator",
+        action="store_true",
+        help="red-top the spawned worktree window (supervisor center / 中枢; §五 防误关)",
     )
     return ap
 

@@ -294,6 +294,210 @@ def test_create_injects_vscode_workspace(home, tmp_path):
     assert wt.is_dirty(r.spawn_workspace)
 
 
+# ─── 监管中枢窗口红顶防误关 (§五 / 2026-06-09 owner立法 / handoff-fanout 派窗路径普适化) ──
+
+# The EXACT proven-rendering red-top spec, byte-parity with dx-spawn-session.sh --coordinator.
+_COORD_RED = {
+    "titleBar.activeBackground": "#8B0000",
+    "titleBar.activeForeground": "#FFFFFF",
+    "titleBar.inactiveBackground": "#5A0000",
+    "titleBar.inactiveForeground": "#E0E0E0",
+}
+# Golden: the EXACT bytes a NON-coordinator worktree workspace must produce (captured from the
+# pre-change engine). Locks zero-regression — any drift in the non-中枢 path fails this test.
+_GOLDEN_NON_COORD = (
+    '{\n  "folders": [\n    {\n      "path": "."\n    }\n  ],\n  "settings": {\n'
+    '    "window.title": "erp-system \\u00b7 stage1-10c [worktree]${separator}${activeEditorShort}",\n'
+    '    "workbench.activityBar.location": "hidden",\n'
+    '    "workbench.startupEditor": "none",\n'
+    '    "claudeCode.preferredLocation": "panel"\n  }\n}'
+)
+
+
+def test_inject_vscode_workspace_coordinator_redtop(tmp_path):
+    """A coordinator worktree's .handoff.code-workspace must carry the red title bar +
+    🧭中枢· prefix (visual parity with dx-spawn-session.sh --coordinator) so the owner can't
+    misclose the 中枢 among many windows — §五·2 (2026-06-09 owner立法)."""
+    src = tmp_path / "src"
+    src.mkdir()
+    wtree = tmp_path / "wt"
+    wtree.mkdir()
+    p = wt.inject_vscode_workspace(
+        src, wtree, "erp-system", "erp-dev-coord-14", is_coordinator=True
+    )
+    s = json.loads(Path(p).read_text())["settings"]
+    # 🧭中枢· prefix, BUT project+task retained → window stays identifiable.
+    assert s["window.title"].startswith("🧭中枢·")
+    assert "erp-system" in s["window.title"]
+    assert "erp-dev-coord-14" in s["window.title"]
+    # exact red values — the proven-rendering spec (colors > text for non-technical owner).
+    assert s["workbench.colorCustomizations"] == _COORD_RED
+    # the singlepane cold-spawn fields are preserved (red-top is additive, not a rewrite).
+    assert s["workbench.activityBar.location"] == "hidden"
+    assert s["claudeCode.preferredLocation"] == "panel"
+
+
+def test_inject_vscode_workspace_default_byte_identical_baseline(tmp_path):
+    """ZERO REGRESSION (validation gate #2): a NON-coordinator worktree workspace is byte-identical
+    to the pre-change golden AND identical whether is_coordinator is omitted (legacy callers) or
+    explicitly False. No colorCustomizations, no 🧭 in title — non-中枢 windows look exactly as before."""
+    src = tmp_path / "src"
+    src.mkdir()
+    wt_default = tmp_path / "wt_default"
+    wt_default.mkdir()
+    wt_false = tmp_path / "wt_false"
+    wt_false.mkdir()
+    p_default = wt.inject_vscode_workspace(src, wt_default, "erp-system", "stage1-10c")
+    p_false = wt.inject_vscode_workspace(
+        src, wt_false, "erp-system", "stage1-10c", is_coordinator=False
+    )
+    b_default = Path(p_default).read_text()
+    b_false = Path(p_false).read_text()
+    assert b_default == _GOLDEN_NON_COORD  # byte-identical to pre-change engine
+    assert b_default == b_false  # default arg == explicit False
+    s = json.loads(b_default)["settings"]
+    assert "workbench.colorCustomizations" not in s
+    assert "🧭" not in s["window.title"]
+
+
+def test_create_worktree_coordinator_threads_redtop(home, tmp_path):
+    """create_worktree threads is_coordinator → the generated .handoff.code-workspace is red-top.
+    (covers the create_worktree → inject_vscode_workspace hop on the fresh-create path)."""
+    _, ws = _bare_and_clone(tmp_path)
+    cfg = _cfg(home, worktree_link_files=[".env"], worktree_link_venv=False)
+    r = wt.create_worktree(
+        source_workspace=ws,
+        project="erp-system",
+        task="erp-dev-coord-14",
+        cfg=cfg,
+        mode=wt.MODE_ON,
+        is_coordinator=True,
+    )
+    assert r.status == wt.ST_CREATED, r.reason
+    cw = r.spawn_workspace / wt.WORKTREE_VSCODE_FILE
+    s = json.loads(cw.read_text())["settings"]
+    assert s["window.title"].startswith("🧭中枢·")
+    assert s["workbench.colorCustomizations"] == _COORD_RED
+
+
+def test_inject_vscode_workspace_coordinator_repaints_existing_non_red(tmp_path):
+    """REUSE path — §五·2 absolute invariant "只要是中枢窗口就必须红顶" (codex+gemini 双脑共识 finding).
+    When a coordinator worktree REUSES a pre-existing .handoff.code-workspace that lacks red-top
+    (pre-patch engine / first created without --coordinator), inject must PATCH the red-top in — not
+    silently return the non-red file. Non-coordinator reuse stays a byte-identical no-op (user-file
+    protection / R2 Gemini P0-2 preserved). Idempotent: re-running never double-prefixes the title."""
+    src = tmp_path / "src"
+    src.mkdir()
+    wtree = tmp_path / "wt"
+    wtree.mkdir()
+    # pre-existing NON-red engine file (as a pre-patch / non-coordinator run would leave it).
+    p0 = wt.inject_vscode_workspace(src, wtree, "erp-system", "role-flip")
+    before = Path(p0).read_text()
+    assert "workbench.colorCustomizations" not in json.loads(before)["settings"]
+    # NON-coordinator reuse → byte-identical no-op (never clobber an existing file).
+    wt.inject_vscode_workspace(src, wtree, "erp-system", "role-flip", is_coordinator=False)
+    assert Path(p0).read_text() == before
+    # COORDINATOR reuse → red-top patched into the existing file.
+    wt.inject_vscode_workspace(src, wtree, "erp-system", "role-flip", is_coordinator=True)
+    s = json.loads(Path(p0).read_text())["settings"]
+    assert s["window.title"].startswith("🧭中枢·")
+    assert s["workbench.colorCustomizations"] == _COORD_RED
+    # idempotent: a 2nd coordinator reuse must NOT double-prefix the title.
+    wt.inject_vscode_workspace(src, wtree, "erp-system", "role-flip", is_coordinator=True)
+    s2 = json.loads(Path(p0).read_text())["settings"]
+    assert s2["window.title"].count("🧭中枢·") == 1
+
+
+def test_inject_vscode_workspace_coordinator_leaves_unparseable_file(tmp_path):
+    """Best-effort guard: a pre-existing UNPARSEABLE .handoff.code-workspace (some user's odd file)
+    is left untouched even for a coordinator — never destroy unknown content (codex: 'fail/warn,
+    don't clobber'). The dump still proceeds (returns the path)."""
+    src = tmp_path / "src"
+    src.mkdir()
+    wtree = tmp_path / "wt"
+    wtree.mkdir()
+    junk = "this is not json {{{"
+    (wtree / wt.WORKTREE_VSCODE_FILE).write_text(junk)
+    p = wt.inject_vscode_workspace(src, wtree, "erp-system", "role-flip", is_coordinator=True)
+    assert p == str(wtree / wt.WORKTREE_VSCODE_FILE)
+    assert (wtree / wt.WORKTREE_VSCODE_FILE).read_text() == junk  # untouched
+
+
+def test_coordinator_redtop_merges_preserves_other_user_colors(tmp_path):
+    """REUSE patch must MERGE the red titleBar keys into an existing colorCustomizations dict, NOT
+    replace it — a user's unrelated colors (editor.background, …) must survive (gemini round-2 P0 /
+    never destroy user content)."""
+    src = tmp_path / "src"
+    src.mkdir()
+    wtree = tmp_path / "wt"
+    wtree.mkdir()
+    (wtree / wt.WORKTREE_VSCODE_FILE).write_text(
+        json.dumps(
+            {
+                "folders": [{"path": "."}],
+                "settings": {
+                    "window.title": "x",
+                    "workbench.colorCustomizations": {"editor.background": "#000000"},
+                },
+            },
+            indent=2,
+        )
+    )
+    wt.inject_vscode_workspace(src, wtree, "erp-system", "role-flip", is_coordinator=True)
+    cc = json.loads((wtree / wt.WORKTREE_VSCODE_FILE).read_text())["settings"][
+        "workbench.colorCustomizations"
+    ]
+    assert cc["editor.background"] == "#000000"  # user's unrelated color survives
+    assert cc["titleBar.activeBackground"] == "#8B0000"  # red merged in
+    assert cc["titleBar.inactiveBackground"] == "#5A0000"
+
+
+def test_coordinator_redtop_warns_when_cannot_apply(tmp_path, capsys):
+    """禁止静默降级铁律 (codex+gemini round-2 P1): when a coordinator worktree's existing workspace
+    can't be red-topped (unparseable / non-engine), the dump still proceeds (never brick) BUT emits
+    a VISIBLE stderr warning — a non-red 中枢 window must NOT slip out silently."""
+    src = tmp_path / "src"
+    src.mkdir()
+    wtree = tmp_path / "wt"
+    wtree.mkdir()
+    (wtree / wt.WORKTREE_VSCODE_FILE).write_text("not json {{{")
+    wt.inject_vscode_workspace(src, wtree, "erp-system", "role-flip", is_coordinator=True)
+    err = capsys.readouterr().err
+    assert "中枢" in err or "coordinator" in err.lower()
+    assert "🧭" in err
+    assert "WARN" in err  # round-3 codex: a literal token so logs/scripts can grep the degrade signal
+
+
+def test_coordinator_redtop_missing_title_fallback(tmp_path):
+    """Edge (gemini round-2 P2): a reused file whose window.title was deleted still gets a
+    🧭中枢·-marked fallback title (project+task identifiable) — not just red, the 中枢 text marker too."""
+    src = tmp_path / "src"
+    src.mkdir()
+    wtree = tmp_path / "wt"
+    wtree.mkdir()
+    (wtree / wt.WORKTREE_VSCODE_FILE).write_text(
+        json.dumps({"folders": [{"path": "."}], "settings": {"workbench.startupEditor": "none"}}, indent=2)
+    )
+    wt.inject_vscode_workspace(src, wtree, "erp-system", "role-flip", is_coordinator=True)
+    s = json.loads((wtree / wt.WORKTREE_VSCODE_FILE).read_text())["settings"]
+    assert s["window.title"].startswith("🧭中枢·")
+    assert "role-flip" in s["window.title"]  # fallback stays identifiable
+    assert s["workbench.colorCustomizations"]["titleBar.activeBackground"] == "#8B0000"
+
+
+def test_create_worktree_default_no_redtop(home, tmp_path):
+    """create_worktree without is_coordinator → NO red-top (zero regression at the create layer)."""
+    _, ws = _bare_and_clone(tmp_path)
+    cfg = _cfg(home, worktree_link_files=[".env"], worktree_link_venv=False)
+    r = wt.create_worktree(
+        source_workspace=ws, project="erp-system", task="stage1-10c", cfg=cfg, mode=wt.MODE_ON
+    )
+    assert r.status == wt.ST_CREATED, r.reason
+    s = json.loads((r.spawn_workspace / wt.WORKTREE_VSCODE_FILE).read_text())["settings"]
+    assert "workbench.colorCustomizations" not in s
+    assert "🧭" not in s["window.title"]
+
+
 def test_create_blocks_on_unpublished_head(home, tmp_path):
     _, ws = _bare_and_clone(tmp_path)
     _commit(ws, "new.txt", "wip", "unpublished work")  # committed but NOT pushed

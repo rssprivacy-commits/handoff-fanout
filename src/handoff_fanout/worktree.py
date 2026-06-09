@@ -503,6 +503,79 @@ def _block(source_workspace: Path, reason: str, **extra) -> WorktreeResult:
     )
 
 
+# 监管中枢窗口红顶防误关 (§五·2 / 2026-06-09 owner立法). Byte-identical to the proven-rendering
+# spec in ``dx-spawn-session.sh --coordinator`` so handoff-fanout's worktree spawn path and the
+# plain cross-project spawn path render an IDENTICAL red block + title prefix.
+_COORDINATOR_TITLE_PREFIX = "🧭中枢·"
+_COORDINATOR_RED_TITLEBAR = {
+    "titleBar.activeBackground": "#8B0000",
+    "titleBar.activeForeground": "#FFFFFF",
+    "titleBar.inactiveBackground": "#5A0000",
+    "titleBar.inactiveForeground": "#E0E0E0",
+}
+
+
+def _warn_coordinator_unredtopped(ws_file: Path, why: str) -> None:
+    """禁止静默降级铁律 (codex+gemini round-2 P1): a coordinator window that can't be red-topped must
+    NOT slip out silently — emit a visible stderr warning so the owner/center knows a 中枢 window
+    will open without its 防误关 marker. Still never bricks the dump (UX polish is best-effort)."""
+    sys.stderr.write(
+        f"[worktree][WARN] ⚠️ 🧭中枢 红顶未能应用到 {ws_file} ({why}); "
+        f"该窗口将无红顶标记 — 留意误关 (§五·2 / 禁止静默降级)\n"
+    )
+
+
+def _ensure_coordinator_redtop(ws_file: Path, project: str, task: str) -> None:
+    """Idempotently patch the §五·2 red-top into an EXISTING ``.handoff.code-workspace`` when a
+    coordinator worktree is REUSED (codex+gemini 双脑共识 finding 2026-06-09): the fresh-create path
+    injects red-top directly, but a reused worktree whose file predates this patch — or was first
+    created without ``--coordinator`` — would otherwise open WITHOUT red, silently breaking the
+    absolute invariant "只要是中枢窗口就必须红顶".
+
+    - title: add the 🧭中枢· prefix; if it was deleted (missing / non-str) install a marked,
+      identifiable fallback (round-2 gemini P2 — keep the text marker, not just the color).
+    - colors: **MERGE** the red titleBar keys into any existing ``colorCustomizations`` rather than
+      replacing the whole dict — a user's unrelated colors (editor.background, …) must survive
+      (round-2 gemini P0 — never destroy user content).
+    - rewrite only when something actually changed (no needless born-dirty churn / no double-prefix).
+    - on a genuinely un-patchable file (unparseable / no ``settings`` dict / write OSError) leave the
+      content untouched BUT WARN (round-2 codex+gemini P1: 降级不静默) — never brick the dump."""
+    try:
+        data = json.loads(ws_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        _warn_coordinator_unredtopped(ws_file, "unreadable / non-JSON")
+        return
+    settings = data.get("settings") if isinstance(data, dict) else None
+    if not isinstance(settings, dict):
+        _warn_coordinator_unredtopped(ws_file, "no settings object")
+        return
+    changed = False
+    title = settings.get("window.title")
+    if not isinstance(title, str):
+        settings["window.title"] = (
+            f"{_COORDINATOR_TITLE_PREFIX}{project} · {task} "
+            "[worktree]${separator}${activeEditorShort}"
+        )
+        changed = True
+    elif not title.startswith(_COORDINATOR_TITLE_PREFIX):
+        settings["window.title"] = _COORDINATOR_TITLE_PREFIX + title
+        changed = True
+    colors = settings.get("workbench.colorCustomizations")
+    if not isinstance(colors, dict):
+        settings["workbench.colorCustomizations"] = dict(_COORDINATOR_RED_TITLEBAR)
+        changed = True
+    else:  # MERGE — preserve the user's other colors (round-2 gemini P0).
+        for k, v in _COORDINATOR_RED_TITLEBAR.items():
+            if colors.get(k) != v:
+                colors[k] = v
+                changed = True
+    if changed:
+        try:
+            ws_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except OSError:
+            _warn_coordinator_unredtopped(ws_file, "write failed")
+
+
 def inject_vscode_workspace(
     source_workspace: Path,
     wt: Path,
@@ -511,6 +584,7 @@ def inject_vscode_workspace(
     *,
     spawn_nonce: str | None = None,
     role: str = "worker",
+    is_coordinator: bool = False,
 ) -> str | None:
     """Make a fresh worktree open as an *identifiable VS Code workspace* (option-C / 2026-06-03
     worktree-spawn-bug fix — dual-brain codex+Gemini).
@@ -521,6 +595,13 @@ def inject_vscode_workspace(
     guessable task token). When ``None`` (the legacy ``dump``→``create_worktree`` callers) the title
     is BYTE-IDENTICAL to the pre-Phase-6a form — this kwarg is purely additive; ``dump`` passes
     nothing and is unaffected.
+
+    ``is_coordinator`` (§五·2 / 2026-06-09 owner立法): when the spawned session is a supervisor
+    center (中枢), tint the window red + prefix the title ``🧭中枢·`` so the owner can't misclose it
+    among many windows. A non-中枢 task is byte-identical to the pre-2026-06-09 engine (zero
+    regression). See the ``if is_coordinator`` branch below. Composes with ``spawn_nonce``: the
+    red-top prefix wraps WHATEVER title was computed (nonce-bound or legacy), so nonce gating and
+    coordinator marking are orthogonal.
 
     A bare ``git worktree`` folder, opened via ``code -r <dir>``, (a) titles the window only
     by the dir basename (``stage1-10c`` — unrecognizable as the project) and (b) has no
@@ -554,6 +635,11 @@ def inject_vscode_workspace(
             if spawn_nonce is None:
                 # legacy (``dump``) callers: BYTE-IDENTICAL pre-Phase-6a behavior —
                 # respect a pre-existing (tracked/user) file; never overwrite.
+                # EXCEPTION (§五·2): a coordinator MUST be red-topped even on the reuse path —
+                # idempotently patch the red-top in (a pre-patch / non-coordinator-first file
+                # would else open without red). A non-coordinator stays a byte-identical no-op.
+                if is_coordinator:
+                    _ensure_coordinator_redtop(ws_file, project, task)
                 return str(ws_file)
             # p6a-fix1 MUST 1: a REUSED worktree still holds the previous spawn's workspace
             # file, whose title carries the STALE nonce — but the delivery contract is
@@ -562,13 +648,16 @@ def inject_vscode_workspace(
             # safely rewritten below with the current title; a USER-tracked file is never
             # overwritten — then the title cannot carry this nonce, so return None and let
             # the spawn caller fail closed instead of producing a title↔sidecar mismatch.
+            # (A coordinator spawn hits the same fail-closed: red-top is moot when the nonce
+            # contract itself cannot be honored.)
             # ``ls-files --error-unmatch`` rc: 0=tracked (user content), 1=untracked (the
             # engine wrote it post-checkout; is_dirty discounts it). Any other rc (no git /
             # timeout) is INDETERMINATE → treat as user content (never risk an overwrite).
             rc_tracked, _, _ = _git(["ls-files", "--error-unmatch", "--", WORKTREE_VSCODE_FILE], wt)
             if rc_tracked != 1:
                 return None
-            # fall through: rewrite the engine-generated file with the current nonce title.
+            # fall through: rewrite the engine-generated file with the current nonce title
+            # (the is_coordinator branch below re-applies the red-top on this rewrite).
         # Phase 6a: bind the unguessable nonce into the title when a fresh-spawn supplies one
         # (project·task·role·nonce via title_for + the [worktree] marker). Legacy ``dump`` callers
         # pass spawn_nonce=None → the BYTE-IDENTICAL pre-Phase-6a title (project · task [worktree]…).
@@ -579,34 +668,44 @@ def inject_vscode_workspace(
             )
         else:
             window_title = f"{project} · {task} [worktree]${{separator}}${{activeEditorShort}}"
+        settings = {
+            # ${...} are VS Code window-title variables (literal here; VS Code expands them).
+            "window.title": window_title,
+            # SINGLE-PANE cold spawn (2026-06-06 / dual-brain codex+Gemini + owner ruling).
+            # A fresh worktree window otherwise opens multi-pane (activity bar + Explorer +
+            # an EMPTY Claude SIDEBAR "Message input"); that empty input grabs keyboard focus,
+            # so the synthetic Enter races the URI-pasted CENTER prompt for focus (~40% miss
+            # under load → readiness-gate honestly withholds → owner presses Enter manually).
+            # Fix = collapse to a single editor pane so there is NO focus competitor.
+            # Declarative half (zero-keystroke, the robust core both brains endorsed):
+            #   - activityBar.location:hidden → removes the activity bar AND its Claude
+            #     sidebar view, i.e. the empty "Message input" competitor. (The Explorer alone
+            #     is an AXOutline, not an AXTextArea "Message input", so it never competes.)
+            #   - startupEditor:none → no Welcome tab grabbing initial focus.
+            # Runtime half (auto-continue.sh close_sidebars_if_front_window_contains) idempotently
+            # closes BOTH side bars BEFORE the URI for a literal one-pane look. preferredLocation
+            # stays "panel" (enum is only sidebar|panel; the URI opens Claude in the editor anyway).
+            "workbench.activityBar.location": "hidden",
+            "workbench.startupEditor": "none",
+            "claudeCode.preferredLocation": "panel",
+        }
+        if is_coordinator:
+            # 监管中枢窗口红顶防误关 (§五·2 / 2026-06-09 owner立法 / handoff-fanout 派窗路径普适化).
+            # Byte-parity with ``dx-spawn-session.sh --coordinator`` so the two spawn paths (plain
+            # cross-project spawn vs handoff-fanout worktree) render an IDENTICAL red block + 🧭中枢
+            # title — owner辨中枢、防误关 across whichever path emitted the window. Colors > text:
+            # a non-technical owner scanning many windows can't visually ignore a red title bar.
+            # ADDITIVE & ORDER-PRESERVING: ``window.title`` keeps project+task (still identifiable;
+            # when spawn_nonce is set the nonce-bound title is wrapped, keeping the watchdog's
+            # substring nonce gate intact) and the singlepane fields are untouched, so a non-中枢
+            # task is byte-identical to the pre-2026-06-09 engine (validation gate #2). NOT
+            # ``ensure_ascii=False`` — that would change the non-coordinator bytes too; VS Code's
+            # JSON parser decodes the 🧭中枢 \uXXXX escapes back to the glyphs (osascript-confirmed
+            # in the spawn e2e).
+            settings["window.title"] = _COORDINATOR_TITLE_PREFIX + settings["window.title"]
+            settings["workbench.colorCustomizations"] = dict(_COORDINATOR_RED_TITLEBAR)
         ws_file.write_text(
-            json.dumps(
-                {
-                    "folders": [{"path": "."}],
-                    "settings": {
-                        # ${...} are VS Code window-title variables (literal here; VS Code expands them).
-                        "window.title": window_title,
-                        # SINGLE-PANE cold spawn (2026-06-06 / dual-brain codex+Gemini + owner ruling).
-                        # A fresh worktree window otherwise opens multi-pane (activity bar + Explorer +
-                        # an EMPTY Claude SIDEBAR "Message input"); that empty input grabs keyboard focus,
-                        # so the synthetic Enter races the URI-pasted CENTER prompt for focus (~40% miss
-                        # under load → readiness-gate honestly withholds → owner presses Enter manually).
-                        # Fix = collapse to a single editor pane so there is NO focus competitor.
-                        # Declarative half (zero-keystroke, the robust core both brains endorsed):
-                        #   - activityBar.location:hidden → removes the activity bar AND its Claude
-                        #     sidebar view, i.e. the empty "Message input" competitor. (The Explorer alone
-                        #     is an AXOutline, not an AXTextArea "Message input", so it never competes.)
-                        #   - startupEditor:none → no Welcome tab grabbing initial focus.
-                        # Runtime half (auto-continue.sh close_sidebars_if_front_window_contains) idempotently
-                        # closes BOTH side bars BEFORE the URI for a literal one-pane look. preferredLocation
-                        # stays "panel" (enum is only sidebar|panel; the URI opens Claude in the editor anyway).
-                        "workbench.activityBar.location": "hidden",
-                        "workbench.startupEditor": "none",
-                        "claudeCode.preferredLocation": "panel",
-                    },
-                },
-                indent=2,
-            ),
+            json.dumps({"folders": [{"path": "."}], "settings": settings}, indent=2),
             encoding="utf-8",
         )
         return str(ws_file)
@@ -624,6 +723,7 @@ def create_worktree(
     env: dict[str, str] | None = None,
     spawn_nonce: str | None = None,
     role: str = "worker",
+    is_coordinator: bool = False,
 ) -> WorktreeResult:
     """Create (or report/degrade/block) a per-session worktree for ``task``.
 
@@ -786,7 +886,13 @@ def create_worktree(
         ):
             linked = link_files(source_workspace, wt, cfg)
             vws = inject_vscode_workspace(
-                source_workspace, wt, project, task, spawn_nonce=spawn_nonce, role=role
+                source_workspace,
+                wt,
+                project,
+                task,
+                spawn_nonce=spawn_nonce,
+                role=role,
+                is_coordinator=is_coordinator,
             )
             return WorktreeResult(
                 status=ST_CREATED,
@@ -844,7 +950,13 @@ def create_worktree(
 
     linked = link_files(source_workspace, wt, cfg)
     vws = inject_vscode_workspace(
-        source_workspace, wt, project, task, spawn_nonce=spawn_nonce, role=role
+        source_workspace,
+        wt,
+        project,
+        task,
+        spawn_nonce=spawn_nonce,
+        role=role,
+        is_coordinator=is_coordinator,
     )
     created_base = head_sha(wt) or base_sha
     return WorktreeResult(
