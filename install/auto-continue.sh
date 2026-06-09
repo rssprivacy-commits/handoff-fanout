@@ -34,6 +34,13 @@ HANDOFF_SHA256_CMD="${HANDOFF_SHA256_CMD:-/usr/bin/shasum}"
 # tests set HANDOFF_SKIP_SPAWN=1 to exercise the overdue-scanner segment
 # without depending on a live VS Code instance.
 HANDOFF_SKIP_SPAWN="${HANDOFF_SKIP_SPAWN:-0}"
+# v4 path-D autoclose (role-gated supervisor succession; spawn-window-unify Task 4.1).
+# Default OFF — opt in via this env or an autoclose.enabled sentinel (global/per-project,
+# 改进 #6). Safe to flip ON globally today: only a `supervisor_succession` spawn ever closes
+# a window, and every current dump writes role="worker" → a no-op until a succession producer
+# lands (dormant-but-ready). HANDOFF_SPAWN_LOCK_TTL mirrors handoff_fanout.spawn_lock.ttl=120.
+HANDOFF_AUTOCLOSE_ENABLED="${HANDOFF_AUTOCLOSE_ENABLED:-0}"
+HANDOFF_SPAWN_LOCK_TTL="${HANDOFF_SPAWN_LOCK_TTL:-120}"
 # tests set HANDOFF_VSCODE_CHECK=0 to skip the `pgrep "Visual Studio Code"`
 # global guard (no-op in CI / headless contexts).
 HANDOFF_VSCODE_CHECK="${HANDOFF_VSCODE_CHECK:-1}"
@@ -194,6 +201,7 @@ fi
 
 SPAWNED=0
 OVERDUE_MARKED=0
+AUTOCLOSED=0
 DEFERRED=0
 shopt -s nullglob
 
@@ -1532,6 +1540,203 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
     scan_overdue_overrides "$PROJ_DIR"
 done
 
-if [ $OVERDUE_MARKED -gt 0 ]; then
-    log "DONE: overdue_marked=$OVERDUE_MARKED this run"
+
+# ─── v4 path-D autoclose — role-gated supervisor-succession close ────────────
+# (spawn-window-unify Task 4.1 — restored from 21dad1b, adapted to the Phase 4
+# role-gated consumer + Phase 2 JSON sidecar + Phase 1 project spawn lock.)
+#
+# Opt-in (HANDOFF_AUTOCLOSE_ENABLED / autoclose.enabled sentinel). The watcher
+# only fires when a fresh successor tab has been submitted (ack/<task>.submitted),
+# its retro evidence is intact (ack/<task>.old_ready — owner's re-enablement gate:
+# never close a window that didn't finish its retro), AND the Phase 2 singlepane
+# sidecar declares this spawn a `supervisor_succession` carrying the predecessor's
+# spawn_nonce. A `worker` (the common case) closes nothing — the parallel worker
+# windows accumulate by design. The extension (handleAutoclose, c2ac814) is the
+# precise self-targeting actor: only the window whose own title carries
+# predecessor_nonce closes itself; everything else fail-closes. The watcher is
+# the producer of `?role=supervisor_succession&predecessor_nonce=…` — it never
+# decides WHICH window dies, only that a close is warranted.
+
+# epoch mtime of a path. BSD (`stat -f %m`, macOS) first, GNU (`stat -c %Y`,
+# Linux CI) fallback — the lock-staleness math must work on both.
+mtime_sec() {
+    stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
+}
+
+# Break a lock dir older than ttl seconds (a crashed holder must not deadlock the
+# project forever). Mirrors handoff_fanout.spawn_lock's TTL stale-break. Idempotent.
+clean_stale_lock() {
+    local lock="$1" ttl="$2"
+    [ -d "$lock" ] || return 0
+    local mt; mt=$(mtime_sec "$lock") || return 0
+    [ -z "$mt" ] && return 0
+    local now; now=$(/bin/date +%s)
+    if [ "$((now - mt))" -gt "$ttl" ]; then
+        rmdir "$lock" 2>/dev/null || true
+    fi
+}
+
+# sha256 of a file via whichever helper the host provides (shasum on macOS,
+# sha256sum on Linux) — must agree with dump.compute_retro_evidence_hash (plain
+# file-bytes sha256) so a hash-tamper is caught.
+sha256_file() {
+    local f="$1"
+    if [ -x "$HANDOFF_SHA256_CMD" ] && [ "$(basename "$HANDOFF_SHA256_CMD")" = "shasum" ]; then
+        "$HANDOFF_SHA256_CMD" -a 256 "$f" 2>/dev/null | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$f" 2>/dev/null | awk '{print $1}'
+    else
+        /usr/bin/shasum -a 256 "$f" 2>/dev/null | awk '{print $1}'
+    fi
+}
+
+# A spawn nonce is secrets.token_hex(8) → exactly 16 lowercase hex chars. Mirror
+# the extension's NONCE_RE so we reject a malformed predecessor_nonce HERE (record
+# a failure marker) instead of firing a URI the extension would only fail-close on.
+is_hex16() {
+    case "$1" in
+        ""|*[!0-9a-f]*) return 1 ;;
+    esac
+    [ "${#1}" -eq 16 ]
+}
+
+autoclose_enabled_for_project() {
+    local proj_dir="$1"
+    [ "$HANDOFF_AUTOCLOSE_ENABLED" = "1" ] && return 0
+    [ -f "$HANDOFF_ROOT/autoclose.enabled" ] && return 0
+    [ -f "$proj_dir/autoclose.enabled" ] && return 0
+    return 1
+}
+
+# old_ready.schema_version whitelist. Keep in sync with
+# handoff_precheck.EVIDENCE_SCHEMA_VERSION (== dump.OLD_READY_SCHEMA_VERSION).
+KNOWN_SCHEMA_VERSIONS="5.5.0"
+ROLE_SUCCESSION="supervisor_succession"
+
+# Validate the retro + role gates, then fire the helper URI under the project
+# spawn lock. Every failure path leaves a `<task>.autoclose_failed.txt` so the
+# watcher won't loop on the same task; non-fire SKIP paths (worker / no sidecar /
+# BLOCKED) leave NO marker (they may legitimately become fire-able later, e.g. a
+# sidecar that lands on the next dump).
+try_autoclose() {
+    local proj_dir="$1"; local task="$2"
+    local project; project=$(basename "$proj_dir")
+    local ack="$proj_dir/ack"
+    local queue="$proj_dir/queue"
+    local old_ready="$ack/$task.old_ready"
+    local sidecar="$queue/$task.singlepane"
+    local done_marker="$ack/$task.autoclose_done"
+    local failed_marker="$ack/$task.autoclose_failed.txt"
+
+    [ -f "$done_marker" ] && return 0
+    [ -f "$failed_marker" ] && return 0
+    [ -f "$queue/$task.BLOCKED.md" ] && {
+        log "AUTOCLOSE-SKIP: project=$project task=$task — BLOCKED.md present"
+        return 0
+    }
+    [ -f "$queue/$task.done" ] && return 0
+    [ -f "$old_ready" ] || return 0
+
+    # ── Role gate (Phase 4 contract): only a supervisor_succession spawn closes a
+    # predecessor. role + predecessor_nonce live in the Phase 2 JSON sidecar. No
+    # sidecar / role!=succession (e.g. role=worker) ⇒ silent SKIP, never a failure
+    # marker — a worker window legitimately keeps, and a non-singlepane spawn has no
+    # sidecar at all. Mirrors the extension's worker-keep / fail-closed semantics.
+    [ -f "$sidecar" ] || return 0
+    local role; role=$(json_get "$sidecar" "role")
+    [ "$role" = "$ROLE_SUCCESSION" ] || return 0
+    local pred_nonce; pred_nonce=$(json_get "$sidecar" "predecessor_nonce")
+    if ! is_hex16 "$pred_nonce"; then
+        printf 'task_id: %s\nreason: predecessor_nonce_invalid\npredecessor_nonce: %s\ntime: %s\n' \
+            "$task" "$pred_nonce" "$(now_iso_utc)" > "$failed_marker"
+        log "AUTOCLOSE-FAIL: project=$project task=$task reason=predecessor_nonce_invalid"
+        return 0
+    fi
+    # The successor's own spawn_nonce → the URI `nonce` (diagnostic; the extension
+    # gates on predecessor_nonce, not this). Fall back to old_ready.nonce if the
+    # sidecar omitted it (legacy), so the URI always carries something traceable.
+    local new_nonce; new_nonce=$(json_get "$sidecar" "spawn_nonce")
+    [ -z "$new_nonce" ] && new_nonce=$(json_get "$old_ready" "nonce")
+
+    # ── Retro gate (unchanged from 21dad1b): schema whitelist + evidence integrity.
+    local schema; schema=$(json_get "$old_ready" "schema_version")
+    if ! printf '%s\n' "$KNOWN_SCHEMA_VERSIONS" | tr ' ' '\n' | grep -Fxq "$schema"; then
+        printf 'task_id: %s\nreason: schema_version_unknown\nschema_version: %s\ntime: %s\n' \
+            "$task" "$schema" "$(now_iso_utc)" > "$failed_marker"
+        log "AUTOCLOSE-FAIL: project=$project task=$task reason=schema_version_unknown ($schema)"
+        return 0
+    fi
+
+    # Resolve the evidence file: absolute path is the fast path; fall back to the
+    # project-relative path (§7.6 portability) when the absolute path is gone.
+    local rel_path abs_path declared_hash evidence_file
+    declared_hash=$(json_get "$old_ready" "retro_evidence_hash")
+    rel_path=$(json_get "$old_ready" "retro_evidence_path")
+    abs_path=$(json_get "$old_ready" "retro_evidence_path_absolute")
+    if [ -n "$abs_path" ] && [ -f "$abs_path" ]; then
+        evidence_file="$abs_path"
+    elif [ -n "$rel_path" ] && [ -f "$proj_dir/$rel_path" ]; then
+        evidence_file="$proj_dir/$rel_path"
+    else
+        printf 'task_id: %s\nreason: missing_retro_evidence\nrel_path: %s\nabs_path: %s\ntime: %s\n' \
+            "$task" "$rel_path" "$abs_path" "$(now_iso_utc)" > "$failed_marker"
+        log "AUTOCLOSE-FAIL: project=$project task=$task reason=missing_retro_evidence"
+        return 0
+    fi
+    local actual_hash; actual_hash=$(sha256_file "$evidence_file")
+    if [ -z "$actual_hash" ] || [ "$actual_hash" != "$declared_hash" ]; then
+        printf 'task_id: %s\nreason: retro_evidence_invalid\ndeclared: %s\nactual: %s\ntime: %s\n' \
+            "$task" "$declared_hash" "$actual_hash" "$(now_iso_utc)" > "$failed_marker"
+        log "AUTOCLOSE-FAIL: project=$project task=$task reason=retro_evidence_invalid"
+        return 0
+    fi
+
+    # ── Critical section under the PROJECT spawn lock (Phase 1 parity). Same lock
+    # dir + TTL as handoff_fanout.spawn_lock.project_spawn_lock so the close decision
+    # is mutually exclusive with a spawn-intent decision AND with a concurrent
+    # launchd autoclose tick (R2 race fix). Autoclose is best-effort, so on
+    # contention we SKIP (retry next tick) rather than block like the Python CM.
+    local lock="$proj_dir/.spawn.lock"
+    clean_stale_lock "$lock" "$HANDOFF_SPAWN_LOCK_TTL"
+    if ! mkdir "$lock" 2>/dev/null; then
+        log "AUTOCLOSE-SKIP: project=$project task=$task — spawn lock held"
+        return 0
+    fi
+    trap 'rmdir "$lock" 2>/dev/null || true' RETURN
+    # Re-check the idempotency sentinels after acquiring the lock (TOCTOU defence).
+    if [ -f "$done_marker" ] || [ -f "$failed_marker" ]; then
+        rmdir "$lock" 2>/dev/null || true
+        trap - RETURN
+        return 0
+    fi
+
+    local uri="vscode://dharmaxis.handoff-helper/autoclose?task_id=${task}&nonce=${new_nonce}&project=${project}&role=${ROLE_SUCCESSION}&predecessor_nonce=${pred_nonce}"
+    if "$HANDOFF_OPEN_CMD" "$uri" 2>>"$LOG"; then
+        printf 'task_id: %s\nnonce: %s\npredecessor_nonce: %s\nrole: %s\nuri: %s\ntime: %s\n' \
+            "$task" "$new_nonce" "$pred_nonce" "$ROLE_SUCCESSION" "$uri" "$(now_iso_utc)" > "$done_marker"
+        log "AUTOCLOSE: project=$project task=$task uri=$uri"
+        AUTOCLOSED=$((AUTOCLOSED + 1))
+    else
+        printf 'task_id: %s\nnonce: %s\nreason: open_uri_failed\ntime: %s\n' \
+            "$task" "$new_nonce" "$(now_iso_utc)" > "$failed_marker"
+        log "AUTOCLOSE-FAIL: project=$project task=$task reason=open_uri_failed"
+    fi
+    rmdir "$lock" 2>/dev/null || true
+    trap - RETURN
+}
+
+for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
+    [ -d "$PROJ_DIR" ] || continue
+    autoclose_enabled_for_project "$PROJ_DIR" || continue
+    ACK_DIR="$PROJ_DIR/ack"
+    [ -d "$ACK_DIR" ] || continue
+    for SUBMITTED in "$ACK_DIR"/*.submitted; do
+        [ -f "$SUBMITTED" ] || continue
+        TASK=$(basename "$SUBMITTED" .submitted)
+        try_autoclose "$PROJ_DIR" "$TASK"
+    done
+done
+
+if [ $OVERDUE_MARKED -gt 0 ] || [ $AUTOCLOSED -gt 0 ]; then
+    log "DONE: overdue_marked=$OVERDUE_MARKED autoclose=$AUTOCLOSED this run"
 fi
