@@ -16,6 +16,12 @@ export interface HandoffCloseParams {
   task: string | null;
   nonce: string | null;
   project: string | null;
+  // Succession-autoclose params (Phase 4 / R2 M3/M4). The watchdog reads them from
+  // the JSON sidecar ({role, predecessor_nonce, …}) and forwards them as URI query
+  // params, so this module stays pure (no fs, no vscode) — same flow as task/nonce.
+  // Optional: legacy / singlepane URIs don't carry them (parseQuery sets null).
+  role?: string | null; // "worker" | "supervisor_succession"
+  predecessorNonce?: string | null; // the OLD supervisor window's spawn_nonce to close
 }
 
 // Canonical URI contract (settled in D-2):
@@ -41,6 +47,8 @@ export function parseQuery(query: string): HandoffCloseParams {
     task: p.get("task_id"),
     nonce: p.get("nonce"),
     project: p.get("project"),
+    role: p.get("role"),
+    predecessorNonce: p.get("predecessor_nonce"),
   };
 }
 
@@ -50,7 +58,7 @@ export function parseQuery(query: string): HandoffCloseParams {
 // plumbing that is out of scope here).
 const NONCE_RE = /^[0-9a-f]{16}$/;
 
-export function isValidNonce(nonce: string | null | undefined): boolean {
+export function isValidNonce(nonce: string | null | undefined): nonce is string {
   return typeof nonce === "string" && NONCE_RE.test(nonce);
 }
 
@@ -81,18 +89,32 @@ export interface CloseResult {
   retried: boolean;
 }
 
+// The reasons the pure close mechanics (closeNonDirtyWithRetry) can produce — a
+// subset of BOTH CloseReason and AutocloseReason, so its result slots into either
+// caller's return type without a cast.
+export type CloseMechanicsReason = "closed" | "nothing-to-close" | "close-failed";
+
+export interface CloseMechanicsResult {
+  ok: boolean;
+  reason: CloseMechanicsReason;
+  closedCount: number;
+  skippedDirty: number;
+  retried: boolean;
+}
+
 // A3 (master decision): one delayed retry (500ms) then give up.
 export const RETRY_DELAY_MS = 500;
 
 /**
- * Core handoff-close handler.
+ * Coarse close primitive: validate task/nonce params → close every non-dirty tab
+ * in the activated window (dirty-safe, retry-once via closeNonDirtyWithRetry).
  *
- * Flow: validate params → validate nonce format → flatten tabs → skip dirty
- * (A4) → close the rest → on `close()===false`, wait 500ms and retry once (A3).
- *
- * Targeting is intentionally coarse for the D-1 MVP: it closes every non-dirty
- * tab in the activated window. Narrowing to the specific stale task tab (by
- * nonce/session fingerprint) is D-2 work — see checklist #2/#8.
+ * STATUS (Phase 4): the live `/autoclose` route now goes through the role-gated
+ * `handleAutoclose` (precise predecessor_nonce self-targeting) — see extension.ts.
+ * This function is no longer wired to a production URI; it is retained as the
+ * param-validated close primitive and the test surface for the shared
+ * closeNonDirtyWithRetry mechanics (dirty-skip / retry / re-filter). Safe to prune
+ * in a later cleanup if no generic stale-tab-close producer ever materializes.
  */
 export async function handleHandoffClose(
   params: HandoffCloseParams,
@@ -110,13 +132,25 @@ export async function handleHandoffClose(
     return base("invalid-nonce", false);
   }
 
+  const result = await closeNonDirtyWithRetry(deps);
+  deps.log(`[handoff-helper] task=${params.task} result=${JSON.stringify(result)}`);
+  return result;
+}
+
+// The actual close mechanics, factored out of handleHandoffClose so the
+// role-gated succession path (handleAutoclose) can reuse the exact same
+// dirty-safe, retry-once behavior without re-validating params it doesn't have.
+// Flow: flatten tabs → skip dirty (A4) → close the rest → on `close()===false`,
+// wait 500ms, RE-FETCH + RE-FILTER (closed handles go invalid; a tab may have
+// turned dirty during the delay), and retry once (A3). Pure: no nonce/role logic.
+async function closeNonDirtyWithRetry(deps: CloseDeps): Promise<CloseMechanicsResult> {
   const allTabs = deps.getAllTabs();
   const dirty = allTabs.filter((t) => t.isDirty);
   let closeable = allTabs.filter((t) => !t.isDirty);
 
   if (closeable.length === 0) {
     deps.log(
-      `[handoff-helper] nothing to close for task=${params.task} (total=${allTabs.length}, dirty=${dirty.length})`,
+      `[handoff-helper] nothing to close (total=${allTabs.length}, dirty=${dirty.length})`,
     );
     return { ok: true, reason: "nothing-to-close", closedCount: 0, skippedDirty: dirty.length, retried: false };
   }
@@ -146,15 +180,13 @@ export async function handleHandoffClose(
     ok = await tryClose(deps, closeable);
   }
 
-  const result: CloseResult = {
+  return {
     ok,
     reason: ok ? "closed" : "close-failed",
     closedCount: ok ? attempted : 0,
     skippedDirty: dirty.length,
     retried,
   };
-  deps.log(`[handoff-helper] task=${params.task} result=${JSON.stringify(result)}`);
-  return result;
 }
 
 // Treats a rejected close (not just a `false` resolution) as a failed attempt,
@@ -171,6 +203,99 @@ async function tryClose(deps: CloseDeps, tabs: TabLike[]): Promise<boolean> {
 
 function base(reason: CloseReason, ok: boolean): CloseResult {
   return { ok, reason, closedCount: 0, skippedDirty: 0, retried: false };
+}
+
+// ── Role-gated succession autoclose (Phase 4 / R2 M3/M4) ──────────────────────
+// The dormant D-1 autoclose closed EVERY non-dirty tab in whatever window the URI
+// landed in — too coarse + no producer. Phase 4 makes it the supervisor-succession
+// close: a NEW supervisor window opens, then the OLD (predecessor) supervisor window
+// is closed — and ONLY that one.
+//
+// Window-local self-targeting: a vscode:// URI lands in one window's extension host;
+// that host can only act on its OWN window. So each window asks "is MY window the
+// predecessor?" by checking whether its own window.title carries `predecessor_nonce`.
+// Only the predecessor matches and closes itself; the new succession window, a
+// worker window, or the owner's normal window all see no match and refuse. This is
+// inherently fail-closed: a mis-routed URI can never close the wrong window.
+//
+//   role=worker                → NEVER close (parallel worker windows accumulate).
+//   role=supervisor_succession → close iff THIS window's title carries predecessor_nonce.
+//   no/unknown role · no predecessor_nonce · title doesn't match · dirty → fail-closed.
+
+/** This window's configured window.title (workspace settings), for self-targeting. */
+export interface AutocloseDeps extends CloseDeps {
+  windowTitle: () => string | undefined;
+}
+
+export type AutocloseReason =
+  | "closed"
+  | "nothing-to-close"
+  | "close-failed"
+  | "worker-keep" // role=worker → never close
+  | "unknown-role" // role missing/unrecognized → fail-closed
+  | "missing-predecessor-nonce" // no valid predecessor_nonce → fail-closed (never guess)
+  | "predecessor-not-here"; // this window's title doesn't carry predecessor_nonce → fail-closed
+
+export interface AutocloseResult {
+  ok: boolean;
+  reason: AutocloseReason;
+  closedCount: number;
+  skippedDirty: number;
+  retried: boolean;
+}
+
+const ROLE_WORKER = "worker";
+const ROLE_SUCCESSION = "supervisor_succession";
+
+// True iff `title` contains `nonce` as a substring. Mirrors the watchdog's osascript
+// `contains` gate — and crucially TOLERATES the live title's trailing
+// " [singlepane]${separator}${activeEditorShort}" suffix, which an exact " · "-token
+// match (spawn_nonce.nonce_in_title) would FALSE-NEGATIVE on. A 16-hex (64-bit) nonce
+// makes a substring false-POSITIVE astronomically unlikely. Fail-closed on undefined.
+export function titleHasNonce(title: string | undefined, nonce: string): boolean {
+  return typeof title === "string" && title.includes(nonce);
+}
+
+function autocloseBase(reason: AutocloseReason, ok: boolean): AutocloseResult {
+  return { ok, reason, closedCount: 0, skippedDirty: 0, retried: false };
+}
+
+export async function handleAutoclose(
+  params: HandoffCloseParams,
+  deps: AutocloseDeps,
+): Promise<AutocloseResult> {
+  // Worker windows never close (they accumulate in parallel by design).
+  if (params.role === ROLE_WORKER) {
+    deps.log(`[handoff-helper] autoclose: role=worker → keep (workers never close) task=${params.task}`);
+    return autocloseBase("worker-keep", true);
+  }
+  // Only a supervisor succession may close a predecessor. Anything else → fail-closed.
+  if (params.role !== ROLE_SUCCESSION) {
+    deps.log(`[handoff-helper] autoclose reject: unknown role=${params.role ?? "null"} task=${params.task}`);
+    return autocloseBase("unknown-role", false);
+  }
+  // predecessor_nonce must be present + well-formed — never guess which window to close.
+  if (!isValidNonce(params.predecessorNonce)) {
+    deps.log(
+      `[handoff-helper] autoclose reject: missing/invalid predecessor_nonce task=${params.task}`,
+    );
+    return autocloseBase("missing-predecessor-nonce", false);
+  }
+  // This window must BE the predecessor: its own title must carry predecessor_nonce.
+  const title = deps.windowTitle();
+  if (!titleHasNonce(title, params.predecessorNonce)) {
+    deps.log(
+      `[handoff-helper] autoclose: this window is not the predecessor (title=${title ?? "none"}) — fail-closed, not closing. task=${params.task}`,
+    );
+    return autocloseBase("predecessor-not-here", false);
+  }
+  // Confirmed predecessor window → reuse the dirty-safe, retry-once close mechanics.
+  deps.log(
+    `[handoff-helper] autoclose: confirmed predecessor (nonce match) → closing task=${params.task}`,
+  );
+  const result = await closeNonDirtyWithRetry(deps);
+  deps.log(`[handoff-helper] autoclose task=${params.task} result=${JSON.stringify(result)}`);
+  return result;
 }
 
 // ── Single-pane (close side bars natively) — 2026-06-06 ───────────────────────

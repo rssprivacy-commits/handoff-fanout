@@ -1,10 +1,12 @@
 import * as assert from "assert";
 import {
+  AutocloseDeps,
   CloseDeps,
   SINGLEPANE_COMMANDS,
   SinglePaneDeps,
   StartupDeps,
   TabLike,
+  handleAutoclose,
   handleHandoffClose,
   handleSinglePane,
   isClosePath,
@@ -13,9 +15,20 @@ import {
   isValidNonce,
   parseQuery,
   runStartupSinglePane,
+  titleHasNonce,
 } from "../src/handoffClose";
 
 const VALID_NONCE = "0123456789abcdef"; // 16 hex chars, mirrors secrets.token_hex(8)
+const PRED_NONCE = "deadbeefcafef00d"; // the predecessor (old supervisor) window's spawn_nonce
+const OTHER_NONCE = "0011223344556677"; // some unrelated window's nonce
+// The REAL window.title the dump writes: spawn_nonce.title_for(...) + a literal
+// " [singlepane]${separator}${activeEditorShort}" suffix (VS Code expands ${...} at
+// runtime; getConfiguration returns the unexpanded template). Built with a plain
+// string (no template literal) so the ${...} stay literal — exactly what the
+// extension reads back. The trailing suffix is why exact " · "-token matching would
+// false-NEGATIVE and the matcher must use substring `contains`.
+const PRED_TITLE =
+  "erp · old-task · supervisor · " + PRED_NONCE + " [singlepane]${separator}${activeEditorShort}";
 
 function tab(label: string, isDirty = false): TabLike {
   return { label, isDirty };
@@ -94,6 +107,18 @@ describe("parseQuery / isClosePath (URI contract)", () => {
   it("ignores the legacy `task` param (no longer accepted)", () => {
     const p = parseQuery("task=legacy&nonce=" + VALID_NONCE);
     assert.strictEqual(p.task, null);
+  });
+  it("parses role + predecessor_nonce (succession autoclose params)", () => {
+    const p = parseQuery(
+      "task_id=t2&nonce=" + VALID_NONCE + "&project=erp&role=supervisor_succession&predecessor_nonce=" + PRED_NONCE,
+    );
+    assert.strictEqual(p.role, "supervisor_succession");
+    assert.strictEqual(p.predecessorNonce, PRED_NONCE);
+  });
+  it("role + predecessor_nonce default to null when absent", () => {
+    const p = parseQuery("task_id=t1&nonce=" + VALID_NONCE);
+    assert.strictEqual(p.role, null);
+    assert.strictEqual(p.predecessorNonce, null);
   });
 });
 
@@ -372,5 +397,216 @@ describe("runStartupSinglePane (onStartupFinished)", () => {
     const res = await runStartupSinglePane(deps);
     assert.strictEqual(res.ran, false);
     assert.strictEqual(res.reason, "command-failed");
+  });
+});
+
+// ── titleHasNonce (predecessor window self-targeting) ─────────────────────────
+
+describe("titleHasNonce", () => {
+  it("matches the nonce as a substring of the REAL window.title (with suffix)", () => {
+    // The live title has a `[singlepane]${...}` suffix after the nonce → an exact
+    // " · "-token match would FAIL; substring `contains` (mirroring the watchdog's
+    // osascript) is what actually works.
+    assert.strictEqual(titleHasNonce(PRED_TITLE, PRED_NONCE), true);
+  });
+  it("matches a bare title with no suffix too", () => {
+    assert.strictEqual(titleHasNonce("erp · t1 · supervisor · " + PRED_NONCE, PRED_NONCE), true);
+  });
+  it("does not match a different window's nonce", () => {
+    assert.strictEqual(titleHasNonce(PRED_TITLE, OTHER_NONCE), false);
+  });
+  it("fail-closed on undefined / empty title", () => {
+    assert.strictEqual(titleHasNonce(undefined, PRED_NONCE), false);
+    assert.strictEqual(titleHasNonce("", PRED_NONCE), false);
+  });
+});
+
+// ── handleAutoclose (role-gated succession autoclose, predecessor_nonce-precise) ──
+
+interface AutocloseCalls {
+  closeCount: number;
+  closedTabs: TabLike[][];
+  delays: number[];
+  logs: string[];
+}
+
+// Like makeDeps but adds the windowTitle dep that decides whether THIS window is
+// the predecessor (its own title carries predecessor_nonce → it closes itself).
+function makeAutocloseDeps(opts: {
+  tabs: TabLike[] | TabLike[][];
+  closeResults?: CloseOutcome[];
+  windowTitle?: string | undefined;
+}): { deps: AutocloseDeps; calls: AutocloseCalls } {
+  const calls: AutocloseCalls = { closeCount: 0, closedTabs: [], delays: [], logs: [] };
+  const snapshots: TabLike[][] = Array.isArray(opts.tabs[0])
+    ? (opts.tabs as TabLike[][])
+    : [opts.tabs as TabLike[]];
+  let getAllTabsCount = 0;
+  const closeResults = opts.closeResults ?? [true];
+  const deps: AutocloseDeps = {
+    getAllTabs: () => {
+      const idx = Math.min(getAllTabsCount, snapshots.length - 1);
+      getAllTabsCount += 1;
+      return snapshots[idx];
+    },
+    closeTabs: async (tabs) => {
+      const outcome = closeResults[calls.closeCount] ?? true;
+      calls.closeCount += 1;
+      calls.closedTabs.push(tabs);
+      if (outcome === "throw") throw new Error("simulated close rejection");
+      return outcome;
+    },
+    delay: async (ms) => {
+      calls.delays.push(ms);
+    },
+    log: (msg) => calls.logs.push(msg),
+    windowTitle: () => opts.windowTitle,
+  };
+  return { deps, calls };
+}
+
+const SUCCESSION = "supervisor_succession";
+
+describe("handleAutoclose", () => {
+  it("role=worker → NEVER closes (worker windows accumulate)", async () => {
+    const { deps, calls } = makeAutocloseDeps({ tabs: [tab("claude-old")], windowTitle: PRED_TITLE });
+    const res = await handleAutoclose(
+      { task: "w1", nonce: VALID_NONCE, project: "erp", role: "worker", predecessorNonce: PRED_NONCE },
+      deps,
+    );
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.reason, "worker-keep");
+    assert.strictEqual(res.closedCount, 0);
+    assert.strictEqual(calls.closeCount, 0);
+  });
+
+  it("role missing → unknown-role, fail-closed (no close)", async () => {
+    const { deps, calls } = makeAutocloseDeps({ tabs: [tab("claude-old")], windowTitle: PRED_TITLE });
+    const res = await handleAutoclose(
+      { task: "t1", nonce: VALID_NONCE, project: "erp", role: null, predecessorNonce: PRED_NONCE },
+      deps,
+    );
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.reason, "unknown-role");
+    assert.strictEqual(calls.closeCount, 0);
+  });
+
+  it("role unrecognized → unknown-role, fail-closed", async () => {
+    const { deps, calls } = makeAutocloseDeps({ tabs: [tab("claude-old")], windowTitle: PRED_TITLE });
+    const res = await handleAutoclose(
+      { task: "t1", nonce: VALID_NONCE, project: "erp", role: "supervisor", predecessorNonce: PRED_NONCE },
+      deps,
+    );
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.reason, "unknown-role");
+    assert.strictEqual(calls.closeCount, 0);
+  });
+
+  it("succession but predecessor_nonce missing → fail-closed (never guess which window)", async () => {
+    const { deps, calls } = makeAutocloseDeps({ tabs: [tab("claude-old")], windowTitle: PRED_TITLE });
+    const res = await handleAutoclose(
+      { task: "t1", nonce: VALID_NONCE, project: "erp", role: SUCCESSION, predecessorNonce: null },
+      deps,
+    );
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.reason, "missing-predecessor-nonce");
+    assert.strictEqual(calls.closeCount, 0);
+  });
+
+  it("succession but predecessor_nonce malformed → fail-closed", async () => {
+    const { deps, calls } = makeAutocloseDeps({ tabs: [tab("claude-old")], windowTitle: PRED_TITLE });
+    const res = await handleAutoclose(
+      { task: "t1", nonce: VALID_NONCE, project: "erp", role: SUCCESSION, predecessorNonce: "nothex" },
+      deps,
+    );
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.reason, "missing-predecessor-nonce");
+    assert.strictEqual(calls.closeCount, 0);
+  });
+
+  it("succession + THIS window's title carries predecessor_nonce → closes it (suffix and all)", async () => {
+    const { deps, calls } = makeAutocloseDeps({
+      tabs: [tab("claude-old"), tab("readme.md")],
+      closeResults: [true],
+      windowTitle: PRED_TITLE,
+    });
+    const res = await handleAutoclose(
+      { task: "succ", nonce: VALID_NONCE, project: "erp", role: SUCCESSION, predecessorNonce: PRED_NONCE },
+      deps,
+    );
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.reason, "closed");
+    assert.strictEqual(res.closedCount, 2);
+    assert.strictEqual(calls.closeCount, 1);
+  });
+
+  it("succession but THIS window is NOT the predecessor (title carries a different nonce) → fail-closed", async () => {
+    const otherTitle = "erp · new-task · supervisor_succession · " + OTHER_NONCE + " [singlepane]${separator}${activeEditorShort}";
+    const { deps, calls } = makeAutocloseDeps({ tabs: [tab("claude-new")], windowTitle: otherTitle });
+    const res = await handleAutoclose(
+      { task: "succ", nonce: VALID_NONCE, project: "erp", role: SUCCESSION, predecessorNonce: PRED_NONCE },
+      deps,
+    );
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.reason, "predecessor-not-here");
+    assert.strictEqual(calls.closeCount, 0);
+  });
+
+  it("succession but window has no title (undefined) → fail-closed, never close", async () => {
+    const { deps, calls } = makeAutocloseDeps({ tabs: [tab("claude-old")], windowTitle: undefined });
+    const res = await handleAutoclose(
+      { task: "succ", nonce: VALID_NONCE, project: "erp", role: SUCCESSION, predecessorNonce: PRED_NONCE },
+      deps,
+    );
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(res.reason, "predecessor-not-here");
+    assert.strictEqual(calls.closeCount, 0);
+  });
+
+  it("succession + predecessor window with a DIRTY tab → dirty never closed (reuses dirty-safe mechanics)", async () => {
+    const { deps, calls } = makeAutocloseDeps({
+      tabs: [tab("claude-old"), tab("unsaved.md", true)],
+      closeResults: [true],
+      windowTitle: PRED_TITLE,
+    });
+    const res = await handleAutoclose(
+      { task: "succ", nonce: VALID_NONCE, project: "erp", role: SUCCESSION, predecessorNonce: PRED_NONCE },
+      deps,
+    );
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.closedCount, 1);
+    assert.strictEqual(res.skippedDirty, 1);
+    assert.deepStrictEqual(calls.closedTabs[0].map((t) => t.label), ["claude-old"]);
+  });
+
+  it("succession + predecessor with ALL tabs dirty → nothing-to-close, no close (fail-safe)", async () => {
+    const { deps, calls } = makeAutocloseDeps({
+      tabs: [tab("unsaved.md", true)],
+      windowTitle: PRED_TITLE,
+    });
+    const res = await handleAutoclose(
+      { task: "succ", nonce: VALID_NONCE, project: "erp", role: SUCCESSION, predecessorNonce: PRED_NONCE },
+      deps,
+    );
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.reason, "nothing-to-close");
+    assert.strictEqual(res.skippedDirty, 1);
+    assert.strictEqual(calls.closeCount, 0);
+  });
+
+  it("succession close: retry once on close()===false then succeed (mechanics reused)", async () => {
+    const { deps, calls } = makeAutocloseDeps({
+      tabs: [tab("claude-old")],
+      closeResults: [false, true],
+      windowTitle: PRED_TITLE,
+    });
+    const res = await handleAutoclose(
+      { task: "succ", nonce: VALID_NONCE, project: "erp", role: SUCCESSION, predecessorNonce: PRED_NONCE },
+      deps,
+    );
+    assert.strictEqual(res.ok, true);
+    assert.strictEqual(res.retried, true);
+    assert.strictEqual(calls.closeCount, 2);
+    assert.deepStrictEqual(calls.delays, [500]);
   });
 });

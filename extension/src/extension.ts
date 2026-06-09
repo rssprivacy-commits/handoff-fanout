@@ -1,10 +1,10 @@
 import * as vscode from "vscode";
 import {
-  CloseDeps,
+  AutocloseDeps,
   SinglePaneDeps,
   StartupDeps,
   TabLike,
-  handleHandoffClose,
+  handleAutoclose,
   handleSinglePane,
   isClosePath,
   isSinglePanePath,
@@ -46,9 +46,11 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
 
-      // /autoclose — legacy stale-tab close (dormant: no current producer).
+      // /autoclose — role-gated supervisor-succession close (Phase 4). worker → never
+      // close; supervisor_succession → close ONLY if THIS window's own window.title
+      // carries predecessor_nonce (window-local self-targeting; fail-closed otherwise).
       if (isClosePath(uri.path)) {
-        const deps: CloseDeps = {
+        const deps: AutocloseDeps = {
           getAllTabs: () =>
             vscode.window.tabGroups.all.flatMap((g) => g.tabs) as unknown as TabLike[],
           closeTabs: (tabs) =>
@@ -57,9 +59,13 @@ export function activate(context: vscode.ExtensionContext): void {
             ),
           delay: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
           log: (msg) => output.appendLine(msg),
+          // This window's configured title (the .handoff.code-workspace sets it to
+          // project·task·role·spawn_nonce…); getConfiguration returns the literal
+          // template, so substring-matching predecessor_nonce against it works.
+          windowTitle: () => vscode.workspace.getConfiguration("window").get<string>("title"),
         };
         try {
-          await handleHandoffClose(params, deps);
+          await handleAutoclose(params, deps);
         } catch (err) {
           output.appendLine(`[handoff-helper] internal error: ${String(err)}`);
         }
