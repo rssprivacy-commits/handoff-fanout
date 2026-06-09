@@ -18,6 +18,7 @@ calls, and that drive ``is_frontmost_code`` / front-window-name deterministicall
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -233,6 +234,80 @@ def test_warm_escape_hatch_falls_back_to_app_level(home, tmp_path):
     assert _run(env).returncode == 0
     assert _read(tmp_path / "key.log") == "k", "escape hatch → app-level Enter still fires"
     assert _ack(home, task, "submitted")
+
+
+# --------------------------------------------------------------------------- single-pane path
+# Phase 2 spawn-window-unify (R2 M1 TOCTOU): the dump now writes a JSON `.singlepane` sidecar
+# {workspace, role, close_policy, spawn_nonce, predecessor_nonce} and binds the spawn_nonce into the
+# generated workspace window.title. The watchdog must (a) JSON-parse the sidecar (not `cat` a path
+# out of it) and (b) gate the Enter on the unguessable spawn_nonce — not merely the task token.
+
+
+def _singlepane_sidecar(home: Path, tmp_path: Path, task: str, nonce: str) -> Path:
+    """Seed a JSON singlepane sidecar (Task 2.1 format) + the workspace file it points to, so the
+    watchdog routes to the SINGLEPANE_WINDOW path (`code -n` the generated .handoff.code-workspace)
+    and gates the submit on the spawn_nonce read from the JSON."""
+    ws_file = tmp_path / "sp" / f"{task}.handoff.code-workspace"
+    ws_file.parent.mkdir(parents=True, exist_ok=True)
+    ws_file.write_text(
+        json.dumps(
+            {
+                "folders": [{"path": str(tmp_path / "repo")}],
+                "settings": {"window.title": f"{PROJECT} · {task} · worker · {nonce} [singlepane]"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    sidecar = home / PROJECT / "queue" / f"{task}.singlepane"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "workspace": str(ws_file),
+                "role": "worker",
+                "close_policy": "keep",
+                "spawn_nonce": nonce,
+                "predecessor_nonce": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return sidecar
+
+
+def test_singlepane_submit_gates_on_spawn_nonce(home, tmp_path):
+    """SINGLEPANE: JSON-sidecar parse routes to a dedicated `-n` window, and the Enter fires only
+    because the front window title carries the unguessable spawn_nonce (the atomic title gate)."""
+    task = "wh-sp"
+    nonce = "deadbeefcafef00d"
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    _seed(home, ws, task, heartbeat=True)
+    _singlepane_sidecar(home, tmp_path, task, nonce)
+    # front window title carries the spawn_nonce → the atomic gate matches → submit fires
+    env = _env(home, tmp_path, front_window=f"{PROJECT} · {task} · worker · {nonce} [singlepane] - x.py")
+    assert _run(env).returncode == 0
+    assert " -n " in f" {_code_log(tmp_path)} ", "singlepane routes to a dedicated new window with -n"
+    assert _read(tmp_path / "key.log") == "k", "Enter fires when the front window carries the spawn_nonce"
+    assert _ack(home, task, "submitted")
+
+
+def test_singlepane_withholds_enter_when_title_lacks_nonce(home, tmp_path):
+    """SINGLEPANE: a front window whose title carries the TASK token but the WRONG nonce (stale /
+    guessed / sibling window) must NOT receive the Enter — the spawn_nonce is the gate, not the task.
+    The window still opens (`-n`), only the synthetic Enter is withheld."""
+    task = "wh-sp"
+    nonce = "deadbeefcafef00d"
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    _seed(home, ws, task, heartbeat=True)
+    _singlepane_sidecar(home, tmp_path, task, nonce)
+    # title carries the task token but a DIFFERENT nonce → the nonce gate withholds the Enter
+    env = _env(home, tmp_path, front_window=f"{PROJECT} · {task} · worker · 0000000000000000 [singlepane]")
+    assert _run(env).returncode == 0
+    assert " -n " in f" {_code_log(tmp_path)} ", "singlepane still opens the dedicated window"
+    assert _read(tmp_path / "key.log") == "", "Enter withheld when the front window lacks the spawn_nonce"
+    assert _ack(home, task, "failed")
+    assert not _ack(home, task, "submitted")
 
 
 # --------------------------------------------------------------------------- cold path

@@ -1059,10 +1059,38 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
         # transcript-retry — the main tree's transcript is shared across windows so a sibling's growth could
         # falsely confirm a submit (codex). Worktree (COLD_WINDOW) wins if a project is somehow in both.
         SINGLEPANE_WINDOW=0
+        SINGLEPANE_NONCE=""
         if [ "$COLD_WINDOW" != "1" ]; then
             _sp_sidecar="$QUEUE/$TASK.singlepane"
             if [ -f "$_sp_sidecar" ]; then
-                _sp_target=$(/bin/cat "$_sp_sidecar" 2>/dev/null)
+                # Phase 2 (spawn-window-unify R2 M1): the sidecar is JSON now
+                # {workspace, role, close_policy, spawn_nonce, predecessor_nonce} — `cat` would hand the
+                # `[ -f ]` test a JSON blob, not a path. Parse via $HANDOFF_PYTHON_CMD (already the
+                # script's python; no jq dependency), printing workspace on line 1 + spawn_nonce on
+                # line 2. A legacy plain-path sidecar (pre-migration) is tolerated: the raw text is
+                # treated as the workspace path with an empty nonce (→ task-token submit gate, as before).
+                _sp_parsed=$("$HANDOFF_PYTHON_CMD" - "$_sp_sidecar" <<'PY' 2>/dev/null
+import json, sys
+try:
+    raw = open(sys.argv[1], encoding="utf-8").read()
+except OSError:
+    raise SystemExit(0)
+try:
+    d = json.loads(raw)
+except ValueError:
+    d = None
+if isinstance(d, dict):
+    print(d.get("workspace", ""))
+    print(d.get("spawn_nonce", "") or "")
+else:
+    # legacy plain-path sidecar (or non-object JSON): raw text IS the workspace path, no nonce
+    print(raw.strip())
+    print("")
+PY
+)
+                { IFS= read -r _sp_target; IFS= read -r SINGLEPANE_NONCE; } <<EOF
+$_sp_parsed
+EOF
                 if [ -n "$_sp_target" ] && [ -f "$_sp_target" ]; then
                     OPEN_TARGET="$_sp_target"; SINGLEPANE_WINDOW=1
                 else
@@ -1184,7 +1212,12 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
                 # HANDOFF_WARM_WINDOW_GUARD=0 → app-level Enter for a custom window.title without rootName.
                 _submit_token="$TASK"
                 if [ "$SINGLEPANE_WINDOW" = "1" ]; then
-                    _submit_token="$TASK"   # singlepane: the generated workspace window.title carries the task
+                    # singlepane: gate on the unguessable spawn_nonce from the JSON sidecar (R2 M1 TOCTOU)
+                    # — the generated workspace title binds project·task·role·nonce, so an exact nonce match
+                    # ATOMICALLY proves THIS is the window we launched (a stale/sibling/guessed-task window
+                    # carries the task but not the nonce). Fall back to the task token (which the title also
+                    # carries) only when the sidecar had no nonce (legacy/parse-fail) — never worse than before.
+                    _submit_token="${SINGLEPANE_NONCE:-$TASK}"
                 elif [ "$COLD_WINDOW" != "1" ]; then
                     _submit_token=$(basename "$WORKSPACE")   # warm: window.title rootName = the folder basename
                 fi

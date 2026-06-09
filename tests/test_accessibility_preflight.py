@@ -95,6 +95,12 @@ def _setup(home: Path, tmp_path: Path, *, ui_enabled: str, keystroke_exit: int =
             "HANDOFF_SKIP_SPAWN": "0",  # exercise the spawn loop
             "HANDOFF_VSCODE_CHECK": "0",
             "HANDOFF_AUTOCLOSE_ENABLED": "0",
+            # Pin the drift guard to the script-under-test so it is its OWN canonical source (no drift).
+            # Otherwise it defaults to the LIVE tree (~/Projects/handoff-fanout/install/auto-continue.sh)
+            # and ANY divergence — e.g. developing this very file in a worktree — fires the drift
+            # notification, polluting the osascript sink these tests inspect (same hermetic pin as
+            # test_window_open_routing.py's HANDOFF_CANON_SRC).
+            "HANDOFF_CANON_SRC": str(SCRIPT),
         },
     )
     env.pop("HANDOFF_HOME", None)
