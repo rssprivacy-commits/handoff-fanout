@@ -516,6 +516,13 @@ def maybe_write_singlepane_sidecar(
         # JSON sidecar (breaking migration from the old plain-path text): watchdog reads `workspace`
         # (open target) + `spawn_nonce` (atomic title gate); role/close_policy/predecessor_nonce feed
         # role-gated autoclose (worker → keep / supervisor_succession → close_predecessor).
+        #
+        # CONTRACT — MUST stay COMPACT SINGLE-LINE JSON (no ``indent=``). The watchdog reads this
+        # sidecar with a line-oriented ``json_get`` (awk) in ``install/auto-continue.sh`` (bash, no
+        # jq), AND the autoclose role/predecessor_nonce extraction relies on the flat one-line shape.
+        # Pretty-printing this (``indent=2``) would risk silently breaking those reads → autoclose
+        # fail-closes. The ``.handoff.code-workspace`` ABOVE is read by VS Code itself, so it may be
+        # indented; THIS sidecar may not. Keep ``json.dumps(...)`` here without an ``indent`` kwarg.
         sidecar.write_text(
             json.dumps(
                 {
@@ -525,7 +532,7 @@ def maybe_write_singlepane_sidecar(
                     "spawn_nonce": spawn_nonce,
                     "predecessor_nonce": predecessor_nonce,
                 }
-            ),
+            ),  # ← no indent= on purpose: single-line contract for the bash json_get reader
             encoding="utf-8",
         )
     except OSError as e:

@@ -1355,7 +1355,13 @@ PY
 }
 
 # very small JSON value extractor: looks for "<key>"\s*:\s*"<value>" or numeric.
-# Good enough for the flat one-level schemas we read (old_ready / override.json).
+# Good enough for the flat one-level schemas we read (old_ready / override.json /
+# queue/<task>.singlepane). CONTRACT: these are written COMPACT (no pretty-print) by
+# the Python writers (dump.compute_*/maybe_write_singlepane_sidecar, handoff_precheck).
+# This awk is line-oriented and stops at the first line carrying the key, so it relies on
+# the value sitting on the same line as the key. The singlepane sidecar in particular is
+# locked to single-line JSON on the writer side (see dump.maybe_write_singlepane_sidecar)
+# — do not switch any of these writers to indent=/pretty without making this tolerant.
 json_get() {
     local file="$1"; local key="$2"
     /usr/bin/awk -v key="\"$key\"" '
@@ -1628,6 +1634,45 @@ try_autoclose() {
     local done_marker="$ack/$task.autoclose_done"
     local failed_marker="$ack/$task.autoclose_failed.txt"
 
+    # ── Cheap pre-lock fast path — OPTIMIZATION ONLY. Every value that feeds the URI
+    # is (re-)read INSIDE the lock below; nothing here reads a URI-feeding value. These
+    # are monotonic / nothing-to-do bail-outs: the done/failed markers never un-set, and
+    # a missing old_ready/sidecar simply means "not fire-able this tick" (a later tick
+    # re-evaluates once one lands). They let the overwhelmingly common no-candidate tick
+    # skip the PROJECT spawn lock (shared with spawn-intent) entirely, so we only contend
+    # for the lock when a close is genuinely plausible.
+    [ -f "$done_marker" ] && return 0
+    [ -f "$failed_marker" ] && return 0
+    [ -f "$old_ready" ] || return 0
+    [ -f "$sidecar" ] || return 0
+
+    # ── Single critical section under the PROJECT spawn lock (Phase 1 parity; design
+    # §6 R2r2-R2). The lock is acquired BEFORE reading the sidecar / old_ready / evidence
+    # so the role read, the retro-evidence gate, and the URI emit are ONE atomic critical
+    # section. This closes the R2 lock-order TOCTOU: a concurrent spawn-intent (which holds
+    # this same lock while it (re)writes $task.singlepane) cannot rewrite the sidecar
+    # between our predecessor_nonce read and the URI we fire. The invariant: every value
+    # that feeds the URI (predecessor_nonce, spawn_nonce, retro-evidence hash) is read
+    # under the lock and cannot change before we emit. Same lock dir + TTL as
+    # handoff_fanout.spawn_lock.project_spawn_lock so the close is also mutually exclusive
+    # with a concurrent launchd autoclose tick. Autoclose is best-effort: on contention we
+    # SKIP (retry next tick) rather than block like the Python CM.
+    local lock="$proj_dir/.spawn.lock"
+    clean_stale_lock "$lock" "$HANDOFF_SPAWN_LOCK_TTL"
+    if ! mkdir "$lock" 2>/dev/null; then
+        log "AUTOCLOSE-SKIP: project=$project task=$task — spawn lock held"
+        return 0
+    fi
+    # Single release point: with functrace OFF (set -u only), this RETURN trap fires on
+    # EVERY return below — and only when try_autoclose itself returns, never on the nested
+    # json_get / sha256_file command substitutions — so each gate may plainly `return 0`
+    # and the lock is freed exactly once. Do NOT add explicit rmdir / `trap - RETURN`.
+    trap 'rmdir "$lock" 2>/dev/null || true' RETURN
+
+    # ── Re-evaluate the full gate INSIDE the lock. The pre-lock checks above were only a
+    # fast path; from here on every check/read is authoritative and lock-protected. Re-read
+    # the idempotency sentinels first (another tick may have completed since the fast path),
+    # then the manual-hold / terminal gates, then existence (files may have vanished).
     [ -f "$done_marker" ] && return 0
     [ -f "$failed_marker" ] && return 0
     [ -f "$queue/$task.BLOCKED.md" ] && {
@@ -1636,13 +1681,14 @@ try_autoclose() {
     }
     [ -f "$queue/$task.done" ] && return 0
     [ -f "$old_ready" ] || return 0
+    [ -f "$sidecar" ] || return 0
 
     # ── Role gate (Phase 4 contract): only a supervisor_succession spawn closes a
-    # predecessor. role + predecessor_nonce live in the Phase 2 JSON sidecar. No
-    # sidecar / role!=succession (e.g. role=worker) ⇒ silent SKIP, never a failure
-    # marker — a worker window legitimately keeps, and a non-singlepane spawn has no
-    # sidecar at all. Mirrors the extension's worker-keep / fail-closed semantics.
-    [ -f "$sidecar" ] || return 0
+    # predecessor. role + predecessor_nonce live in the Phase 2 JSON sidecar (read HERE,
+    # under the lock — the R2 fix). No sidecar / role!=succession (e.g. role=worker) ⇒
+    # silent SKIP, never a failure marker — a worker window legitimately keeps, and a
+    # non-singlepane spawn has no sidecar at all. Mirrors the extension's worker-keep /
+    # fail-closed semantics.
     local role; role=$(json_get "$sidecar" "role")
     [ "$role" = "$ROLE_SUCCESSION" ] || return 0
     local pred_nonce; pred_nonce=$(json_get "$sidecar" "predecessor_nonce")
@@ -1691,25 +1737,11 @@ try_autoclose() {
         return 0
     fi
 
-    # ── Critical section under the PROJECT spawn lock (Phase 1 parity). Same lock
-    # dir + TTL as handoff_fanout.spawn_lock.project_spawn_lock so the close decision
-    # is mutually exclusive with a spawn-intent decision AND with a concurrent
-    # launchd autoclose tick (R2 race fix). Autoclose is best-effort, so on
-    # contention we SKIP (retry next tick) rather than block like the Python CM.
-    local lock="$proj_dir/.spawn.lock"
-    clean_stale_lock "$lock" "$HANDOFF_SPAWN_LOCK_TTL"
-    if ! mkdir "$lock" 2>/dev/null; then
-        log "AUTOCLOSE-SKIP: project=$project task=$task — spawn lock held"
-        return 0
-    fi
-    trap 'rmdir "$lock" 2>/dev/null || true' RETURN
-    # Re-check the idempotency sentinels after acquiring the lock (TOCTOU defence).
-    if [ -f "$done_marker" ] || [ -f "$failed_marker" ]; then
-        rmdir "$lock" 2>/dev/null || true
-        trap - RETURN
-        return 0
-    fi
-
+    # ── Fire the helper URI (still under the lock). Injection-safe by construction: `task`
+    # and `project` are already-validated slugs (handoff_fanout slug rules), `pred_nonce`
+    # passed is_hex16 above, and `new_nonce` is a spawn_nonce (secrets.token_hex shape) or
+    # the old_ready nonce — no shell/URL metacharacter can reach the query string, so no
+    # extra percent-encoding is required.
     local uri="vscode://dharmaxis.handoff-helper/autoclose?task_id=${task}&nonce=${new_nonce}&project=${project}&role=${ROLE_SUCCESSION}&predecessor_nonce=${pred_nonce}"
     if "$HANDOFF_OPEN_CMD" "$uri" 2>>"$LOG"; then
         printf 'task_id: %s\nnonce: %s\npredecessor_nonce: %s\nrole: %s\nuri: %s\ntime: %s\n' \
@@ -1721,8 +1753,7 @@ try_autoclose() {
             "$task" "$new_nonce" "$(now_iso_utc)" > "$failed_marker"
         log "AUTOCLOSE-FAIL: project=$project task=$task reason=open_uri_failed"
     fi
-    rmdir "$lock" 2>/dev/null || true
-    trap - RETURN
+    # The RETURN trap releases the lock as try_autoclose returns here.
 }
 
 for PROJ_DIR in "$HANDOFF_ROOT"/*/; do

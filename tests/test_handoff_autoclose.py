@@ -372,6 +372,98 @@ def test_A07_spawn_lock_serializes_two_runs(home, tmp_path, stubbed_env):
     assert log.count("task_id=") == 1, log
 
 
+# ─── R2 lock-order TOCTOU — sidecar read + evidence gate + URI emit are ONE
+#     atomic critical section under the spawn lock (Task 4.1 fix1) ──────────────
+
+
+def test_autoclose_sidecar_rewrite_during_critical_section(home, tmp_path, stubbed_env):
+    """R2 lock-order regression: a concurrent spawn-intent rewriting the sidecar must
+    NOT let the producer emit a torn / stale ``predecessor_nonce``.
+
+    The fix acquires the PROJECT spawn lock BEFORE reading the sidecar / old_ready /
+    evidence, so the role read, the retro-evidence gate, and the URI emit are a single
+    atomic critical section. We prove the gate executes UNDER the lock by stubbing the
+    sha256 helper: ``sha256_file`` is called by the evidence gate, which sits BETWEEN the
+    sidecar read and the URI emit. The stub (1) records whether ``.spawn.lock`` is held at
+    call time and (2) injects a racing rewrite of the sidecar's ``predecessor_nonce``
+    (P1 → P2), then (3) emits the REAL digest so the evidence gate still passes.
+
+    Pre-fix the gate ran BEFORE the lock was taken → the probe would read ``free`` and the
+    racing rewrite would slip into the read→emit window. After the fix the probe reads
+    ``held`` and the emitted URI carries the lock-consistent value snapshotted at the top of
+    the critical section (P1) — never the value the mid-section rewrite tried to smuggle in.
+    """
+    _full_succession(home)  # sidecar predecessor_nonce = PRED_NONCE (P1)
+
+    lock_dir = home / PROJECT / ".spawn.lock"
+    sidecar = home / PROJECT / "queue" / f"{TASK}.singlepane"
+    probe = tmp_path / "lock_probe.txt"
+    rewrote = tmp_path / "rewrote.flag"
+    p2_nonce = "8899aabbccddeeff"  # the racing rewrite's (different, well-formed) nonce
+    # The racing rewrite the stub drops in mid-critical-section — a fresh succession
+    # sidecar carrying P2 instead of P1. Written via a file (no shell quoting of JSON).
+    rewritten = tmp_path / "rewritten_sidecar.json"
+    rewritten.write_text(
+        json.dumps(
+            {
+                "workspace": str(
+                    home / PROJECT / "singlepane" / f"{TASK}.handoff.code-workspace"
+                ),
+                "role": "supervisor_succession",
+                "close_policy": "keep",
+                "spawn_nonce": NEW_NONCE,
+                "predecessor_nonce": p2_nonce,
+            }
+        )
+    )
+
+    # A `shasum` stub. The evidence gate calls it as `shasum -a 256 <file>` (sha256_file
+    # gates on basename == "shasum"); the early drift self-check calls it bare as
+    # `shasum <path>` — delegate those unchanged so the script behaves normally.
+    shasum_stub = tmp_path / "stubs" / "shasum"
+    shasum_stub.parent.mkdir(parents=True, exist_ok=True)
+    shasum_stub.write_text(
+        "#!/bin/bash\n"
+        'if [ "$1" = "-a" ]; then\n'
+        f'    if [ -d "{lock_dir}" ]; then echo held > "{probe}"; else echo free > "{probe}"; fi\n'
+        f'    if [ ! -f "{rewrote}" ]; then cp "{rewritten}" "{sidecar}"; : > "{rewrote}"; fi\n'
+        '    /usr/bin/shasum -a 256 "$3"\n'
+        "else\n"
+        '    /usr/bin/shasum "$@"\n'
+        "fi\n",
+        encoding="utf-8",
+    )
+    shasum_stub.chmod(0o755)
+    stubbed_env["HANDOFF_SHA256_CMD"] = str(shasum_stub)
+
+    proc = _run_script(stubbed_env)
+    assert proc.returncode == 0, proc.stderr
+
+    # 1) The evidence gate (and therefore the sidecar read just above it) executed UNDER
+    #    the spawn lock. Pre-fix this ran before the lock was acquired → probe == "free".
+    assert probe.read_text().strip() == "held", (
+        "evidence gate ran OUTSIDE the spawn lock — read→emit is not a single critical "
+        "section (R2 lock-order TOCTOU not fixed)"
+    )
+
+    # 2) The racing rewrite really fired mid-critical-section (guard the test itself).
+    assert rewrote.exists(), "stub barrier never ran — test would be vacuous"
+    assert json.loads(sidecar.read_text())["predecessor_nonce"] == p2_nonce
+
+    # 3) Exactly one URI dispatched, carrying the lock-consistent value (P1) — never the
+    #    value the mid-section rewrite smuggled in (P2). No torn / stale emit.
+    log = _open_log(stubbed_env)
+    assert log.count("task_id=") == 1, log
+    assert f"predecessor_nonce={PRED_NONCE}" in log
+    assert f"predecessor_nonce={p2_nonce}" not in log
+
+    done = home / PROJECT / "ack" / f"{TASK}.autoclose_done"
+    failed = home / PROJECT / "ack" / f"{TASK}.autoclose_failed.txt"
+    assert done.exists()
+    assert not failed.exists()
+    assert f"predecessor_nonce: {PRED_NONCE}" in done.read_text()
+
+
 # ─── A-08 stale project spawn lock self-clean (TTL 120s) ─────────────────────
 
 
