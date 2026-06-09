@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from handoff_fanout import config as _config
+from handoff_fanout import spawn_nonce as _spawn_nonce
 
 # A worktree whose ``queue/<task>.heartbeat`` was touched within this window is
 # treated as a LIVE session — GC never reclaims it out from under a running tab.
@@ -496,9 +497,24 @@ def _block(source_workspace: Path, reason: str, **extra) -> WorktreeResult:
     )
 
 
-def inject_vscode_workspace(source_workspace: Path, wt: Path, project: str, task: str) -> str | None:
+def inject_vscode_workspace(
+    source_workspace: Path,
+    wt: Path,
+    project: str,
+    task: str,
+    *,
+    spawn_nonce: str | None = None,
+    role: str = "worker",
+) -> str | None:
     """Make a fresh worktree open as an *identifiable VS Code workspace* (option-C / 2026-06-03
     worktree-spawn-bug fix — dual-brain codex+Gemini).
+
+    ``spawn_nonce`` (spawn-window-unify Phase 6a / design §4): when supplied, the ``window.title``
+    binds ``project·task·role·nonce`` via :func:`spawn_nonce.title_for` so the watchdog can
+    ATOMICALLY prove the front window is the exact one launched (the unguessable nonce, not just a
+    guessable task token). When ``None`` (the legacy ``dump``→``create_worktree`` callers) the title
+    is BYTE-IDENTICAL to the pre-Phase-6a form — this kwarg is purely additive; ``dump`` passes
+    nothing and is unaffected.
 
     A bare ``git worktree`` folder, opened via ``code -r <dir>``, (a) titles the window only
     by the dir basename (``stage1-10c`` — unrecognizable as the project) and (b) has no
@@ -530,13 +546,23 @@ def inject_vscode_workspace(source_workspace: Path, wt: Path, project: str, task
         ws_file = wt / WORKTREE_VSCODE_FILE
         if ws_file.exists():
             return str(ws_file)  # respect a pre-existing (tracked/user) file; never overwrite.
+        # Phase 6a: bind the unguessable nonce into the title when a fresh-spawn supplies one
+        # (project·task·role·nonce via title_for + the [worktree] marker). Legacy ``dump`` callers
+        # pass spawn_nonce=None → the BYTE-IDENTICAL pre-Phase-6a title (project · task [worktree]…).
+        if spawn_nonce:
+            window_title = (
+                _spawn_nonce.title_for(project=project, task_id=task, role=role, nonce=spawn_nonce)
+                + " [worktree]${separator}${activeEditorShort}"
+            )
+        else:
+            window_title = f"{project} · {task} [worktree]${{separator}}${{activeEditorShort}}"
         ws_file.write_text(
             json.dumps(
                 {
                     "folders": [{"path": "."}],
                     "settings": {
                         # ${...} are VS Code window-title variables (literal here; VS Code expands them).
-                        "window.title": f"{project} · {task} [worktree]${{separator}}${{activeEditorShort}}",
+                        "window.title": window_title,
                         # SINGLE-PANE cold spawn (2026-06-06 / dual-brain codex+Gemini + owner ruling).
                         # A fresh worktree window otherwise opens multi-pane (activity bar + Explorer +
                         # an EMPTY Claude SIDEBAR "Message input"); that empty input grabs keyboard focus,
@@ -573,6 +599,8 @@ def create_worktree(
     cfg: _config.Config,
     mode: str,
     env: dict[str, str] | None = None,
+    spawn_nonce: str | None = None,
+    role: str = "worker",
 ) -> WorktreeResult:
     """Create (or report/degrade/block) a per-session worktree for ``task``.
 
@@ -584,6 +612,10 @@ def create_worktree(
     failure) from **unsafe state** (BLOCK, never silently proceed: source HEAD not
     published to the integration branch / a dirty same-task worktree collision) —
     R1-C2 / R1-R3.
+
+    ``spawn_nonce``/``role`` (Phase 6a / design §4): forwarded to
+    :func:`inject_vscode_workspace` so the worktree's ``.handoff.code-workspace`` title carries the
+    unguessable nonce. Purely additive — ``dump`` passes neither and gets the legacy title.
     """
     if env is None:
         env = dict(os.environ)
@@ -730,7 +762,9 @@ def create_worktree(
             and existing["branch_head"] == origin_head
         ):
             linked = link_files(source_workspace, wt, cfg)
-            vws = inject_vscode_workspace(source_workspace, wt, project, task)
+            vws = inject_vscode_workspace(
+                source_workspace, wt, project, task, spawn_nonce=spawn_nonce, role=role
+            )
             return WorktreeResult(
                 status=ST_CREATED,
                 spawn_workspace=wt,
@@ -785,7 +819,9 @@ def create_worktree(
         return _degrade(source_workspace, f"git worktree add failed: {err[:200]}")
 
     linked = link_files(source_workspace, wt, cfg)
-    vws = inject_vscode_workspace(source_workspace, wt, project, task)
+    vws = inject_vscode_workspace(
+        source_workspace, wt, project, task, spawn_nonce=spawn_nonce, role=role
+    )
     created_base = head_sha(wt) or base_sha
     return WorktreeResult(
         status=ST_CREATED,

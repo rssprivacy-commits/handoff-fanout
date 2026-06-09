@@ -25,6 +25,10 @@ def main(argv: list[str] | None = None) -> int:
         help="Generate handoff queue file for next task (full args: see `handoff-dump --help`)",
     )
     sub.add_parser(
+        "spawn",
+        help="Fresh-spawn intent producer (no retro gate / no roadmap; see `handoff spawn --help`)",
+    )
+    sub.add_parser(
         "watchdog", help="Run watchdog scan (fail-safe fan-in trigger; meant for launchd/cron)"
     )
     sub.add_parser(
@@ -98,6 +102,10 @@ def main(argv: list[str] | None = None) -> int:
         from handoff_fanout import dump
 
         return dump.main(rest)
+    if args.subcommand == "spawn":
+        from handoff_fanout import spawn
+
+        return spawn.main(rest)
     if args.subcommand == "watchdog":
         from handoff_fanout import watchdog
 
