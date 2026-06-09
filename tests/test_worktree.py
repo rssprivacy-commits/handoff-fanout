@@ -480,7 +480,11 @@ def test_is_dirty_only_discounts_untracked_links(home, tmp_path):
     assert wt.is_dirty(ws, ignore={".env"}) is True
     (ws / "a -> .env").unlink()
     # (3) a TRACKED modification of a link-named file is genuine WIP → dirty despite ignore.
-    _run(["git", "add", ".env"], ws)
+    # ``-f``: a user's GLOBAL gitignore (``~/.config/git/ignore``) commonly lists ``.env``,
+    # so a bare ``git add .env`` is REFUSED (rc 1) and the file is never tracked → step (3)
+    # silently degenerates into the untracked case + the test fails on this machine. Force
+    # past the global ignore so the test is hermetic regardless of the user's git config.
+    _run(["git", "add", "-f", ".env"], ws)
     _run(["git", "commit", "-qm", "track env"], ws)
     (ws / ".env").write_text("modified")
     assert wt.is_dirty(ws, ignore={".env"}) is True
