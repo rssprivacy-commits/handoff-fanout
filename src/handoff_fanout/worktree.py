@@ -650,10 +650,24 @@ def inject_vscode_workspace(
             # escapes back to the glyphs (osascript-confirmed in the spawn e2e).
             settings["window.title"] = _COORDINATOR_TITLE_PREFIX + settings["window.title"]
             settings["workbench.colorCustomizations"] = dict(_COORDINATOR_RED_TITLEBAR)
-        ws_file.write_text(
-            json.dumps({"folders": [{"path": "."}], "settings": settings}, indent=2),
-            encoding="utf-8",
-        )
+        try:
+            ws_file.write_text(
+                json.dumps({"folders": [{"path": "."}], "settings": settings}, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            # 禁止静默降级铁律 (coord-redtop-fold round-3 codex P1): symmetry with the REUSE path's
+            # _ensure_coordinator_redtop write-failure WARN (see above). A coordinator whose FRESH
+            # workspace write fails must NOT slip out silently un-red-topped — emit the visible
+            # stderr WARN so the owner knows this 中枢 window has no 防误关 marker. ``ws_file`` is
+            # guaranteed bound here (assigned above), so warning from THIS inner except can never
+            # raise UnboundLocalError the way warning from the OUTER except would — the .vscode
+            # symlink above can raise OSError before ``ws_file`` is set. A non-中枢 write failure
+            # stays a byte-identical silent ``return None`` (zero regression, validation gate #2),
+            # and the outer ``except OSError`` below is left untouched (symlink-fail path unchanged).
+            if is_coordinator:
+                _warn_coordinator_unredtopped(ws_file, "write failed")
+            return None
         return str(ws_file)
     except OSError:
         return None
