@@ -530,6 +530,31 @@ def test_worktree_reuse_publish_failure_does_not_remove_worktree(tmp_path, monke
 # ─── arg validation ─────────────────────────────────────────────────────────
 
 
+def test_invalid_close_policy_fails_closed(tmp_path, monkeypatch):
+    """SHOULD (p6a-fix1): close_policy is an enum the watchdog acts on — an unknown value
+    must fail closed, not flow into the sidecar for the consumer to mis-read."""
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    rc = spawn.main(_argv(isolation="singlepane", workspace=repo, close_policy="nuke-all"))
+    assert rc == 2
+    qd = home / PROJECT / "queue"
+    assert not (qd / f"{TASK}.uri").exists()
+    assert not (qd / f"{TASK}.singlepane").exists()
+
+
+def test_succession_without_predecessor_nonce_fails_closed(tmp_path, monkeypatch):
+    """SHOULD (p6a-fix1): a supervisor_succession's purpose is closing its predecessor
+    window — without --predecessor-nonce the window cannot be identified, so the intent
+    would be unactionable. Fail closed."""
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    rc = spawn.main(
+        _argv(isolation="singlepane", workspace=repo, role="supervisor_succession")
+    )
+    assert rc == 2
+    assert not (home / PROJECT / "queue" / f"{TASK}.uri").exists()
+
+
 def test_both_brief_and_prompt_rejected(tmp_path, monkeypatch):
     home = _home(tmp_path, monkeypatch)
     repo = _plain_repo(tmp_path)

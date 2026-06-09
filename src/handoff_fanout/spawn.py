@@ -21,12 +21,19 @@ This module REUSES the real production primitives (``worktree.create_worktree`` 
 ``inject_vscode_workspace`` with its new ``spawn_nonce`` kwarg, ``spawn_nonce.title_for``,
 ``atomic.atomic_replace``). It NEVER invokes, imports, or alters ``dump`` (design §13: ``dump``
 stays the retro-gated *old-session handoff* producer — routing a fresh spawn through it, the
-rejected candidate B, would plant a legal bypass next to the retro mandate). The singlepane
-workspace/sidecar JSON shapes deliberately mirror ``dump.maybe_write_singlepane_sidecar``'s (the
-SAME watchdog contract) and add an ``isolation`` field (the watchdog's ``json_get`` reads only
-known keys, so the extra field is tolerated). They are authored here against that contract rather
-than shared via a ``dump`` refactor because the "dump unchanged" constraint forbids editing
-``dump`` to delegate; a follow-up pure extraction so ``dump`` delegates here is recommended.
+rejected candidate B, would plant a legal bypass next to the retro mandate).
+
+DELIBERATE dump-mirror duplication (single consolidated note — p6a-fix1 SHOULD): two pieces are
+authored here against ``dump``'s contracts rather than shared via a ``dump`` refactor, because the
+"dump unchanged" red line forbids editing ``dump`` to delegate:
+  1. the singlepane workspace/sidecar JSON shapes mirror ``dump.maybe_write_singlepane_sidecar``'s
+     (the SAME watchdog contract) + an additive ``isolation`` field (the watchdog's ``json_get``
+     reads only known keys, so the extra field is tolerated);
+  2. ``_active_singlepane_worker`` (MUST 3, design §5.4 concurrency REJECT) mirrors ``dump``'s
+     file-based active-pane signal (sidecar + non-terminal ``.uri``), sharing only the standalone
+     ``spawn_lock`` module.
+A follow-up PURE refactor extracting both into a shared module that ``dump`` and ``spawn`` import
+is the recommended single consolidation point.
 
 Fail-closed (design §13: never a partial/残缺 intent): an invalid identity / untrusted (corrupt)
 config / missing workspace / an UNSAFE or UNAVAILABLE worktree state all return ``2`` and write
@@ -62,6 +69,11 @@ ROLE_SUCCESSION = "supervisor_succession"
 
 ISOLATION_WORKTREE = "worktree"
 ISOLATION_SINGLEPANE = "singlepane"
+
+# close_policy enum the watchdog's try_autoclose acts on — anything else is unactionable.
+CLOSE_KEEP = "keep"
+CLOSE_PREDECESSOR = "close_predecessor"
+CLOSE_POLICIES = (CLOSE_KEEP, CLOSE_PREDECESSOR)
 
 
 def _err(msg: str) -> None:
@@ -400,6 +412,17 @@ def run_spawn(
     if predecessor_nonce is not None and not _NONCE_RE.match(predecessor_nonce):
         _err(f"--predecessor-nonce must be lowercase hex: {predecessor_nonce!r}")
         return EXIT_FAIL_CLOSED
+    # SHOULD (p6a-fix1): close_policy is an enum the watchdog acts on; an unknown value in
+    # the sidecar would be silently unactionable downstream — reject it here instead.
+    if close_policy is not None and close_policy not in CLOSE_POLICIES:
+        _err(f"--close-policy must be one of {'/'.join(CLOSE_POLICIES)}: {close_policy!r}")
+        return EXIT_FAIL_CLOSED
+    # SHOULD (p6a-fix1): a succession's whole purpose is closing its predecessor window;
+    # without that window's nonce it cannot be identified → the intent is unactionable.
+    if role == ROLE_SUCCESSION and predecessor_nonce is None:
+        _err("role=supervisor_succession requires --predecessor-nonce (the nonce of the "
+             "predecessor window it closes)")
+        return EXIT_FAIL_CLOSED
 
     cfg = _config.load()
     # An untrusted (corrupt/unreadable) config fails the unified-spawn switch CLOSED in
@@ -416,7 +439,7 @@ def run_spawn(
 
     if close_policy is None:
         # worker keeps its own window; a succession's whole purpose is to close its predecessor.
-        close_policy = "close_predecessor" if role == ROLE_SUCCESSION else "keep"
+        close_policy = CLOSE_PREDECESSOR if role == ROLE_SUCCESSION else CLOSE_KEEP
 
     nonce = _spawn_nonce.new_nonce()
     prompt_text = _build_prompt(task, brief=brief, prompt=prompt)
