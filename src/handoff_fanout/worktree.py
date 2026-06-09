@@ -1041,6 +1041,17 @@ def add_worktree_or_reclaim_orphan(
     conditions as inputs (rather than computing them) — determining process liveness
     (transcript-mtime) and persisted state is the spawn-intent / business merge-back
     layer's job; this is the §5.2 state-machine interface they call.
+
+    🔴 RED-TOP INVARIANT (§五·2 / dual-brain Q5 consensus 2026-06-10 fold-audit): this
+    helper does the git *add/reclaim/rebuild* ONLY — it deliberately does NOT touch the
+    VS Code workspace, so it never calls :func:`inject_vscode_workspace`. It is currently
+    a PARALLEL primitive NOT yet wired into :func:`create_worktree` (which still adds the
+    worktree directly + calls inject right after). If a future refactor routes
+    ``create_worktree`` through this helper as the real add primitive, the caller MUST
+    still call ``inject_vscode_workspace(..., is_coordinator=...)`` after a successful
+    add/rebuild — otherwise a reclaimed-and-rebuilt coordinator (中枢) worktree would open
+    WITHOUT its red title bar, silently breaking the absolute invariant "只要是中枢窗口就
+    必须红顶". Keep inject at the caller/orchestration layer, never bury it past this add.
     """
 
     def _add() -> tuple[int, str, str]:
