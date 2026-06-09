@@ -138,6 +138,74 @@ def test_dump_on_creates_worktree(tmp_path, monkeypatch):
     assert (expected_wt / ".env").is_file() and not (expected_wt / ".env").is_symlink()
 
 
+def _wt_settings(home: Path):
+    cw = home / PROJECT / "worktrees" / TASK / wt.WORKTREE_VSCODE_FILE
+    return json.loads(cw.read_text())["settings"]
+
+
+def test_dump_coordinator_flag_threads_redtop(tmp_path, monkeypatch):
+    """Full CLI plumbing (§五 / 2026-06-09): `handoff dump --coordinator` → the spawned worktree's
+    .handoff.code-workspace is red-top + 🧭中枢· (args.coordinator → create_worktree → inject)."""
+    _, ws = _bare_and_clone(tmp_path)
+    home = _home(tmp_path)
+    (home / "config.json").write_text(json.dumps({"worktree_link_venv": False}))
+    rc = _dump(home, ws, monkeypatch, on=True, extra=["--coordinator"])
+    assert rc == 0
+    s = _wt_settings(home)
+    assert s["window.title"].startswith("🧭中枢·")
+    assert s["workbench.colorCustomizations"]["titleBar.activeBackground"] == "#8B0000"
+    assert s["workbench.colorCustomizations"]["titleBar.inactiveBackground"] == "#5A0000"
+
+
+def test_dump_without_coordinator_no_redtop(tmp_path, monkeypatch):
+    """Zero regression at the dump layer: no --coordinator → no red-top, title unchanged."""
+    _, ws = _bare_and_clone(tmp_path)
+    home = _home(tmp_path)
+    (home / "config.json").write_text(json.dumps({"worktree_link_venv": False}))
+    rc = _dump(home, ws, monkeypatch, on=True)
+    assert rc == 0
+    s = _wt_settings(home)
+    assert "workbench.colorCustomizations" not in s
+    assert "🧭" not in s["window.title"]
+
+
+def test_audit_close_coordinator_threads_redtop(tmp_path, monkeypatch):
+    """The ERP coordinator spawn path goes through `handoff audit-close`, not bare dump.
+    audit-close must forward --coordinator → dump → red-top worktree (§五 / 2026-06-09)."""
+    from handoff_fanout import codex_audit
+
+    _, ws = _bare_and_clone(tmp_path)
+    home = _home(tmp_path)
+    (home / "config.json").write_text(json.dumps({"worktree_link_venv": False}))
+    monkeypatch.setenv("HANDOFF_HOME", str(home))
+    for v in (
+        "HANDOFF_RETRO_MANDATE",
+        "HANDOFF_RETRO_BYPASS",
+        "HANDOFF_AUDIT_MANDATE",
+        "HANDOFF_SAFE_COMMIT_LOCK",
+        "HANDOFF_SAFE_COMMIT_BYPASS",
+    ):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("HANDOFF_WORKTREE_ISOLATION", "on")
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(ws), capture_output=True, text=True
+    ).stdout.strip()
+    argv = [
+        "--task", TASK, "--project", PROJECT, "--workspace", str(ws),
+        "--next", "spawn next", "--audit-mode", "empty_diff_attestation",
+        "--audit-base", head, "--status", "active", "--coordinator",
+    ]
+    for k in handoff_precheck.PHASE0_KEYS:
+        argv += ["--phase0-status", f"{k}=✅"]
+    for k in handoff_precheck.PHASE1_KEYS:
+        argv += ["--phase1-status", f"{k}=✅"]
+    rc = codex_audit.main_audit_close(argv)
+    assert rc == 0, rc
+    s = _wt_settings(home)
+    assert s["window.title"].startswith("🧭中枢·")
+    assert s["workbench.colorCustomizations"]["titleBar.activeBackground"] == "#8B0000"
+
+
 def test_dump_on_old_ready_anchored_to_source(tmp_path, monkeypatch):
     """old_ready.commit_hash must be the CLOSING session's HEAD (R1-C1)."""
     _, ws = _bare_and_clone(tmp_path)
