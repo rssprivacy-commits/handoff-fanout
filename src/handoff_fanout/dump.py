@@ -36,6 +36,7 @@ from handoff_fanout import atomic, retro_gate, templates
 from handoff_fanout import config as _config
 from handoff_fanout import spawn_nonce as _spawn_nonce
 from handoff_fanout import worktree as _worktree
+from handoff_fanout.spawn_lock import LockHeld, project_spawn_lock
 from handoff_fanout.git_guard import git_guard_dir
 from handoff_fanout.handoff_precheck import (
     EVIDENCE_SCHEMA_VERSION,
@@ -538,6 +539,119 @@ def maybe_write_singlepane_sidecar(
     except OSError as e:
         print(f"[dump] (non-fatal) could not write singlepane workspace: {e}")
         sidecar.unlink(missing_ok=True)
+
+
+# ─── singlepane worker concurrency hard-REJECT (design §5.4 / R2 M5) ─────────
+
+
+class SinglepaneBusy(Exception):
+    """A ``singlepane``-isolation project already has an active worker / a concurrent
+    spawn holds its project lock → a SECOND worker dispatch is REJECTED.
+
+    Fail-closed by design (§5.4): a singlepane project shares ONE editor pane in the
+    main tree, so two workers would clobber each other's files. The engine NEVER
+    silently degrades to a concurrent main-dir spawn — it raises this instead, and the
+    guard writes an owner-readable ``ack/<task>.singlepane_busy.txt`` before raising so a
+    non-technical owner can see WHY the dispatch was refused (not just a stack trace).
+    """
+
+    def __init__(
+        self, *, project: str, task: str, reason: str, holder_task: str | None = None
+    ) -> None:
+        self.project = project
+        self.task = task
+        self.reason = reason
+        self.holder_task = holder_task
+        msg = f"singlepane project {project!r}: worker spawn for {task!r} rejected — {reason}"
+        if holder_task:
+            msg += f" (pane held by active worker {holder_task!r})"
+        super().__init__(msg)
+
+
+def _active_singlepane_worker(cfg: _config.Config, project: str, *, exclude_task: str) -> str | None:
+    """task_id of an existing ACTIVE singlepane worker for ``project`` other than
+    ``exclude_task``, else ``None``.
+
+    Active = a ``queue/<task>.singlepane`` sidecar whose ``<task>.uri`` is present and
+    NON-terminal (no ``.done`` / ``.BLOCKED.md``) — the same file-based "active tab"
+    signal as ``count_global_active_tabs`` (deterministic; no flaky pid probe). A
+    terminal task's ``.uri`` is unlinked by ``write_active_dump``, so its pane frees up
+    and a successor may spawn. ``exclude_task`` is the task being dumped now, so a worker
+    re-publishing its OWN active dump never rejects itself.
+    """
+    queue = cfg.queue_dir(project)
+    if not queue.exists():
+        return None
+    for sidecar in sorted(queue.glob("*.singlepane")):
+        other = sidecar.stem
+        if other == exclude_task:
+            continue
+        if not (queue / f"{other}.uri").exists():
+            continue  # spawn not pending / its .uri was unlinked → pane not held by it
+        if (queue / f"{other}.done").exists() or (queue / f"{other}.BLOCKED.md").exists():
+            continue  # terminal → pane free
+        return other
+    return None
+
+
+def _reject_singlepane(
+    cfg: _config.Config, project: str, task: str, reason: str, holder: str | None = None
+) -> SinglepaneBusy:
+    """Write the owner-readable busy ack (best-effort), then RETURN the exception to raise.
+
+    The raise is the HARD guarantee (caller fails closed); the ack is the soft, human-
+    facing breadcrumb. A failed ack write must not mask the rejection, so it is swallowed.
+    """
+    try:
+        ack_dir = cfg.ack_dir(project)
+        ack_dir.mkdir(parents=True, exist_ok=True)
+        (ack_dir / f"{task}.singlepane_busy.txt").write_text(
+            f"task_id: {task}\n"
+            f"project: {project}\n"
+            f"reason: {reason}\n"
+            + (f"held_by: {holder}\n" if holder else "")
+            + f"time: {now_iso()}\n"
+            "action: REJECTED — a singlepane project may have only ONE active worker. "
+            "The existing worker window must finish (its task → done/blocked) before a "
+            "new worker can spawn here; the engine refuses to spawn concurrently to avoid "
+            "clobbering the live worker's files.\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+    return SinglepaneBusy(project=project, task=task, reason=reason, holder_task=holder)
+
+
+@contextlib.contextmanager
+def singlepane_worker_guard(
+    cfg: _config.Config, *, project: str, task: str, role: str = "worker"
+):
+    """Concurrency hard-gate for a ``singlepane``-isolation WORKER spawn (design §5.4).
+
+    NO-OP unless the project's EXPLICIT ``worker_isolation`` is ``"singlepane"`` AND this
+    is a ``worker`` dispatch (the central / ``supervisor_succession`` path is exempt — it
+    replaces the predecessor, design §6). Otherwise it holds the project ``.spawn.lock``
+    across the WHOLE active critical section (the body run inside the ``with``), so a
+    concurrent worker #2 cannot slip its sidecar / ``.uri`` in between our check and
+    publish. It REJECTS — fail-closed + owner-readable ack — when EITHER:
+      * the project spawn lock is already held (a concurrent spawn in flight), OR
+      * an active singlepane worker for a DIFFERENT task already occupies the pane.
+    The same lock dir + TTL backs the autoclose critical section (§7: one lock, no
+    sub-lock races). It NEVER degrades to a concurrent main-dir spawn.
+    """
+    if role != "worker" or cfg.worker_isolation_for(project) != "singlepane":
+        yield
+        return
+    try:
+        with project_spawn_lock(project, root=cfg.home):
+            holder = _active_singlepane_worker(cfg, project, exclude_task=task)
+            if holder is not None:
+                raise _reject_singlepane(
+                    cfg, project, task, "active singlepane worker present", holder
+                )
+            yield  # the active dump body runs here, still under the lock
+    except LockHeld as e:
+        raise _reject_singlepane(cfg, project, task, "concurrent spawn lock held") from e
 
 
 # ─── role.env writing (used by sub-task / fan-in handoffs) ──────────────────
@@ -1646,22 +1760,41 @@ def main(argv: list[str] | None = None) -> int:
     ):
         retro_evidence_path = Path(args.retro_evidence).resolve()
 
-    return write_active_dump(
-        cfg=cfg,
-        project=project,
-        task=args.task,
-        workspace=spawn_workspace,
-        next_brief=args.next_brief,
-        status=args.status,
-        tests=args.tests or None,
-        baseline=baseline,
-        queue_dir=queue_dir,
-        osascript_subtitle=args.blocked_reason or None,
-        retro_evidence_path=retro_evidence_path,
-        source_workspace=source_workspace,
-        old_head=old_head,
-        worktree_info=worktree_info,
+    # Singlepane concurrency hard-gate (design §5.4): for an ACTIVE worker spawn into a
+    # ``worker_isolation == "singlepane"`` project, hold the project spawn lock across the
+    # WHOLE write (sidecar + .uri publish) and REJECT a concurrent / over-spawned second
+    # worker rather than clobber the live one. NO-OP for non-singlepane projects and for
+    # the terminal (done/blocked) paths — those never spawn a worker.
+    spawn_guard: contextlib.AbstractContextManager = (
+        singlepane_worker_guard(cfg, project=project, task=args.task)
+        if args.status == "active"
+        else contextlib.nullcontext()
     )
+    try:
+        with spawn_guard:
+            return write_active_dump(
+                cfg=cfg,
+                project=project,
+                task=args.task,
+                workspace=spawn_workspace,
+                next_brief=args.next_brief,
+                status=args.status,
+                tests=args.tests or None,
+                baseline=baseline,
+                queue_dir=queue_dir,
+                osascript_subtitle=args.blocked_reason or None,
+                retro_evidence_path=retro_evidence_path,
+                source_workspace=source_workspace,
+                old_head=old_head,
+                worktree_info=worktree_info,
+            )
+    except SinglepaneBusy as e:
+        print(
+            f"❌ {e}\n   (singlepane project already busy; see "
+            f"ack/{args.task}.singlepane_busy.txt — the existing worker must finish first)",
+            file=sys.stderr,
+        )
+        return 2
 
 
 if __name__ == "__main__":
