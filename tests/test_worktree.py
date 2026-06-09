@@ -468,6 +468,39 @@ def test_coordinator_redtop_warns_when_cannot_apply(tmp_path, capsys):
     assert "WARN" in err  # round-3 codex: a literal token so logs/scripts can grep the degrade signal
 
 
+def test_coordinator_fresh_create_warns_on_write_failure(tmp_path, monkeypatch, capsys):
+    """禁止静默降级铁律 — FRESH-create symmetry (coord-redtop-fold-fix / round-3 codex P1). The REUSE
+    path (_ensure_coordinator_redtop) WARNs on a write failure; the fresh-create path must too. When
+    a coordinator's brand-new .handoff.code-workspace can't be written (OSError — full disk / RO
+    mount / perms), inject must NOT slip the 中枢 window out silently un-red-topped: emit the visible
+    stderr WARN, still return None (never brick / never raise). A NON-coordinator write failure stays
+    a byte-identical silent ``return None`` with NO warning (zero regression, validation gate #2)."""
+    src = tmp_path / "src"
+    src.mkdir()
+    wt_coord = tmp_path / "wt_coord"
+    wt_coord.mkdir()
+    wt_plain = tmp_path / "wt_plain"
+    wt_plain.mkdir()
+
+    def _boom(self, *a, **k):  # the .handoff.code-workspace write fails
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "write_text", _boom)
+
+    # COORDINATOR fresh-create write failure → visible WARN + None (must not raise).
+    p = wt.inject_vscode_workspace(src, wt_coord, "erp-system", "role-flip", is_coordinator=True)
+    assert p is None
+    err = capsys.readouterr().err
+    assert "中枢" in err or "coordinator" in err.lower()
+    assert "🧭" in err
+    assert "WARN" in err  # grep-able degrade signal (parity with the reuse-path WARN test)
+
+    # NON-coordinator fresh-create write failure → silent None, NO warn (byte-identical behavior).
+    p2 = wt.inject_vscode_workspace(src, wt_plain, "erp-system", "stage1-10c")
+    assert p2 is None
+    assert capsys.readouterr().err == ""
+
+
 def test_coordinator_redtop_missing_title_fallback(tmp_path):
     """Edge (gemini round-2 P2): a reused file whose window.title was deleted still gets a
     🧭中枢·-marked fallback title (project+task identifiable) — not just red, the 中枢 text marker too."""
