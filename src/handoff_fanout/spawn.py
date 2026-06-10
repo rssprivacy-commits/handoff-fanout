@@ -504,6 +504,18 @@ def run_spawn(
     if close_policy is None:
         # worker keeps its own window; a succession's whole purpose is to close its predecessor.
         close_policy = CLOSE_PREDECESSOR if role == ROLE_SUCCESSION else CLOSE_KEEP
+    elif (close_policy == CLOSE_PREDECESSOR) != (role == ROLE_SUCCESSION):
+        # codex SHOULD (redtop-succ verification round): an EXPLICIT close policy that
+        # contradicts the role is unactionable metadata — the watchdog/extension act on
+        # role (succession closes its predecessor; a worker is never closed), so a
+        # "succession+keep" or "worker+close_predecessor" sidecar would lie about what
+        # the consumers will actually do. Reject the combo fail-closed rather than bake
+        # the contradiction into the intent.
+        _err(
+            f"--close-policy {close_policy!r} contradicts --role {role!r} "
+            "(succession⇔close_predecessor, worker⇔keep) — refusing the intent"
+        )
+        return EXIT_FAIL_CLOSED
 
     nonce = _spawn_nonce.new_nonce()
     prompt_text = _build_prompt(task, brief=brief, prompt=prompt)

@@ -409,6 +409,42 @@ def test_worker_singlepane_workspace_has_no_redtop(tmp_path, monkeypatch):
     assert not ws["settings"]["window.title"].startswith("🧭中枢·")
 
 
+def test_worker_worktree_workspace_has_no_redtop(tmp_path, monkeypatch):
+    """codex SHOULD (redtop-succ round): assert no-redtop DIRECTLY on the spawn-worktree
+    worker path (not only via the lower create_worktree/inject golden tests)."""
+    home = _home(tmp_path, monkeypatch)
+    _, ws_repo = _bare_and_clone(tmp_path)
+    assert spawn.main(_argv(isolation="worktree", workspace=ws_repo)) == 0
+    wt_workspace = Path(_uri_lines(home)["WORKSPACE"])
+    spec = json.loads((wt_workspace / ".handoff.code-workspace").read_text())
+    assert not spec["settings"]["window.title"].startswith("🧭中枢·")
+    assert "workbench.colorCustomizations" not in spec["settings"]
+
+
+def test_explicit_close_policy_contradicting_role_is_rejected(tmp_path, monkeypatch):
+    """codex SHOULD (redtop-succ round): succession+keep / worker+close_predecessor are
+    contradictory metadata (consumers act on role) — fail closed, produce no intent."""
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    rc = spawn.main(
+        _argv(
+            isolation="singlepane",
+            workspace=repo,
+            role="supervisor_succession",
+            predecessor_nonce="0123456789abcdef",
+        )
+        + ["--close-policy", "keep"]
+    )
+    assert rc != 0
+    assert not (home / PROJECT / "queue" / f"{TASK}.uri").exists()
+
+    rc = spawn.main(
+        _argv(isolation="singlepane", workspace=repo) + ["--close-policy", "close_predecessor"]
+    )
+    assert rc != 0
+    assert not (home / PROJECT / "queue" / f"{TASK}.uri").exists()
+
+
 def test_succession_worktree_workspace_is_redtopped(tmp_path, monkeypatch):
     """The worktree isolation path passes is_coordinator into create_worktree — a
     succession's worktree .handoff.code-workspace carries the same red-top."""
