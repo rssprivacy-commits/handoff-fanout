@@ -284,6 +284,12 @@ raise_task_window() {
         end run' "$tok" 2>>"$LOG")
         if [ "$hit" = "hit" ]; then
             RAISE_MATCHED_TOKEN="$tok"
+            # TOCTOU (fdv2-fix1 SHOULD, documented as ACCEPTED): the window matched by the enum
+            # above can close in the gap before this raise script runs — its `activate` still
+            # fires app-level and pulls VS Code's last-active (possibly the owner's) window
+            # front ONCE. Best-effort by design; folding the title match INTO this script would
+            # put an app-activation keyword on the enumerate path and break the stubbed
+            # provability of the miss case (the enum script deliberately carries none).
             "$HANDOFF_OSASCRIPT_CMD" -e 'on run argv
                 -- handoff-window-raise
                 set token to item 1 of argv
@@ -306,13 +312,24 @@ raise_task_window() {
 
 # ONE System Events probe (focus-drift v2 / 2026-06-10). Prints, prefix-tagged so empty values and
 # arbitrary window titles parse unambiguously:
+#   PROBE:OK                         (FIRST line — fdv2-fix1 trust marker: the enumeration
+#                                     COMPLETED. An osascript error / AX hang prints NOTHING
+#                                     (stderr dropped), and callers MUST read a missing
+#                                     PROBE:OK as a FAILED probe — never as "Code has no
+#                                     windows". Conflating the two was fail-OPEN: a failed
+#                                     snapshot made every front window test "fresh" and the
+#                                     discriminator dispatched into the owner's old window.)
 #   FRONT_APP:<frontmost app name>
 #   FRONT_WIN:<frontmost Code window name — empty unless Code is frontmost>
 #   WIN:<name>                       (one line per Code window, any order)
+# Window names are newline-sanitized IN-SCRIPT (cleanName: linefeed/return → space) so one
+# window is always exactly one WIN: line — a pathological filename-with-newline title would
+# otherwise shear the line protocol that bash parses with `sed`/`grep -Fxq` (codex MUST-2).
 # Three consumers: (a) the PRE-`code -n` snapshot the timeout discriminator checks membership
 # against; (b) re-run at discriminator time for the FRESH front app/window; (c) the retry-tick
-# probe (does the target window still exist / is it already front?). Errors / no Code process /
-# no windows ⇒ fewer or no lines — callers treat that as an empty snapshot, never a crash.
+# probe (does the target window still exist / is it already front?). "PROBE:OK + zero WIN:
+# lines" = a LEGAL empty snapshot (no Code process / no windows — a first-window spawn still
+# dispatches); output without PROBE:OK = probe FAILURE → callers fail-closed.
 probe_code_windows() {
     "$HANDOFF_OSASCRIPT_CMD" -e 'on run
         -- handoff-window-probe
@@ -326,16 +343,25 @@ probe_code_windows() {
             if exists process "Code" then
                 tell process "Code"
                     repeat with w in windows
-                        set winLines to winLines & "WIN:" & (name of w) & linefeed
+                        set winLines to winLines & "WIN:" & my cleanName(name of w) & linefeed
                     end repeat
                     if frontApp is "Code" and (count of windows) > 0 then
-                        set frontWin to name of front window
+                        set frontWin to my cleanName(name of front window)
                     end if
                 end tell
             end if
-            return "FRONT_APP:" & frontApp & linefeed & "FRONT_WIN:" & frontWin & linefeed & winLines
+            return "PROBE:OK" & linefeed & "FRONT_APP:" & frontApp & linefeed & "FRONT_WIN:" & frontWin & linefeed & winLines
         end tell
-    end run' 2>/dev/null
+    end run
+    on cleanName(t)
+        -- codex MUST-2: replace linefeed/return with a space so one window == one line
+        set text item delimiters of AppleScript to {linefeed, return}
+        set parts to every text item of (t as text)
+        set text item delimiters of AppleScript to " "
+        set cleaned to parts as text
+        set text item delimiters of AppleScript to ""
+        return cleaned
+    end cleanName' 2>/dev/null
 }
 
 # Does any newline-separated window name in <list> CONTAIN <token>? (substring per line —
@@ -1019,6 +1045,21 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
 
     mkdir -p "$LAUNCHED"
 
+    # fdv2-fix1 SHOULD (housekeeping): a .focus_contended marker normally dies on URI success,
+    # give-up, or its own next retry tick — but a task terminated OUTSIDE the focus-retry path
+    # (queue .done guard / a done|failed ack) with the .uri already gone leaves the marker
+    # orphaned forever. One pass per project tick: clear markers whose task is finished and has
+    # no .uri left to ever clear them. (nullglob is on — an empty glob skips the loop.)
+    for _FCM in "$QUEUE"/*.focus_contended; do
+        [ -f "$_FCM" ] || continue
+        _FCT=$(basename "$_FCM" .focus_contended)
+        [ -f "$QUEUE/$_FCT.uri" ] && continue   # live retry chain — not stale
+        if [ -f "$QUEUE/$_FCT.done" ] || [ -f "$PROJ_DIR/ack/$_FCT.done" ] || [ -f "$PROJ_DIR/ack/$_FCT.failed" ]; then
+            rm -f "$_FCM" 2>/dev/null
+            log "FOCUS-HOUSEKEEPING: cleared stale focus_contended marker (task finished, no .uri). project=$PROJECT task=$_FCT"
+        fi
+    done
+
     # 遍历项目 queue 内 .uri 文件
     for URI_FILE in "$QUEUE"/*.uri; do
         [ ! -f "$URI_FILE" ] && continue
@@ -1210,34 +1251,54 @@ EOF
                 # post-timeout discriminator can tell "fresh window whose title merely lags" (front
                 # window ∉ snapshot → dispatch) from "the owner's OLD window still holds front"
                 # (∈ snapshot → fail-closed). The same single call doubles as the retry-tick probe.
-                # Empty output (no Code process / no windows / osascript error) = a legal empty snapshot.
+                # fdv2-fix1 (dual-brain re-audit MUST): the probe carries a PROBE:OK first-line trust
+                # marker. "PROBE:OK + zero WIN: lines" = a LEGAL empty snapshot (Code genuinely has
+                # no windows — a first-window spawn still dispatches). NO PROBE:OK (osascript error /
+                # AX hang — a cold render is exactly when System Events stalls) = a FAILED probe:
+                # _snap_ok=0 makes the 2.4 discriminator unconditionally fail-closed. Pre-fix both
+                # shapes parsed as an empty snapshot, so a failed probe made EVERY front window test
+                # "fresh" ("∉ empty snapshot") → the URI dispatched into the owner's old window =
+                # fail-OPEN on the very contract whose core is "everything else fail-closed".
                 _probe_out=$(probe_code_windows)
+                _snap_ok=0
+                case "$_probe_out" in PROBE:OK*) _snap_ok=1 ;; esac
                 _snap_wins=$(printf '%s\n' "$_probe_out" | /usr/bin/sed -n 's/^WIN://p')
                 _skip_code_n=0; _front_verified=0; _skip_primary_wait=0
                 FOCUS_MARKER="$QUEUE/$TASK.focus_contended"
                 if [ -f "$FOCUS_MARKER" ]; then
                     # 2.5 retry tick — minimize focus theft (codex Q2). Reuse the snapshot probe:
+                    #   (0) probe FAILED → the window state is UNKNOWN: do NOT `code -n` (a blind
+                    #       rebuild against a state we cannot see can stack a duplicate window —
+                    #       the pre-fix code read a failed probe as "target gone → rebuild"); go
+                    #       straight to the raise + discriminator, which fail-closes on _snap_ok=0
+                    #       (fdv2-fix1 MUST);
                     #   (a) target window already FRONT → skip `code -n` (and the waits) entirely;
                     #   (b) target exists in the BACKGROUND → skip `code -n` (its focusing of an
                     #       existing workspace is only a SHOULD-level assumption, never a correctness
                     #       premise), go straight to the hardened raise + a short re-wait;
                     #   (c) target gone (owner closed it) → rebuild via the normal `code -n` path.
-                    _p_app=$(printf '%s\n' "$_probe_out" | /usr/bin/sed -n 's/^FRONT_APP://p' | /usr/bin/head -1)
-                    _p_win=$(printf '%s\n' "$_probe_out" | /usr/bin/sed -n 's/^FRONT_WIN://p' | /usr/bin/head -1)
-                    if _wins_contain "$_snap_wins" "$_focus_token" || _wins_contain "$_snap_wins" "$TASK"; then
+                    if [ "$_snap_ok" != "1" ]; then
                         _skip_code_n=1
-                        if [ "$_p_app" = "Code" ]; then
-                            case "$_p_win" in
-                                *"$_focus_token"*|*"$TASK"*) _front_verified=1 ;;
-                            esac
-                        fi
-                        if [ "$_front_verified" = "1" ]; then
-                            log "FOCUS-RETRY: target window already frontmost — skipping code -n + waits. project=$PROJECT task=$TASK"
-                        else
-                            _skip_primary_wait=1
-                        fi
+                        _skip_primary_wait=1
+                        log "FOCUS-RETRY: window probe FAILED — unknown window state: skipping code -n, raise + discriminator will fail-closed. project=$PROJECT task=$TASK"
                     else
-                        log "FOCUS-RETRY: target window gone (owner closed it?) — rebuilding via code -n. project=$PROJECT task=$TASK"
+                        _p_app=$(printf '%s\n' "$_probe_out" | /usr/bin/sed -n 's/^FRONT_APP://p' | /usr/bin/head -1)
+                        _p_win=$(printf '%s\n' "$_probe_out" | /usr/bin/sed -n 's/^FRONT_WIN://p' | /usr/bin/head -1)
+                        if _wins_contain "$_snap_wins" "$_focus_token" || _wins_contain "$_snap_wins" "$TASK"; then
+                            _skip_code_n=1
+                            if [ "$_p_app" = "Code" ]; then
+                                case "$_p_win" in
+                                    *"$_focus_token"*|*"$TASK"*) _front_verified=1 ;;
+                                esac
+                            fi
+                            if [ "$_front_verified" = "1" ]; then
+                                log "FOCUS-RETRY: target window already frontmost — skipping code -n + waits. project=$PROJECT task=$TASK"
+                            else
+                                _skip_primary_wait=1
+                            fi
+                        else
+                            log "FOCUS-RETRY: target window gone (owner closed it?) — rebuilding via code -n. project=$PROJECT task=$TASK"
+                        fi
                     fi
                 fi
                 if [ "$_skip_code_n" != "1" ]; then
@@ -1260,7 +1321,11 @@ EOF
                 if [ "$_front_verified" != "1" ]; then
                     _primary_ok=0
                     if [ "$_skip_primary_wait" = "1" ]; then
-                        log "FOCUS-RETRY: target window in background — skipping code -n, straight to raise. project=$PROJECT task=$TASK"
+                        # (0) failed-probe ticks logged their decision above — only the (b)
+                        # background-window tick gets this message (fdv2-fix1).
+                        if [ "$_snap_ok" = "1" ]; then
+                            log "FOCUS-RETRY: target window in background — skipping code -n, straight to raise. project=$PROJECT task=$TASK"
+                        fi
                     elif wait_target_window_frontmost "$TASK" "${HANDOFF_WIN_FRONT_SECS:-3}"; then
                         _primary_ok=1
                     else
@@ -1288,11 +1353,16 @@ EOF
                     # BY HAND after the snapshot is not in it and gets mis-judged as ours → the URI
                     # lands there; the Enter nonce/readiness gate still withholds = no worse than the
                     # pre-fix behavior.
+                    # fdv2-fix1 (dual-brain re-audit MUST): the ∉-snapshot test is only meaningful
+                    # when the snapshot actually COMPLETED (_snap_ok=1). A failed probe yields an
+                    # empty snapshot in which EVERY window tests "fresh" — pre-fix that dispatched
+                    # into the owner's old window (fail-open); now it defers. (A failed
+                    # discriminator-time probe needs no extra guard: it leaves _d_app empty ≠ Code.)
                     _d_out=$(probe_code_windows)
                     _d_app=$(printf '%s\n' "$_d_out" | /usr/bin/sed -n 's/^FRONT_APP://p' | /usr/bin/head -1)
                     _d_win=$(printf '%s\n' "$_d_out" | /usr/bin/sed -n 's/^FRONT_WIN://p' | /usr/bin/head -1)
                     _dispatch=0
-                    if [ "$_d_app" = "Code" ] && [ -n "$_d_win" ] && \
+                    if [ "$_snap_ok" = "1" ] && [ "$_d_app" = "Code" ] && [ -n "$_d_win" ] && \
                        ! printf '%s\n' "$_snap_wins" | /usr/bin/grep -Fxq -- "$_d_win"; then
                         _dispatch=1
                         log "FOCUS-DISCRIMINATOR: front Code window not in the pre-open snapshot → fresh window with a lagging title — dispatching. front_title=$_d_win project=$PROJECT task=$TASK"
@@ -1314,7 +1384,7 @@ EOF
                         _fc_count=$((_fc_count + 1))
                         _fc_max="${HANDOFF_FOCUS_DEFER_MAX:-5}"
                         case "$_fc_max" in ''|*[!0-9]*) _fc_max=5 ;; esac
-                        log "FOCUS-CONTENDED: URI WITHHELD (fail-closed) matched_by=$_matched_by front_app=$_d_app front_title=$_d_win count=$_fc_count/$_fc_max project=$PROJECT task=$TASK"
+                        log "FOCUS-CONTENDED: URI WITHHELD (fail-closed) matched_by=$_matched_by snap_ok=$_snap_ok front_app=$_d_app front_title=$_d_win count=$_fc_count/$_fc_max project=$PROJECT task=$TASK"
                         if [ "$_fc_count" -ge "$_fc_max" ]; then
                             # give up: CONSUME the .uri (no restore — no infinite retry); the intent
                             # text stays parked in launched/ for the owner's manual recovery.
