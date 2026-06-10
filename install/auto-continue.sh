@@ -677,6 +677,218 @@ cold_submit_with_retry() {
     return 1
 }
 
+# ─── SINGLEPANE bounded submit retry (sw-sp-enter-retry / 2026-06-10, dual-brain GREEN) ──────
+# THE BUG (owner: "经常手动 Enter"): the singlepane path submitted through the WARM one-shot
+# gate (ONE osascript title-nonce assertion + bare Enter, no retry) — but a singlepane spawn is
+# a cold-rendering NEW window, so the Enter can fire while the URI paste has not landed
+# (swallowed) → no second chance. cold_submit_with_retry's transcript line-GROWTH gate cannot
+# be reused: a singlepane session writes into the SHARED project transcript dir
+# (~/.claude/projects/<project-slug>/, cwd = the real repo) where a SIBLING session's growth
+# would false-confirm. CONTRACT (dual-brain GREEN + coordinator arbitration):
+#   confirm   = a NEW *.jsonl (∉ the pre-URI baseline FILE-SET) carrying the 🆔<task> marker.
+#               mtime is BANNED — a resume / re-dispatch of the same task leaves OLD files
+#               containing the same 🆔, which an mtime/content-only probe would false-confirm
+#               (the false-positive MAIN path);
+#   re-probe BEFORE every retry — already confirmed → ack submitted, NEVER press again;
+#   retry gate = ONE osascript asserting Code frontmost ∧ front window title contains the
+#               nonce token ∧ focused element is the Claude "Message input" ∧ its value still
+#               contains 🆔<task> (= OUR prompt sits UNSUBMITTED in OUR input) → only then
+#               keystroke return. Empty/markerless input → DO NOT press (a submitted prompt
+#               empties the input — a second Enter there is the double-submit hazard), keep
+#               polling the jsonl; front window without the nonce → nonce-first
+#               raise_task_window, then retry;
+#   bounded   = retries ≤ HANDOFF_SP_RETRY_MAX (default 2) after the first Enter; confirm
+#               poll window HANDOFF_SP_POLL_SECS × HANDOFF_SP_POLL_TRIES (default 2s×3) per
+#               attempt. Exhausted → an HONEST failed ack saying which step fell empty.
+# Scope: SINGLEPANE_WINDOW=1 AND the URI `open` succeeded. The focus-contended defer/give-up
+# paths happen BEFORE the URI dispatch and never reach this machinery; a visible-park window
+# never receives an Enter.
+
+# Newline list of the project transcript dir's existing *.jsonl paths (sorted, stable). The
+# slug derives from the RESOLVED workspace path ('/'+'.' → '-', Claude Code convention) — the
+# same resolution worktree_transcript_lines performs (kept duplicated ON PURPOSE: the cold
+# path is byte-frozen; extracting a shared skeleton belongs to the 共享模块重构 backlog).
+singlepane_list_jsonls() {
+    local ws="$1" rp slug pd
+    rp=$(cd "$ws" 2>/dev/null && pwd -P) || rp=""
+    [ -n "$rp" ] || rp="$ws"
+    slug=$(printf '%s' "$rp" | sed 's#[/.]#-#g')
+    pd="${HANDOFF_TRANSCRIPT_ROOT:-$HOME/.claude/projects}/$slug"
+    [ -d "$pd" ] || return 0
+    /usr/bin/find "$pd" -maxdepth 1 -name '*.jsonl' 2>/dev/null | LC_ALL=C /usr/bin/sort
+}
+
+# 0 = CONFIRMED: some *.jsonl NOT in the baseline set carries the 🆔<task> marker. Sets
+# SP_PROBE_STATE ∈ confirmed|new-jsonl-no-marker|no-new-jsonl (the SP-SUBMIT diagnostic enum).
+# A baseline (pre-existing) file is NEVER a confirm source even when it greps the marker —
+# that is exactly the resume/re-dispatch false-positive the new-file-set design exists to kill.
+SP_PROBE_STATE=""
+singlepane_probe_confirm() {
+    local ws="$1" task="$2" base="$3" f cur found_new=0
+    SP_PROBE_STATE="no-new-jsonl"
+    cur=$(singlepane_list_jsonls "$ws")
+    [ -n "$cur" ] || return 1
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        if [ -n "$base" ] && printf '%s\n' "$base" | /usr/bin/grep -Fxq -- "$f"; then
+            continue
+        fi
+        found_new=1
+        if /usr/bin/grep -qF -- "🆔$task" "$f" 2>/dev/null; then
+            SP_PROBE_STATE="confirmed"
+            return 0
+        fi
+    done <<EOF
+$cur
+EOF
+    [ "$found_new" = "1" ] && SP_PROBE_STATE="new-jsonl-no-marker"
+    return 1
+}
+
+# Retry-Enter gate — ONE osascript process (TOCTOU narrowed to the physical limit, as in
+# cold_submit_with_retry, whose AX-guard pattern this mirrors: every AX read is
+# missing-value-guarded BEFORE any string op — an unguarded op on `missing value` THROWS and
+# bash would mis-read "osascript error" exactly when it should keep waiting). Echoes one of:
+# sent|nofront|nowin|mismatch|noelem|notinput|emptyinput|wronginput. argv-passed (no
+# AppleScript injection). Non-zero exit = osascript itself errored (accessibility revoked).
+singlepane_retry_gate() {
+    local token="$1" marker="$2"
+    "$HANDOFF_OSASCRIPT_CMD" -e 'on run argv
+        -- handoff-sp-retry-gate
+        set token to item 1 of argv
+        set marker to item 2 of argv
+        tell application "System Events"
+            set fa to name of first application process whose frontmost is true
+            if fa is not "Code" then return "nofront"
+            tell process "Code"
+                if (count of windows) is 0 then return "nowin"
+                set wname to ""
+                try
+                    set wname to name of front window
+                end try
+                if wname is missing value then set wname to ""
+                if wname does not contain token then return "mismatch"
+                set f to missing value
+                try
+                    set f to value of attribute "AXFocusedUIElement"
+                end try
+                if f is missing value then return "noelem"
+                set r to ""
+                try
+                    set r to (role of f)
+                end try
+                if r is missing value then set r to ""
+                if r is not "AXTextArea" then return "notinput"
+                set d to ""
+                try
+                    set d to (description of f)
+                end try
+                if d is missing value then set d to ""
+                if d does not contain "Message input" then return "notinput"
+                set v to ""
+                try
+                    set v to (value of f)
+                end try
+                if v is missing value then return "emptyinput"
+                if v is "" then return "emptyinput"
+                if v does not contain marker then return "wronginput"
+                keystroke return
+                return "sent"
+            end tell
+        end tell
+    end run' "$token" "$marker" 2>>"$LOG"
+}
+
+# Orchestrator. Return codes (HONEST per-state acks, mirroring cold):
+#   0 = our Enter + a NEW 🆔-marked jsonl (script-verified submit)
+#   3 = a NEW 🆔-marked jsonl appeared WITHOUT our machinery pressing (external/manual Enter,
+#       or confirm raced ahead of the press) → running, mark submitted but NOT script-verified
+#   2 = osascript hard error (accessibility revoked mid-run)
+#   6 = ambiguous-after-first-enter: Enter WAS pressed, the input then read empty/markerless,
+#       and no marked jsonl arrived in the budget → NEVER press again (contract: 不盲按)
+#   1 = Enter sent (marker-verified or first-shot) but no marked jsonl within the budget
+#   5 = exhausted without EVER pressing (front never ours / input never ready) → manual Enter
+SP_LAST_OUTCOME=""
+singlepane_submit_with_retry() {
+    local token="$1" task="$2" ws="$3" base="$4"
+    local marker="🆔$task"
+    local retry_max poll_secs poll_tries
+    retry_max="${HANDOFF_SP_RETRY_MAX:-2}"; case "$retry_max" in ''|*[!0-9]*) retry_max=2 ;; esac
+    poll_secs="${HANDOFF_SP_POLL_SECS:-2}"; case "$poll_secs" in ''|*[!0-9]*) poll_secs=2 ;; esac; [ "$poll_secs" -lt 1 ] && poll_secs=1
+    poll_tries="${HANDOFF_SP_POLL_TRIES:-3}"; case "$poll_tries" in ''|*[!0-9]*) poll_tries=3 ;; esac; [ "$poll_tries" -lt 1 ] && poll_tries=1
+    local attempt=0 max_attempts=$((1 + retry_max)) enter_pressed=0 out rc i base_n
+    base_n=$(printf '%s' "$base" | /usr/bin/grep -c . || true)
+    SP_LAST_OUTCOME=""
+    log "SP-SUBMIT-START: token=$token task=$task retries≤$retry_max poll=${poll_secs}sx${poll_tries} base_jsonls=$base_n (new-file-set + 🆔 confirm, bounded Enter retry)"
+    while [ "$attempt" -lt "$max_attempts" ]; do
+        attempt=$((attempt + 1))
+        # contract: RE-PROBE before any press — already confirmed → never press again
+        if singlepane_probe_confirm "$ws" "$task" "$base"; then
+            log "SP-SUBMIT: attempt=$attempt outcome=confirmed (pre-press probe — no further Enter)"
+            [ "$enter_pressed" = "1" ] && return 0
+            return 3
+        fi
+        if [ "$attempt" -eq 1 ]; then
+            # first press = the pre-existing warm atomic title(nonce)-gated bare Enter —
+            # status quo for the initial submit; the NEW machinery is everything after it.
+            submit_enter_if_front_window_contains "$token"; rc=$?
+            if [ "$rc" = "2" ]; then return 2; fi
+            if [ "$rc" = "0" ]; then out="sent"; else out="mismatch"; fi
+        else
+            out=$(singlepane_retry_gate "$token" "$marker") || return 2
+        fi
+        case "$out" in
+            sent)
+                enter_pressed=1
+                i=0
+                while [ "$i" -lt "$poll_tries" ]; do
+                    sleep "$poll_secs"
+                    if singlepane_probe_confirm "$ws" "$task" "$base"; then
+                        log "SP-SUBMIT: attempt=$attempt outcome=confirmed"
+                        return 0
+                    fi
+                    i=$((i + 1))
+                done
+                SP_LAST_OUTCOME="$SP_PROBE_STATE"
+                log "SP-SUBMIT: attempt=$attempt outcome=$SP_PROBE_STATE (Enter sent, confirm poll exhausted)"
+                ;;
+            nofront|nowin|mismatch)
+                SP_LAST_OUTCOME="front-mismatch"
+                log "SP-SUBMIT: attempt=$attempt outcome=front-mismatch (gate=$out) — nonce-first raise + retry"
+                raise_task_window "$token" "$task"
+                sleep "$poll_secs"
+                ;;
+            *)
+                # noelem|notinput|emptyinput|wronginput → DO NOT press; keep polling the jsonl
+                # (a submitted prompt EMPTIES the input — pressing here is the double-submit
+                # hazard; a markerless value is not provably our prompt input).
+                SP_LAST_OUTCOME="input-not-ready"
+                log "SP-SUBMIT: attempt=$attempt outcome=input-not-ready (gate=$out) — Enter withheld, polling jsonl"
+                i=0
+                while [ "$i" -lt "$poll_tries" ]; do
+                    sleep "$poll_secs"
+                    if singlepane_probe_confirm "$ws" "$task" "$base"; then
+                        log "SP-SUBMIT: attempt=$attempt outcome=confirmed (during input-not-ready poll — no further Enter)"
+                        [ "$enter_pressed" = "1" ] && return 0
+                        return 3
+                    fi
+                    i=$((i + 1))
+                done
+                ;;
+        esac
+    done
+    if [ "$enter_pressed" = "1" ]; then
+        if [ "$SP_LAST_OUTCOME" = "input-not-ready" ]; then
+            log "SP-SUBMIT: AMBIGUOUS after first Enter — input empty/markerless, no 🆔-marked jsonl in budget (attempts=$attempt) — never pressing again (rc=6)"
+            return 6
+        fi
+        log "SP-SUBMIT: Enter sent but NO new 🆔-marked jsonl within budget (last=$SP_LAST_OUTCOME attempts=$attempt) (rc=1)"
+        return 1
+    fi
+    log "SP-SUBMIT: exhausted without ever pressing (last=$SP_LAST_OUTCOME attempts=$attempt) — Enter WITHHELD (rc=5)"
+    return 5
+}
+
 # Accessibility (UI-scripting) preflight. `keystroke` requires the process that
 # ultimately drives System Events (launchd's osascript binary) to hold the
 # Accessibility permission. Probe it NON-destructively via `UI elements enabled`
@@ -1424,6 +1636,13 @@ EOF
             log "WARN: WORKSPACE empty/invalid ($WORKSPACE), falling back to frontmost"
         fi
 
+        # SP-SUBMIT baseline (sw-sp-enter-retry): the singlepane confirm signal is a NEW
+        # transcript *.jsonl (∉ this set) carrying 🆔<task>. Captured BEFORE the URI dispatch
+        # so ANY session file born after it counts as new; the set (not mtime) is the
+        # discriminator — old files from a resume/re-dispatch carry the same 🆔 and must
+        # never confirm.
+        _SP_BASE_JSONLS=""
+        [ "$SINGLEPANE_WINDOW" = "1" ] && _SP_BASE_JSONLS=$(singlepane_list_jsonls "$WORKSPACE")
         # Step 2: open URI in the activated workspace
         if "$HANDOFF_OPEN_CMD" "$URI"; then
             log "SUCCESS: spawned Claude tab in project=$PROJECT task=$TASK (archived: $TASK-$TS.txt)"
@@ -1481,7 +1700,14 @@ EOF
                 warn_accessibility_once
                 log "ABORT-SUBMIT: Accessibility 权限缺失 — Enter 未按 (tab 已开, 需手动按一次). project=$PROJECT task=$TASK"
                 write_ack "$PROJ_DIR" "$TASK" "failed" "accessibility-missing: 需手动按 Enter (System Settings → 辅助功能)"
-            elif [ "$COLD_WINDOW" = "1" ] || _perf_call "$TASK" "is-frontmost-code" is_frontmost_code; then
+            elif [ "$COLD_WINDOW" = "1" ] || [ "$SINGLEPANE_WINDOW" = "1" ] || _perf_call "$TASK" "is-frontmost-code" is_frontmost_code; then
+                # SINGLEPANE short-circuit (sw-sp-enter-retry): mirror of the cold rationale
+                # below — singlepane_submit_with_retry's per-press gates (title-nonce atomic
+                # first press; title-nonce + focused-input-marker retries) are STRICTLY
+                # STRONGER than the app-level is_frontmost_code, and a not-frontmost moment
+                # here must flow into the machinery's front-mismatch → raise → retry path
+                # (the one-shot "frontmost not Code → give up" abort is exactly the
+                # no-second-chance bug being fixed).
                 # +20s fix (2026-06-07 spawn-speedup): for the COLD path, SHORT-CIRCUIT past is_frontmost_code.
                 # PERF instrumentation proved is_frontmost_code (app==Code only) BLOCKED ~10s under cold window
                 # render — yet it is REDUNDANT for cold: cold_submit_with_retry's atomic poll is a STRICTLY
@@ -1545,6 +1771,40 @@ EOF
                     # `.handoff.code-workspace`. The launcher's `close_sidebars_if_front_window_contains` (the
                     # /singlepane URI) is kept defined as a FALLBACK only — re-enable it here (right after the URI)
                     # if a real spawn is ever observed to re-open a side bar after startup (codex: "only if observed").
+                elif [ "$SINGLEPANE_WINDOW" = "1" ]; then
+                    # SINGLEPANE bounded submit (sw-sp-enter-retry): replaces the warm one-shot
+                    # gate for this path only. NOTE: singlepane deliberately no longer falls
+                    # through to the HANDOFF_WARM_WINDOW_GUARD=0 escape hatch below — an
+                    # app-level ungated Enter would bypass the spawn_nonce red line.
+                    singlepane_submit_with_retry "$_submit_token" "$TASK" "$WORKSPACE" "$_SP_BASE_JSONLS"
+                    case $? in
+                        0)
+                            log "AUTO-SUBMIT: Enter + new 🆔-marked transcript jsonl verified (singlepane, auto) for project=$PROJECT task=$TASK"
+                            write_ack "$PROJ_DIR" "$TASK" "submitted" "Enter + new 🆔-marked transcript jsonl verified (singlepane, auto)"
+                            ;;
+                        3)
+                            # confirm arrived without our machinery pressing — running, but HONEST
+                            log "AUTO-SUBMIT: singlepane session already running via external/manual Enter (NOT script-verified) for project=$PROJECT task=$TASK"
+                            write_ack "$PROJ_DIR" "$TASK" "submitted" "external/manual Enter started the session before auto-submit — running, NOT script-verified (singlepane)"
+                            ;;
+                        2)
+                            warn_accessibility_once
+                            log "WARN: osascript keystroke failed despite accessibility preflight OK (transient / 权限 mid-run 撤销?) project=$PROJECT task=$TASK"
+                            write_ack "$PROJ_DIR" "$TASK" "failed" "osascript keystroke failed post-preflight"
+                            ;;
+                        6)
+                            log "ABORT-SUBMIT: singlepane ambiguous-after-first-enter — Enter 已按、输入框已空/无标记、轮询窗内无 🆔 新 jsonl — 绝不重按. 主人请核实会话是否已在跑(勿盲按). project=$PROJECT task=$TASK"
+                            write_ack "$PROJ_DIR" "$TASK" "failed" "ambiguous-after-first-enter: Enter pressed, input then empty/markerless, no new 🆔 jsonl in poll window — NOT re-pressed; 请核实窗口里会话是否已在跑, 没跑再手动按一次 Enter (singlepane)"
+                            ;;
+                        1)
+                            log "ABORT-SUBMIT: singlepane Enter sent but NO new 🆔-marked jsonl within budget — tab 已开, 主人核实/手动按一次 Enter. project=$PROJECT task=$TASK"
+                            write_ack "$PROJ_DIR" "$TASK" "failed" "Enter sent but no new 🆔-marked jsonl within poll budget — manual check/Enter needed (singlepane)"
+                            ;;
+                        *)
+                            log "ABORT-SUBMIT: singlepane submit exhausted without a safe press (last=${SP_LAST_OUTCOME:-none}) — Enter WITHHELD, tab 已开, 主人手动按一次 Enter. project=$PROJECT task=$TASK"
+                            write_ack "$PROJ_DIR" "$TASK" "failed" "submit withheld after bounded retries (last=${SP_LAST_OUTCOME:-none}): 手动按一次 Enter (singlepane)"
+                            ;;
+                    esac
                 elif [ "${HANDOFF_WARM_WINDOW_GUARD:-1}" = "0" ]; then
                     # warm escape-hatch: legacy app-level Enter (custom window.title without folder name)
                     if "$HANDOFF_OSASCRIPT_CMD" -e 'tell application "System Events" to tell process "Code" to keystroke return' 2>>"$LOG"; then

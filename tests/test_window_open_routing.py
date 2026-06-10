@@ -60,7 +60,7 @@ def _env(home: Path, tmp_path: Path, *, front_window: str,
          grow_transcript: Path | None = None, grow_on_attempt: int | None = None,
          grow_after_open: str | None = None, ready_after: str | None = None,
          wrong_ready: str | None = None, osa_sleep: str | None = None,
-         code_wins: list[str] | None = None) -> dict:
+         code_wins: list[str] | None = None, grow_content: str | None = None) -> dict:
     stub = tmp_path / "stubs"
     stub.mkdir(exist_ok=True)
     code_sink = tmp_path / "code.log"
@@ -109,6 +109,16 @@ def _env(home: Path, tmp_path: Path, *, front_window: str,
         '      if [ -n "$_CODE_WINS" ] && printf "%s\\n" "$_CODE_WINS" | grep -Fq -- "$tok"; then echo hit; else echo nohit; fi ;;\n'
         '  *"handoff-window-raise"*) echo raised ;;\n'
         '  *"UI elements enabled"*) echo true ;;\n'
+        # singlepane retry gate (sw-sp-enter-retry; carries AXFocusedUIElement + on run argv too, so it
+        # MUST route before those generic cases): token = second-to-last argv (last is the 🆔 marker).
+        # Minimal model for this harness: matching front title → emptyinput (no input model here —
+        # the dedicated input/jsonl scenarios live in test_singlepane_submit_retry.py), else mismatch.
+        '  *"handoff-sp-retry-gate"*)\n'
+        '      tok="${@: -2:1}"\n'
+        '      case "$_FRONT_WIN" in\n'
+        '        *"$tok"*) echo emptyinput ;;\n'
+        '        *) echo mismatch ;;\n'
+        "      esac ;;\n"
         # readiness-gated cold submit (`on run argv` … `AXFocusedUIElement` … `Message input`): simulate the
         # center Claude tab grabbing focus only after _READY_AFTER polls. token is the LAST argv.
         '  *"AXFocusedUIElement"*)\n'
@@ -137,7 +147,9 @@ def _env(home: Path, tmp_path: Path, *, front_window: str,
         # count submit attempts; grow the worktree transcript on/after attempt N (simulate the cold
         # session finally STARTING — transcript appears → cold_submit_with_retry detects + stops).
         '          n=$(cat "$_SUBMIT_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$_SUBMIT_COUNT"\n'
-        '          if [ -n "$_GROW_ON_ATTEMPT" ] && [ "$n" -ge "$_GROW_ON_ATTEMPT" ]; then echo x >> "$_GROW_TRANSCRIPT"; fi\n'
+        # _GROW_CONTENT (default "x"): the singlepane confirm greps the NEW jsonl for the 🆔 marker,
+        # so the singlepane test writes marker-bearing lines; cold tests keep counting plain "x" lines.
+        '          if [ -n "$_GROW_ON_ATTEMPT" ] && [ "$n" -ge "$_GROW_ON_ATTEMPT" ]; then echo "${_GROW_CONTENT:-x}" >> "$_GROW_TRANSCRIPT"; fi\n'
         '          echo sent ;;\n'
         '        *) echo mismatch ;;\n'
         "      esac ;;\n"
@@ -169,6 +181,10 @@ def _env(home: Path, tmp_path: Path, *, front_window: str,
             "HANDOFF_TRANSCRIPT_ROOT": str(tmp_path / "transcripts"),
             "HANDOFF_COLD_VERIFY_SECS": "1",
             "HANDOFF_COLD_READY_SECS": "2",  # readiness-gate poll timeout (8 × 0.25s) — keep tests fast
+            # singlepane bounded-retry knobs (sw-sp-enter-retry) — fast confirm polls in tests
+            "HANDOFF_SP_POLL_SECS": "1",
+            "HANDOFF_SP_POLL_TRIES": "1",
+            "_GROW_CONTENT": grow_content or "",
             "_FRONT_WIN": front_window,
             "_CODE_WINS": "\n".join(code_wins) if code_wins else "",
             "_OSA_SLEEP": str(osa_sleep) if osa_sleep else "",
@@ -293,15 +309,29 @@ def _singlepane_sidecar(home: Path, tmp_path: Path, task: str, nonce: str) -> Pa
 
 def test_singlepane_submit_gates_on_spawn_nonce(home, tmp_path):
     """SINGLEPANE: JSON-sidecar parse routes to a dedicated `-n` window, and the Enter fires only
-    because the front window title carries the unguessable spawn_nonce (the atomic title gate)."""
+    because the front window title carries the unguessable spawn_nonce (the atomic title gate).
+    sw-sp-enter-retry: the submit now CONFIRMS via a NEW 🆔-marked transcript jsonl, so the
+    press births one (the happy path of the bounded-retry machinery)."""
     task = "wh-sp"
     nonce = "deadbeefcafef00d"
     ws = tmp_path / "repo"
     ws.mkdir()
     _seed(home, ws, task, heartbeat=True)
     _singlepane_sidecar(home, tmp_path, task, nonce)
+    # transcript dir for the repo workspace (slug: '/'+'.' → '-'); the NEW session jsonl is
+    # born by the press itself — it must NOT pre-exist (the confirm is a new-FILE-set test)
+    slug = re.sub(r"[/.]", "-", str(ws))
+    tdir = tmp_path / "transcripts" / slug
+    tdir.mkdir(parents=True)
     # front window title carries the spawn_nonce → the atomic gate matches → submit fires
-    env = _env(home, tmp_path, front_window=f"{PROJECT} · {task} · worker · {nonce} [singlepane] - x.py")
+    env = _env(
+        home,
+        tmp_path,
+        front_window=f"{PROJECT} · {task} · worker · {nonce} [singlepane] - x.py",
+        grow_transcript=tdir / "new-sess.jsonl",
+        grow_on_attempt=1,
+        grow_content=f"🆔{task} session started",
+    )
     assert _run(env).returncode == 0
     assert " -n " in f" {_code_log(tmp_path)} ", "singlepane routes to a dedicated new window with -n"
     assert _read(tmp_path / "key.log") == "k", "Enter fires when the front window carries the spawn_nonce"
@@ -311,7 +341,8 @@ def test_singlepane_submit_gates_on_spawn_nonce(home, tmp_path):
 def test_singlepane_withholds_enter_when_title_lacks_nonce(home, tmp_path):
     """SINGLEPANE: a front window whose title carries the TASK token but the WRONG nonce (stale /
     guessed / sibling window) must NOT receive the Enter — the spawn_nonce is the gate, not the task.
-    The window still opens (`-n`), only the synthetic Enter is withheld."""
+    The window still opens (`-n`), only the synthetic Enter is withheld. sw-sp-enter-retry: the
+    bounded retries re-gate on the same nonce, so NO press fires across the whole budget either."""
     task = "wh-sp"
     nonce = "deadbeefcafef00d"
     ws = tmp_path / "repo"
@@ -320,6 +351,7 @@ def test_singlepane_withholds_enter_when_title_lacks_nonce(home, tmp_path):
     _singlepane_sidecar(home, tmp_path, task, nonce)
     # title carries the task token but a DIFFERENT nonce → the nonce gate withholds the Enter
     env = _env(home, tmp_path, front_window=f"{PROJECT} · {task} · worker · 0000000000000000 [singlepane]")
+    env["HANDOFF_SP_RETRY_MAX"] = "1"  # bounded fast: 1 retry suffices to prove the withhold
     assert _run(env).returncode == 0
     assert " -n " in f" {_code_log(tmp_path)} ", "singlepane still opens the dedicated window"
     assert _read(tmp_path / "key.log") == "", "Enter withheld when the front window lacks the spawn_nonce"
