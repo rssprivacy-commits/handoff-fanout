@@ -553,16 +553,6 @@ def test_autoclose_skips_while_python_spawn_lock_held_then_fires_after_release(
     assert (home / project / "ack" / f"{task}.autoclose_done").exists()
 
 
-@pytest.mark.xfail(
-    reason=(
-        "REAL GAP (escalated to coordinator in the p7 report, watchdog unchanged per the "
-        "Phase 7 red line): design §6 临界区① requires 'no pending/inflight spawn intent "
-        "for this project' as part of the autoclose critical section, but try_autoclose "
-        "only gates on the succession task's own markers — an in-flight worker .uri "
-        "dispatched by the OLD coordinator does not withhold the close."
-    ),
-    strict=False,
-)
 def test_autoclose_withholds_while_worker_intent_inflight(
     tmp_path: Path, sp_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

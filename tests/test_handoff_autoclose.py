@@ -583,6 +583,56 @@ def test_A12_unknown_schema_version_rejects(home, stubbed_env):
     assert "schema_version_unknown" in failed.read_text()
 
 
+# ─── A-13..A-15 pending-intent gate (design §6 临界区①) — an unconsumed
+#     queue/<other>.uri is an in-flight spawn intent dispatched by the OLD
+#     coordinator; the close must be withheld until it is consumed ─────────────
+
+
+def test_A13_pending_worker_intent_withholds_close(home, stubbed_env):
+    """An unconsumed worker .uri (watchdog has not yet mv'ed it → launched/) must
+    withhold the succession's autoclose: no URI, no done/failed marker — SKIP, not
+    failure (same semantics as the lock-contention skip)."""
+    _full_succession(home)
+    (home / PROJECT / "queue" / "infl-worker.uri").write_text("URI=vscode://file/tmp/infl-worker\n")
+
+    _run_script(stubbed_env)
+    ack = home / PROJECT / "ack"
+    assert "task_id" not in _open_log(stubbed_env)
+    assert not (ack / f"{TASK}.autoclose_done").exists()
+    assert not (ack / f"{TASK}.autoclose_failed.txt").exists()  # skip, not a failure
+
+
+def test_A14_intent_consumed_next_tick_fires(home, stubbed_env):
+    """Once the in-flight intent is consumed (mv → launched/, exactly what the
+    watchdog spawn segment does), the next tick fires the close normally."""
+    _full_succession(home)
+    inflight = home / PROJECT / "queue" / "infl-worker.uri"
+    inflight.write_text("URI=vscode://file/tmp/infl-worker\n")
+
+    _run_script(stubbed_env)
+    assert "task_id" not in _open_log(stubbed_env)  # tick 1: withheld
+
+    launched = home / PROJECT / "launched"
+    launched.mkdir(exist_ok=True)
+    inflight.rename(launched / "infl-worker-consumed.txt")
+
+    _run_script(stubbed_env)  # tick 2: intent consumed → close proceeds
+    assert (home / PROJECT / "ack" / f"{TASK}.autoclose_done").exists()
+    assert _open_log(stubbed_env).count("task_id=") == 1
+
+
+def test_A15_own_residual_uri_does_not_deadlock(home, stubbed_env):
+    """The succession's OWN residual queue/<task>.uri (e.g. the spawn segment has
+    not consumed it yet when the autoclose segment runs) must NOT withhold its own
+    close — gating on it would deadlock the very succession it belongs to."""
+    _full_succession(home)
+    (home / PROJECT / "queue" / f"{TASK}.uri").write_text("URI=vscode://file/tmp/own\n")
+
+    _run_script(stubbed_env)
+    assert (home / PROJECT / "ack" / f"{TASK}.autoclose_done").exists()
+    assert _open_log(stubbed_env).count("task_id=") == 1
+
+
 # ─── default-OFF guard — no env, no sentinel → segment short-circuits ─────────
 
 

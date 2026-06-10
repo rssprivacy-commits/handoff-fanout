@@ -1737,6 +1737,26 @@ try_autoclose() {
         return 0
     fi
 
+    # ── Pending-intent gate (design §6 临界区①, still under the lock — a concurrent
+    # spawn-intent publishes its .uri while holding this same lock, so the check cannot
+    # race a publish). An unconsumed queue/<other>.uri is an in-flight spawn intent the
+    # watchdog has not yet mv'ed → launched/ — typically a worker the OLD coordinator
+    # dispatched; closing the predecessor now could orphan that dispatch (§6: 关窗不得
+    # 吞掉在飞派发). SKIP this tick (no marker — same semantics as the lock-contention
+    # skip): once the intent is consumed, a later tick re-evaluates and fires. The
+    # succession's OWN residual .uri is excluded — gating on it would deadlock the very
+    # close it belongs to. nullglob (top of script) makes the loop a no-op when no .uri
+    # exists. Ranked AFTER the retro gate: §6 makes the retro evidence gate the highest
+    # precondition (排在竞态守门之前), so a terminal evidence failure still marks even
+    # while an intent is in flight.
+    local pending
+    for pending in "$queue"/*.uri; do
+        [ -f "$pending" ] || continue
+        [ "$pending" = "$queue/$task.uri" ] && continue
+        log "AUTOCLOSE-SKIP: project=$project task=$task — spawn intent in flight ($(basename "$pending"))"
+        return 0
+    done
+
     # ── Fire the helper URI (still under the lock). Injection-safe by construction: `task`
     # and `project` are already-validated slugs (handoff_fanout slug rules), `pred_nonce`
     # passed is_hex16 above, and `new_nonce` is a spawn_nonce (secrets.token_hex shape) or
