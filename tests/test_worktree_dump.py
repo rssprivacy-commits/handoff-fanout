@@ -169,6 +169,49 @@ def test_dump_without_coordinator_no_redtop(tmp_path, monkeypatch):
     assert "🧭" not in s["window.title"]
 
 
+def _singlepane_ws(home: Path) -> tuple[dict, dict]:
+    """(workspace settings, sidecar meta) of the singlepane spawn artifacts."""
+    meta = json.loads((home / PROJECT / "queue" / f"{TASK}.singlepane").read_text())
+    return json.loads(Path(meta["workspace"]).read_text())["settings"], meta
+
+
+def test_dump_coordinator_singlepane_threads_redtop(tmp_path, monkeypatch):
+    """Full CLI plumbing on the SINGLEPANE path (owner-caught gap 2026-06-10): `handoff dump
+    --coordinator` on a singlepane project (worktree off) red-tops the OUT-OF-TREE workspace —
+    args.coordinator → write_active_dump → maybe_write_singlepane_sidecar. Before the fix the
+    flag only reached create_worktree, so wilde-hexe/sdgf/fb 中枢 windows could never go red."""
+    _, ws = _bare_and_clone(tmp_path)
+    home = _home(tmp_path)
+    (home / "config.json").write_text(json.dumps({"singlepane_projects": [PROJECT]}))
+    rc = _dump(home, ws, monkeypatch, on=False, extra=["--coordinator"])
+    assert rc == 0
+    s, meta = _singlepane_ws(home)
+    title = s["window.title"]
+    assert title.startswith("🧭中枢·")
+    assert meta["spawn_nonce"] in title  # watchdog's atomic nonce substring gate intact
+    assert TASK in title  # task token intact (task-match submit guard)
+    assert s["workbench.colorCustomizations"]["titleBar.activeBackground"] == "#8B0000"
+    assert s["workbench.colorCustomizations"]["titleBar.inactiveBackground"] == "#5A0000"
+
+
+def test_dump_singlepane_without_coordinator_no_redtop(tmp_path, monkeypatch):
+    """Zero regression on the singlepane path: no --coordinator → the locked THIN key set
+    (precise set assertion, mirroring test_spawn_fresh's no-redtop pattern)."""
+    _, ws = _bare_and_clone(tmp_path)
+    home = _home(tmp_path)
+    (home / "config.json").write_text(json.dumps({"singlepane_projects": [PROJECT]}))
+    rc = _dump(home, ws, monkeypatch, on=False)
+    assert rc == 0
+    s, _ = _singlepane_ws(home)
+    assert set(s) == {
+        "window.title",
+        "workbench.activityBar.location",
+        "workbench.startupEditor",
+        "claudeCode.preferredLocation",
+    }
+    assert not s["window.title"].startswith("🧭中枢·")
+
+
 def test_audit_close_coordinator_threads_redtop(tmp_path, monkeypatch):
     """The ERP coordinator spawn path goes through `handoff audit-close`, not bare dump.
     audit-close must forward --coordinator → dump → red-top worktree (§五 / 2026-06-09)."""

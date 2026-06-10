@@ -453,6 +453,7 @@ def maybe_write_singlepane_sidecar(
     close_policy: str,
     spawn_nonce: str,
     predecessor_nonce: str | None = None,
+    is_coordinator: bool = False,
 ) -> None:
     """Single-pane (non-worktree) spawn: if ``project`` opts in via ``singlepane_projects``
     and this is NOT a worktree spawn, generate an OUT-OF-TREE ``.handoff.code-workspace``
@@ -473,6 +474,17 @@ def maybe_write_singlepane_sidecar(
     ``predecessor_nonce`` drive role-gated autoclose downstream. The write + watchdog read + tests
     migrate together (the read side cannot ``cat`` a path out of JSON).
 
+    §五·2 red-top (owner-caught gap 2026-06-10): ``is_coordinator`` (``handoff dump
+    --coordinator``) red-tops THIS singlepane window too — wilde-hexe/sdgf/fb are singlepane
+    projects, so before this their 中枢 dumps could never go red (the flag only reached the
+    worktree path via ``create_worktree``), violating "EVERY coordinator window must be
+    red-topped regardless of spawn path". Same 🧭中枢· prefix + red titleBar as
+    ``worktree.inject_vscode_workspace``/``spawn._singlepane_workspace_json`` (shared
+    ``worktree._COORDINATOR_*`` constants). The prefix WRAPS the nonce-bound title so the
+    watchdog's substring nonce/task gates are untouched; the red-top VISUAL keys are not the
+    coordinator inject-config block the THIN rule bans (gating stays in the repo's own
+    ``.vscode``). A non-coordinator dump stays byte-identical (zero regression, golden-locked).
+
     Cleanup/no-op otherwise: a project that does NOT opt in, or a worktree spawn (which has
     its own ``.handoff.code-workspace`` and wins), gets the sidecar REMOVED so a stale opt-in
     can't linger across a config flip-off. Best-effort — an OSError never bricks the dump
@@ -485,30 +497,36 @@ def maybe_write_singlepane_sidecar(
         sp_dir = cfg.home / project / "singlepane"
         sp_dir.mkdir(parents=True, exist_ok=True)
         ws_file = sp_dir / f"{task}.handoff.code-workspace"
+        # project·task·role·nonce via the Phase-1 title_for so the watchdog can match
+        # the front window by the unguessable spawn_nonce (osascript substring `contains`,
+        # kills focus-drift TOCTOU). KEEP the task token (backward-compat task-match) + the
+        # [singlepane] marker + the VS Code ${activeEditorShort} display variable (literal
+        # here; VS Code expands ${...} at runtime).
+        title = (
+            _spawn_nonce.title_for(project=project, task_id=task, role=role, nonce=spawn_nonce)
+            + " [singlepane]${separator}${activeEditorShort}"
+        )
+        settings: dict[str, object] = {
+            "window.title": title,
+            # Same declarative single-pane settings the worktree workspace uses (see
+            # worktree.write_workspace_file): hide the activity bar (removes the empty
+            # Claude sidebar focus competitor) + no Welcome tab. P0 THIN workspace — these
+            # UX keys only, never a coordinator/inject config block.
+            "workbench.activityBar.location": "hidden",
+            "workbench.startupEditor": "none",
+            "claudeCode.preferredLocation": "panel",
+        }
+        if is_coordinator:
+            # §五·2: prefix WRAPS the nonce-bound title (substring gates intact) + the shared
+            # red-titleBar spec (worktree._COORDINATOR_* — same constants as the worktree /
+            # spawn.py succession paths, so every 中枢 window renders identically).
+            settings["window.title"] = _worktree._COORDINATOR_TITLE_PREFIX + title
+            settings["workbench.colorCustomizations"] = dict(_worktree._COORDINATOR_RED_TITLEBAR)
         ws_file.write_text(
             json.dumps(
                 {
                     "folders": [{"path": str(workspace)}],
-                    "settings": {
-                        # project·task·role·nonce via the Phase-1 title_for so the watchdog can match
-                        # the front window by the unguessable spawn_nonce (osascript substring `contains`,
-                        # kills focus-drift TOCTOU). KEEP the task token (backward-compat task-match) + the
-                        # [singlepane] marker + the VS Code ${activeEditorShort} display variable (literal
-                        # here; VS Code expands ${...} at runtime).
-                        "window.title": (
-                            _spawn_nonce.title_for(
-                                project=project, task_id=task, role=role, nonce=spawn_nonce
-                            )
-                            + " [singlepane]${separator}${activeEditorShort}"
-                        ),
-                        # Same declarative single-pane settings the worktree workspace uses (see
-                        # worktree.write_workspace_file): hide the activity bar (removes the empty
-                        # Claude sidebar focus competitor) + no Welcome tab. P0 THIN workspace — these
-                        # UX keys only, never a coordinator/inject config block.
-                        "workbench.activityBar.location": "hidden",
-                        "workbench.startupEditor": "none",
-                        "claudeCode.preferredLocation": "panel",
-                    },
+                    "settings": settings,
                 },
                 indent=2,
             ),
@@ -714,6 +732,7 @@ def write_active_dump(
     source_workspace: Path | None = None,
     old_head: str | None = None,
     worktree_info: dict | None = None,
+    is_coordinator: bool = False,
 ) -> int:
     roadmap_excerpt = get_roadmap_excerpt(cfg, project)
     # ``workspace`` is the successor's tree (a worktree under isolation, else the
@@ -857,7 +876,8 @@ def write_active_dump(
 
     # Single-pane (non-worktree) spawn workspace + sidecar (before the .uri publish, same
     # ordering rule as the other sidecars). Skipped when this is a CREATED worktree (the
-    # worktree has its own .handoff.code-workspace and wins).
+    # worktree has its own .handoff.code-workspace and wins — and already carries the §五·2
+    # red-top via create_worktree(is_coordinator=...) on that path).
     maybe_write_singlepane_sidecar(
         cfg,
         project,
@@ -870,6 +890,7 @@ def write_active_dump(
         role="worker",
         close_policy="keep",
         spawn_nonce=_spawn_nonce.new_nonce(),
+        is_coordinator=is_coordinator,
     )
 
     _maybe_pbcopy(handoff_content)
@@ -1635,8 +1656,9 @@ def _build_parser() -> argparse.ArgumentParser:
     # §五·2 (2026-06-09 owner立法 / handoff-fanout 派窗路径红顶普适化): mark the spawned session as a
     # supervisor center (中枢). Its isolated worktree's .handoff.code-workspace gets a red title bar +
     # 🧭中枢· prefix (byte-parity with dx-spawn-session.sh --coordinator) so the owner can't misclose
-    # the 中枢 among many windows. Effective only on the worktree-isolation active path; a no-op for
-    # non-中枢 dumps (byte-identical legacy behavior).
+    # the 中枢 among many windows. Effective on the worktree-isolation active path AND the singlepane
+    # active path (owner-caught gap 2026-06-10 — wilde-hexe/sdgf/fb are singlepane projects); a no-op
+    # for non-中枢 dumps (byte-identical legacy behavior).
     ap.add_argument(
         "--coordinator",
         action="store_true",
@@ -1800,6 +1822,10 @@ def main(argv: list[str] | None = None) -> int:
                 source_workspace=source_workspace,
                 old_head=old_head,
                 worktree_info=worktree_info,
+                # §五·2 singlepane red-top (owner-caught gap 2026-06-10): the same getattr
+                # convention as resolve_spawn_workspace keeps legacy/batch callers (whose
+                # args lack --coordinator) working unchanged.
+                is_coordinator=getattr(args, "coordinator", False),
             )
     except SinglepaneBusy as e:
         print(

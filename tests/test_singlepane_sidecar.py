@@ -180,3 +180,83 @@ def test_title_carries_nonce(tmp_path: Path) -> None:
     assert "worker" in title  # role
     assert "wilde-hexe" in title  # project
     assert "wh-foo" in title  # task token (backward-compat with the task-match submit guard)
+
+
+# ─── §五·2 coordinator red-top (owner-caught gap 2026-06-10) ─────────────────
+# `handoff dump --coordinator` previously red-topped ONLY the worktree path
+# (create_worktree); the singlepane writer ignored the flag entirely, so the
+# singlepane projects (wilde-hexe/sdgf/fb) could NEVER render a red 中枢 window.
+
+# sha256 of the NON-coordinator workspace bytes for the fixed inputs in _write_fixed,
+# captured from the PRE-fix writer (main @ cd28d4e). Locks byte-zero regression:
+# every caller that does not pass is_coordinator=True — including the open-batch
+# sub-task + fan-in call sites, which never thread the flag — must keep producing
+# EXACTLY these bytes.
+_GOLDEN_WS_SHA256 = "acbea9304b393bc6e02ebdcd8e34f9f209805bb2935c27437e11e3067af719ce"
+
+
+def _write_fixed(tmp_path: Path, **kw) -> tuple[Path, str]:
+    """Drive the writer with fully deterministic inputs (fixed fake repo path + fixed
+    nonce) so the workspace bytes are reproducible across machines/runs. Returns
+    ``(ws_file, sidecar_text)``."""
+    cfg = _cfg(tmp_path, ["wilde-hexe"])
+    qd = tmp_path / "wilde-hexe" / "queue"
+    qd.mkdir(parents=True, exist_ok=True)
+    dump.maybe_write_singlepane_sidecar(
+        cfg,
+        "wilde-hexe",
+        "wh-foo",
+        Path("/repo"),
+        qd,
+        worktree_active=False,
+        role="worker",
+        close_policy="keep",
+        spawn_nonce=_NONCE,
+        **kw,
+    )
+    sidecar_text = (qd / "wh-foo.singlepane").read_text()
+    return Path(json.loads(sidecar_text)["workspace"]), sidecar_text
+
+
+def test_non_coordinator_workspace_byte_identical_golden(tmp_path: Path) -> None:
+    """Byte-zero regression: omitting is_coordinator (legacy/batch/fan-in callers) AND
+    passing an explicit False both reproduce the pre-fix golden bytes exactly."""
+    import hashlib
+
+    ws_omitted, _ = _write_fixed(tmp_path / "a")
+    ws_false, _ = _write_fixed(tmp_path / "b", is_coordinator=False)
+    assert hashlib.sha256(ws_omitted.read_bytes()).hexdigest() == _GOLDEN_WS_SHA256
+    assert hashlib.sha256(ws_false.read_bytes()).hexdigest() == _GOLDEN_WS_SHA256
+
+
+def test_coordinator_workspace_is_redtopped(tmp_path: Path) -> None:
+    """is_coordinator=True → 🧭中枢· prefix WRAPS the nonce-bound title (the watchdog's
+    substring nonce/task gates must still hit) + the exact shared red-titleBar spec."""
+    ws_file, sidecar_text = _write_fixed(tmp_path, is_coordinator=True)
+    spec = json.loads(ws_file.read_text())
+    title = spec["settings"]["window.title"]
+    assert title.startswith("🧭中枢·")
+    assert _NONCE in title  # nonce substring gate intact under the prefix
+    assert "wh-foo" in title  # task token intact (task-match submit guard)
+    # Exactly the THIN key set + the one visual red-top key — nothing else rides along.
+    assert set(spec["settings"]) == {
+        "window.title",
+        "workbench.activityBar.location",
+        "workbench.startupEditor",
+        "claudeCode.preferredLocation",
+        "workbench.colorCustomizations",
+    }
+    # Full 4-key red spec, byte-parity with worktree/dx-spawn (shared constants).
+    assert spec["settings"]["workbench.colorCustomizations"] == {
+        "titleBar.activeBackground": "#8B0000",
+        "titleBar.activeForeground": "#FFFFFF",
+        "titleBar.inactiveBackground": "#5A0000",
+        "titleBar.inactiveForeground": "#E0E0E0",
+    }
+    # The coordinator flag must NOT leak into the sidecar contract: still compact
+    # single-line JSON (bash json_get line reader) with the unchanged worker fields.
+    assert "\n" not in sidecar_text
+    meta = json.loads(sidecar_text)
+    assert meta["role"] == "worker"
+    assert meta["close_policy"] == "keep"
+    assert meta["spawn_nonce"] == _NONCE
