@@ -365,6 +365,72 @@ def test_succession_sidecar_carries_predecessor(tmp_path, monkeypatch):
     assert sc["close_policy"] == "close_predecessor"
 
 
+# ─── §五·2 red-top: succession = the next coordinator window ─────────────────
+# (semantic-merge gap: red-top forked before spawn.py existed; dual-brain codex+gemini
+#  both flagged the omission — closed by deriving is_coordinator from role.)
+
+
+def test_succession_singlepane_workspace_is_redtopped(tmp_path, monkeypatch):
+    """A succession's singlepane workspace must carry the 🧭中枢· prefix (WRAPPING the
+    nonce-bound title — the watchdog's substring nonce gate must still hit) + red titleBar."""
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    rc = spawn.main(
+        _argv(
+            isolation="singlepane",
+            workspace=repo,
+            role="supervisor_succession",
+            predecessor_nonce="0123456789abcdef",
+        )
+    )
+    assert rc == 0
+    ws = json.loads(Path(_sidecar(home)["workspace"]).read_text())
+    title = ws["settings"]["window.title"]
+    assert title.startswith("🧭中枢·")
+    assert NONCE in title  # nonce substring gate intact under the prefix
+    colors = ws["settings"]["workbench.colorCustomizations"]
+    assert colors["titleBar.activeBackground"] == "#8B0000"
+    assert colors["titleBar.inactiveBackground"] == "#5A0000"
+
+
+def test_worker_singlepane_workspace_has_no_redtop(tmp_path, monkeypatch):
+    """Zero regression: a worker singlepane workspace keeps the locked THIN key set —
+    no 🧭 prefix, no colorCustomizations."""
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    assert spawn.main(_argv(isolation="singlepane", workspace=repo)) == 0
+    ws = json.loads(Path(_sidecar(home)["workspace"]).read_text())
+    assert set(ws["settings"]) == {
+        "window.title",
+        "workbench.activityBar.location",
+        "workbench.startupEditor",
+        "claudeCode.preferredLocation",
+    }
+    assert not ws["settings"]["window.title"].startswith("🧭中枢·")
+
+
+def test_succession_worktree_workspace_is_redtopped(tmp_path, monkeypatch):
+    """The worktree isolation path passes is_coordinator into create_worktree — a
+    succession's worktree .handoff.code-workspace carries the same red-top."""
+    home = _home(tmp_path, monkeypatch)
+    _, ws_repo = _bare_and_clone(tmp_path)
+    rc = spawn.main(
+        _argv(
+            isolation="worktree",
+            workspace=ws_repo,
+            role="supervisor_succession",
+            predecessor_nonce="0123456789abcdef",
+        )
+    )
+    assert rc == 0
+    wt_workspace = Path(_uri_lines(home)["WORKSPACE"])
+    spec = json.loads((wt_workspace / ".handoff.code-workspace").read_text())
+    title = spec["settings"]["window.title"]
+    assert title.startswith("🧭中枢·") and NONCE in title
+    colors = spec["settings"]["workbench.colorCustomizations"]
+    assert colors["titleBar.activeBackground"] == "#8B0000"
+
+
 # ─── fail-closed ────────────────────────────────────────────────────────────
 
 

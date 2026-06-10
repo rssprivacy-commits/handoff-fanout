@@ -141,22 +141,36 @@ def _write_sidecar(
 def _singlepane_workspace_json(*, src: Path, project: str, task: str, role: str, nonce: str) -> str:
     """The OUT-OF-TREE ``.handoff.code-workspace`` content for a singlepane spawn (``folders``→the
     real repo). THIN settings — ``window.title`` (binding project·task·role·nonce via
-    ``title_for``) + the 3 single-pane UX keys ONLY, never a coordinator/inject block (per-project
-    gating must stay in the repo's own ``.vscode``). Key set is locked by the singlepane sidecar
-    tests on the ``dump`` side and mirrored here."""
+    ``title_for``) + the 3 single-pane UX keys ONLY, never the coordinator's own settings/inject
+    config block (per-project gating must stay in the repo's own ``.vscode``). Key set is locked by
+    the singlepane sidecar tests on the ``dump`` side and mirrored here.
+
+    §五·2 red-top (semantic-merge gap closed 2026-06-10, dual-brain codex MUST + gemini MUST):
+    ``role=supervisor_succession`` IS the next coordinator window (design §3/§6: 中枢/继任 =
+    singlepane + close_predecessor), and owner law says EVERY coordinator window must be red-topped
+    regardless of spawn path — so derive ``is_coordinator`` from the role (single source of truth,
+    no extra flag that could contradict it) and apply the same 🧭中枢· prefix + red titleBar as
+    ``worktree.inject_vscode_workspace``/``dx-spawn --coordinator``. The prefix WRAPS the
+    nonce-bound title, so the watchdog's substring nonce gate is untouched. The red-top VISUAL keys
+    are not the coordinator inject-config block the THIN rule bans — gating still lives in the
+    target repo's ``.vscode``. A ``role=worker`` spawn stays byte-identical (zero regression)."""
     title = (
         _spawn_nonce.title_for(project=project, task_id=task, role=role, nonce=nonce)
         + " [singlepane]${separator}${activeEditorShort}"
     )
+    settings: dict[str, object] = {
+        "window.title": title,
+        "workbench.activityBar.location": "hidden",
+        "workbench.startupEditor": "none",
+        "claudeCode.preferredLocation": "panel",
+    }
+    if role == ROLE_SUCCESSION:
+        settings["window.title"] = _worktree._COORDINATOR_TITLE_PREFIX + title
+        settings["workbench.colorCustomizations"] = dict(_worktree._COORDINATOR_RED_TITLEBAR)
     return json.dumps(
         {
             "folders": [{"path": str(src)}],
-            "settings": {
-                "window.title": title,
-                "workbench.activityBar.location": "hidden",
-                "workbench.startupEditor": "none",
-                "claudeCode.preferredLocation": "panel",
-            },
+            "settings": settings,
         },
         indent=2,
     )
@@ -369,6 +383,9 @@ def _produce_worktree(
         mode=_worktree.MODE_ON,
         spawn_nonce=nonce,
         role=role,
+        # §五·2 red-top: a succession spawn IS the next coordinator window — derive from
+        # role (single source of truth; see _singlepane_workspace_json's docstring).
+        is_coordinator=(role == ROLE_SUCCESSION),
     )
     if result.is_blocked:
         _err(f"worktree isolation BLOCKED (unsafe state): {result.reason}")
