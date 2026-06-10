@@ -54,3 +54,4 @@ dmypy.json
 # Project local
 .handoff-fanout/
 *.local
+.codegraph/
