@@ -727,7 +727,15 @@ def test_full_chain_dx_spawn_routes_to_engine_with_gating(tmp_path: Path) -> Non
     """The REAL p6b router invokes the REAL engine: registry routes worker_isolation,
     the unified_spawn query runs through the engine's own config parser (shebang
     path, no query stub), the engine produces the worktree intent in the sandbox
-    HANDOFF_HOME, and the chain leaks zero ERP content + opens zero real windows."""
+    HANDOFF_HOME, and the chain leaks zero ERP content + opens zero real windows.
+
+    Sandbox seal: the stub bin dir is PREPENDED to PATH so a bare `open`/`code`/
+    `osascript` (the regression that once opened 12 real tabs) lands on a stub, and
+    a positive-control probe proves the shadow works BEFORE the negative "log
+    absent == never called" assertions are trusted. Residual risk: a hardcoded
+    absolute `/usr/bin/open` bypasses both PATH and the seam env — that layer is
+    owned by p6b's source-level tripwire test (dharmaxis
+    tests/test_dx_spawn_routing.py) and deliberately not duplicated here."""
     project, task = "chain-proj", "chain-task"
     home = _home(tmp_path, config=_gated_config(tmp_path))
     _, ws = _bare_and_clone(tmp_path, name=project)
@@ -768,7 +776,9 @@ def test_full_chain_dx_spawn_routes_to_engine_with_gating(tmp_path: Path) -> Non
         stubs[name] = stub
 
     env = {
-        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",  # real git+python3; no real code/open
+        # stub bin dir FIRST: bare `open`/`code`/`osascript` resolve to the stubs,
+        # never /usr/bin; real git/python3 still resolve from the system dirs.
+        "PATH": f"{tmp_path / 'bin'}:/usr/bin:/bin:/usr/sbin:/sbin",
         "HOME": os.environ["HOME"],
         "PYTHONPATH": str(SRC_DIR),
         "HANDOFF_HOME": str(home),
@@ -777,7 +787,29 @@ def test_full_chain_dx_spawn_routes_to_engine_with_gating(tmp_path: Path) -> Non
         "OPEN_BIN": str(stubs["open"]),
         "CODE_BIN": str(stubs["code"]),
         "HANDOFF_OSASCRIPT_CMD": str(stubs["osascript"]),
+        # watchdog seam, not exercised here — but if chain code ever falls back to
+        # `${HANDOFF_OPEN_CMD:-/usr/bin/open}` (absolute default that PATH cannot
+        # shadow), the seam still lands on the stub instead of the real binary.
+        "HANDOFF_OPEN_CMD": str(stubs["open"]),
     }
+
+    # positive control (tripwire): prove the PATH shadow really intercepts bare
+    # invocations before trusting the negative assertions at the end. A silently
+    # broken shadow would otherwise let a regressed router invoke the REAL
+    # /usr/bin/open during the test run and still pass.
+    for name in ("open", "code", "osascript"):
+        probe = subprocess.run(
+            ["/bin/bash", "-c", f"{name} --handoff-shadow-probe"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        log = records / f"{name}.log"
+        assert probe.returncode == 0 and log.is_file(), f"PATH shadow inactive for {name}"
+        assert "--handoff-shadow-probe" in log.read_text()
+        log.unlink()  # clean slate: from here on, "log absent" == "never invoked"
+
     proc = subprocess.run(
         [
             "/bin/bash",
