@@ -36,13 +36,13 @@ from handoff_fanout import atomic, retro_gate, templates
 from handoff_fanout import config as _config
 from handoff_fanout import spawn_nonce as _spawn_nonce
 from handoff_fanout import worktree as _worktree
-from handoff_fanout.spawn_lock import LockHeld, project_spawn_lock
 from handoff_fanout.git_guard import git_guard_dir
 from handoff_fanout.handoff_precheck import (
     EVIDENCE_SCHEMA_VERSION,
     compute_retro_evidence_hash,
     resolve_session_id,
 )
+from handoff_fanout.spawn_lock import LockHeld, project_spawn_lock
 
 # v5.4 old_ready schema (§7.6). Bumped together with retro_evidence schema.
 OLD_READY_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION

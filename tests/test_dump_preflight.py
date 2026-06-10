@@ -14,8 +14,6 @@ import json
 import subprocess
 from pathlib import Path
 
-import pytest
-
 from handoff_fanout import dump
 
 TASK = "preflight-test-task"

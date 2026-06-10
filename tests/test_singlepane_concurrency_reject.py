@@ -64,19 +64,23 @@ def test_lock_held_rejects_second_concurrent_worker(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
     _queue(tmp_path)
     # First worker's dump is "in progress" — it holds the project spawn lock.
-    with project_spawn_lock(PROJECT, root=cfg.home):
-        with pytest.raises(dump.SinglepaneBusy):
-            with dump.singlepane_worker_guard(cfg, project=PROJECT, task="wh-second"):
-                pass  # must never reach the body — the lock is held
+    with (
+        project_spawn_lock(PROJECT, root=cfg.home),
+        pytest.raises(dump.SinglepaneBusy),
+        dump.singlepane_worker_guard(cfg, project=PROJECT, task="wh-second"),
+    ):
+        pass  # must never reach the body — the lock is held
 
 
 def test_lock_contention_writes_owner_readable_ack(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
     _queue(tmp_path)
-    with project_spawn_lock(PROJECT, root=cfg.home):
-        with pytest.raises(dump.SinglepaneBusy):
-            with dump.singlepane_worker_guard(cfg, project=PROJECT, task="wh-second"):
-                pass
+    with (
+        project_spawn_lock(PROJECT, root=cfg.home),
+        pytest.raises(dump.SinglepaneBusy),
+        dump.singlepane_worker_guard(cfg, project=PROJECT, task="wh-second"),
+    ):
+        pass
     ack = tmp_path / PROJECT / "ack" / "wh-second.singlepane_busy.txt"
     assert ack.exists()
     body = ack.read_text()
@@ -90,9 +94,11 @@ def test_active_worker_rejects_second_different_task(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
     queue = _queue(tmp_path)
     _mark_active(queue, "wh-first")  # a live worker occupies the single pane
-    with pytest.raises(dump.SinglepaneBusy):
-        with dump.singlepane_worker_guard(cfg, project=PROJECT, task="wh-second"):
-            pass
+    with (
+        pytest.raises(dump.SinglepaneBusy),
+        dump.singlepane_worker_guard(cfg, project=PROJECT, task="wh-second"),
+    ):
+        pass
 
 
 def test_terminal_worker_frees_the_pane(tmp_path: Path) -> None:
