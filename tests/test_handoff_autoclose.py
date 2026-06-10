@@ -445,9 +445,7 @@ def test_autoclose_sidecar_rewrite_during_critical_section(home, tmp_path, stubb
     rewritten.write_text(
         json.dumps(
             {
-                "workspace": str(
-                    home / PROJECT / "singlepane" / f"{TASK}.handoff.code-workspace"
-                ),
+                "workspace": str(home / PROJECT / "singlepane" / f"{TASK}.handoff.code-workspace"),
                 "role": "supervisor_succession",
                 "close_policy": "keep",
                 "spawn_nonce": NEW_NONCE,
