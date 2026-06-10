@@ -1662,7 +1662,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--coordinator",
         action="store_true",
-        help="red-top the spawned worktree window (supervisor center / 中枢; §五 防误关)",
+        help="red-top the spawned window — worktree AND singlepane paths (supervisor center / 中枢; §五 防误关)",
     )
     return ap
 
