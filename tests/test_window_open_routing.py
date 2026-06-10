@@ -59,7 +59,8 @@ def _seed(home: Path, ws: Path, task: str, *, heartbeat: bool = False) -> None:
 def _env(home: Path, tmp_path: Path, *, front_window: str,
          grow_transcript: Path | None = None, grow_on_attempt: int | None = None,
          grow_after_open: str | None = None, ready_after: str | None = None,
-         wrong_ready: str | None = None, osa_sleep: str | None = None) -> dict:
+         wrong_ready: str | None = None, osa_sleep: str | None = None,
+         code_wins: list[str] | None = None) -> dict:
     stub = tmp_path / "stubs"
     stub.mkdir(exist_ok=True)
     code_sink = tmp_path / "code.log"
@@ -78,6 +79,12 @@ def _env(home: Path, tmp_path: Path, *, front_window: str,
        'if [ -n "$_GROW_AFTER_OPEN" ] && [ -n "$_GROW_TRANSCRIPT" ]; then '
        '( sleep "$_GROW_AFTER_OPEN"; echo x >> "$_GROW_TRANSCRIPT" ) & fi\nexit 0\n')
     # osascript stub. Order matters — earlier cases win on scripts that contain several substrings:
+    #   - focus-drift v2 scripts FIRST (each carries a unique handoff-window-* marker; they also
+    #     contain generic substrings like "name of front window"/"on run argv" that would otherwise
+    #     mis-route to the legacy cases): probe → FRONT_APP:/FRONT_WIN:/WIN: lines (front app is
+    #     always Code here, matching the legacy `frontmost is true` answer; window list from
+    #     $_CODE_WINS); enum → hit iff a $_CODE_WINS line contains the token (LAST argv);
+    #     raise → "raised" (its script text carries activate+AXRaise → visible in the sink).
     #   - atomic submit (`on run argv` … `keystroke return`): token is the LAST argv; emulate
     #     "front window contains token" → echo sent + record `k`, else echo mismatch (NO keystroke).
     #   - legacy warm escape-hatch keystroke (`… to keystroke return`, no argv): record `k` + echo ok.
@@ -92,6 +99,14 @@ def _env(home: Path, tmp_path: Path, *, front_window: str,
         # root cause). Used to prove wait_target_window_frontmost honours a WALL-CLOCK budget (not step-count).
         '[ -n "$_OSA_SLEEP" ] && sleep "$_OSA_SLEEP"\n'
         "case \"$args\" in\n"
+        '  *"handoff-window-probe"*)\n'
+        '      echo "FRONT_APP:Code"\n'
+        '      echo "FRONT_WIN:$_FRONT_WIN"\n'
+        '      if [ -n "$_CODE_WINS" ]; then printf "%s\\n" "$_CODE_WINS" | while IFS= read -r w; do echo "WIN:$w"; done; fi ;;\n'
+        '  *"handoff-window-enum"*)\n'
+        '      tok="${@: -1}"\n'
+        '      if [ -n "$_CODE_WINS" ] && printf "%s\\n" "$_CODE_WINS" | grep -Fq -- "$tok"; then echo hit; else echo nohit; fi ;;\n'
+        '  *"handoff-window-raise"*) echo raised ;;\n'
         '  *"UI elements enabled"*) echo true ;;\n'
         # readiness-gated cold submit (`on run argv` … `AXFocusedUIElement` … `Message input`): simulate the
         # center Claude tab grabbing focus only after _READY_AFTER polls. token is the LAST argv.
@@ -154,6 +169,7 @@ def _env(home: Path, tmp_path: Path, *, front_window: str,
             "HANDOFF_COLD_VERIFY_SECS": "1",
             "HANDOFF_COLD_READY_SECS": "2",  # readiness-gate poll timeout (8 × 0.25s) — keep tests fast
             "_FRONT_WIN": front_window,
+            "_CODE_WINS": "\n".join(code_wins) if code_wins else "",
             "_OSA_SLEEP": str(osa_sleep) if osa_sleep else "",
             "_KEY_SINK": str(key_sink),
             "_CODE_SINK": str(code_sink),
@@ -349,12 +365,18 @@ def test_cold_focus_assert_blocks_enter_when_task_window_not_frontmost(home, tmp
     """The synthetic Enter must NOT fire if the frontmost window isn't THE task window — and on that
     mismatch the launcher must AXRaise the task window back to front (owner: "if it's not on top, let it
     be on top, then Enter") so a later attempt can submit. AXRaise preserves the editor focus (proven
-    live); only the removed focus chord broke it."""
+    live); only the removed focus chord broke it.
+
+    focus-drift v2 note: the hardened raise only AXRaises a window that EXISTS (enumerate-first),
+    so the task window is modeled in ``code_wins``; the frontmost stranger window is NOT in the
+    pre-open snapshot (it appeared post-snapshot) → the discriminator still dispatches the URI and
+    the Enter is withheld by the readiness gate — the pre-v2 contract of this test, unchanged."""
     task = "cold-wrongwin"
     ws = _cold_ws(tmp_path, task)
     _seed(home, ws, task)
     _cold_transcript(tmp_path, ws)  # dir exists, never grows (no Enter is ever sent — front window mismatches)
-    env = _env(home, tmp_path, front_window="some-other-project — z.py")
+    env = _env(home, tmp_path, front_window="some-other-project — z.py",
+               code_wins=[f"demo · {task} [worktree] — x.py"])
     assert _run(env).returncode == 0
     assert _read(tmp_path / "key.log") == "", "Enter must NOT be pressed onto a wrong window"
     assert "AXRaise" in _read(tmp_path / "osa.log"), "on mismatch the task window must be AXRaised back to front"
