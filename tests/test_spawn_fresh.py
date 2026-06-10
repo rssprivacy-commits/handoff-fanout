@@ -72,11 +72,12 @@ def _plain_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _issue_token(home: Path, *, project: str = PROJECT) -> str:
-    """A fresh one-time succession authority, exactly as a retro-gated
-    ``audit-close --coordinator --status active`` would issue (G4 收口: every succession
-    spawn in this suite must hold one — the bare manual path is closed)."""
-    return str(_authority.issue_token(home=home, project=project, task="wh-closing-leg"))
+def _issue_token(home: Path, *, project: str = PROJECT, task: str = TASK) -> str:
+    """A fresh one-time succession authority BOUND TO THE SUCCESSOR ``task`` (Step2 C
+    契约: issuer's task = the designated successor; consume rejects any other), exactly
+    as a retro-gated ``audit-close --coordinator --status active --task <succ>`` would
+    issue (G4 收口: every succession spawn in this suite must hold one)."""
+    return str(_authority.issue_token(home=home, project=project, task=task))
 
 
 def _run(args: list[str], cwd: Path) -> None:
@@ -183,7 +184,8 @@ def test_singlepane_produces_workspace_sidecar_uri(tmp_path, monkeypatch):
     assert repo not in ws_file.parents
     assert ws_file.name.endswith(".handoff.code-workspace")
 
-    # (2) workspace file — folders→real repo, nonce in title, the 4 UX settings only
+    # (2) workspace file — folders→real repo, nonce in title, the 4 UX settings + the
+    # Step2 B 轨二 session-identity env signal only
     spec = json.loads(ws_file.read_text())
     assert spec["folders"] == [{"path": str(repo)}]
     title = spec["settings"]["window.title"]
@@ -194,6 +196,11 @@ def test_singlepane_produces_workspace_sidecar_uri(tmp_path, monkeypatch):
         "workbench.activityBar.location",
         "workbench.startupEditor",
         "claudeCode.preferredLocation",
+        "terminal.integrated.env.osx",
+    }
+    assert spec["settings"]["terminal.integrated.env.osx"] == {
+        "HANDOFF_SESSION_ROLE": "worker",
+        "HANDOFF_SESSION_TASK": TASK,
     }
 
     # (4) .uri — WORKSPACE = the real repo (NOT under /worktrees/ ⇒ singlepane consumer path)
@@ -290,7 +297,7 @@ def test_singlepane_succession_exempt_from_worker_guard(tmp_path, monkeypatch):
             workspace=repo,
             role="supervisor_succession",
             predecessor_nonce="0123456789abcdef",
-            succession_token=_issue_token(home),
+            succession_token=_issue_token(home, task="wh-succession"),
         )
     )
     assert rc == 0
@@ -321,7 +328,7 @@ def test_singlepane_succession_publish_holds_project_spawn_lock(tmp_path, monkey
             workspace=repo,
             role="supervisor_succession",
             predecessor_nonce="0123456789abcdef",
-            succession_token=_issue_token(home),
+            succession_token=_issue_token(home, task="wh-succession"),
         )
     )
     assert rc == 0
@@ -346,7 +353,7 @@ def test_singlepane_succession_lock_held_rejected(tmp_path, monkeypatch, capsys)
                 workspace=repo,
                 role="supervisor_succession",
                 predecessor_nonce="0123456789abcdef",
-                succession_token=_issue_token(home),
+                succession_token=_issue_token(home, task="wh-succession"),
             )
         )
     assert rc == 2
@@ -464,11 +471,17 @@ def test_succession_singlepane_workspace_is_redtopped(tmp_path, monkeypatch):
     colors = ws["settings"]["workbench.colorCustomizations"]
     assert colors["titleBar.activeBackground"] == "#8B0000"
     assert colors["titleBar.inactiveBackground"] == "#5A0000"
+    # Step2 B 轨二: a succession window's SESSION role is the coordinator one.
+    assert ws["settings"]["terminal.integrated.env.osx"] == {
+        "HANDOFF_SESSION_ROLE": "supervisor_succession",
+        "HANDOFF_SESSION_TASK": TASK,
+    }
 
 
 def test_worker_singlepane_workspace_has_no_redtop(tmp_path, monkeypatch):
-    """Zero regression: a worker singlepane workspace keeps the locked THIN key set —
-    no 🧭 prefix, no colorCustomizations."""
+    """Zero regression: a worker singlepane workspace keeps the locked THIN key set
+    (+ the Step2 env signal, which is all-path additive) — no 🧭 prefix, no
+    colorCustomizations."""
     home = _home(tmp_path, monkeypatch)
     repo = _plain_repo(tmp_path)
     assert spawn.main(_argv(isolation="singlepane", workspace=repo)) == 0
@@ -478,6 +491,7 @@ def test_worker_singlepane_workspace_has_no_redtop(tmp_path, monkeypatch):
         "workbench.activityBar.location",
         "workbench.startupEditor",
         "claudeCode.preferredLocation",
+        "terminal.integrated.env.osx",
     }
     assert not ws["settings"]["window.title"].startswith("🧭中枢·")
 

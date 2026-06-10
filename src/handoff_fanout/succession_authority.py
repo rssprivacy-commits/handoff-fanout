@@ -90,9 +90,12 @@ def _sweep_expired(home: Path, project: str) -> None:
 def issue_token(*, home: Path, project: str, task: str) -> Path:
     """Issue a fresh one-time succession authority for ``project``.
 
-    ``task`` is the CLOSING coordinator task (the one whose retro gate just passed) —
-    recorded for the audit trail; the consumer binds on project + nonce + TTL, not on
-    the successor's task id (which the issuer cannot know).
+    ``task`` is the SUCCESSOR task id (Step2 契约 C.1 语义厘清 / 修 F4 歧义):
+    ``audit-close --task`` is the next coordinator leg under v5.4 dump semantics, and
+    that is exactly what callers pass here. The consumer binds on project + nonce +
+    TTL **+ this successor task** (``consume_token``'s required ``expected_task``) —
+    the token authorizes ONE designated succession, never "any succession in this
+    project for 120s".
 
     The file is created 0600 + ``O_EXCL`` (the nonce is cryptographically unique, so a
     name collision means something is forging — fail loudly rather than overwrite).
@@ -117,12 +120,22 @@ def issue_token(*, home: Path, project: str, task: str) -> Path:
         # Never leave a half-written authority file behind.
         path.unlink(missing_ok=True)
         raise
-    _audit_log(home, project, "ISSUED", f"token={path.name} task={task}")
+    _audit_log(home, project, "ISSUED", f"token={path.name} successor_task={task}")
     return path
 
 
-def consume_token(token_path: Path, *, home: Path, project: str) -> tuple[bool, str]:
+def consume_token(
+    token_path: Path, *, home: Path, project: str, expected_task: str
+) -> tuple[bool, str]:
     """Validate + CONSUME (unlink) a succession token. Returns ``(ok, reason)``.
+
+    ``expected_task`` is REQUIRED (Step2 契约 C.2 / SHOULD#5 接口纪律): the consumer's
+    own successor task id (``spawn --role supervisor_succession --task X`` passes X).
+    The token payload's ``task`` (bound by the issuer to the designated successor) must
+    match it — a mismatch is REJECTED *without consuming* (a wrong-task spawn must not
+    burn the designated successor's authority). This collapses the pre-Step2 "project-
+    level 120s universal key" to a designated-successor key. Missing/empty
+    ``expected_task`` is rejected loudly (never silently un-bound).
 
     Consumption happens on the validated file via ``unlink`` — when two spawns race the
     same token, exactly one unlink succeeds and the loser is rejected (one-time). The
@@ -134,6 +147,12 @@ def consume_token(token_path: Path, *, home: Path, project: str) -> tuple[bool, 
     def _reject(reason: str) -> tuple[bool, str]:
         _audit_log(home, project, "REJECTED", f"token={token_path.name} reason={reason}")
         return False, reason
+
+    if not expected_task:
+        return _reject(
+            "expected_task missing/empty — the consumer must bind its own successor "
+            "task id (spawn passes its --task); an un-bound consume is not allowed"
+        )
 
     try:
         resolved = token_path.resolve()
@@ -168,6 +187,13 @@ def consume_token(token_path: Path, *, home: Path, project: str) -> tuple[bool, 
         return _reject(f"issued for project {payload.get('project')!r}, not {project!r}")
     if payload.get("task") != m.group("task") or payload.get("nonce") != m.group("nonce"):
         return _reject("filename/payload identity mismatch (tampered?)")
+    if payload.get("task") != expected_task:
+        # Step2 C.2: the authority designates ONE successor; a different task may not
+        # ride it. Reject WITHOUT unlinking — the designated successor can still spawn.
+        return _reject(
+            f"task-mismatch: token is bound to successor_task={payload.get('task')!r}, "
+            f"this spawn's task is {expected_task!r}"
+        )
 
     try:
         issued = datetime.fromisoformat(str(payload.get("issued_at", "")))

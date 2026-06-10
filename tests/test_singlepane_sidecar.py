@@ -60,15 +60,22 @@ def test_optin_writes_sidecar_and_out_of_tree_workspace(tmp_path: Path) -> None:
     assert spec["folders"] == [{"path": str(real_repo)}]  # window opens the REAL repo
     assert "wh-foo" in spec["settings"]["window.title"]  # task token for the submit guard
     assert spec["settings"]["workbench.activityBar.location"] == "hidden"  # single pane
-    # P0 THIN workspace: settings carry ONLY window.title + the single-pane UX keys — never a
-    # coordinator/inject config block (per-project gating must stay in the repo's own .vscode so
-    # v1.12.0 gating still governs it). Lock the exact key set so a regression can't smuggle one in.
+    # P0 THIN workspace: settings carry ONLY window.title + the single-pane UX keys + the
+    # Step2 session env signal — never a coordinator/inject config block (per-project gating
+    # must stay in the repo's own .vscode so v1.12.0 gating still governs it). Lock the exact
+    # key set so a regression can't smuggle one in.
     assert set(spec) == {"folders", "settings"}
     assert set(spec["settings"]) == {
         "window.title",
         "workbench.activityBar.location",
         "workbench.startupEditor",
         "claudeCode.preferredLocation",
+        "terminal.integrated.env.osx",
+    }
+    # Step2 B 轨二: a worker dump window carries the worker session identity.
+    assert spec["settings"]["terminal.integrated.env.osx"] == {
+        "HANDOFF_SESSION_ROLE": "worker",
+        "HANDOFF_SESSION_TASK": "wh-foo",
     }
 
 
@@ -188,11 +195,16 @@ def test_title_carries_nonce(tmp_path: Path) -> None:
 # singlepane projects (wilde-hexe/sdgf/fb) could NEVER render a red 中枢 window.
 
 # sha256 of the NON-coordinator workspace bytes for the fixed inputs in _write_fixed,
-# captured from the PRE-fix writer (main @ cd28d4e). Locks byte-zero regression:
-# every caller that does not pass is_coordinator=True — including the open-batch
-# sub-task + fan-in call sites, which never thread the flag — must keep producing
-# EXACTLY these bytes.
-_GOLDEN_WS_SHA256 = "acbea9304b393bc6e02ebdcd8e34f9f209805bb2935c27437e11e3067af719ce"
+# captured from the PRE-Step2 writer (main @ cd28d4e — before the B 轨二 env signal).
+# Kept as the byte-precision REFERENCE: stripping ONLY the env key from today's bytes
+# must reproduce EXACTLY these bytes (proves the Step2 diff is the two env vars and
+# nothing else — the brief's 精确断言).
+_PRE_STEP2_GOLDEN_WS_SHA256 = "acbea9304b393bc6e02ebdcd8e34f9f209805bb2935c27437e11e3067af719ce"
+# sha256 of the CURRENT non-coordinator workspace bytes (= pre-Step2 + the one
+# terminal.integrated.env.osx key appended LAST). Locks byte-zero regression for every
+# caller that does not pass is_coordinator=True — including the open-batch sub-task +
+# fan-in call sites, which never thread the flag.
+_GOLDEN_WS_SHA256 = "1419c0ef57bb3ee3e4e4a8cceed3219c345215104f7100aa7d3d02277c7ee6e9"
 
 
 def _write_fixed(tmp_path: Path, **kw) -> tuple[Path, str]:
@@ -220,13 +232,27 @@ def _write_fixed(tmp_path: Path, **kw) -> tuple[Path, str]:
 
 def test_non_coordinator_workspace_byte_identical_golden(tmp_path: Path) -> None:
     """Byte-zero regression: omitting is_coordinator (legacy/batch/fan-in callers) AND
-    passing an explicit False both reproduce the pre-fix golden bytes exactly."""
+    passing an explicit False both reproduce the current golden bytes exactly."""
     import hashlib
 
     ws_omitted, _ = _write_fixed(tmp_path / "a")
     ws_false, _ = _write_fixed(tmp_path / "b", is_coordinator=False)
     assert hashlib.sha256(ws_omitted.read_bytes()).hexdigest() == _GOLDEN_WS_SHA256
     assert hashlib.sha256(ws_false.read_bytes()).hexdigest() == _GOLDEN_WS_SHA256
+
+
+def test_step2_env_signal_is_the_only_byte_diff_vs_pre_step2(tmp_path: Path) -> None:
+    """Step2 B 轨二 precision contract (the brief's 精确断言): today's artifact minus the
+    ONE ``terminal.integrated.env.osx`` key re-serializes to EXACTLY the pre-Step2 golden
+    bytes — i.e. the all-path additive change is the two env vars and zero other drift."""
+    import hashlib
+
+    ws_file, _ = _write_fixed(tmp_path)
+    spec = json.loads(ws_file.read_text())
+    env = spec["settings"].pop("terminal.integrated.env.osx")
+    assert env == {"HANDOFF_SESSION_ROLE": "worker", "HANDOFF_SESSION_TASK": "wh-foo"}
+    stripped = json.dumps(spec, indent=2).encode("utf-8")
+    assert hashlib.sha256(stripped).hexdigest() == _PRE_STEP2_GOLDEN_WS_SHA256
 
 
 def test_coordinator_workspace_is_redtopped(tmp_path: Path) -> None:
@@ -238,13 +264,23 @@ def test_coordinator_workspace_is_redtopped(tmp_path: Path) -> None:
     assert title.startswith("🧭中枢·")
     assert _NONCE in title  # nonce substring gate intact under the prefix
     assert "wh-foo" in title  # task token intact (task-match submit guard)
-    # Exactly the THIN key set + the one visual red-top key — nothing else rides along.
+    # Exactly the THIN key set + the one visual red-top key + the Step2 env signal —
+    # nothing else rides along.
     assert set(spec["settings"]) == {
         "window.title",
         "workbench.activityBar.location",
         "workbench.startupEditor",
         "claudeCode.preferredLocation",
         "workbench.colorCustomizations",
+        "terminal.integrated.env.osx",
+    }
+    # Step2 B 轨二: the dump --coordinator window's SESSION role is the coordinator one
+    # (supervisor_succession → the memory-guard matrix lets it write/sediment memory),
+    # even though the watchdog SIDECAR keeps role="worker" (asserted below — that
+    # contract is untouched).
+    assert spec["settings"]["terminal.integrated.env.osx"] == {
+        "HANDOFF_SESSION_ROLE": "supervisor_succession",
+        "HANDOFF_SESSION_TASK": "wh-foo",
     }
     # Full 4-key red spec, byte-parity with worktree/dx-spawn (shared constants).
     assert spec["settings"]["workbench.colorCustomizations"] == {

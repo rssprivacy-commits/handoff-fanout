@@ -34,6 +34,7 @@ from pathlib import Path
 
 from handoff_fanout import atomic, retro_gate, templates
 from handoff_fanout import config as _config
+from handoff_fanout import memory_baseline as _memory_baseline
 from handoff_fanout import spawn_nonce as _spawn_nonce
 from handoff_fanout import worktree as _worktree
 from handoff_fanout.git_guard import git_guard_dir
@@ -522,6 +523,13 @@ def maybe_write_singlepane_sidecar(
             # spawn.py succession paths, so every 中枢 window renders identically).
             settings["window.title"] = _worktree._COORDINATOR_TITLE_PREFIX + title
             settings["workbench.colorCustomizations"] = dict(_worktree._COORDINATOR_RED_TITLEBAR)
+        # Step2 B 轨二: session-identity env signal — LAST key (byte-precise golden diff).
+        # A coordinator dump keeps role="worker" in the SIDECAR (watchdog contract,
+        # asserted below) but its SESSION role is supervisor_succession (see
+        # worktree.session_env_osx).
+        settings[_worktree.SESSION_ENV_SETTINGS_KEY] = _worktree.session_env_osx(
+            role=role, task=task, is_coordinator=is_coordinator
+        )
         ws_file.write_text(
             json.dumps(
                 {
@@ -892,6 +900,20 @@ def write_active_dump(
         spawn_nonce=_spawn_nonce.new_nonce(),
         is_coordinator=is_coordinator,
     )
+
+    # Step2 契约 A (G3): a coordinator dispatch — BOTH the worktree and the singlepane
+    # relay land here — records the dispatch-time memory snapshot baseline before the
+    # .uri publish (same ordering rule as the other sidecars). The successor's own
+    # relay (`audit-close --coordinator --self-task <this task>`) compares against it.
+    # ``source_workspace`` (the real project tree, not a successor worktree) locates
+    # the project memory dir. Best-effort by contract: never bricks the dump.
+    if is_coordinator:
+        _memory_baseline.write_baseline(
+            home=cfg.home,
+            project=project,
+            coordinator_task=task,
+            workspace=source_workspace,
+        )
 
     _maybe_pbcopy(handoff_content)
 

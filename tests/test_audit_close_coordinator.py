@@ -337,11 +337,16 @@ def test_no_remote_isolation_off_relay_still_works(tmp_path, monkeypatch):
 
 
 def test_succession_close_predecessor_full_chain(tmp_path, monkeypatch):
-    """The whole Step1 contract end-to-end: retro-gated coordinator close → one-time
-    authority → succession spawn that closes the predecessor window. The token is
-    consumed; the succession sidecar carries close_predecessor + the predecessor nonce."""
+    """D1 ① + ④ (Step2 contract): retro-gated coordinator close → one-time authority →
+    a succession spawn FOR THE SAME SUCCESSOR TASK (the audit-close ``--task``) consumes
+    it and closes the predecessor window. The whole dump/token chain runs on a repo
+    WITHOUT any git remote (SHOULD#9 锁回归: the chain must not assume origin exists)."""
     home = _home(tmp_path, monkeypatch, config=json.dumps({"singlepane_projects": [PROJECT]}))
-    ws = _git_repo(tmp_path)
+    ws = _git_repo(tmp_path)  # deliberately NO remote (D1 ④ / SHOULD#9)
+    assert (
+        subprocess.run(["git", "remote"], cwd=ws, capture_output=True, text=True).stdout.strip()
+        == ""
+    )
     assert codex_audit.main_audit_close(_close_argv(ws)) == 0
     [token] = _tokens(home)
     predecessor = json.loads((home / PROJECT / "queue" / f"{TASK}.singlepane").read_text())[
@@ -355,7 +360,7 @@ def test_succession_close_predecessor_full_chain(tmp_path, monkeypatch):
             "--project",
             PROJECT,
             "--task-id",
-            "coord-leg-8",
+            TASK,  # Step2 C: the token designates THIS successor — same id as --task above
             "--role",
             "supervisor_succession",
             "--isolation",
@@ -372,11 +377,51 @@ def test_succession_close_predecessor_full_chain(tmp_path, monkeypatch):
     )
 
     assert rc == 0
-    sc = json.loads((home / PROJECT / "queue" / "coord-leg-8.singlepane").read_text())
+    sc = json.loads((home / PROJECT / "queue" / f"{TASK}.singlepane").read_text())
     assert sc["role"] == "supervisor_succession"
     assert sc["close_policy"] == "close_predecessor"
     assert sc["predecessor_nonce"] == predecessor
     assert not token.exists(), "authority consumed by the succession spawn"
+
+
+def test_succession_spawn_for_other_task_rejected(tmp_path, monkeypatch, capsys):
+    """D1 ② (Step2 contract): the audit-close-issued token designates ONE successor —
+    a spawn for any other task is REJECTED (task-mismatch) and the authority survives
+    for the designated successor."""
+    home = _home(tmp_path, monkeypatch, config=json.dumps({"singlepane_projects": [PROJECT]}))
+    ws = _git_repo(tmp_path)
+    assert codex_audit.main_audit_close(_close_argv(ws)) == 0
+    [token] = _tokens(home)
+
+    from handoff_fanout import spawn
+
+    rc = spawn.main(
+        [
+            "--project",
+            PROJECT,
+            "--task-id",
+            "coord-leg-8",  # ≠ the audit-close --task (the designated successor)
+            "--role",
+            "supervisor_succession",
+            "--isolation",
+            "singlepane",
+            "--workspace",
+            str(ws),
+            "--prompt",
+            "hijack the relay",
+            "--predecessor-nonce",
+            "feedfacecafebeef",
+            "--succession-token",
+            str(token),
+        ]
+    )
+
+    assert rc == 2
+    assert "task-mismatch" in capsys.readouterr().err
+    assert token.exists(), "a mismatching spawn must not burn the designated authority"
+    assert not (home / PROJECT / "queue" / "coord-leg-8.uri").exists()
+    log = (home / PROJECT / "authority" / "succession-audit.log").read_text()
+    assert "task-mismatch" in log
 
 
 # ─── guards that must NOT regress / leak ──────────────────────────────────────

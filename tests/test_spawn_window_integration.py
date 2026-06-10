@@ -469,10 +469,11 @@ def _spawn_succession(home: Path, project: str, task: str, repo: Path) -> dict:
 
     G4 收口 (Step1): a succession spawn is no longer a bare CLI path — issue the
     one-time authority token first, exactly as a retro-gated
-    ``audit-close --coordinator --status active`` would."""
+    ``audit-close --coordinator --status active`` would. Step2 C binds the token to the
+    SUCCESSOR ``task`` (the audit-close --task), so issue for the task we spawn."""
     from handoff_fanout import succession_authority as _authority
 
-    token = _authority.issue_token(home=home, project=project, task="closing-coord-leg")
+    token = _authority.issue_token(home=home, project=project, task=task)
     rc = cli.main(
         [
             "spawn",
@@ -701,6 +702,11 @@ def test_worktree_workspace_settings_are_thin(
         "workbench.activityBar.location",
         "workbench.startupEditor",
         "claudeCode.preferredLocation",
+        "terminal.integrated.env.osx",  # Step2 B 轨二: all-path additive session signal
+    }
+    assert spec["settings"]["terminal.integrated.env.osx"] == {
+        "HANDOFF_SESSION_ROLE": "worker",
+        "HANDOFF_SESSION_TASK": "thin-task",
     }
     # the coordinator-only red-top block must never ride along
     assert "workbench.colorCustomizations" not in spec["settings"]

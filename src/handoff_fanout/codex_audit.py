@@ -38,6 +38,7 @@ from pathlib import Path
 from handoff_fanout import atomic
 from handoff_fanout import config as _config
 from handoff_fanout import handoff_precheck as _pc
+from handoff_fanout import memory_baseline as _memory_baseline
 from handoff_fanout import succession_authority as _authority
 from handoff_fanout import worktree as _worktree
 
@@ -2095,6 +2096,34 @@ def main_audit_disposition(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _report_g3_sedimentation(self_task: str | None, project: str, workspace: Path) -> None:
+    """Step2 契约 A.2 — G3 真沉淀 check on the coordinator relay path, WARN-only (A.5
+    observe-then-enforce): print + audit-log the verdict, NEVER block or change rc.
+    Called only after the retro-gated dump returned 0 on a ``--coordinator --status
+    active`` close. Without ``--self-task`` the baseline cannot be located → loud WARN
+    (绝不静默) so the observe-period log shows which relays ran identity-less."""
+    home = _config.home_dir()
+    if self_task is None:
+        sys.stderr.write(
+            "WARN G3-no-self-task: coordinator relay closed without --self-task — its "
+            "memory-sedimentation baseline cannot be located; relay proceeds (WARN "
+            "mode), but coordinator relays should pass --self-task <own task id>\n"
+        )
+        _authority._audit_log(home, project, "G3-NO-SELF-TASK", "audit-close without --self-task")
+        return
+    try:
+        status, detail = _memory_baseline.verify_sedimentation(
+            home=home, project=project, self_task=self_task, workspace=workspace
+        )
+    except Exception as e:  # WARN-mode contract: an evidence-layer crash never kills a relay
+        sys.stderr.write(f"WARN G3-check-failed: {e} — relay proceeds (WARN mode)\n")
+        return
+    if status == _memory_baseline.VERIFY_WARN:
+        sys.stderr.write(f"WARN G3-no-sedimentation: {detail}\n")
+    else:
+        sys.stdout.write(f"OK G3-sedimentation: {detail}\n")
+
+
 def main_audit_close(argv: list[str] | None = None) -> int:
     """Single-process: assemble the codex_audit block from registered runs +
     dispositions, fold it into retro evidence, then invoke ``dump`` — all under
@@ -2170,6 +2199,17 @@ def main_audit_close(argv: list[str] | None = None) -> int:
         action="store_true",
         help="forward to dump: red-top the spawned worktree window (supervisor center / 中枢)",
     )
+    # Step2 契约 A.2 — the CLOSING coordinator's own task id, locating its dispatch-time
+    # memory baseline for the G3 sedimentation check (WARN-only this slice). --task stays
+    # the SUCCESSOR's id (v5.4 dump semantics) — two different identities by design.
+    ap.add_argument(
+        "--self-task",
+        default=None,
+        dest="self_task",
+        help="the CLOSING coordinator's OWN task id (≠ --task, which is the successor): "
+        "locates authority/<self-task>.memory-baseline.json for the G3 真沉淀 check on a "
+        "--coordinator --status active relay (WARN-only; missing baseline → A.4 fallback)",
+    )
     # retro evidence phase status (forwarded to precheck-style build)
     ap.add_argument("--phase0-status", action="append", default=[])
     ap.add_argument("--phase1-status", action="append", default=[])
@@ -2178,6 +2218,17 @@ def main_audit_close(argv: list[str] | None = None) -> int:
     if not _pc.TASK_ID_RE.match(args.task):
         sys.stderr.write(f"ERR-FATAL invalid-task-id: {args.task!r}\n")
         return 1
+    if args.self_task is not None:
+        if not _pc.TASK_ID_RE.match(args.self_task):
+            sys.stderr.write(f"ERR-FATAL invalid-self-task: {args.self_task!r}\n")
+            return 1
+        if not args.coordinator:
+            sys.stderr.write(
+                "ERR-FATAL self-task-needs-coordinator: --self-task is the coordinator "
+                "relay's G3 sedimentation identity — pass --coordinator (a non-coordinator "
+                "close has no dispatch baseline to compare)\n"
+            )
+            return 1
     project, workspace = _resolve_project_workspace(args)
     if not _pc.TASK_ID_RE.match(project):
         sys.stderr.write(f"ERR-FATAL invalid-project-slug: {project!r}\n")
@@ -2378,6 +2429,10 @@ def main_audit_close(argv: list[str] | None = None) -> int:
             # that unlocks `handoff spawn --role supervisor_succession` (which closes the
             # predecessor coordinator window); a bare manual succession spawn is rejected.
             if rc == 0 and args.coordinator and args.status == "active":
+                # Step2 契约 A.2 (G3 / WARN-only): the retro gate passed — now compare
+                # the CLOSING coordinator's dispatch-time memory baseline against the
+                # current snapshot. Never changes rc; never blocks the relay this slice.
+                _report_g3_sedimentation(args.self_task, project, workspace)
                 try:
                     token_path = _authority.issue_token(
                         home=_config.home_dir(), project=project, task=args.task
@@ -2398,6 +2453,13 @@ def main_audit_close(argv: list[str] | None = None) -> int:
                         f"(one-time, TTL {_authority.TOKEN_TTL_SECONDS}s — pass via "
                         "`handoff spawn --role supervisor_succession --succession-token`)\n"
                     )
+            elif rc == 0 and args.self_task is not None:
+                # 绝不静默: --self-task on a terminal (done/blocked) close is legal but
+                # has no relay to gate — say so instead of silently dropping the check.
+                sys.stdout.write(
+                    "OK G3-check-skipped: terminal close (--status "
+                    f"{args.status}) dispatches no successor — no sedimentation gate\n"
+                )
             return rc
     except atomic.LockAcquisitionError:
         sys.stderr.write(f"ERR-LOCKED audit-close-lock-held: {locks_root}\n")

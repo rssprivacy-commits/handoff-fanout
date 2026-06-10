@@ -303,14 +303,27 @@ _COORD_RED = {
     "titleBar.inactiveBackground": "#5A0000",
     "titleBar.inactiveForeground": "#E0E0E0",
 }
-# Golden: the EXACT bytes a NON-coordinator worktree workspace must produce (captured from the
-# pre-change engine). Locks zero-regression — any drift in the non-中枢 path fails this test.
-_GOLDEN_NON_COORD = (
+# Golden: the EXACT bytes a NON-coordinator worktree workspace produced BEFORE the Step2
+# B 轨二 env signal (captured from the pre-Step2 engine). Kept as the byte-precision
+# REFERENCE: stripping ONLY the env key from today's bytes must reproduce these exactly.
+_PRE_STEP2_GOLDEN_NON_COORD = (
     '{\n  "folders": [\n    {\n      "path": "."\n    }\n  ],\n  "settings": {\n'
     '    "window.title": "erp-system \\u00b7 stage1-10c [worktree]${separator}${activeEditorShort}",\n'
     '    "workbench.activityBar.location": "hidden",\n'
     '    "workbench.startupEditor": "none",\n'
     '    "claudeCode.preferredLocation": "panel"\n  }\n}'
+)
+# Golden: the EXACT current bytes (= pre-Step2 + the one terminal.integrated.env.osx key
+# appended LAST). Locks zero-regression in the non-中枢 path.
+_GOLDEN_NON_COORD = (
+    '{\n  "folders": [\n    {\n      "path": "."\n    }\n  ],\n  "settings": {\n'
+    '    "window.title": "erp-system \\u00b7 stage1-10c [worktree]${separator}${activeEditorShort}",\n'
+    '    "workbench.activityBar.location": "hidden",\n'
+    '    "workbench.startupEditor": "none",\n'
+    '    "claudeCode.preferredLocation": "panel",\n'
+    '    "terminal.integrated.env.osx": {\n'
+    '      "HANDOFF_SESSION_ROLE": "worker",\n'
+    '      "HANDOFF_SESSION_TASK": "stage1-10c"\n    }\n  }\n}'
 )
 
 
@@ -353,11 +366,51 @@ def test_inject_vscode_workspace_default_byte_identical_baseline(tmp_path):
     )
     b_default = Path(p_default).read_text()
     b_false = Path(p_false).read_text()
-    assert b_default == _GOLDEN_NON_COORD  # byte-identical to pre-change engine
+    assert b_default == _GOLDEN_NON_COORD  # byte-identical to the locked golden
     assert b_default == b_false  # default arg == explicit False
     s = json.loads(b_default)["settings"]
     assert "workbench.colorCustomizations" not in s
     assert "🧭" not in s["window.title"]
+    # Step2 B 轨二 precision contract (the brief's 精确断言): stripping the ONE env key
+    # re-serializes to EXACTLY the pre-Step2 golden — no other byte drift rode along.
+    spec = json.loads(b_default)
+    env = spec["settings"].pop("terminal.integrated.env.osx")
+    assert env == {"HANDOFF_SESSION_ROLE": "worker", "HANDOFF_SESSION_TASK": "stage1-10c"}
+    assert json.dumps(spec, indent=2) == _PRE_STEP2_GOLDEN_NON_COORD
+
+
+def test_inject_reuse_patches_env_signal_into_pre_step2_file(tmp_path):
+    """REUSE path (Step2 B 轨二, 红顶幂等前例同款): a pre-Step2 engine file — no env
+    signal — must get the two env vars MERGED in on reuse (a window must never open
+    without session identity), preserving every other byte-level setting; a 2nd reuse
+    with the same identity is a no-op (idempotent); a user's other env keys survive."""
+    src = tmp_path / "src"
+    src.mkdir()
+    wtree = tmp_path / "wt"
+    wtree.mkdir()
+    # a pre-Step2-shaped engine file, plus a user's own env key that must survive.
+    legacy = json.loads(_PRE_STEP2_GOLDEN_NON_COORD)
+    legacy["settings"]["terminal.integrated.env.osx"] = {"USER_KEY": "keep-me"}
+    p = wtree / wt.WORKTREE_VSCODE_FILE
+    p.write_text(json.dumps(legacy, indent=2))
+
+    out = wt.inject_vscode_workspace(src, wtree, "erp-system", "stage1-10c")
+    assert out == str(p)
+    env = json.loads(p.read_text())["settings"]["terminal.integrated.env.osx"]
+    assert env == {
+        "USER_KEY": "keep-me",  # merge, never replace (user content survives)
+        "HANDOFF_SESSION_ROLE": "worker",
+        "HANDOFF_SESSION_TASK": "stage1-10c",
+    }
+    # idempotent: same identity again → byte-identical no-op.
+    before = p.read_text()
+    wt.inject_vscode_workspace(src, wtree, "erp-system", "stage1-10c")
+    assert p.read_text() == before
+    # a coordinator reuse flips the SESSION role to the coordinator one (and red-tops).
+    wt.inject_vscode_workspace(src, wtree, "erp-system", "stage1-10c", is_coordinator=True)
+    s = json.loads(p.read_text())["settings"]
+    assert s["terminal.integrated.env.osx"]["HANDOFF_SESSION_ROLE"] == "supervisor_succession"
+    assert s["terminal.integrated.env.osx"]["USER_KEY"] == "keep-me"
 
 
 def test_create_worktree_coordinator_threads_redtop(home, tmp_path):

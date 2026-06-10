@@ -57,6 +57,7 @@ from pathlib import Path
 
 from handoff_fanout import atomic
 from handoff_fanout import config as _config
+from handoff_fanout import memory_baseline as _memory_baseline
 from handoff_fanout import spawn_nonce as _spawn_nonce
 from handoff_fanout import succession_authority as _authority
 from handoff_fanout import worktree as _worktree
@@ -173,6 +174,9 @@ def _singlepane_workspace_json(*, src: Path, project: str, task: str, role: str,
     if role == ROLE_SUCCESSION:
         settings["window.title"] = _worktree._COORDINATOR_TITLE_PREFIX + title
         settings["workbench.colorCustomizations"] = dict(_worktree._COORDINATOR_RED_TITLEBAR)
+    # Step2 B 轨二: session-identity env signal — LAST key (byte-precise golden diff).
+    # ``role`` here IS the session role (worker / supervisor_succession), no override.
+    settings[_worktree.SESSION_ENV_SETTINGS_KEY] = _worktree.session_env_osx(role=role, task=task)
     return json.dumps(
         {
             "folders": [{"path": str(src)}],
@@ -540,8 +544,13 @@ def run_spawn(
     # A consumed token is gone even if the produce step then fails — conservative:
     # re-issue via a fresh retro-gated audit-close rather than leave authority reusable.
     if role == ROLE_SUCCESSION:
+        # Step2 C.2: bind the consume to THIS spawn's task — the token authorizes one
+        # designated successor (the audit-close --task), not any succession in-project.
         ok, reason = _authority.consume_token(
-            Path(succession_token).expanduser(), home=cfg.home, project=project
+            Path(succession_token).expanduser(),
+            home=cfg.home,
+            project=project,
+            expected_task=task,
         )
         if not ok:
             _err(
@@ -568,8 +577,18 @@ def run_spawn(
         queue_dir=queue_dir,
     )
     if isolation == ISOLATION_WORKTREE:
-        return _spawn_worktree(**common)
-    return _spawn_singlepane(**common)
+        rc = _spawn_worktree(**common)
+    else:
+        rc = _spawn_singlepane(**common)
+    # Step2 契约 A (G3): a succession spawn IS a coordinator dispatch — record the
+    # dispatch-time memory snapshot baseline its own future relay compares against.
+    # AFTER the publish succeeded so a failed/rolled-back intent never leaves a
+    # baseline behind; best-effort inside (a baseline failure never fails the spawn).
+    if rc == EXIT_OK and role == ROLE_SUCCESSION:
+        _memory_baseline.write_baseline(
+            home=cfg.home, project=project, coordinator_task=task, workspace=src
+        )
+    return rc
 
 
 def _build_parser() -> argparse.ArgumentParser:

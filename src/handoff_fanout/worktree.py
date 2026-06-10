@@ -514,6 +514,64 @@ _COORDINATOR_RED_TITLEBAR = {
     "titleBar.inactiveForeground": "#E0E0E0",
 }
 
+# Step2 契约 B 轨二 — session-identity env signal. EVERY engine-produced
+# ``.handoff.code-workspace`` (worktree + singlepane; worker AND coordinator windows —
+# a DELIBERATE all-path additive change) injects these two env vars via VS Code's
+# workspace ``terminal.integrated.env.osx`` so the window's Claude Code process and its
+# hook children (Step2b memory-guard role gate, Step3 identity hooks) can read the
+# session's role/task from ``os.environ``. The role value range is the engine's existing
+# worker/supervisor_succession enum — shared constants here (the same cross-module home
+# as the red-top spec: spawn/dump import worktree, never the reverse).
+SESSION_ENV_SETTINGS_KEY = "terminal.integrated.env.osx"
+SESSION_ENV_ROLE = "HANDOFF_SESSION_ROLE"
+SESSION_ENV_TASK = "HANDOFF_SESSION_TASK"
+_ROLE_SUCCESSION = "supervisor_succession"  # mirrors spawn.ROLE_SUCCESSION (spawn imports us)
+
+
+def session_env_osx(*, role: str, task: str, is_coordinator: bool = False) -> dict[str, str]:
+    """The Step2 env-signal payload. ``is_coordinator`` overrides the role to
+    ``supervisor_succession``: a ``dump --coordinator`` relay carries role="worker" in
+    its watchdog sidecar (that contract is untouched), but the SESSION role — what the
+    memory-guard matrix fences on — is the coordinator one (env=supervisor_succession →
+    放行 per the B.3 判定矩阵; tagging a 中枢 window "worker" would fence the very
+    session that MUST sediment memory)."""
+    return {
+        SESSION_ENV_ROLE: _ROLE_SUCCESSION if is_coordinator else role,
+        SESSION_ENV_TASK: task,
+    }
+
+
+def _ensure_session_env(ws_file: Path, *, role: str, task: str, is_coordinator: bool) -> None:
+    """Idempotently MERGE the Step2 env signal into an EXISTING engine workspace file —
+    the REUSE path (参照 ``_ensure_coordinator_redtop`` 幂等前例): a worktree reused
+    across relay legs keeps its file, which may predate this signal or carry a stale
+    task id. Merge-only (a user's other ``terminal.integrated.env.osx`` keys survive);
+    rewrite only on change. Best-effort: an unpatchable/unwritable file is left alone —
+    a worktree window still carries the 轨一 cwd-in-``/worktrees/`` signal, so the env
+    signal is redundant on this path (the singlepane writers always full-rewrite and
+    never come through here)."""
+    try:
+        data = json.loads(ws_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    settings = data.get("settings") if isinstance(data, dict) else None
+    if not isinstance(settings, dict):
+        return
+    env = settings.get(SESSION_ENV_SETTINGS_KEY)
+    if not isinstance(env, dict):
+        env = {}
+        settings[SESSION_ENV_SETTINGS_KEY] = env
+    changed = False
+    for k, v in session_env_osx(role=role, task=task, is_coordinator=is_coordinator).items():
+        if env.get(k) != v:
+            env[k] = v
+            changed = True
+    if changed:
+        try:
+            ws_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except OSError:
+            return  # best-effort (轨一 covers the worktree window; see docstring)
+
 
 def _warn_coordinator_unredtopped(ws_file: Path, why: str) -> None:
     """禁止静默降级铁律 (codex+gemini round-2 P1): a coordinator window that can't be red-topped must
@@ -640,6 +698,10 @@ def inject_vscode_workspace(
                 # would else open without red). A non-coordinator stays a byte-identical no-op.
                 if is_coordinator:
                     _ensure_coordinator_redtop(ws_file, project, task)
+                # Step2 B 轨二: the env signal is patched on the reuse path too (same
+                # idempotent precedent) — a pre-Step2 / stale-task file must not open a
+                # window without (or with the WRONG) session identity.
+                _ensure_session_env(ws_file, role=role, task=task, is_coordinator=is_coordinator)
                 return str(ws_file)
             # p6a-fix1 MUST 1: a REUSED worktree still holds the previous spawn's workspace
             # file, whose title carries the STALE nonce — but the delivery contract is
@@ -704,6 +766,11 @@ def inject_vscode_workspace(
             # in the spawn e2e).
             settings["window.title"] = _COORDINATOR_TITLE_PREFIX + settings["window.title"]
             settings["workbench.colorCustomizations"] = dict(_COORDINATOR_RED_TITLEBAR)
+        # Step2 B 轨二: session-identity env signal — appended LAST so the byte-precise
+        # "the only diff vs the pre-Step2 artifact is this one key" assertions hold.
+        settings[SESSION_ENV_SETTINGS_KEY] = session_env_osx(
+            role=role, task=task, is_coordinator=is_coordinator
+        )
         try:
             ws_file.write_text(
                 json.dumps({"folders": [{"path": "."}], "settings": settings}, indent=2),

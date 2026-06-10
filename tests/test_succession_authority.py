@@ -28,8 +28,7 @@ from handoff_fanout import spawn
 from handoff_fanout import succession_authority as _authority
 
 PROJECT = "wilde-hexe"
-TASK = "wh-succ-next"
-CLOSING_TASK = "wh-coord-leg"
+TASK = "wh-succ-next"  # the SUCCESSOR task — Step2 C binds the token to it
 PRED_NONCE = "feedfacecafebeef"
 
 
@@ -116,7 +115,7 @@ def test_manual_succession_without_token_rejected(tmp_path, monkeypatch, capsys)
 def test_succession_with_valid_token_spawns_and_consumes(tmp_path, monkeypatch):
     home = _home(tmp_path, monkeypatch)
     repo = _plain_repo(tmp_path)
-    token = _authority.issue_token(home=home, project=PROJECT, task=CLOSING_TASK)
+    token = _authority.issue_token(home=home, project=PROJECT, task=TASK)
     assert token.exists()
     assert (token.stat().st_mode & 0o777) == 0o600, "token must be owner-only"
 
@@ -136,7 +135,7 @@ def test_token_replay_rejected(tmp_path, monkeypatch, capsys):
     """One-time means ONE spawn: replaying the same (now consumed) token fails closed."""
     home = _home(tmp_path, monkeypatch)
     repo = _plain_repo(tmp_path)
-    token = _authority.issue_token(home=home, project=PROJECT, task=CLOSING_TASK)
+    token = _authority.issue_token(home=home, project=PROJECT, task=TASK)
     assert spawn.main(_succession_argv(repo, token=str(token))) == 0
 
     rc = spawn.main(_succession_argv(repo, task="wh-succ-replay", token=str(token)))
@@ -153,7 +152,7 @@ def test_token_replay_rejected(tmp_path, monkeypatch, capsys):
 def test_token_expired_rejected(tmp_path, monkeypatch, capsys):
     home = _home(tmp_path, monkeypatch)
     repo = _plain_repo(tmp_path)
-    token = _authority.issue_token(home=home, project=PROJECT, task=CLOSING_TASK)
+    token = _authority.issue_token(home=home, project=PROJECT, task=TASK)
     # Cross the TTL by moving the module clock, not by sleeping.
     expired_at = datetime.now(UTC) + timedelta(seconds=_authority.TOKEN_TTL_SECONDS + 1)
     monkeypatch.setattr(_authority, "_now", lambda: expired_at)
@@ -170,7 +169,7 @@ def test_token_for_other_project_rejected(tmp_path, monkeypatch, capsys):
     project B (path containment is part of the identity)."""
     home = _home(tmp_path, monkeypatch)
     repo = _plain_repo(tmp_path)
-    token = _authority.issue_token(home=home, project="other-proj", task=CLOSING_TASK)
+    token = _authority.issue_token(home=home, project="other-proj", task=TASK)
 
     rc = spawn.main(_succession_argv(repo, token=str(token)))
 
@@ -184,7 +183,7 @@ def test_token_tampered_payload_rejected(tmp_path, monkeypatch, capsys):
     rejected — the filename↔payload binding is part of the authority."""
     home = _home(tmp_path, monkeypatch)
     repo = _plain_repo(tmp_path)
-    token = _authority.issue_token(home=home, project=PROJECT, task=CLOSING_TASK)
+    token = _authority.issue_token(home=home, project=PROJECT, task=TASK)
     payload = json.loads(token.read_text())
     payload["nonce"] = "0" * 16  # disagree with the filename nonce
     token.write_text(json.dumps(payload))
@@ -198,7 +197,7 @@ def test_token_tampered_payload_rejected(tmp_path, monkeypatch, capsys):
 def test_token_loose_permissions_rejected(tmp_path, monkeypatch, capsys):
     home = _home(tmp_path, monkeypatch)
     repo = _plain_repo(tmp_path)
-    token = _authority.issue_token(home=home, project=PROJECT, task=CLOSING_TASK)
+    token = _authority.issue_token(home=home, project=PROJECT, task=TASK)
     token.chmod(0o644)
 
     rc = spawn.main(_succession_argv(repo, token=str(token)))
@@ -212,7 +211,7 @@ def test_worker_spawn_with_token_rejected(tmp_path, monkeypatch, capsys):
     (and never consume the token)."""
     home = _home(tmp_path, monkeypatch)
     repo = _plain_repo(tmp_path)
-    token = _authority.issue_token(home=home, project=PROJECT, task=CLOSING_TASK)
+    token = _authority.issue_token(home=home, project=PROJECT, task=TASK)
 
     rc = spawn.main(
         [
@@ -241,7 +240,7 @@ def test_worker_spawn_with_token_rejected(tmp_path, monkeypatch, capsys):
 def test_expired_tokens_swept_on_next_issue(tmp_path, monkeypatch):
     """Issuing sweeps expired token files so authority can't accumulate on disk."""
     home = _home(tmp_path, monkeypatch)
-    old = _authority.issue_token(home=home, project=PROJECT, task=CLOSING_TASK)
+    old = _authority.issue_token(home=home, project=PROJECT, task=TASK)
     future = datetime.now(UTC) + timedelta(seconds=_authority.TOKEN_TTL_SECONDS + 1)
     monkeypatch.setattr(_authority, "_now", lambda: future)
 
@@ -249,3 +248,86 @@ def test_expired_tokens_swept_on_next_issue(tmp_path, monkeypatch):
 
     assert not old.exists(), "expired token must be swept"
     assert fresh.exists()
+
+
+# ─── Step2 契约 C: token 绑定 successor (consume_token expected_task 必传) ──────
+
+
+def test_token_task_mismatch_rejected_and_not_consumed(tmp_path, monkeypatch, capsys):
+    """D1 ②: a token bound to successor X must not authorize a spawn for task Y —
+    REJECTED with a readable task-mismatch reason, audit-logged, and the token is NOT
+    consumed (the designated successor X can still spawn afterwards)."""
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    token = _authority.issue_token(home=home, project=PROJECT, task=TASK)
+
+    rc = spawn.main(_succession_argv(repo, task="wh-some-other-task", token=str(token)))
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "task-mismatch" in err
+    assert token.exists(), "a task-mismatch must NOT burn the designated successor's authority"
+    log = (home / PROJECT / "authority" / _authority.AUDIT_LOG_NAME).read_text()
+    assert "REJECTED" in log and "task-mismatch" in log
+    assert not (home / PROJECT / "queue" / "wh-some-other-task.uri").exists()
+
+    # the designated successor still gets through on the SAME (unburned) token
+    assert spawn.main(_succession_argv(repo, token=str(token))) == 0
+    assert not token.exists()
+
+
+def test_consume_token_without_expected_task_is_a_type_error(tmp_path, monkeypatch):
+    """SHOULD#5 接口纪律: ``expected_task`` is a REQUIRED parameter — an updated-callers
+    miss must blow up at the call site, never silently consume un-bound."""
+    home = _home(tmp_path, monkeypatch)
+    token = _authority.issue_token(home=home, project=PROJECT, task=TASK)
+
+    with pytest.raises(TypeError):
+        _authority.consume_token(token, home=home, project=PROJECT)  # type: ignore[call-arg]
+    assert token.exists(), "a TypeError must not consume the authority"
+
+
+def test_consume_token_empty_expected_task_rejected_with_log(tmp_path, monkeypatch):
+    """SHOULD#5: an EMPTY expected_task is rejected loudly (clear reason + audit line),
+    never treated as 'match anything'."""
+    home = _home(tmp_path, monkeypatch)
+    token = _authority.issue_token(home=home, project=PROJECT, task=TASK)
+
+    ok, reason = _authority.consume_token(token, home=home, project=PROJECT, expected_task="")
+
+    assert ok is False
+    assert "expected_task" in reason
+    assert token.exists()
+    log = (home / PROJECT / "authority" / _authority.AUDIT_LOG_NAME).read_text()
+    assert "REJECTED" in log and "expected_task" in log
+
+
+def test_issue_audit_log_names_successor_task(tmp_path, monkeypatch):
+    """Step2 C.1 语义厘清: the ISSUED audit line names the field ``successor_task=`` —
+    the issuer's task IS the designated successor (v5.4 dump semantics), never the
+    closing coordinator."""
+    home = _home(tmp_path, monkeypatch)
+    _authority.issue_token(home=home, project=PROJECT, task=TASK)
+    log = (home / PROJECT / "authority" / _authority.AUDIT_LOG_NAME).read_text()
+    assert f"successor_task={TASK}" in log
+
+
+def test_sweep_logs_swept_expired_without_alarm(tmp_path, monkeypatch):
+    """D1 ③ + SHOULD#6: an unconsumed token rotting past its TTL is the EXPECTED idle
+    outcome of the dual-path design (audit-close's inner dump already dispatched the
+    relay window; spawn is the router's entry). The sweep records ``SWEPT-EXPIRED`` and
+    must NOT escalate to WARN/alert noise."""
+    home = _home(tmp_path, monkeypatch)
+    old = _authority.issue_token(home=home, project=PROJECT, task=TASK)
+    future = datetime.now(UTC) + timedelta(seconds=_authority.TOKEN_TTL_SECONDS + 1)
+    monkeypatch.setattr(_authority, "_now", lambda: future)
+
+    _authority.issue_token(home=home, project=PROJECT, task="wh-succ-next2")  # triggers sweep
+
+    assert not old.exists()
+    log = (home / PROJECT / "authority" / _authority.AUDIT_LOG_NAME).read_text()
+    swept_lines = [ln for ln in log.splitlines() if "SWEPT-EXPIRED" in ln]
+    assert swept_lines, "the sweep must be auditable"
+    assert all("WARN" not in ln and "ALERT" not in ln for ln in swept_lines), (
+        "rot is an expected idle outcome — never alarm noise"
+    )

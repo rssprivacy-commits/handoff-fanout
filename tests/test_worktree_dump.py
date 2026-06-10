@@ -208,7 +208,9 @@ def test_dump_singlepane_without_coordinator_no_redtop(tmp_path, monkeypatch):
         "workbench.activityBar.location",
         "workbench.startupEditor",
         "claudeCode.preferredLocation",
+        "terminal.integrated.env.osx",  # Step2 B 轨二: all-path additive session signal
     }
+    assert s["terminal.integrated.env.osx"]["HANDOFF_SESSION_ROLE"] == "worker"
     assert not s["window.title"].startswith("🧭中枢·")
 
 
