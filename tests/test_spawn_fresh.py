@@ -28,6 +28,7 @@ import pytest
 
 from handoff_fanout import spawn
 from handoff_fanout import spawn_nonce as _spawn_nonce
+from handoff_fanout import succession_authority as _authority
 
 PROJECT = "wilde-hexe"
 TASK = "wh-frobnicate"
@@ -71,6 +72,13 @@ def _plain_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _issue_token(home: Path, *, project: str = PROJECT) -> str:
+    """A fresh one-time succession authority, exactly as a retro-gated
+    ``audit-close --coordinator --status active`` would issue (G4 收口: every succession
+    spawn in this suite must hold one — the bare manual path is closed)."""
+    return str(_authority.issue_token(home=home, project=project, task="wh-closing-leg"))
+
+
 def _run(args: list[str], cwd: Path) -> None:
     subprocess.run(args, cwd=str(cwd), check=True, capture_output=True, text=True)
 
@@ -106,6 +114,7 @@ def _argv(
     brief: Path | None = None,
     close_policy: str | None = None,
     predecessor_nonce: str | None = None,
+    succession_token: str | None = None,
 ) -> list[str]:
     a = [
         "--project",
@@ -127,6 +136,8 @@ def _argv(
         a += ["--close-policy", close_policy]
     if predecessor_nonce is not None:
         a += ["--predecessor-nonce", predecessor_nonce]
+    if succession_token is not None:
+        a += ["--succession-token", succession_token]
     return a
 
 
@@ -279,6 +290,7 @@ def test_singlepane_succession_exempt_from_worker_guard(tmp_path, monkeypatch):
             workspace=repo,
             role="supervisor_succession",
             predecessor_nonce="0123456789abcdef",
+            succession_token=_issue_token(home),
         )
     )
     assert rc == 0
@@ -309,6 +321,7 @@ def test_singlepane_succession_publish_holds_project_spawn_lock(tmp_path, monkey
             workspace=repo,
             role="supervisor_succession",
             predecessor_nonce="0123456789abcdef",
+            succession_token=_issue_token(home),
         )
     )
     assert rc == 0
@@ -333,6 +346,7 @@ def test_singlepane_succession_lock_held_rejected(tmp_path, monkeypatch, capsys)
                 workspace=repo,
                 role="supervisor_succession",
                 predecessor_nonce="0123456789abcdef",
+                succession_token=_issue_token(home),
             )
         )
     assert rc == 2
@@ -412,6 +426,7 @@ def test_succession_sidecar_carries_predecessor(tmp_path, monkeypatch):
             workspace=repo,
             role="supervisor_succession",
             predecessor_nonce="0123456789abcdef",
+            succession_token=_issue_token(home),
         )
     )
     assert rc == 0
@@ -438,6 +453,7 @@ def test_succession_singlepane_workspace_is_redtopped(tmp_path, monkeypatch):
             workspace=repo,
             role="supervisor_succession",
             predecessor_nonce="0123456789abcdef",
+            succession_token=_issue_token(home),
         )
     )
     assert rc == 0
@@ -483,17 +499,21 @@ def test_explicit_close_policy_contradicting_role_is_rejected(tmp_path, monkeypa
     contradictory metadata (consumers act on role) — fail closed, produce no intent."""
     home = _home(tmp_path, monkeypatch)
     repo = _plain_repo(tmp_path)
+    token = _issue_token(home)
     rc = spawn.main(
         _argv(
             isolation="singlepane",
             workspace=repo,
             role="supervisor_succession",
             predecessor_nonce="0123456789abcdef",
+            succession_token=token,
         )
         + ["--close-policy", "keep"]
     )
     assert rc != 0
     assert not (home / PROJECT / "queue" / f"{TASK}.uri").exists()
+    # an earlier semantic rejection must never burn the one-time authority
+    assert Path(token).exists()
 
     rc = spawn.main(
         _argv(isolation="singlepane", workspace=repo) + ["--close-policy", "close_predecessor"]
@@ -513,6 +533,7 @@ def test_succession_worktree_workspace_is_redtopped(tmp_path, monkeypatch):
             workspace=ws_repo,
             role="supervisor_succession",
             predecessor_nonce="0123456789abcdef",
+            succession_token=_issue_token(home),
         )
     )
     assert rc == 0
