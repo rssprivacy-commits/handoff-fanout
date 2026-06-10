@@ -139,6 +139,23 @@ def test_slug_flattens_slashes_and_dots() -> None:
     )
 
 
+def test_memory_dir_normalizes_workspace_spellings(tmp_path, monkeypatch, claude_root) -> None:
+    """slug-resolve (warmgap-B codex SHOULD): the SAME project dir written as an absolute
+    path / via a symlink / as a relative path / with a trailing slash must flatten to ONE
+    slug — different spellings must never split the baseline across sibling memory dirs."""
+    real = tmp_path / "proj"
+    real.mkdir()
+    link = tmp_path / "proj-link"
+    link.symlink_to(real)
+    monkeypatch.chdir(tmp_path)
+
+    canonical = mb.memory_dir_for_workspace(real.resolve())
+    assert mb.memory_dir_for_workspace(link) == canonical  # symlink spelling
+    assert mb.memory_dir_for_workspace(Path("proj")) == canonical  # relative spelling
+    assert mb.memory_dir_for_workspace(str(real) + "/") == canonical  # trailing slash
+    assert mb.memory_dir_for_workspace(tmp_path / "sub" / ".." / "proj") == canonical
+
+
 # ─── baseline write (unit) ────────────────────────────────────────────────────
 
 

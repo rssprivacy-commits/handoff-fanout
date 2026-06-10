@@ -70,7 +70,12 @@ def claude_project_slug(workspace: Path | str) -> str:
 
 
 def memory_dir_for_workspace(workspace: Path | str) -> Path:
-    return claude_projects_root() / claude_project_slug(workspace) / "memory"
+    """slug-resolve (warmgap-B codex SHOULD): ``Path.resolve()`` BEFORE flattening, so the
+    same project dir written as a relative path / through a symlink / with redundant
+    components flattens to ONE slug — different spellings must never split the baseline
+    across sibling memory dirs. This is the single chokepoint every caller (write_baseline,
+    verify_sedimentation, the A.4 fallback) funnels through."""
+    return claude_projects_root() / claude_project_slug(Path(workspace).resolve()) / "memory"
 
 
 def snapshot_memory_files(memory_dir: Path) -> dict[str, str]:

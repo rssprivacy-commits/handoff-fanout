@@ -289,10 +289,161 @@ def test_coordinator_workspace_is_redtopped(tmp_path: Path) -> None:
         "titleBar.inactiveBackground": "#5A0000",
         "titleBar.inactiveForeground": "#E0E0E0",
     }
-    # The coordinator flag must NOT leak into the sidecar contract: still compact
-    # single-line JSON (bash json_get line reader) with the unchanged worker fields.
+    # Sidecar contract: still compact single-line JSON (bash json_get line reader) with
+    # the unchanged worker fields, PLUS the warmgap-B SHOULD observable marker
+    # ``is_coordinator: true`` (watchdog/兜底/cleanup semantics) — added only on a 中枢.
     assert "\n" not in sidecar_text
     meta = json.loads(sidecar_text)
     assert meta["role"] == "worker"
     assert meta["close_policy"] == "keep"
     assert meta["spawn_nonce"] == _NONCE
+    assert meta["is_coordinator"] is True
+
+
+# ─── warmgap-B: coordinator ⇒ singlepane engine invariant (owner 批 B / 2026-06-10) ──
+# The fourth red-top gap: a project in NEITHER singlepane_projects NOR worktree mode let
+# `dump --coordinator` fall to the WARM path (reuse-a-window tab — no red-top, no nonce
+# title, no independent window). MUST-1 forces singlepane production for a non-worktree
+# coordinator regardless of config; MUST-2 makes a write failure on that path FAIL CLOSED.
+
+
+def test_coordinator_forces_singlepane_for_non_optin_project(tmp_path: Path) -> None:
+    """MUST-1: is_coordinator=True + project NOT in singlepane_projects → the full
+    singlepane artifact set is produced anyway (out-of-tree workspace + red-top + nonce
+    title + JSON sidecar with the coordinator marker) — the warm path is structurally
+    unable to honour the 中枢 window invariant, so config cannot opt a coordinator out."""
+    cfg = _cfg(tmp_path, [])  # NO project opts in — the exact warm-gap configuration
+    qd = tmp_path / "handoff-fanout" / "queue"
+    qd.mkdir(parents=True)
+    real_repo = tmp_path / "repo"
+    real_repo.mkdir()
+
+    dump.maybe_write_singlepane_sidecar(
+        cfg,
+        "handoff-fanout",
+        "hf-coord-1",
+        real_repo,
+        qd,
+        worktree_active=False,
+        role="worker",
+        close_policy="keep",
+        spawn_nonce=_NONCE,
+        is_coordinator=True,
+    )
+
+    sidecar_text = (qd / "hf-coord-1.singlepane").read_text()
+    assert "\n" not in sidecar_text  # compact single-line contract intact on the forced path
+    meta = json.loads(sidecar_text)
+    assert meta["is_coordinator"] is True
+    ws_file = Path(meta["workspace"])
+    assert ws_file.parent == tmp_path / "handoff-fanout" / "singlepane"  # out-of-tree
+    spec = json.loads(ws_file.read_text())
+    assert spec["folders"] == [{"path": str(real_repo)}]  # opens the real repo
+    title = spec["settings"]["window.title"]
+    assert title.startswith("🧭中枢·")  # red-top prefix
+    assert _NONCE in title  # nonce gate intact
+    assert (
+        spec["settings"]["workbench.colorCustomizations"]["titleBar.activeBackground"] == "#8B0000"
+    )
+    assert spec["settings"]["terminal.integrated.env.osx"]["HANDOFF_SESSION_ROLE"] == (
+        "supervisor_succession"
+    )
+
+
+def test_non_coordinator_non_optin_still_skips(tmp_path: Path) -> None:
+    """MUST-1 regression guard: the forced path is coordinator-ONLY — a plain dump for a
+    non-opted-in project still produces nothing (and cleans a stale sidecar), byte-identical
+    legacy behavior."""
+    cfg = _cfg(tmp_path, [])
+    qd = tmp_path / "handoff-fanout" / "queue"
+    qd.mkdir(parents=True)
+    sidecar = qd / "hf-solo-1.singlepane"
+    sidecar.write_text("stale")
+    dump.maybe_write_singlepane_sidecar(
+        cfg,
+        "handoff-fanout",
+        "hf-solo-1",
+        tmp_path,
+        qd,
+        worktree_active=False,
+        role="solo",
+        close_policy="keep",
+        spawn_nonce=_NONCE,
+        is_coordinator=False,
+    )
+    assert not sidecar.exists()
+    assert not (tmp_path / "handoff-fanout" / "singlepane").exists()
+
+
+def test_coordinator_worktree_active_unchanged(tmp_path: Path) -> None:
+    """MUST-1 boundary: a worktree-CREATED coordinator keeps its worktree window (which
+    already carries the red-top via create_worktree) — the invariant only takes over the
+    would-otherwise-be-warm case, so no singlepane sidecar is produced."""
+    cfg = _cfg(tmp_path, [])
+    qd = tmp_path / "handoff-fanout" / "queue"
+    qd.mkdir(parents=True)
+    dump.maybe_write_singlepane_sidecar(
+        cfg,
+        "handoff-fanout",
+        "hf-coord-wt",
+        tmp_path,
+        qd,
+        worktree_active=True,
+        role="worker",
+        close_policy="keep",
+        spawn_nonce=_NONCE,
+        is_coordinator=True,
+    )
+    assert not (qd / "hf-coord-wt.singlepane").exists()
+
+
+def test_coordinator_write_failure_fails_closed(tmp_path: Path) -> None:
+    """MUST-2: a coordinator whose singlepane workspace cannot be written must RAISE
+    (CoordinatorSinglepaneError → dump aborts before the .uri publish), never degrade to
+    the warm path. A FILE squatting the singlepane dir path makes mkdir raise OSError."""
+    import pytest
+
+    cfg = _cfg(tmp_path, [])
+    qd = tmp_path / "handoff-fanout" / "queue"
+    qd.mkdir(parents=True)
+    (tmp_path / "handoff-fanout" / "singlepane").write_text("squatter")  # mkdir → OSError
+
+    with pytest.raises(dump.CoordinatorSinglepaneError):
+        dump.maybe_write_singlepane_sidecar(
+            cfg,
+            "handoff-fanout",
+            "hf-coord-2",
+            tmp_path,
+            qd,
+            worktree_active=False,
+            role="worker",
+            close_policy="keep",
+            spawn_nonce=_NONCE,
+            is_coordinator=True,
+        )
+    assert not (qd / "hf-coord-2.singlepane").exists()  # no partial sidecar left behind
+
+
+def test_non_coordinator_write_failure_stays_non_fatal(tmp_path: Path, capsys) -> None:
+    """MUST-2 boundary: the SAME write failure on a non-coordinator dump keeps the legacy
+    best-effort contract (print + clean up, never raise) — singlepane stays UX polish for
+    everyone but the 中枢."""
+    cfg = _cfg(tmp_path, ["wilde-hexe"])
+    qd = tmp_path / "wilde-hexe" / "queue"
+    qd.mkdir(parents=True)
+    (tmp_path / "wilde-hexe" / "singlepane").write_text("squatter")
+
+    dump.maybe_write_singlepane_sidecar(
+        cfg,
+        "wilde-hexe",
+        "wh-solo-2",
+        tmp_path,
+        qd,
+        worktree_active=False,
+        role="solo",
+        close_policy="keep",
+        spawn_nonce=_NONCE,
+        is_coordinator=False,
+    )
+    assert "(non-fatal) could not write singlepane workspace" in capsys.readouterr().out
+    assert not (qd / "wh-solo-2.singlepane").exists()

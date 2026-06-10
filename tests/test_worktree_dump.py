@@ -12,6 +12,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from handoff_fanout import config as _config
 from handoff_fanout import dump, handoff_precheck
 from handoff_fanout import worktree as wt
@@ -196,13 +198,16 @@ def test_dump_coordinator_singlepane_threads_redtop(tmp_path, monkeypatch):
 
 def test_dump_singlepane_without_coordinator_no_redtop(tmp_path, monkeypatch):
     """Zero regression on the singlepane path: no --coordinator → the locked THIN key set
-    (precise set assertion, mirroring test_spawn_fresh's no-redtop pattern)."""
+    (precise set assertion, mirroring test_spawn_fresh's no-redtop pattern). E3 role
+    taxonomy: the single-task active relay is the SOLO chain — sidecar role + session env
+    say "solo", and the title (project·task·role·nonce) carries the solo token (an
+    INTENTIONAL title change; the watchdog gates on nonce/task substrings, never the role)."""
     _, ws = _bare_and_clone(tmp_path)
     home = _home(tmp_path)
     (home / "config.json").write_text(json.dumps({"singlepane_projects": [PROJECT]}))
     rc = _dump(home, ws, monkeypatch, on=False)
     assert rc == 0
-    s, _ = _singlepane_ws(home)
+    s, meta = _singlepane_ws(home)
     assert set(s) == {
         "window.title",
         "workbench.activityBar.location",
@@ -210,8 +215,105 @@ def test_dump_singlepane_without_coordinator_no_redtop(tmp_path, monkeypatch):
         "claudeCode.preferredLocation",
         "terminal.integrated.env.osx",  # Step2 B 轨二: all-path additive session signal
     }
-    assert s["terminal.integrated.env.osx"]["HANDOFF_SESSION_ROLE"] == "worker"
+    assert s["terminal.integrated.env.osx"]["HANDOFF_SESSION_ROLE"] == "solo"
+    assert meta["role"] == "solo"  # E3: the solo relay is not a true worker
+    assert "is_coordinator" not in meta  # the coordinator marker never rides a solo dump
+    assert f" · solo · {meta['spawn_nonce']}" in s["window.title"]
     assert not s["window.title"].startswith("🧭中枢·")
+
+
+def test_dump_worktree_relay_env_role_is_solo(tmp_path, monkeypatch):
+    """E3 on the WORKTREE path: the single-task active relay into a created worktree is the
+    same solo chain — its workspace env signal says "solo" (the dump path passes no
+    spawn_nonce, so the window title keeps the legacy byte-identical form)."""
+    _, ws = _bare_and_clone(tmp_path)
+    home = _home(tmp_path)
+    (home / "config.json").write_text(json.dumps({"worktree_link_venv": False}))
+    rc = _dump(home, ws, monkeypatch, on=True)
+    assert rc == 0
+    s = _wt_settings(home)
+    assert s["terminal.integrated.env.osx"] == {
+        "HANDOFF_SESSION_ROLE": "solo",
+        "HANDOFF_SESSION_TASK": TASK,
+    }
+    assert s["window.title"] == f"{PROJECT} · {TASK} [worktree]${{separator}}${{activeEditorShort}}"
+
+
+# ─── warmgap-B engine invariant, full CLI plumbing (owner 批 B / 2026-06-10) ──
+
+
+def test_dump_coordinator_forces_singlepane_on_unconfigured_project(tmp_path, monkeypatch):
+    """MUST-1 end-to-end (the exact fourth-red-top-gap reproduction): a project in NEITHER
+    singlepane_projects NOR worktree mode + `dump --coordinator` must NOT fall to the warm
+    path — the engine forces the full singlepane artifact set, which the sidecar-driven
+    watchdog consume chain then opens as an independent red-top window."""
+    _, ws = _bare_and_clone(tmp_path)
+    home = _home(tmp_path)  # config: {} — no singlepane_projects, no worktree mode
+    rc = _dump(home, ws, monkeypatch, on=False, extra=["--coordinator"])
+    assert rc == 0
+    s, meta = _singlepane_ws(home)  # would raise FileNotFoundError pre-fix (no sidecar)
+    assert meta["is_coordinator"] is True
+    assert meta["role"] == "worker"  # coordinator sidecar keeps the watchdog role contract
+    title = s["window.title"]
+    assert title.startswith("🧭中枢·")
+    assert meta["spawn_nonce"] in title  # nonce gate intact
+    assert s["workbench.colorCustomizations"]["titleBar.activeBackground"] == "#8B0000"
+    assert s["terminal.integrated.env.osx"]["HANDOFF_SESSION_ROLE"] == "supervisor_succession"
+    assert _uri_workspace(home) == str(ws)  # .uri published; workspace = the real repo
+
+
+def test_dump_coordinator_singlepane_write_failure_fails_closed(tmp_path, monkeypatch):
+    """MUST-2 end-to-end: when the forced singlepane artifacts cannot be written, the dump
+    exits non-zero and the .uri is NEVER published (no spawn trigger → no warm fallback)."""
+    _, ws = _bare_and_clone(tmp_path)
+    home = _home(tmp_path)
+    sp_dir = home / PROJECT / "singlepane"
+    sp_dir.parent.mkdir(parents=True, exist_ok=True)
+    sp_dir.write_text("squatter")  # a FILE squatting the dir path → mkdir raises OSError
+    rc = _dump(home, ws, monkeypatch, on=False, extra=["--coordinator"])
+    assert rc == 1
+    assert not (home / PROJECT / "queue" / f"{TASK}.uri").exists()
+    assert not (home / PROJECT / "queue" / f"{TASK}.singlepane").exists()
+
+
+def test_dump_coordinator_worktree_degrade_forces_singlepane(tmp_path, monkeypatch):
+    """MUST-1 on the DEGRADE path: worktree isolation requested but unavailable (no git
+    remote) + --coordinator must land on the FORCED singlepane form, not the warm shared
+    tree — "非 worktree-created" includes the degrade case, so the invariant still holds."""
+    ws = tmp_path / "local"
+    ws.mkdir()
+    subprocess.run(["git", "init", "-qb", "main", str(ws)], check=True, capture_output=True)
+    for k, v in (("user.email", "t@t"), ("user.name", "t"), ("commit.gpgsign", "false")):
+        _run(["git", "config", k, v], ws)
+    (ws / "a.txt").write_text("x")
+    _run(["git", "add", "."], ws)
+    _run(["git", "commit", "-qm", "init"], ws)
+    home = _home(tmp_path)  # config {}: not a singlepane project either
+    rc = _dump(home, ws, monkeypatch, on=True, extra=["--coordinator"])
+    assert rc == 0
+    assert _uri_workspace(home) == str(ws)  # worktree degraded → shared tree workspace
+    s, meta = _singlepane_ws(home)  # …but the WINDOW form is the forced singlepane one
+    assert meta["is_coordinator"] is True
+    assert s["window.title"].startswith("🧭中枢·")
+
+
+@pytest.mark.parametrize(
+    "combo",
+    [
+        ["--open-batch", "/nonexistent/manifest.json"],
+        ["--batch-id", "b1", "--batch-done"],
+        ["--batch-id", "b1", "--batch-blocked"],
+        ["--batch-id", "b1", "--batch-fan-in"],
+    ],
+)
+def test_dump_coordinator_rejects_batch_combos(tmp_path, monkeypatch, combo):
+    """MUST-3 (was help-text only, now a machine gate): --coordinator × any batch/fan-in
+    flag is rejected up front — a 中枢 relay is a single-task dispatch."""
+    _, ws = _bare_and_clone(tmp_path)
+    home = _home(tmp_path)
+    with pytest.raises(SystemExit, match="--coordinator cannot be combined"):
+        _dump(home, ws, monkeypatch, on=False, extra=["--coordinator", *combo])
+    assert not (home / PROJECT / "queue" / f"{TASK}.uri").exists()
 
 
 def test_audit_close_coordinator_threads_redtop(tmp_path, monkeypatch):

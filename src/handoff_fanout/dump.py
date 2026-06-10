@@ -63,6 +63,16 @@ HANDOFF_ROLE_MAIN = "main"
 HANDOFF_ROLE_SUB_TASK = "sub-task"
 HANDOFF_ROLE_FAN_IN = "fan-in"
 
+# E3 role taxonomy (warmgap-B / 2a gate 双脑一致): the NON-coordinator single-task active
+# dump — the solo auto-relay chain — is NOT a true worker (batch sub-task / fan-in tabs and
+# ``handoff spawn`` workers are). Its watchdog sidecar ``role`` + workspace env
+# ``HANDOFF_SESSION_ROLE`` carry this value so downstream identity consumers (memory-guard
+# role matrix, Step3 hooks) can tell the relay mainline apart from fenced workers. Distinct
+# from the batch HANDOFF_ROLE_* env above (different mechanism: queue .env files). The
+# watchdog open path is role-agnostic and autoclose acts only on ``supervisor_succession``,
+# so this value rides through both safely (test-locked).
+ROLE_SOLO = "solo"
+
 # v5.1 spawn-storm defenders (carried over from the v5.1 / 5.2 audit).
 SUB_TASK_N_MAX = 3
 STAGGER_SPAWN_SECONDS = 30
@@ -442,6 +452,16 @@ def get_roadmap_excerpt(cfg: _config.Config, project: str) -> str:
 # ─── single-pane (non-worktree) spawn workspace ─────────────────────────────
 
 
+class CoordinatorSinglepaneError(Exception):
+    """A coordinator relay's forced-singlepane workspace/sidecar could not be written.
+
+    warmgap-B MUST-2 (owner 批 B / 2026-06-10 双脑 GREEN): for ``is_coordinator=True`` the
+    singlepane artifacts are an ENGINE INVARIANT (中枢=独占红顶单栏窗), not UX polish — a
+    write failure must FAIL CLOSED (abort before the ``.uri`` publish) and never fall back
+    to the warm reuse-a-window path that produced the fourth red-top gap. ``main()``
+    catches this and exits non-zero with a remedy."""
+
+
 def maybe_write_singlepane_sidecar(
     cfg: _config.Config,
     project: str,
@@ -486,12 +506,27 @@ def maybe_write_singlepane_sidecar(
     coordinator inject-config block the THIN rule bans (gating stays in the repo's own
     ``.vscode``). A non-coordinator dump stays byte-identical (zero regression, golden-locked).
 
+    warmgap-B MUST-1 (owner 批 B / 2026-06-10): ``is_coordinator=True`` on a NON-worktree
+    spawn FORCES singlepane production regardless of ``singlepane_projects`` — the warm
+    reuse-a-window path is structurally unable to honour "凡监管中枢窗口必须红顶 🧭 + 单栏"
+    (no workspace file to bind a title/red-top/nonce to), so for a coordinator the opt-in
+    config becomes irrelevant: 中枢=独占红顶单栏窗 is an engine invariant, not a config
+    courtesy. The watchdog is sidecar-driven (not config-driven), so the existing singlepane
+    consume chain (``code -n`` + nonce gate + bounded Enter retry) picks this up unchanged.
+
     Cleanup/no-op otherwise: a project that does NOT opt in, or a worktree spawn (which has
     its own ``.handoff.code-workspace`` and wins), gets the sidecar REMOVED so a stale opt-in
-    can't linger across a config flip-off. Best-effort — an OSError never bricks the dump
-    (single-pane is UX polish; the warm submit still works without it)."""
+    can't linger across a config flip-off. Best-effort for a NON-coordinator — an OSError
+    never bricks the dump (single-pane is UX polish; the warm submit still works without it).
+    For a coordinator a write failure raises :class:`CoordinatorSinglepaneError` instead
+    (MUST-2 fail-closed: never fall back warm; the caller aborts before the .uri publish).
+
+    warmgap-B SHOULD: a coordinator sidecar additionally carries ``"is_coordinator": true``
+    (observable semantics for the watchdog/兜底/cleanup). The key is added ONLY when true so
+    every non-coordinator sidecar stays byte-identical (golden-locked)."""
     sidecar = queue_dir / f"{task}.singlepane"
-    if worktree_active or project not in cfg.singlepane_projects:
+    forced = is_coordinator and not worktree_active  # MUST-1: config cannot opt a 中枢 out
+    if worktree_active or (not forced and project not in cfg.singlepane_projects):
         sidecar.unlink(missing_ok=True)
         return
     try:
@@ -550,21 +585,34 @@ def maybe_write_singlepane_sidecar(
         # Pretty-printing this (``indent=2``) would risk silently breaking those reads → autoclose
         # fail-closes. The ``.handoff.code-workspace`` ABOVE is read by VS Code itself, so it may be
         # indented; THIS sidecar may not. Keep ``json.dumps(...)`` here without an ``indent`` kwarg.
+        sidecar_payload: dict[str, object] = {
+            "workspace": str(ws_file),
+            "role": role,
+            "close_policy": close_policy,
+            "spawn_nonce": spawn_nonce,
+            "predecessor_nonce": predecessor_nonce,
+        }
+        if is_coordinator:
+            # warmgap-B SHOULD: observable coordinator marker (watchdog/兜底/cleanup 语义).
+            # Added only when true → non-coordinator sidecars stay byte-identical.
+            sidecar_payload["is_coordinator"] = True
         sidecar.write_text(
-            json.dumps(
-                {
-                    "workspace": str(ws_file),
-                    "role": role,
-                    "close_policy": close_policy,
-                    "spawn_nonce": spawn_nonce,
-                    "predecessor_nonce": predecessor_nonce,
-                }
-            ),  # ← no indent= on purpose: single-line contract for the bash json_get reader
+            # ← no indent= on purpose: single-line contract for the bash json_get reader
+            json.dumps(sidecar_payload),
             encoding="utf-8",
         )
     except OSError as e:
-        print(f"[dump] (non-fatal) could not write singlepane workspace: {e}")
         sidecar.unlink(missing_ok=True)
+        if is_coordinator:
+            # MUST-2 fail-closed: a 中枢 window without its singlepane artifacts would fall
+            # to the warm path = the exact fourth-red-top-gap accident. Abort the dump (the
+            # .uri publish never happens), never degrade silently.
+            raise CoordinatorSinglepaneError(
+                f"coordinator relay {project}/{task}: singlepane workspace/sidecar write "
+                f"failed ({e}) — fail-closed, NOT falling back to a warm window. Fix the "
+                f"filesystem issue (or use dx-spawn-session.sh --coordinator) and re-dump."
+            ) from e
+        print(f"[dump] (non-fatal) could not write singlepane workspace: {e}")
 
 
 # ─── singlepane worker concurrency hard-REJECT (design §5.4 / R2 M5) ─────────
@@ -895,7 +943,12 @@ def write_active_dump(
         worktree_active=bool(
             worktree_info and worktree_info.get("status") == _worktree.ST_CREATED
         ),
-        role="worker",
+        # E3 role taxonomy: the single-task active relay is the SOLO chain, not a true
+        # worker (batch sub-task / fan-in keep role="worker" at their own call sites).
+        # A coordinator dump keeps role="worker" in the sidecar — the watchdog contract
+        # asserted by the red-top tests — its coordinator semantics ride in the env
+        # signal (supervisor_succession) + the is_coordinator sidecar marker.
+        role=("worker" if is_coordinator else ROLE_SOLO),
         close_policy="keep",
         spawn_nonce=_spawn_nonce.new_nonce(),
         is_coordinator=is_coordinator,
@@ -1561,15 +1614,22 @@ def resolve_spawn_workspace(
     if mode == _worktree.MODE_OFF:
         return source_workspace, None, None
 
+    is_coordinator = getattr(args, "coordinator", False)
     result = _worktree.create_worktree(
         source_workspace=source_workspace,
         project=project,
         task=args.task,
         cfg=cfg,
         mode=mode,
+        # E3 role taxonomy: the dump single-task active relay is the SOLO chain on this
+        # path too — its workspace env signal (HANDOFF_SESSION_ROLE) must say "solo", not
+        # "worker". Title is unaffected (dump passes no spawn_nonce → legacy title). A
+        # coordinator's env is overridden to supervisor_succession inside session_env_osx
+        # regardless of this value (kept "worker" for symmetry with the sidecar contract).
+        role=("worker" if is_coordinator else ROLE_SOLO),
         # §五·2 (2026-06-09 owner立法): a 中枢 dump red-tops its worktree window. getattr keeps
         # batch / fan-in / legacy callers (whose args lack --coordinator) working unchanged.
-        is_coordinator=getattr(args, "coordinator", False),
+        is_coordinator=is_coordinator,
     )
     if result.is_blocked:
         head = _worktree.head_sha(source_workspace) or "(unknown)"
@@ -1684,7 +1744,10 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--coordinator",
         action="store_true",
-        help="red-top the spawned window — worktree AND singlepane paths (supervisor center / 中枢; §五 防误关)",
+        help="red-top the spawned window — worktree AND singlepane paths (supervisor center / 中枢; "
+        "§五 防误关). A 中枢 relay is a SINGLE-TASK dispatch: combining with any batch/fan-in flag "
+        "is machine-REJECTED (warmgap-B MUST-3), and a non-worktree coordinator FORCES the "
+        "singlepane window form regardless of singlepane_projects (MUST-1 engine invariant)",
     )
     return ap
 
@@ -1692,6 +1755,23 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     cfg = _config.load()
+
+    # warmgap-B MUST-3 (machine gate, was help-text only): --coordinator × batch/fan-in is
+    # structurally invalid — a 中枢 relay is a single-task dispatch; the batch paths thread
+    # neither the red-top nor the forced-singlepane invariant, so silently accepting the
+    # combo would reopen the warm-gap (and fan-in to a coordinator risks session bleeding).
+    if getattr(args, "coordinator", False) and (
+        args.open_batch
+        or args.batch_id
+        or args.batch_done
+        or args.batch_blocked
+        or args.batch_fan_in
+    ):
+        raise SystemExit(
+            "❌ --coordinator cannot be combined with batch/fan-in flags "
+            "(--open-batch/--batch-id/--batch-done/--batch-blocked/--batch-fan-in): "
+            "a 中枢 relay is a single-task dispatch (warmgap-B MUST-3)"
+        )
 
     if args.cleanup_orphan:
         return handle_cleanup_orphan(args)
@@ -1856,6 +1936,11 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    except CoordinatorSinglepaneError as e:
+        # warmgap-B MUST-2: the forced-singlepane artifacts failed to write — the .uri was
+        # never published (no spawn happened), and falling back warm is forbidden.
+        print(f"❌ {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
