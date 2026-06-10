@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import json
 import os
 import re
 import shlex
@@ -709,9 +710,55 @@ def _format_enforcement_block(
 
 # ─── mode 5: cross-project orphan scan ──────────────────────────────────────
 
+# A unified ``handoff spawn`` dispatch (spawn.py) publishes a ``queue/<task>.singlepane``
+# sidecar + a ``.uri`` and, by contract, NEVER a ``queue/<task>.md`` (that is the legacy
+# dump path's product). So once the legacy ``.md``-missing orphan predicate would fire, the
+# sidecar's presence is what tells mode 5 this is a KNOWN unified-spawn dispatch — not a
+# stray orphan. These three states drive the differential treatment below.
+_SPAWN_STATE_NONE = "none"  # no sidecar → genuine legacy orphan path (unchanged)
+_SPAWN_STATE_ACTIVE = "active"  # valid sidecar + workspace still on disk → live dispatch
+_SPAWN_STATE_STALE = "stale"  # sidecar present but no live signal → residue (surfaced, not masked)
+
+
+def _unified_spawn_state(queue_dir: Path, task_id: str) -> str:
+    """Classify a ``.md``-less ``ack/<task>.spawned`` against its ``queue/<task>.singlepane``
+    sidecar (see the ``_SPAWN_STATE_*`` constants).
+
+    ACTIVE — the false-positive the bug was about — is a parseable sidecar carrying a
+    non-empty ``workspace`` whose file still exists: a live ``handoff spawn`` worker holds
+    that workspace open, so mode 5 must leave it alone. The sidecar is static (a unified
+    spawn worker emits no heartbeat and has no ``.md``), so the only deterministic
+    dead-signal a file scanner has is the workspace being GONE — that is the STALE residue
+    we surface distinctly rather than mask. A sidecar that is present but unparseable or
+    missing its ``workspace`` field is itself anomalous residue ⇒ STALE (never the legacy
+    orphan path, which would mislead on a possibly-live worker)."""
+    sidecar = queue_dir / f"{task_id}.singlepane"
+    if not sidecar.exists():
+        return _SPAWN_STATE_NONE
+    try:
+        data = json.loads(sidecar.read_text())
+    except (OSError, ValueError):
+        return _SPAWN_STATE_STALE
+    if not isinstance(data, dict):
+        return _SPAWN_STATE_STALE
+    ws = data.get("workspace")
+    if not isinstance(ws, str) or not ws:
+        return _SPAWN_STATE_STALE
+    return _SPAWN_STATE_ACTIVE if Path(ws).exists() else _SPAWN_STATE_STALE
+
 
 def scan_orphan_spawns() -> int:
-    """Find ``ack/*.spawned`` files whose queue ``.md`` is missing past the grace window."""
+    """Find ``ack/*.spawned`` files whose queue ``.md`` is missing past the grace window.
+
+    A legacy dump-path spawn that never produced its ``queue/<task>.md`` is a true orphan
+    (BLOCKED.md + notify). But a unified ``handoff spawn`` dispatch NEVER writes a ``.md``
+    (spawn.py contract) — it publishes a ``queue/<task>.singlepane`` sidecar instead — so the
+    bare ``.md``-missing predicate systematically mis-flagged every unified-spawn worker past
+    the 300s grace, writing a BLOCKED.md that misled the owner into closing a LIVE tab. We
+    recognise the sidecar: an active dispatch (workspace present) is left alone; stale residue
+    (workspace gone / corrupt sidecar) is surfaced DISTINCTLY (a ``.stale-spawn`` note, never
+    the orphan BLOCKED.md). A sidecar-less ``ack/.spawned`` (ERP-style legacy dump residue) is
+    detected exactly as before — the ``.md``/.done/.BLOCKED.md/age skips are untouched."""
     orphans = 0
     root = handoff_root()
     if not root.exists():
@@ -736,6 +783,19 @@ def scan_orphan_spawns() -> int:
                 continue
             age = time.time() - spawned.stat().st_mtime
             if age < ORPHAN_GRACE_SECONDS:
+                continue
+            # ``.md`` missing past grace. Before the legacy orphan verdict, recognise a
+            # unified-spawn dispatch by its sidecar — the ONLY case this branch changes
+            # (no sidecar ⇒ NONE ⇒ identical legacy behaviour).
+            state = _unified_spawn_state(queue_dir, task_id)
+            if state == _SPAWN_STATE_ACTIVE:
+                # KNOWN live ``handoff spawn`` worker — the ``.md``-missing predicate never
+                # applied to it. A healthy worker is nothing to surface (matching mode 1-4,
+                # which log/act only on a detected problem, not per healthy tick): skip
+                # silently — no BLOCKED.md, no Basso, no per-tick log spam.
+                continue
+            if state == _SPAWN_STATE_STALE:
+                _mark_stale_spawn(proj_dir, task_id, age)
                 continue
             _mark_orphan(proj_dir, task_id, age)
             orphans += 1
@@ -764,6 +824,47 @@ def _mark_orphan(proj_dir: Path, task_id: str, age_seconds: float) -> None:
         "v5.2 watchdog / orphan",
         project,
         sound="Basso",
+    )
+
+
+def _mark_stale_spawn(proj_dir: Path, task_id: str, age_seconds: float) -> None:
+    """Surface a stale unified-spawn residue WITHOUT the owner-misleading orphan BLOCKED.md.
+
+    A unified-spawn dispatch whose workspace is gone (or whose sidecar is corrupt) is real
+    residue worth cleaning, but it is NOT a traditional orphan: the orphan BLOCKED.md tells
+    the owner to close a tab — harmful on a still-relevant window. We write a distinct,
+    idempotent ``.stale-spawn`` note (no Basso) so the residue is visible/auditable yet never
+    mistaken for a 'close your tab' instruction. Stale/hung detection of a LIVE worker is out
+    of mode 5's reach (it scans files, not processes) and a unified-spawn worker emits no
+    heartbeat, so this marker is a cleanup hint, not a liveness verdict."""
+    project = proj_dir.name
+    queue_dir = proj_dir / "queue"
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    marker = queue_dir / f"{task_id}.stale-spawn"
+    if not atomic.atomic_create(marker):
+        return  # idempotent — already noted on an earlier tick
+    spawned_path = shlex.quote(str(proj_dir / "ack" / f"{task_id}.spawned"))
+    sidecar_path = shlex.quote(str(queue_dir / f"{task_id}.singlepane"))
+    marker_path = shlex.quote(str(marker))
+    atomic.write_with_fsync(
+        marker,
+        (
+            f"task_id: {task_id}\n"
+            f"detected_at: {dump.now_iso()}\n"
+            f"age_seconds: {age_seconds:.0f}\n"
+            f"kind: unified-spawn stale residue\n\n"
+            "## What this is\n"
+            "A `handoff spawn` dispatch left ack/<task>.spawned + queue/<task>.singlepane,\n"
+            "but its workspace is gone (torn-down worktree) or the sidecar is unreadable.\n"
+            "This is residue to clean up — NOT a live orphan, and NOT an instruction to\n"
+            "close any tab.\n\n"
+            "## Cleanup (only if you've confirmed no tab is still working this task)\n"
+            f"  rm {spawned_path} {sidecar_path} {marker_path}\n"
+        ),
+    )
+    print(
+        f"  [watchdog mode 5] stale unified-spawn residue: "
+        f"{project}/{task_id} (age={age_seconds:.0f}s)"
     )
 
 

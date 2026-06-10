@@ -264,3 +264,127 @@ def test_watchdog_orphan_scan_idempotent(isolated_handoff_home):
     assert watchdog.scan_orphan_spawns() == 1
     # second pass: BLOCKED.md exists, so it's skipped
     assert watchdog.scan_orphan_spawns() == 0
+
+
+# ─── C3 / mode 5: unified-spawn (`handoff spawn`) recognition ─────────────────
+# A unified spawn (spawn.py) writes a compact-JSON `queue/<task>.singlepane` sidecar
+# + a `.uri`, and NEVER a `queue/<task>.md` (that is the legacy dump path's product).
+# The orphan predicate is `.md`-missing, so EVERY unified-spawn worker running past
+# the 300s grace was systematically mis-flagged. mode 5 must recognise these.
+
+
+def _write_spawn_sidecar(
+    queue: Path,
+    task: str,
+    *,
+    workspace: Path,
+    isolation: str = "worktree",
+    role: str = "worker",
+) -> Path:
+    """Mirror ``spawn._write_sidecar``'s COMPACT single-line JSON shape (the watchdog
+    contract): workspace / role / close_policy / spawn_nonce / isolation / predecessor_nonce."""
+    sidecar = queue / f"{task}.singlepane"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "workspace": str(workspace),
+                "role": role,
+                "close_policy": "keep",
+                "spawn_nonce": "deadbeef",
+                "isolation": isolation,
+                "predecessor_nonce": None,
+            }
+        )
+    )
+    return sidecar
+
+
+def test_watchdog_orphan_scan_skips_active_unified_spawn(isolated_handoff_home):
+    """A LIVE ``handoff spawn`` worker — valid non-terminal sidecar + its workspace
+    still present, NO ``queue/.md`` by contract — must NOT be mis-flagged as a legacy
+    orphan (the bug: BLOCKED.md misled the owner into closing an active tab)."""
+    p = _setup_project(isolated_handoff_home)
+    ws = p["proj"] / "worktrees" / "u1" / ".handoff.code-workspace"
+    ws.parent.mkdir(parents=True)
+    ws.write_text("{}")  # the worker's open target still exists ⇒ a live dispatch
+    spawned = p["ack"] / "u1.spawned"
+    spawned.write_text("(test)")
+    _write_spawn_sidecar(p["queue"], "u1", workspace=ws)
+    _stale(spawned, seconds_ago=watchdog.ORPHAN_GRACE_SECONDS + 60)
+
+    assert watchdog.scan_orphan_spawns() == 0
+    assert not (p["queue"] / "u1.BLOCKED.md").exists()
+    assert not (p["queue"] / "u1.stale-spawn").exists()
+
+
+def test_watchdog_orphan_scan_marks_stale_unified_spawn_distinctly(isolated_handoff_home):
+    """A unified-spawn dispatch whose workspace is GONE (torn-down worktree / leaked
+    residue) must NOT be masked — it gets a DISTINCT ``.stale-spawn`` marker, never the
+    owner-misleading orphan BLOCKED.md."""
+    p = _setup_project(isolated_handoff_home)
+    ws = p["proj"] / "worktrees" / "u2" / ".handoff.code-workspace"  # deliberately never created
+    spawned = p["ack"] / "u2.spawned"
+    spawned.write_text("(test)")
+    _write_spawn_sidecar(p["queue"], "u2", workspace=ws)
+    _stale(spawned, seconds_ago=watchdog.ORPHAN_GRACE_SECONDS + 60)
+
+    watchdog.scan_orphan_spawns()
+    assert not (p["queue"] / "u2.BLOCKED.md").exists()  # never the misleading 'close tab' marker
+    stale = p["queue"] / "u2.stale-spawn"
+    assert stale.exists()  # not masked — a visible, auditable residue
+    assert "u2" in stale.read_text()
+
+
+def test_watchdog_orphan_scan_stale_unified_spawn_idempotent(isolated_handoff_home):
+    """A second pass must not re-write the stale unified-spawn residue marker."""
+    p = _setup_project(isolated_handoff_home)
+    ws = p["proj"] / "worktrees" / "u3" / ".handoff.code-workspace"  # gone
+    spawned = p["ack"] / "u3.spawned"
+    spawned.write_text("(test)")
+    _write_spawn_sidecar(p["queue"], "u3", workspace=ws)
+    _stale(spawned, seconds_ago=watchdog.ORPHAN_GRACE_SECONDS + 60)
+
+    watchdog.scan_orphan_spawns()
+    stale = p["queue"] / "u3.stale-spawn"
+    first = stale.stat().st_mtime
+    watchdog.scan_orphan_spawns()
+    assert stale.stat().st_mtime == first  # not re-marked
+
+
+def test_watchdog_orphan_scan_corrupt_sidecar_not_legacy_orphan(isolated_handoff_home):
+    """A corrupt/unparseable sidecar is STILL evidence of a unified-spawn dispatch (the
+    legacy dump path always writes a ``queue/.md``, absent here) — so it must NOT get the
+    legacy orphan BLOCKED.md; it is treated as stale residue instead."""
+    p = _setup_project(isolated_handoff_home)
+    spawned = p["ack"] / "u4.spawned"
+    spawned.write_text("(test)")
+    (p["queue"] / "u4.singlepane").write_text("{ not valid json")
+    _stale(spawned, seconds_ago=watchdog.ORPHAN_GRACE_SECONDS + 60)
+
+    watchdog.scan_orphan_spawns()
+    assert not (p["queue"] / "u4.BLOCKED.md").exists()
+    assert (p["queue"] / "u4.stale-spawn").exists()
+
+
+def test_watchdog_orphan_scan_mixed_active_and_legacy_orphan(isolated_handoff_home):
+    """Zero-regression + per-task classification: in ONE scan, an active unified-spawn
+    worker is skipped while a true legacy orphan (no sidecar) still gets its BLOCKED.md.
+    The sidecar recognition only changes the ``no .md BUT sidecar present`` case — a
+    sidecar-less ERP-style residue is detected exactly as before."""
+    p = _setup_project(isolated_handoff_home)
+    # active unified-spawn worker
+    ws = p["proj"] / "worktrees" / "alive" / ".handoff.code-workspace"
+    ws.parent.mkdir(parents=True)
+    ws.write_text("{}")
+    (p["ack"] / "alive.spawned").write_text("(test)")
+    _write_spawn_sidecar(p["queue"], "alive", workspace=ws)
+    _stale(p["ack"] / "alive.spawned", seconds_ago=watchdog.ORPHAN_GRACE_SECONDS + 60)
+    # legacy orphan — no sidecar at all
+    (p["ack"] / "legacy.spawned").write_text("(test)")
+    _stale(p["ack"] / "legacy.spawned", seconds_ago=watchdog.ORPHAN_GRACE_SECONDS + 60)
+
+    count = watchdog.scan_orphan_spawns()
+    assert count == 1  # only the legacy orphan counts as an orphan
+    assert (p["queue"] / "legacy.BLOCKED.md").exists()
+    assert not (p["queue"] / "alive.BLOCKED.md").exists()
+    assert not (p["queue"] / "alive.stale-spawn").exists()
