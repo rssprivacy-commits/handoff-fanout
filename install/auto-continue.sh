@@ -250,19 +250,99 @@ verify_session_started() {
 # window). The engine-injected .code-workspace sets `window.title` to contain the task id, so AXRaise
 # the window whose name contains it. Best-effort (always returns 0; a miss just falls back to the
 # pre-existing frontmost-app guard). Cold worktree windows only — main-window tab spawns don't need it.
+#
+# focus-drift v2 hardening (2026-06-10 / dual-brain gemini MUST): ENUMERATE FIRST — the old code ran
+# the app-level `activate` BEFORE the title match, so when no window matched the net effect was
+# pulling VS Code's LAST-ACTIVE (= the owner's OLD) window to front: the exact reverse of the intent
+# (the wh-coord-10 secondary lesion). Now a separate enumerate-only osascript (which deliberately
+# contains NO app-activation keyword, so a recording stub can prove the no-op) looks for a window
+# whose title carries one of the tokens; ONLY a hit runs activate→AXRaise (activate must precede
+# AXRaise — a bare AXRaise only reorders windows INSIDE a backgrounded app). A miss does NOTHING.
+# Tokens are tried in argv order (caller passes the singlepane spawn_nonce first when it has one,
+# the task id as fallback); argv-passed (no AppleScript injection). Sets RAISE_MATCHED_TOKEN to the
+# token that hit ("" = no hit, nothing raised) for the discriminator diagnostics. Always returns 0.
+RAISE_MATCHED_TOKEN=""
 raise_task_window() {
-    local task="$1"
-    "$HANDOFF_OSASCRIPT_CMD" -e "tell application \"Visual Studio Code\" to activate" \
-        -e "delay 0.3" \
-        -e "tell application \"System Events\" to tell process \"Code\"
-            repeat with w in windows
-                if name of w contains \"${task}\" then
-                    perform action \"AXRaise\" of w
-                    exit repeat
-                end if
-            end repeat
-        end tell" 2>>"$LOG"
+    local tok hit prev=""
+    RAISE_MATCHED_TOKEN=""
+    for tok in "$@"; do
+        [ -z "$tok" ] && continue
+        [ "$tok" = "$prev" ] && continue   # cold path passes (task, task) — don't enum twice
+        prev="$tok"
+        hit=$("$HANDOFF_OSASCRIPT_CMD" -e 'on run argv
+            -- handoff-window-enum
+            set token to item 1 of argv
+            tell application "System Events"
+                if not (exists process "Code") then return "nohit"
+                tell process "Code"
+                    repeat with w in windows
+                        if name of w contains token then return "hit"
+                    end repeat
+                end tell
+            end tell
+            return "nohit"
+        end run' "$tok" 2>>"$LOG")
+        if [ "$hit" = "hit" ]; then
+            RAISE_MATCHED_TOKEN="$tok"
+            "$HANDOFF_OSASCRIPT_CMD" -e 'on run argv
+                -- handoff-window-raise
+                set token to item 1 of argv
+                tell application "Visual Studio Code" to activate
+                delay 0.3
+                tell application "System Events" to tell process "Code"
+                    repeat with w in windows
+                        if name of w contains token then
+                            perform action "AXRaise" of w
+                            exit repeat
+                        end if
+                    end repeat
+                end tell
+            end run' "$tok" 2>>"$LOG"
+            return 0
+        fi
+    done
     return 0
+}
+
+# ONE System Events probe (focus-drift v2 / 2026-06-10). Prints, prefix-tagged so empty values and
+# arbitrary window titles parse unambiguously:
+#   FRONT_APP:<frontmost app name>
+#   FRONT_WIN:<frontmost Code window name — empty unless Code is frontmost>
+#   WIN:<name>                       (one line per Code window, any order)
+# Three consumers: (a) the PRE-`code -n` snapshot the timeout discriminator checks membership
+# against; (b) re-run at discriminator time for the FRESH front app/window; (c) the retry-tick
+# probe (does the target window still exist / is it already front?). Errors / no Code process /
+# no windows ⇒ fewer or no lines — callers treat that as an empty snapshot, never a crash.
+probe_code_windows() {
+    "$HANDOFF_OSASCRIPT_CMD" -e 'on run
+        -- handoff-window-probe
+        tell application "System Events"
+            set frontApp to ""
+            try
+                set frontApp to name of first application process whose frontmost is true
+            end try
+            set frontWin to ""
+            set winLines to ""
+            if exists process "Code" then
+                tell process "Code"
+                    repeat with w in windows
+                        set winLines to winLines & "WIN:" & (name of w) & linefeed
+                    end repeat
+                    if frontApp is "Code" and (count of windows) > 0 then
+                        set frontWin to name of front window
+                    end if
+                end tell
+            end if
+            return "FRONT_APP:" & frontApp & linefeed & "FRONT_WIN:" & frontWin & linefeed & winLines
+        end tell
+    end run' 2>/dev/null
+}
+
+# Does any newline-separated window name in <list> CONTAIN <token>? (substring per line —
+# mirrors AppleScript `contains`). Empty list / empty token ⇒ 1.
+_wins_contain() {
+    [ -n "$1" ] && [ -n "$2" ] || return 1
+    printf '%s\n' "$1" | /usr/bin/grep -Fq -- "$2"
 }
 
 # Window-level frontmost helpers (2026-06-03 code-r-clobber fix / dual-brain codex+Gemini).
@@ -1118,24 +1198,151 @@ EOF
         #                     under the default openFoldersInNewWindow it never replaces a folder-window.
         if [ -n "$WORKSPACE" ] && [ -d "$WORKSPACE" ]; then
             if [ "$COLD_WINDOW" = "1" ] || [ "$SINGLEPANE_WINDOW" = "1" ]; then
-                # `-n` forces a NEW dedicated window opening OPEN_TARGET (worktree's, or the singlepane
-                # generated .handoff.code-workspace) — never reuses/clobbers the owner's window.
-                "$CODE_BIN" -n "$OPEN_TARGET" 2>>"$LOG" || log "WARN: code -n $OPEN_TARGET failed (continue with open)"
+                # ── focus-drift fail-closed v2 (2026-06-10 / wh-coord-10; dual-brain: codex RED closed
+                # by the snapshot discriminator, gemini raise-ordering absorbed; owner-approved) ──
+                # Window token precedence: the unguessable singlepane spawn_nonce when the sidecar
+                # carried one, the task id otherwise (worktree titles carry the task id only).
+                _focus_token="$TASK"
+                if [ "$SINGLEPANE_WINDOW" = "1" ] && [ -n "$SINGLEPANE_NONCE" ]; then
+                    _focus_token="$SINGLEPANE_NONCE"
+                fi
+                # 2.1 PRE-`code -n` snapshot: ONE osascript enumerates every Code window name, so the
+                # post-timeout discriminator can tell "fresh window whose title merely lags" (front
+                # window ∉ snapshot → dispatch) from "the owner's OLD window still holds front"
+                # (∈ snapshot → fail-closed). The same single call doubles as the retry-tick probe.
+                # Empty output (no Code process / no windows / osascript error) = a legal empty snapshot.
+                _probe_out=$(probe_code_windows)
+                _snap_wins=$(printf '%s\n' "$_probe_out" | /usr/bin/sed -n 's/^WIN://p')
+                _skip_code_n=0; _front_verified=0; _skip_primary_wait=0
+                FOCUS_MARKER="$QUEUE/$TASK.focus_contended"
+                if [ -f "$FOCUS_MARKER" ]; then
+                    # 2.5 retry tick — minimize focus theft (codex Q2). Reuse the snapshot probe:
+                    #   (a) target window already FRONT → skip `code -n` (and the waits) entirely;
+                    #   (b) target exists in the BACKGROUND → skip `code -n` (its focusing of an
+                    #       existing workspace is only a SHOULD-level assumption, never a correctness
+                    #       premise), go straight to the hardened raise + a short re-wait;
+                    #   (c) target gone (owner closed it) → rebuild via the normal `code -n` path.
+                    _p_app=$(printf '%s\n' "$_probe_out" | /usr/bin/sed -n 's/^FRONT_APP://p' | /usr/bin/head -1)
+                    _p_win=$(printf '%s\n' "$_probe_out" | /usr/bin/sed -n 's/^FRONT_WIN://p' | /usr/bin/head -1)
+                    if _wins_contain "$_snap_wins" "$_focus_token" || _wins_contain "$_snap_wins" "$TASK"; then
+                        _skip_code_n=1
+                        if [ "$_p_app" = "Code" ]; then
+                            case "$_p_win" in
+                                *"$_focus_token"*|*"$TASK"*) _front_verified=1 ;;
+                            esac
+                        fi
+                        if [ "$_front_verified" = "1" ]; then
+                            log "FOCUS-RETRY: target window already frontmost — skipping code -n + waits. project=$PROJECT task=$TASK"
+                        else
+                            _skip_primary_wait=1
+                        fi
+                    else
+                        log "FOCUS-RETRY: target window gone (owner closed it?) — rebuilding via code -n. project=$PROJECT task=$TASK"
+                    fi
+                fi
+                if [ "$_skip_code_n" != "1" ]; then
+                    # `-n` forces a NEW dedicated window opening OPEN_TARGET (worktree's, or the singlepane
+                    # generated .handoff.code-workspace) — never reuses/clobbers the owner's window.
+                    "$CODE_BIN" -n "$OPEN_TARGET" 2>>"$LOG" || log "WARN: code -n $OPEN_TARGET failed (continue with open)"
+                fi
                 _perf_mark "$TASK" "code-n"
                 # Wait for the fresh window to render + take focus (title carries the task id) BEFORE
                 # `open URI`, so the Claude tab lands in THIS window — not a stale/other Code window.
                 # `code -n` makes the new window frontmost almost immediately, so the title-match
                 # normally hits in ~1-2s. TIMEOUT capped at 3s (2026-06-05 owner: "too long"). The wait is
-                # now a true /bin/date wall clock (was step-counting that overshot to ~16s — see
-                # wait_target_window_frontmost). On timeout we open the URI anyway (the URI lands in the
-                # frontmost window = the just-opened worktree window) + the fallback AXRaise nudges it.
-                if ! wait_target_window_frontmost "$TASK" "${HANDOFF_WIN_FRONT_SECS:-3}"; then
-                    # fallback: AXRaise THE task window, then re-wait for IT (not merely the Code app —
-                    # else the URI/Enter could still target a wrong window; R2 codex). Best-effort.
-                    log "PERF[$TASK]: wait-frontmost TIMED OUT (${HANDOFF_WIN_FRONT_SECS:-3}s) → AXRaise fallback"
-                    raise_task_window "$TASK"; wait_target_window_frontmost "$TASK" 2
+                # a true /bin/date wall clock (was step-counting that overshot to ~16s — see
+                # wait_target_window_frontmost). On timeout: AXRaise fallback + re-wait; if THAT also
+                # fails, the 2.4 discriminator below decides dispatch vs fail-closed — the pre-fix
+                # "open the URI anyway" assumed timeout ⇒ frontmost == the just-opened window, which a
+                # 交棒 (dispatch typed in the OLD window's terminal, owner holding it front) inverts:
+                # the URI pasted the prompt into the OLD window (wh-coord-10, log L94919-94929).
+                _focus_ok=1
+                if [ "$_front_verified" != "1" ]; then
+                    _primary_ok=0
+                    if [ "$_skip_primary_wait" = "1" ]; then
+                        log "FOCUS-RETRY: target window in background — skipping code -n, straight to raise. project=$PROJECT task=$TASK"
+                    elif wait_target_window_frontmost "$TASK" "${HANDOFF_WIN_FRONT_SECS:-3}"; then
+                        _primary_ok=1
+                    else
+                        log "PERF[$TASK]: wait-frontmost TIMED OUT (${HANDOFF_WIN_FRONT_SECS:-3}s) → AXRaise fallback"
+                    fi
+                    if [ "$_primary_ok" != "1" ]; then
+                        # fallback: AXRaise THE task window (nonce token first), then re-wait for IT
+                        # (not merely the Code app — else the URI/Enter could still target a wrong
+                        # window; R2 codex). Best-effort; a miss raises nothing (v2 hardening).
+                        raise_task_window "$_focus_token" "$TASK"
+                        wait_target_window_frontmost "$TASK" 2 || _focus_ok=0
+                    fi
                 fi
                 _perf_mark "$TASK" "wait-frontmost"
+                if [ "$_focus_ok" = "0" ]; then
+                    # 2.4 timeout discriminator (the codex-RED closure): wait + raise + re-wait ALL
+                    # failed. ONE fresh probe decides:
+                    #   frontmost is Code AND its window name ∉ the pre-open snapshot → that IS the
+                    #   window we just opened (title binding lags on a cold render) → dispatch (the
+                    #   Enter stays nonce/readiness-gated downstream; zero cold-boot regression).
+                    #   EVERYTHING else (front window ∈ snapshot = the owner's old window holds
+                    #   front; front app not Code; window name unreadable) → fail-closed: never
+                    #   paste the prompt into a window we cannot prove is ours.
+                    # RESIDUAL RISK (documented per the dual-brain review): a window the owner opened
+                    # BY HAND after the snapshot is not in it and gets mis-judged as ours → the URI
+                    # lands there; the Enter nonce/readiness gate still withholds = no worse than the
+                    # pre-fix behavior.
+                    _d_out=$(probe_code_windows)
+                    _d_app=$(printf '%s\n' "$_d_out" | /usr/bin/sed -n 's/^FRONT_APP://p' | /usr/bin/head -1)
+                    _d_win=$(printf '%s\n' "$_d_out" | /usr/bin/sed -n 's/^FRONT_WIN://p' | /usr/bin/head -1)
+                    _dispatch=0
+                    if [ "$_d_app" = "Code" ] && [ -n "$_d_win" ] && \
+                       ! printf '%s\n' "$_snap_wins" | /usr/bin/grep -Fxq -- "$_d_win"; then
+                        _dispatch=1
+                        log "FOCUS-DISCRIMINATOR: front Code window not in the pre-open snapshot → fresh window with a lagging title — dispatching. front_title=$_d_win project=$PROJECT task=$TASK"
+                    fi
+                    if [ "$_dispatch" != "1" ]; then
+                        _matched_by="none"
+                        if [ -n "$RAISE_MATCHED_TOKEN" ]; then
+                            if [ "$RAISE_MATCHED_TOKEN" = "$TASK" ]; then _matched_by="task"; else _matched_by="nonce"; fi
+                        fi
+                        # 2.5 bounded retry: a DEDICATED consecutive counter (the generic .deferred
+                        # marker is rm'd at every claim — L"Consuming the .uri" above — so its ticks
+                        # never accumulate). Cleared when a URI is successfully dispatched; bumped
+                        # once per fail-closed pass; ≥ HANDOFF_FOCUS_DEFER_MAX (default 5) → give up.
+                        _fc_count=$(/usr/bin/sed -n 's/^count=//p' "$FOCUS_MARKER" 2>/dev/null | /usr/bin/head -1)
+                        case "$_fc_count" in ''|*[!0-9]*) _fc_count=0 ;; esac
+                        _fc_first=$(/usr/bin/sed -n 's/^first_epoch=//p' "$FOCUS_MARKER" 2>/dev/null | /usr/bin/head -1)
+                        _fc_now=$(/bin/date +%s)
+                        case "$_fc_first" in ''|*[!0-9]*) _fc_first="$_fc_now" ;; esac
+                        _fc_count=$((_fc_count + 1))
+                        _fc_max="${HANDOFF_FOCUS_DEFER_MAX:-5}"
+                        case "$_fc_max" in ''|*[!0-9]*) _fc_max=5 ;; esac
+                        log "FOCUS-CONTENDED: URI WITHHELD (fail-closed) matched_by=$_matched_by front_app=$_d_app front_title=$_d_win count=$_fc_count/$_fc_max project=$PROJECT task=$TASK"
+                        if [ "$_fc_count" -ge "$_fc_max" ]; then
+                            # give up: CONSUME the .uri (no restore — no infinite retry); the intent
+                            # text stays parked in launched/ for the owner's manual recovery.
+                            rm -f "$FOCUS_MARKER" 2>/dev/null
+                            write_ack "$PROJ_DIR" "$TASK" "failed" "focus-contended x$_fc_count: URI 未发, 新窗已留在桌面(visible park), 手动恢复: 点击新窗 → 在 Claude 输入框粘贴 queue 里 launched/$TASK-*.txt 的 prompt"
+                            log "FOCUS-GIVE-UP: $_fc_count consecutive contended ticks — URI consumed, failed ack written. project=$PROJECT task=$TASK"
+                            # owner notification through the SAME 6h throttle file defer_uri uses
+                            _nfile="$PROJ_DIR/.deferred-notified"
+                            _notify=1
+                            if [ -f "$_nfile" ]; then
+                                _nmt=$(_u_mtime "$_nfile")
+                                [ -n "$_nmt" ] && [ "$((_fc_now - _nmt))" -lt 21600 ] && _notify=0
+                            fi
+                            if [ "$_notify" = "1" ]; then
+                                : > "$_nfile" 2>/dev/null || true
+                                "$HANDOFF_OSASCRIPT_CMD" -e 'display notification "接续窗口前台争夺多次未决 — URI 未发，新窗已留桌面，请点击新窗手动粘贴 prompt" with title "Handoff ⚠️ 前台争夺" sound name "Basso"' 2>>"$LOG" || true
+                            fi
+                            _post_iter_cleanup
+                            continue
+                        fi
+                        printf 'count=%s\nfirst_epoch=%s\n' "$_fc_count" "$_fc_first" > "$FOCUS_MARKER"
+                        # hand the intent back for the next tick (the L"re-locked" precedent below)
+                        mv "$LAUNCHED_FILE" "$URI_FILE" 2>/dev/null
+                        defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "focus-contended"
+                        _post_iter_cleanup
+                        continue
+                    fi
+                fi
                 # SINGLE-PANE: the side-bar close moved to AFTER the URI + submit (see the cold submit block
                 # below). Closing BEFORE the URI did not survive — the URI re-opens the Claude chat side bar.
             else
@@ -1151,6 +1358,9 @@ EOF
         if "$HANDOFF_OPEN_CMD" "$URI"; then
             log "SUCCESS: spawned Claude tab in project=$PROJECT task=$TASK (archived: $TASK-$TS.txt)"
             write_ack "$PROJ_DIR" "$TASK" "spawned" "open URI success @ $TS"
+            # a successfully dispatched URI resets the focus-contended streak (the counter is
+            # CONSECUTIVE by contract — focus-drift v2 §2.5; no-op on warm / uncontended spawns)
+            rm -f "$QUEUE/$TASK.focus_contended" 2>/dev/null
             SPAWNED=$((SPAWNED + 1))
             _perf_mark "$TASK" "open-uri"
             # PRE-SETTLE baseline (cold only): capture the worktree transcript line count BEFORE the 0.5s settle
