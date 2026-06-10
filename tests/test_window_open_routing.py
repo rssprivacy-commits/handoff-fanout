@@ -100,6 +100,7 @@ def _env(home: Path, tmp_path: Path, *, front_window: str,
         '[ -n "$_OSA_SLEEP" ] && sleep "$_OSA_SLEEP"\n'
         "case \"$args\" in\n"
         '  *"handoff-window-probe"*)\n'
+        '      echo "PROBE:OK"\n'
         '      echo "FRONT_APP:Code"\n'
         '      echo "FRONT_WIN:$_FRONT_WIN"\n'
         '      if [ -n "$_CODE_WINS" ]; then printf "%s\\n" "$_CODE_WINS" | while IFS= read -r w; do echo "WIN:$w"; done; fi ;;\n'

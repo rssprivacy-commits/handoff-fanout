@@ -100,12 +100,16 @@ def _env(
     code_wins: list[str] | None = None,
     grow_transcript: Path | None = None,
     grow_on_attempt: int | None = None,
+    probe_fail: str | None = None,
 ) -> dict:
     """Stub harness: env seams + PATH shadow over ``osascript``/``open``/``code``.
 
     ``front_window`` drives every frontmost answer (wait poll, probe FRONT_WIN, submit gate);
     ``code_wins`` is the full Code window-name list the probe/enumerate stubs report —
     i.e. the PRE-``code -n`` snapshot AND the raise-enumerate universe.
+    ``probe_fail`` models the probe osascript ERRORING (no stdout at all — the real script
+    drops stderr): ``"first"`` fails only the snapshot probe (the discriminator-time re-probe
+    RECOVERS — the dangerous fdv2-fix1 shape), ``"all"`` fails every probe call.
     """
     stub = tmp_path / "stubs"
     stub.mkdir(exist_ok=True)
@@ -119,7 +123,10 @@ def _env(
     # osascript stub. Case order matters — the three NEW v2 scripts carry unique markers and
     # are answered FIRST (they also contain generic substrings like "name of front window" /
     # "on run argv" that would otherwise mis-route to the legacy cases):
-    #   handoff-window-probe → FRONT_APP:/FRONT_WIN:/WIN: lines from $_FRONT_APP/$_FRONT_WIN/$_CODE_WINS
+    #   handoff-window-probe → PROBE:OK + FRONT_APP:/FRONT_WIN:/WIN: lines from
+    #                          $_FRONT_APP/$_FRONT_WIN/$_CODE_WINS (fdv2-fix1: PROBE:OK first —
+    #                          the contract of the SUCCESSFUL real probe; $_PROBE_FAIL=first|all
+    #                          exits 1 with no stdout = the real osascript-error shape)
     #   handoff-window-enum  → "hit" iff any $_CODE_WINS line contains the token (last argv)
     #   handoff-window-raise → "raised" (its script text carries activate+AXRaise → visible in the sink)
     _w(
@@ -128,6 +135,9 @@ def _env(
         'printf "%s\\n" "$args" >> "$_OSA_SINK"\n'
         'case "$args" in\n'
         '  *"handoff-window-probe"*)\n'
+        '      if [ "$_PROBE_FAIL" = "all" ]; then exit 1; fi\n'
+        '      if [ "$_PROBE_FAIL" = "first" ] && [ ! -f "$_PROBE_STAMP" ]; then : > "$_PROBE_STAMP"; exit 1; fi\n'
+        '      echo "PROBE:OK"\n'
         '      fa="${_FRONT_APP:-Code}"\n'
         '      echo "FRONT_APP:$fa"\n'
         '      if [ "$fa" = "Code" ]; then echo "FRONT_WIN:$_FRONT_WIN"; else echo "FRONT_WIN:"; fi\n'
@@ -195,6 +205,8 @@ def _env(
             "_SUBMIT_COUNT": str(tmp_path / "submit_count.txt"),
             "_GROW_TRANSCRIPT": str(grow_transcript) if grow_transcript else "",
             "_GROW_ON_ATTEMPT": str(grow_on_attempt) if grow_on_attempt else "",
+            "_PROBE_FAIL": probe_fail or "",
+            "_PROBE_STAMP": str(tmp_path / "probe_fail_stamp"),
         }
     )
     env.pop("HANDOFF_HOME", None)
@@ -506,3 +518,140 @@ def test_singlepane_contention_uses_nonce_token_first(home, tmp_path):
     got = re.search(r"handoff-window-enum.*?end run (\S+)", osa, re.S)
     assert got, "an enumerate call must be recorded"
     assert got.group(1) == nonce, "the FIRST enumerate must try the spawn_nonce token"
+
+
+# ─── 9. probe 失败 fail-closed: snapshot probe 报错 + 老窗前台 → URI 不发 ──────────────
+
+
+def test_probe_failure_with_owner_front_fail_closed(home, tmp_path):
+    """fdv2-fix1 MUST (dual-brain re-audit RED): the SNAPSHOT probe ERRORING (osascript
+    error / AX hang — a cold render is exactly when System Events stalls) must NOT parse as a
+    legal empty snapshot. Pre-fix (9358a5f) it did: every front window tested "∉ empty
+    snapshot = fresh" and the URI dispatched into the owner's OLD window — fail-OPEN on the
+    very contract whose core is "everything else fail-closed". Now: no PROBE:OK → _snap_ok=0
+    → the discriminator unconditionally fail-closes (defer + counter), even though the
+    discriminator-time re-probe RECOVERED and sees the owner's window frontmost."""
+    task = "fd-pfail"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    _cold_transcript(tmp_path, ws)
+    env = _env(home, tmp_path, front_window=OWNER_WIN, code_wins=[OWNER_WIN], probe_fail="first")
+    assert _run(env, tmp_path).returncode == 0
+    assert _read(tmp_path / "open.log") == "", "URI must be WITHHELD (tripwire: open never called)"
+    assert (home / PROJECT / "queue" / f"{task}.uri").exists(), ".uri must be restored"
+    assert _marker_count(home, task) == 1, "fail-closed pass must bump the dedicated counter"
+    assert (home / PROJECT / "queue" / f"{task}.deferred").exists(), "defer marker must exist"
+    assert not _ack(home, task, "spawned").exists(), "no spawned ack — nothing was dispatched"
+    assert _read(tmp_path / "key.log") == "", "no Enter anywhere near a fail-closed dispatch"
+    assert "snap_ok=0" in _log(home), "diagnostics must say the snapshot probe failed"
+
+
+# ─── 10. probe 失败 + 重试 tick: 未知状态 → 不跑 code -n, defer ────────────────────────
+
+
+def test_probe_failure_on_retry_tick_skips_code_n_and_defers(home, tmp_path):
+    """fdv2-fix1 MUST: a RETRY tick (marker present) whose probe FAILS must not read the empty
+    output as "target gone → rebuild via code -n" (the pre-fix behavior — a blind re-open
+    against a window state we cannot see can stack duplicate windows). It must skip ``code -n``
+    (tripwire) and fall through to the raise + discriminator, which fail-closes (1→2)."""
+    task = "fd-pfail-retry"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    _cold_transcript(tmp_path, ws)
+    _seed_marker(home, task, 1)
+    env = _env(home, tmp_path, front_window=OWNER_WIN, code_wins=[OWNER_WIN], probe_fail="all")
+    assert _run(env, tmp_path).returncode == 0
+    assert _read(tmp_path / "code.log") == "", (
+        "code -n must NOT run on a failed-probe retry tick (tripwire)"
+    )
+    assert _read(tmp_path / "open.log") == "", "URI still withheld"
+    assert _marker_count(home, task) == 2, "still contended → counter bumps 1→2"
+    assert (home / PROJECT / "queue" / f"{task}.uri").exists(), ".uri restored for the next tick"
+    assert "FOCUS-RETRY: window probe FAILED" in _log(home), (
+        "the unknown-state decision must be logged"
+    )
+
+
+# ─── 11. PROBE:OK 空快照: Code 无窗 + 新窗标题滞后 → 照发（首窗零回归） ────────────────
+
+
+def test_probe_ok_empty_snapshot_still_dispatches(home, tmp_path):
+    """fdv2-fix1 zero-regression guard: "PROBE:OK + zero WIN: lines" is a LEGAL empty snapshot
+    (Code genuinely had no windows before ``code -n`` — the first-window spawn). The fresh
+    front window (title still lagging) is ∉ the empty snapshot → the discriminator must STILL
+    dispatch. This pins the fix to distinguishing failed-probe (no PROBE:OK → fail-closed)
+    from legal-empty (PROBE:OK → trusted), instead of blanket-deferring empty snapshots."""
+    task = "fd-empty"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    tr = _cold_transcript(tmp_path, ws)
+    env = _env(
+        home, tmp_path, front_window="Untitled (Workspace)", code_wins=None, grow_transcript=tr
+    )
+    assert _run(env, tmp_path).returncode == 0
+    assert "vscode://anthropic.claude-code" in _read(tmp_path / "open.log"), (
+        "URI must dispatch on a legal empty snapshot"
+    )
+    assert _ack(home, task, "spawned").exists()
+    assert _marker_count(home, task) is None, "no contention marker on a dispatched spawn"
+    assert "FOCUS-DISCRIMINATOR" in _log(home), "the dispatch decision must be logged"
+
+
+# ─── 12. 窗口名含换行: probe 在 AppleScript 源头清洗 + 判别方向不变 ────────────────────
+
+
+def test_newline_in_window_title_protocol_sanitized(home, tmp_path):
+    """codex MUST-2: a window title CAN carry a linefeed (a filename with a newline is
+    pathological but representable) — raw, it would shear the one-line-per-window
+    WIN:/FRONT_WIN: protocol (the bash side's ``sed``/``grep -Fxq`` assume single-line
+    titles). The fix sanitizes INSIDE the probe AppleScript (linefeed/return → space,
+    cleanName helper) so bash only ever sees one line per window. Proof: (a) the AppleScript
+    text that actually reached osascript carries the PROBE:OK marker + the cleanName
+    sanitizer (RED pre-fix: v2's probe emitted raw names); (b) under the sanitized contract
+    the contention direction is unchanged — owner-front fail-closes. (Only the probe script
+    can carry these tokens, so whole-sink substring binding is sound.)"""
+    task = "fd-nl"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    _cold_transcript(tmp_path, ws)
+    # the post-contract shape of a raw "wilde-hexe\n— coordinator.md" owner title
+    sanitized = "wilde-hexe — coordinator.md"
+    env = _env(home, tmp_path, front_window=sanitized, code_wins=[sanitized])
+    assert _run(env, tmp_path).returncode == 0
+    osa = _read(tmp_path / "osa.log")
+    assert "handoff-window-probe" in osa, "the probe must have run"
+    assert "PROBE:OK" in osa, "the probe script must ship the success trust marker (fdv2-fix1)"
+    assert "cleanName" in osa and "text item delimiters" in osa, (
+        "the probe script must sanitize window names (linefeed/return → space) before"
+        " emitting WIN:/FRONT_WIN: lines"
+    )
+    assert _read(tmp_path / "open.log") == "", (
+        "owner-front must still fail-close under the sanitized contract"
+    )
+    assert _marker_count(home, task) == 1
+
+
+# ─── 13. housekeeping: 外部终结的 task 留下的 stale marker 被清, 在飞的不动 ────────────
+
+
+def test_stale_focus_marker_cleared_when_task_finished(home, tmp_path):
+    """fdv2-fix1 SHOULD: a ``.focus_contended`` marker normally dies on URI success, give-up,
+    or its own next tick — but a task terminated OUTSIDE the focus-retry path (queue .done
+    guard / a done|failed ack) with the .uri already gone leaves the marker orphaned forever.
+    The per-project housekeeping pass must clear exactly the stale one; a marker whose task
+    still has a live .uri must survive (even with a stray failed ack from an old attempt)."""
+    stale, live = "fd-stale", "fd-live"
+    # stale: marker + queue done guard, NO .uri
+    _seed_marker(home, stale, 3)
+    (home / PROJECT / "queue" / f"{stale}.done").write_text("", encoding="utf-8")
+    # live: marker + a still-queued .uri + a stray old failed ack (must NOT kill it)
+    ws = _cold_ws(tmp_path, live)
+    _seed(home, ws, live)
+    _cold_transcript(tmp_path, ws)
+    _seed_marker(home, live, 1)
+    (home / PROJECT / "ack" / f"{live}.failed").write_text("old attempt", encoding="utf-8")
+    env = _env(home, tmp_path, front_window=OWNER_WIN, code_wins=[OWNER_WIN])
+    assert _run(env, tmp_path).returncode == 0
+    assert not _marker(home, stale).exists(), "stale marker must be cleared"
+    assert "FOCUS-HOUSEKEEPING" in _log(home), "the housekeeping action must be logged"
+    assert _marker(home, live).exists(), "a live task's marker must survive housekeeping"
