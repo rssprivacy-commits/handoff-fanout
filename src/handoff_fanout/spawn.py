@@ -252,33 +252,26 @@ def _spawn_singlepane(
     project ``.spawn.lock`` dump/autoclose use (``spawn_lock`` is a standalone shared module;
     ``dump`` itself stays untouched), so a concurrent worker #2 cannot slip its artifacts in
     between our check and publish — fail-closed, never 'it shouldn't be concurrent'.
-    ``supervisor_succession`` is exempt from the active-worker REJECT (it REPLACES its
-    predecessor window, design §6 — mirrors ``dump.singlepane_worker_guard``)."""
-    if role != ROLE_WORKER:
-        return _produce_singlepane(
-            cfg=cfg,
-            project=project,
-            task=task,
-            role=role,
-            src=src,
-            nonce=nonce,
-            close_policy=close_policy,
-            predecessor_nonce=predecessor_nonce,
-            prompt_text=prompt_text,
-            queue_dir=queue_dir,
-        )
+
+    ``supervisor_succession`` is exempt from the active-worker REJECT only (it REPLACES its
+    predecessor window, design §6 — mirrors ``dump.singlepane_worker_guard``); it is NOT
+    exempt from the lock (t41b-fix1): the watchdog's §6 pending-intent gate scans
+    ``queue/*.uri`` under this same lock and counts on every spawn-side publisher holding
+    it — an unlocked succession publish could land its .uri between the gate's scan and
+    its close decision."""
     try:
         with project_spawn_lock(project, root=cfg.home):
-            holder = _active_singlepane_worker(cfg, project, exclude_task=task)
-            if holder is not None:
-                _err(
-                    f"singlepane project {project!r}: worker spawn for {task!r} REJECTED — "
-                    f"pane held by active worker {holder!r}. A singlepane project may have "
-                    "only ONE active worker; wait for it to finish (its task → done/blocked) "
-                    "before spawning here (design §5.4: never spawn concurrently into the "
-                    "same real repo)"
-                )
-                return EXIT_FAIL_CLOSED
+            if role == ROLE_WORKER:
+                holder = _active_singlepane_worker(cfg, project, exclude_task=task)
+                if holder is not None:
+                    _err(
+                        f"singlepane project {project!r}: worker spawn for {task!r} REJECTED — "
+                        f"pane held by active worker {holder!r}. A singlepane project may have "
+                        "only ONE active worker; wait for it to finish (its task → done/blocked) "
+                        "before spawning here (design §5.4: never spawn concurrently into the "
+                        "same real repo)"
+                    )
+                    return EXIT_FAIL_CLOSED
             return _produce_singlepane(
                 cfg=cfg,
                 project=project,
@@ -293,7 +286,7 @@ def _spawn_singlepane(
             )
     except LockHeld as e:
         _err(
-            f"singlepane project {project!r}: worker spawn for {task!r} REJECTED — "
+            f"singlepane project {project!r}: {role} spawn for {task!r} REJECTED — "
             f"a concurrent spawn holds the project lock ({e}); retry after it settles"
         )
         return EXIT_FAIL_CLOSED

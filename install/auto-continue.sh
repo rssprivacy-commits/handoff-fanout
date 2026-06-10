@@ -1737,16 +1737,24 @@ try_autoclose() {
         return 0
     fi
 
-    # ── Pending-intent gate (design §6 临界区①, still under the lock — a concurrent
-    # spawn-intent publishes its .uri while holding this same lock, so the check cannot
-    # race a publish). An unconsumed queue/<other>.uri is an in-flight spawn intent the
-    # watchdog has not yet mv'ed → launched/ — typically a worker the OLD coordinator
-    # dispatched; closing the predecessor now could orphan that dispatch (§6: 关窗不得
-    # 吞掉在飞派发). SKIP this tick (no marker — same semantics as the lock-contention
-    # skip): once the intent is consumed, a later tick re-evaluates and fires. The
-    # succession's OWN residual .uri is excluded — gating on it would deadlock the very
-    # close it belongs to. nullglob (top of script) makes the loop a no-op when no .uri
-    # exists. Ranked AFTER the retro gate: §6 makes the retro evidence gate the highest
+    # ── Pending-intent gate (design §6 临界区①, still under the lock). Atomicity is
+    # exact for the lock-held .uri publishers — spawn worker singlepane, spawn worktree,
+    # spawn succession singlepane (since t41b-fix1), and dump's singlepane-worker path
+    # all publish while holding this same project .spawn.lock, so their publishes cannot
+    # race this check. dump's active(non-singlepane)/batch/fan-in publishers do NOT hold
+    # the lock yet (known residual; backlog: folded in when dump's publish paths move to
+    # the shared module) — against those the gate is best-effort: a .uri landing between
+    # this scan and the close decision can slip past one tick. An unconsumed
+    # queue/<other>.uri is an in-flight spawn intent the watchdog has not yet mv'ed →
+    # launched/ — typically a worker the OLD coordinator dispatched; closing the
+    # predecessor now could orphan that dispatch (§6: 关窗不得吞掉在飞派发). SKIP this
+    # tick (no marker — same semantics as the lock-contention skip): once the intent is
+    # consumed, a later tick re-evaluates and fires. A STALE never-consumed .uri
+    # therefore withholds autoclose indefinitely — surfacing/reclaiming that is the §6c
+    # reclaim-report/patrol scope, deliberately not this gate's job. The succession's
+    # OWN residual .uri is excluded — gating on it would deadlock the very close it
+    # belongs to. nullglob (top of script) makes the loop a no-op when no .uri exists.
+    # Ranked AFTER the retro gate: §6 makes the retro evidence gate the highest
     # precondition (排在竞态守门之前), so a terminal evidence failure still marks even
     # while an intent is in flight.
     local pending

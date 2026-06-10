@@ -15,8 +15,8 @@ artifacts each side produces/consumes (no hand-rolled doubles of either side):
     intent drives the REAL ``install/auto-continue.sh`` autoclose segment; the
     critical section interoperates with ``handoff_fanout.spawn_lock`` (same
     ``.spawn.lock`` dir); the design-§6 "no pending/inflight intent" gate is
-    pinned as an xfail (real gap — escalated to the coordinator, watchdog
-    unchanged per the Phase 7 red line);
+    implemented (t41b — formerly pinned here as an xfail) and exercised as a
+    regular passing test;
   ④ P0 safety — per-project gating (an ERP-gated config leaks NOTHING into a
     sibling project's spawn artifacts), THIN workspace (window.title + the 3
     single-pane UX keys only, never a coordinator settings block), and the full

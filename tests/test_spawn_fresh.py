@@ -285,6 +285,63 @@ def test_singlepane_succession_exempt_from_worker_guard(tmp_path, monkeypatch):
     assert (home / PROJECT / "queue" / "wh-succession.uri").exists()
 
 
+def test_singlepane_succession_publish_holds_project_spawn_lock(tmp_path, monkeypatch):
+    """t41b-fix1: the succession branch publishes under the SAME project .spawn.lock as
+    the worker branch. The watchdog's §6 pending-intent gate scans queue/*.uri under
+    that lock assuming every spawn-side publisher holds it — an unlocked succession
+    publish could slip its .uri between the gate's scan and its close decision. The
+    succession exemption covers the active-worker REJECT only, never the lock."""
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+
+    seen: dict[str, bool] = {}
+    real_write_uri = spawn._write_uri
+
+    def probe(queue_dir: Path, task: str, *, workspace: Path, uri: str) -> None:
+        seen["lock_held"] = (home / PROJECT / ".spawn.lock").is_dir()
+        real_write_uri(queue_dir, task, workspace=workspace, uri=uri)
+
+    monkeypatch.setattr(spawn, "_write_uri", probe)
+    rc = spawn.main(
+        _argv(
+            task="wh-succession",
+            isolation="singlepane",
+            workspace=repo,
+            role="supervisor_succession",
+            predecessor_nonce="0123456789abcdef",
+        )
+    )
+    assert rc == 0
+    assert seen.get("lock_held") is True, (
+        "succession publish ran OUTSIDE the project spawn lock — the watchdog's "
+        "pending-intent gate atomicity premise (all .uri publishers hold the lock) is broken"
+    )
+
+
+def test_singlepane_succession_lock_held_rejected(tmp_path, monkeypatch, capsys):
+    """t41b-fix1: a held project .spawn.lock fail-closes a succession spawn too (rc 2,
+    no partial intent, readable reason) — same semantics as the worker branch."""
+    from handoff_fanout.spawn_lock import project_spawn_lock
+
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    with project_spawn_lock(PROJECT, root=home):
+        rc = spawn.main(
+            _argv(
+                task="wh-succession",
+                isolation="singlepane",
+                workspace=repo,
+                role="supervisor_succession",
+                predecessor_nonce="0123456789abcdef",
+            )
+        )
+    assert rc == 2
+    qd = home / PROJECT / "queue"
+    assert not (qd / "wh-succession.uri").exists()
+    assert not (qd / "wh-succession.singlepane").exists()
+    assert "REJECTED" in capsys.readouterr().err
+
+
 # ─── worktree path ──────────────────────────────────────────────────────────
 
 
