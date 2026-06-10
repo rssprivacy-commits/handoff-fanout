@@ -1,8 +1,13 @@
 """``handoff spawn`` — fresh-spawn intent producer (design §13 A' / Phase 6a).
 
 Project-agnostic. NO v5.4 retro-mandate gate (a missing ``--retro-evidence`` never exits 4) and
-NO roadmap injection. Produces exactly the artifacts the watchdog (``install/auto-continue.sh``)
-already consumes for a fresh window — so the consumer side needs no change:
+NO roadmap injection. ONE exception (Step1 G4 收口): ``--role supervisor_succession`` — the only
+role that closes a predecessor coordinator window — is NOT a manual CLI path; it demands the
+one-time ``--succession-token`` that a retro-gated ``handoff audit-close --coordinator --status
+active`` issues (see :mod:`handoff_fanout.succession_authority`), so a coordinator relay can
+never bypass the retro mandate through this producer. Produces exactly the artifacts the
+watchdog (``install/auto-continue.sh``) already consumes for a fresh window — so the consumer
+side needs no change:
 
   * ``--isolation worktree``  → a per-session git worktree (via ``worktree.create_worktree``)
     whose ``.handoff.code-workspace`` ``window.title`` carries the unguessable ``spawn_nonce``;
@@ -53,6 +58,7 @@ from pathlib import Path
 from handoff_fanout import atomic
 from handoff_fanout import config as _config
 from handoff_fanout import spawn_nonce as _spawn_nonce
+from handoff_fanout import succession_authority as _authority
 from handoff_fanout import worktree as _worktree
 from handoff_fanout.spawn_lock import LockHeld, project_spawn_lock
 
@@ -451,9 +457,16 @@ def run_spawn(
     prompt: str | None = None,
     close_policy: str | None = None,
     predecessor_nonce: str | None = None,
+    succession_token: str | None = None,
 ) -> int:
     """Orchestrate one fresh spawn. Returns ``0`` on success, ``2`` fail-closed (never raises for a
-    semantic error; never returns the retro RETRY code 4)."""
+    semantic error; never returns the retro RETRY code 4).
+
+    Step1 G4 收口: ``role=supervisor_succession`` (the only role that closes a predecessor
+    coordinator window) is NOT a manual CLI path — it requires the one-time
+    ``--succession-token`` that ``handoff audit-close --coordinator --status active`` issues
+    after its retro gate passes (see :mod:`handoff_fanout.succession_authority`). A worker
+    spawn never takes a token."""
     # ── identity + arg validation (fail-closed) ──
     if not _SLUG_RE.match(project) or len(project) > 60:
         _err(f"project must be kebab-case (a-z 0-9 -), ≤60: {project!r}")
@@ -478,6 +491,18 @@ def run_spawn(
         _err(
             "role=supervisor_succession requires --predecessor-nonce (the nonce of the "
             "predecessor window it closes)"
+        )
+        return EXIT_FAIL_CLOSED
+    # ── G4 收口 (Step1 / tribrain MUST#1): succession is retro-gated, never manual ──
+    if succession_token is not None and role != ROLE_SUCCESSION:
+        _err("--succession-token is only valid with --role supervisor_succession")
+        return EXIT_FAIL_CLOSED
+    if role == ROLE_SUCCESSION and succession_token is None:
+        _err(
+            "role=supervisor_succession is not a manual CLI path (G4 retro-mandate 收口): "
+            "close the coordinator leg via `handoff audit-close --coordinator "
+            "--status active` — after its retro gate passes it issues the one-time "
+            "succession authority this spawn requires (--succession-token <path>)"
         )
         return EXIT_FAIL_CLOSED
 
@@ -510,6 +535,22 @@ def run_spawn(
         )
         return EXIT_FAIL_CLOSED
 
+    # ── G4 收口: validate + CONSUME the one-time succession authority LAST, just
+    # before production (so an earlier arg/config rejection never burns a token).
+    # A consumed token is gone even if the produce step then fails — conservative:
+    # re-issue via a fresh retro-gated audit-close rather than leave authority reusable.
+    if role == ROLE_SUCCESSION:
+        ok, reason = _authority.consume_token(
+            Path(succession_token).expanduser(), home=cfg.home, project=project
+        )
+        if not ok:
+            _err(
+                f"succession authority rejected: {reason} — obtain a fresh one-time "
+                "token via `handoff audit-close --coordinator --status active` "
+                f"(TTL {_authority.TOKEN_TTL_SECONDS}s, single use)"
+            )
+            return EXIT_FAIL_CLOSED
+
     nonce = _spawn_nonce.new_nonce()
     prompt_text = _build_prompt(task, brief=brief, prompt=prompt)
     queue_dir = cfg.queue_dir(project)
@@ -534,7 +575,10 @@ def run_spawn(
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="handoff spawn",
-        description="Fresh-spawn intent producer (no retro gate / no roadmap; design §13 A').",
+        description="Fresh-spawn intent producer (no retro gate / no roadmap; design §13 A'). "
+        "EXCEPTION (G4 收口): --role supervisor_succession requires the one-time "
+        "--succession-token issued by the retro-gated `handoff audit-close --coordinator "
+        "--status active` — a bare manual succession spawn is rejected.",
     )
     p.add_argument("--project", required=True, help="project slug (kebab-case)")
     p.add_argument("--task-id", required=True, dest="task", help="task id (kebab-case)")
@@ -554,6 +598,14 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="predecessor_nonce",
         help="nonce of the predecessor window a supervisor_succession closes",
     )
+    p.add_argument(
+        "--succession-token",
+        default=None,
+        dest="succession_token",
+        help="one-time succession authority issued by `handoff audit-close --coordinator "
+        "--status active` (required for --role supervisor_succession; G4 收口 — a bare "
+        "manual succession spawn is rejected)",
+    )
     return p
 
 
@@ -569,6 +621,7 @@ def main(argv: list[str] | None = None) -> int:
         prompt=args.prompt,
         close_policy=args.close_policy,
         predecessor_nonce=args.predecessor_nonce,
+        succession_token=args.succession_token,
     )
 
 

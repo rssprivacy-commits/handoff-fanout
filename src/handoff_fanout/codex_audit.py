@@ -38,6 +38,8 @@ from pathlib import Path
 from handoff_fanout import atomic
 from handoff_fanout import config as _config
 from handoff_fanout import handoff_precheck as _pc
+from handoff_fanout import succession_authority as _authority
+from handoff_fanout import worktree as _worktree
 
 FINDINGS_FILENAME = "codex-findings.json"
 MANIFEST_FILENAME = "codex-findings.json.manifest"
@@ -2101,8 +2103,38 @@ def main_audit_close(argv: list[str] | None = None) -> int:
     Phase A note (mandate OFF): the dump gate does not yet enforce G0-G9, so a
     close here only *records* the audit block. The lock + single-process
     sequencing is the Phase-B-ready scaffold.
+
+    Step1 A-收口 (coordinator relay / 中枢交棒): ``--coordinator --status active`` is THE
+    retro-gated coordinator relay path — batch/fan-in dump paths and the bare
+    ``handoff spawn`` MUST NOT be used for 中枢接力. On this path the close additionally:
+
+      * fails closed (before any artifact is written) when an explicit ``--project``
+        contradicts the launching workspace basename and no ``--workspace`` was given —
+        a cross-project relay (A 项目中枢派 B 项目中枢) must pass the EXPLICIT pair
+        ``--project <target> --workspace <target repo>``, never ride the cwd default
+        into a silently misrouted intent;
+      * fails closed when the project's worktree isolation mode is ON but the workspace
+        is not a git repo / has no ``origin`` remote — ``create_worktree`` would
+        otherwise silently degrade the relay to a shared-tree spawn (禁止静默降级);
+        remedies: add a remote, or switch the project to singlepane/off isolation;
+      * issues the ONE-TIME succession authority token (see
+        :mod:`handoff_fanout.succession_authority`) AFTER the inner retro-gated dump
+        returned 0 — the only key that unlocks
+        ``handoff spawn --role supervisor_succession`` (G4 收口).
+
+    The coordinator-on-main-tree case stays NON-destructive by construction: the engine
+    only runs the retro gate + produces the successor intent; the only worktree git
+    mutations on this path are ``create_worktree``'s same-task stale-worktree reclaim
+    (clean+published verified first) — never any destructive op against the main tree
+    (tribrain MUST: locked by tests/test_audit_close_coordinator.py).
     """
-    ap = argparse.ArgumentParser(prog="handoff audit-close")
+    ap = argparse.ArgumentParser(
+        prog="handoff audit-close",
+        description="Assemble codex_audit block → write evidence → dump, under one lock. "
+        "With --coordinator --status active this is THE coordinator relay (中枢交棒) path: "
+        "it runs the v5.4 retro gate and then issues the one-time succession authority "
+        "token. batch/fan-in dump paths MUST NOT be used for coordinator succession.",
+    )
     _common_args(ap)
     ap.add_argument("--next", required=True, help="next task brief")
     ap.add_argument(
@@ -2150,6 +2182,45 @@ def main_audit_close(argv: list[str] | None = None) -> int:
     if not _pc.TASK_ID_RE.match(project):
         sys.stderr.write(f"ERR-FATAL invalid-project-slug: {project!r}\n")
         return 1
+
+    # ── Step1 A-收口: coordinator-relay-only hardening (tribrain MUST 2+3). Scoped to
+    # --coordinator so every legacy non-coordinator close stays byte-identical. ──
+    if args.coordinator:
+        # MUST 2 (cross-project 交棒): --project that contradicts the cwd-derived
+        # workspace basename without an explicit --workspace would bind {project}'s
+        # queue artifacts to the WRONG tree (the launching repo) — a silently
+        # misrouted coordinator window. Demand the explicit pair, fail closed.
+        if args.project and not args.workspace and workspace.name != args.project:
+            sys.stderr.write(
+                f"ERR-FATAL cross-project-needs-workspace: --project {project!r} does not "
+                f"match the launching workspace basename {workspace.name!r} and no "
+                "--workspace was given — a cross-project coordinator relay must pass the "
+                f"explicit pair: --project {project} --workspace </abs/path/to/{project}>\n"
+            )
+            return 1
+        # MUST 3 (no-remote 项目): with worktree isolation ON, create_worktree would
+        # DEGRADE a non-repo / no-remote workspace to a shared-tree spawn — a silent
+        # downgrade of the relay's isolation (禁止静默降级). Fail closed with remedies
+        # instead; singlepane / isolation-off projects are untouched (no origin needed).
+        if _worktree.resolve_mode(_config.load(), project) == _worktree.MODE_ON:
+            if not _worktree.is_git_repo(workspace):
+                sys.stderr.write(
+                    f"ERR-FATAL coordinator-workspace-not-git: {workspace} is not a git "
+                    "repository but the project's worktree isolation mode is ON — the "
+                    "relay would silently degrade to a shared-tree spawn. Init the repo, "
+                    "or switch the project to singlepane / worktree-off isolation\n"
+                )
+                return 1
+            if not _worktree.has_remote(workspace):
+                sys.stderr.write(
+                    f"ERR-FATAL no-remote-coordinator-relay: {workspace} has no 'origin' "
+                    "remote but the project's worktree isolation mode is ON (origin "
+                    "containment required) — the relay would silently degrade to a "
+                    "shared-tree spawn. Add one (git remote add origin <url> && git push "
+                    "-u origin <branch>), or switch the project to singlepane / "
+                    "worktree-off isolation\n"
+                )
+                return 1
 
     # Parse caller inputs (pure; on-disk state is validated under the lock below).
     try:
@@ -2301,7 +2372,33 @@ def main_audit_close(argv: list[str] | None = None) -> int:
                 dump_argv += ["--tests", args.tests]
             if args.coordinator:
                 dump_argv.append("--coordinator")  # §五·2: red-top the spawned 中枢 worktree window
-            return dump.main(dump_argv)
+            rc = dump.main(dump_argv)
+            # ── Step1 G4 收口: the retro gate just passed (the gated dump returned 0) —
+            # ONLY now may the one-time succession authority exist. It is the single key
+            # that unlocks `handoff spawn --role supervisor_succession` (which closes the
+            # predecessor coordinator window); a bare manual succession spawn is rejected.
+            if rc == 0 and args.coordinator and args.status == "active":
+                try:
+                    token_path = _authority.issue_token(
+                        home=_config.home_dir(), project=project, task=args.task
+                    )
+                except OSError as e:
+                    # The dump's artifacts are already published (the relay window WILL
+                    # spawn); failing the whole close now would lie about that. Loud warn:
+                    # without the token a succession-style spawn stays locked until a
+                    # fresh audit-close re-issues one.
+                    sys.stderr.write(
+                        f"WARN succession-authority-unissued: {e} — relay artifacts are "
+                        "published, but `handoff spawn --role supervisor_succession` "
+                        "stays locked; re-run audit-close to issue a token\n"
+                    )
+                else:
+                    sys.stdout.write(
+                        f"OK succession-authority-issued: {token_path} "
+                        f"(one-time, TTL {_authority.TOKEN_TTL_SECONDS}s — pass via "
+                        "`handoff spawn --role supervisor_succession --succession-token`)\n"
+                    )
+            return rc
     except atomic.LockAcquisitionError:
         sys.stderr.write(f"ERR-LOCKED audit-close-lock-held: {locks_root}\n")
         return 3

@@ -22,11 +22,17 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser(
         "dump",
-        help="Generate handoff queue file for next task (full args: see `handoff-dump --help`)",
+        help="Generate handoff queue file for next task (full args: see `handoff-dump --help`). "
+        "batch/fan-in paths (--batch-*/--open-batch) MUST NOT be used for coordinator "
+        "succession (中枢接力) — that goes through `handoff audit-close --coordinator "
+        "--status active`",
     )
     sub.add_parser(
         "spawn",
-        help="Fresh-spawn intent producer (no retro gate / no roadmap; see `handoff spawn --help`)",
+        help="Fresh-spawn intent producer (no retro gate / no roadmap; see `handoff spawn "
+        "--help`). --role supervisor_succession is NOT a manual path: it requires the "
+        "one-time --succession-token issued by `handoff audit-close --coordinator "
+        "--status active` (G4 收口)",
     )
     sub.add_parser(
         "watchdog", help="Run watchdog scan (fail-safe fan-in trigger; meant for launchd/cron)"
@@ -56,7 +62,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub.add_parser(
         "audit-close",
-        help="Single-process: assemble codex_audit block → write evidence → dump",
+        help="Single-process: assemble codex_audit block → write evidence → dump. With "
+        "--coordinator --status active this is THE coordinator relay (中枢交棒) path: "
+        "retro-gated, and the sole issuer of the one-time succession authority token",
     )
     sub.add_parser(
         "worktree",

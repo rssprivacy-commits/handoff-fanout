@@ -465,7 +465,14 @@ def _succession_ready(home: Path, project: str, task: str) -> None:
 
 
 def _spawn_succession(home: Path, project: str, task: str, repo: Path) -> dict:
-    """Produce a REAL succession intent via the engine CLI; returns its sidecar."""
+    """Produce a REAL succession intent via the engine CLI; returns its sidecar.
+
+    G4 收口 (Step1): a succession spawn is no longer a bare CLI path — issue the
+    one-time authority token first, exactly as a retro-gated
+    ``audit-close --coordinator --status active`` would."""
+    from handoff_fanout import succession_authority as _authority
+
+    token = _authority.issue_token(home=home, project=project, task="closing-coord-leg")
     rc = cli.main(
         [
             "spawn",
@@ -483,6 +490,8 @@ def _spawn_succession(home: Path, project: str, task: str, repo: Path) -> dict:
             "take over coordination",
             "--predecessor-nonce",
             PRED_NONCE,
+            "--succession-token",
+            str(token),
         ]
     )
     assert rc == 0
