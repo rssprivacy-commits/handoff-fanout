@@ -2124,6 +2124,137 @@ def _report_g3_sedimentation(self_task: str | None, project: str, workspace: Pat
         sys.stdout.write(f"OK G3-sedimentation: {detail}\n")
 
 
+# ─── warmgap-C: succession routing (token 闸凭证 → 路由凭证) ──────────────────
+
+# Mirrors ``spawn._NONCE_RE`` (the engine's hex spawn-nonce shape); kept local so the
+# routing probe never needs a module-level ``spawn`` import.
+_HEX_NONCE_RE = re.compile(r"^[0-9a-f]+$")
+
+
+def _predecessor_spawn_nonce(project: str, self_task: str | None) -> str | None:
+    """warmgap-C §1b.1 routing probe: the CLOSING coordinator's own engine spawn nonce.
+
+    Reads ``queue/<self_task>.singlepane`` (the sidecar the engine wrote when THIS
+    coordinator window was spawned) and returns its ``spawn_nonce`` when it is a clean
+    hex string. EVERY failure mode — ``--self-task`` not given / sidecar missing /
+    JSON corrupt / nonce missing or non-hex — returns ``None``, which routes the relay
+    down the LEGACY full-dump publication (the bootstrap leg: a dx-spawn-launched or
+    first-generation coordinator has no engine sidecar). Convergence: the legacy dump
+    publishes a sidecar WITH a spawn_nonce, so a chain has at most one legacy leg.
+    """
+    if self_task is None:
+        return None
+    sidecar = _config.home_dir() / project / "queue" / f"{self_task}.singlepane"
+    try:
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    nonce = payload.get("spawn_nonce")
+    if isinstance(nonce, str) and _HEX_NONCE_RE.match(nonce):
+        return nonce
+    return None
+
+
+def _succession_relay(
+    *,
+    project: str,
+    workspace: Path,
+    successor_task: str,
+    next_brief: str,
+    predecessor_nonce: str,
+) -> int:
+    """warmgap-C §1b.2: publish the relay's window intent via ``spawn --role
+    supervisor_succession`` — the succession token becomes a ROUTING credential
+    (issued → consumed inside this very process), no longer an idle-expiring gate
+    credential.
+
+    Called ONLY after the retro-gated ``dump.main(..., suppress_spawn_artifacts=True)``
+    returned 0: the ledger artifacts (queue/<succ>.md / .queued / old_ready) exist but
+    NO window intent (.singlepane sidecar / memory baseline / .uri / notification) was
+    published — so failing CLOSED here is finally truthful (v0's WARN-and-continue was
+    only honest because dump had already published). On success, audit-close sends the
+    ONE notification (the suppressed dump sent none — never a double 响, codex MUST#3).
+    NEVER falls back to a legacy self-publication on failure (禁止静默降级); the manual
+    escape hatch is ``dx-spawn-session.sh --coordinator``.
+
+    LOCK ORDERING (gemini SHOULD / §1b.3): the audit-close critical section holds
+    precheck.lock → dump.lock → <task>.audit.lock when this runs; ``spawn.run_spawn``
+    then takes the project ``.spawn.lock`` INSIDE them — the same innermost position
+    dump's own singlepane guard gives it. Never acquire precheck/dump/audit locks while
+    holding ``.spawn.lock``.
+    """
+    home = _config.home_dir()
+    try:
+        token_path = _authority.issue_token(home=home, project=project, task=successor_task)
+    except OSError as e:
+        # Succession route: nothing window-publishable exists yet (the ledger .md /
+        # old_ready are harmless), so this may fail CLOSED — unlike v0's WARN.
+        sys.stderr.write(
+            f"ERR-FATAL succession-authority-unissued: {e} — ledger artifacts "
+            f"(queue/{successor_task}.md / old_ready) are written but NO window intent "
+            "was published; re-run audit-close to issue a fresh token and spawn\n"
+        )
+        return 1
+    sys.stdout.write(
+        f"OK succession-authority-issued: {token_path} "
+        f"(one-time, TTL {_authority.TOKEN_TTL_SECONDS}s — routing credential, consumed "
+        "by the in-process succession spawn)\n"
+    )
+
+    # Same text as ``dump.encode_short_prompt`` (assembled HERE as plain text — spawn
+    # percent-encodes it itself and never imports dump; design §13 red line intact).
+    prompt_text = (
+        f"自动接续 / project=`{project}` / task=`{successor_task}` — "
+        f"open `{home}/{project}/queue/{successor_task}.md` "
+        f"and continue per the baseline + reading list."
+    )
+    from handoff_fanout import spawn as _spawn
+
+    spawn_rc = _spawn.run_spawn(
+        project=project,
+        task=successor_task,
+        role=_spawn.ROLE_SUCCESSION,
+        isolation=_spawn.ISOLATION_SINGLEPANE,
+        workspace=str(workspace),
+        prompt=prompt_text,
+        succession_token=str(token_path),
+        predecessor_nonce=predecessor_nonce,
+    )
+    if spawn_rc != 0:
+        # codex MUST#5: the remedy depends on whether the spawn burned the token —
+        # stat the file instead of guessing from the rc.
+        if token_path.exists():
+            sys.stderr.write(
+                f"ERR-FATAL succession-spawn-failed: spawn rc={spawn_rc}; the token was "
+                f"NOT consumed ({token_path.name}, TTL {_authority.TOKEN_TTL_SECONDS}s) — "
+                "the spawn was rejected before consuming authority (lock held / bad args "
+                "/ config); fix the rejection and re-run audit-close. NO window intent "
+                "was published (no silent legacy fallback); manual escape hatch: "
+                "dx-spawn-session.sh --coordinator\n"
+            )
+        else:
+            sys.stderr.write(
+                f"ERR-FATAL succession-spawn-failed: spawn rc={spawn_rc}; the token was "
+                "BURNED (consumed, then the produce step failed and rolled back its "
+                "partial intent) — re-run audit-close to re-issue a fresh authority. NO "
+                "window intent was published (no silent legacy fallback); manual escape "
+                "hatch: dx-spawn-session.sh --coordinator\n"
+            )
+        return 1
+
+    # The ONE relay notification (the suppressed dump sent none — codex MUST#3).
+    from handoff_fanout import dump as _dump
+
+    _dump._notify(next_brief, f"自动接续 / {project}", successor_task)
+    sys.stdout.write(
+        f"OK succession-spawned: {project}/{successor_task} via supervisor_succession "
+        f"(predecessor nonce {predecessor_nonce}; token consumed in-process)\n"
+    )
+    return 0
+
+
 def main_audit_close(argv: list[str] | None = None) -> int:
     """Single-process: assemble the codex_audit block from registered runs +
     dispositions, fold it into retro evidence, then invoke ``dump`` — all under
@@ -2405,6 +2536,15 @@ def main_audit_close(argv: list[str] | None = None) -> int:
 
             from handoff_fanout import dump
 
+            # ── warmgap-C §1b.1: ROUTE DECISION before the dump — the dump call FORM
+            # depends on it (suppress for the succession route vs the full legacy
+            # publication). Deciding after a suppressed dump and "re-publishing" when the
+            # spawn turns out infeasible would expose a half-published intermediate
+            # state — forbidden by design (no two-phase fallback).
+            succession_nonce: str | None = None
+            if args.coordinator and args.status == "active":
+                succession_nonce = _predecessor_spawn_nonce(project, args.self_task)
+
             dump_argv = [
                 "--task",
                 args.task,
@@ -2423,7 +2563,7 @@ def main_audit_close(argv: list[str] | None = None) -> int:
                 dump_argv += ["--tests", args.tests]
             if args.coordinator:
                 dump_argv.append("--coordinator")  # §五·2: red-top the spawned 中枢 worktree window
-            rc = dump.main(dump_argv)
+            rc = dump.main(dump_argv, suppress_spawn_artifacts=succession_nonce is not None)
             # ── Step1 G4 收口: the retro gate just passed (the gated dump returned 0) —
             # ONLY now may the one-time succession authority exist. It is the single key
             # that unlocks `handoff spawn --role supervisor_succession` (which closes the
@@ -2433,6 +2573,28 @@ def main_audit_close(argv: list[str] | None = None) -> int:
                 # the CLOSING coordinator's dispatch-time memory baseline against the
                 # current snapshot. Never changes rc; never blocks the relay this slice.
                 _report_g3_sedimentation(args.self_task, project, workspace)
+                if succession_nonce is not None:
+                    # warmgap-C §1b.2: succession route — the dump above was ledger-only
+                    # (suppressed); the window intent is published by the in-process
+                    # succession spawn, which consumes the token it routes on.
+                    return _succession_relay(
+                        project=project,
+                        workspace=workspace,
+                        successor_task=args.task,
+                        next_brief=args.next,
+                        predecessor_nonce=succession_nonce,
+                    )
+                # Legacy route (bootstrap leg: dx-spawn-launched / first-generation
+                # coordinator — no engine sidecar nonce): the dump above already
+                # published the full v0 window intent; the token stays a gate
+                # credential (issued, expected-idle, TTL 120s — D1 ruling). Loud WARN
+                # by contract so the observe logs show which legs ran legacy.
+                sys.stderr.write(
+                    "WARN legacy-relay: no engine spawn_nonce for predecessor "
+                    f"{args.self_task or '(--self-task not given)'} — succession routing "
+                    "unavailable this leg; the NEXT leg will route via succession "
+                    "(dump sidecar carries spawn_nonce)\n"
+                )
                 try:
                     token_path = _authority.issue_token(
                         home=_config.home_dir(), project=project, task=args.task

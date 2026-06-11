@@ -789,7 +789,18 @@ def write_active_dump(
     old_head: str | None = None,
     worktree_info: dict | None = None,
     is_coordinator: bool = False,
+    suppress_spawn_artifacts: bool = False,
 ) -> int:
+    # warmgap-C §1a: ``suppress_spawn_artifacts=True`` (Python-keyword-only, NEVER a CLI
+    # flag — a public flag would be a legal bypass of the spawn-side G4 contract) keeps
+    # the LEDGER half of an active dump (queue/<task>.md / BLOCKED supersede / .queued /
+    # old_ready / .worktree ack / pbcopy) and SKIPS the WINDOW-INTENT half (singlepane
+    # sidecar+workspace / coordinator memory baseline / .uri publish / notification) —
+    # the retro-gated ``audit-close --coordinator --status active`` succession route
+    # publishes those via ``spawn --role supervisor_succession`` instead (codex_audit
+    # ``_succession_relay``; the spawn writes the baseline itself, audit-close sends the
+    # single notification — never a double 响). Default False = byte-identical v0
+    # behavior for every caller (CLI / batch / fan-in / skill / tests).
     roadmap_excerpt = get_roadmap_excerpt(cfg, project)
     # ``workspace`` is the successor's tree (a worktree under isolation, else the
     # source tree); ``source_workspace`` is the closing session's tree used only for
@@ -934,25 +945,26 @@ def write_active_dump(
     # ordering rule as the other sidecars). Skipped when this is a CREATED worktree (the
     # worktree has its own .handoff.code-workspace and wins — and already carries the §五·2
     # red-top via create_worktree(is_coordinator=...) on that path).
-    maybe_write_singlepane_sidecar(
-        cfg,
-        project,
-        task,
-        workspace,
-        queue_dir,
-        worktree_active=bool(
-            worktree_info and worktree_info.get("status") == _worktree.ST_CREATED
-        ),
-        # E3 role taxonomy: the single-task active relay is the SOLO chain, not a true
-        # worker (batch sub-task / fan-in keep role="worker" at their own call sites).
-        # A coordinator dump keeps role="worker" in the sidecar — the watchdog contract
-        # asserted by the red-top tests — its coordinator semantics ride in the env
-        # signal (supervisor_succession) + the is_coordinator sidecar marker.
-        role=("worker" if is_coordinator else ROLE_SOLO),
-        close_policy="keep",
-        spawn_nonce=_spawn_nonce.new_nonce(),
-        is_coordinator=is_coordinator,
-    )
+    if not suppress_spawn_artifacts:
+        maybe_write_singlepane_sidecar(
+            cfg,
+            project,
+            task,
+            workspace,
+            queue_dir,
+            worktree_active=bool(
+                worktree_info and worktree_info.get("status") == _worktree.ST_CREATED
+            ),
+            # E3 role taxonomy: the single-task active relay is the SOLO chain, not a true
+            # worker (batch sub-task / fan-in keep role="worker" at their own call sites).
+            # A coordinator dump keeps role="worker" in the sidecar — the watchdog contract
+            # asserted by the red-top tests — its coordinator semantics ride in the env
+            # signal (supervisor_succession) + the is_coordinator sidecar marker.
+            role=("worker" if is_coordinator else ROLE_SOLO),
+            close_policy="keep",
+            spawn_nonce=_spawn_nonce.new_nonce(),
+            is_coordinator=is_coordinator,
+        )
 
     # Step2 契约 A (G3): a coordinator dispatch — BOTH the worktree and the singlepane
     # relay land here — records the dispatch-time memory snapshot baseline before the
@@ -960,7 +972,7 @@ def write_active_dump(
     # relay (`audit-close --coordinator --self-task <this task>`) compares against it.
     # ``source_workspace`` (the real project tree, not a successor worktree) locates
     # the project memory dir. Best-effort by contract: never bricks the dump.
-    if is_coordinator:
+    if is_coordinator and not suppress_spawn_artifacts:
         _memory_baseline.write_baseline(
             home=cfg.home,
             project=project,
@@ -969,6 +981,16 @@ def write_active_dump(
         )
 
     _maybe_pbcopy(handoff_content)
+
+    if suppress_spawn_artifacts:
+        # warmgap-C §1a: ledger-only close — NO window intent was published (no sidecar /
+        # baseline / .uri / notification). The caller (audit-close succession route) now
+        # owns publishing it via `spawn --role supervisor_succession`, or failing CLOSED.
+        print(
+            f"[dump] ✅ ledger dump complete for {project}/{task} "
+            "(spawn artifacts suppressed — succession spawn publishes the window intent)"
+        )
+        return 0
 
     # ── PUBLISH: write the .uri trigger LAST (all sidecars now exist) ────────────
     # §3.7 — atomic .uri write (see the .md note above).
@@ -1752,7 +1774,11 @@ def _build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, suppress_spawn_artifacts: bool = False) -> int:
+    # warmgap-C §1a: ``suppress_spawn_artifacts`` is a Python-keyword-only seam for the
+    # audit-close succession route (codex MUST#2: it must NEVER enter argparse — a public
+    # CLI flag would let any caller strip the window intent off a dump and bypass the
+    # spawn-side G4 contract). See ``write_active_dump`` for the kept/skipped split.
     args = _build_parser().parse_args(argv)
     cfg = _config.load()
 
@@ -1928,6 +1954,7 @@ def main(argv: list[str] | None = None) -> int:
                 # convention as resolve_spawn_workspace keeps legacy/batch callers (whose
                 # args lack --coordinator) working unchanged.
                 is_coordinator=getattr(args, "coordinator", False),
+                suppress_spawn_artifacts=suppress_spawn_artifacts,
             )
     except SinglepaneBusy as e:
         print(
