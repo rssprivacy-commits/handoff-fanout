@@ -58,6 +58,20 @@ from .oracle import (
     OracleType,
     Severity,
 )
+from .oracle_runner import (
+    LIVE_DB_DENYLIST,
+    CriterionExecutor,
+    CriterionResult,
+    LiveDbError,
+    OracleOutcome,
+    OracleRunner,
+    OracleRunResult,
+    PsqlSandboxDb,
+    RawExecution,
+    SandboxDb,
+    SubprocessExecutor,
+    aggregate_outcome,
+)
 from .payloads import (
     ContextPatch,
     ContextPatchOp,
@@ -66,6 +80,18 @@ from .payloads import (
     RollbackRecord,
 )
 from .plan import MergePolicy, Node, NodeType, Plan, RiskTier, WorktreeMode
+from .plan_draft import (
+    LockedPlan,
+    PlanDraft,
+    amend_locked_plan,
+    approve_plan,
+    canonical_bytes,
+    draft_plan,
+    is_lock_valid,
+    oracle_hash,
+    plan_hash,
+    verify_lock,
+)
 from .states import (
     ABORTABLE_NODE_STATES,
     INFORMATIONAL_EVENTS,
@@ -199,4 +225,29 @@ __all__ = [
     "outgoing",
     "reachable_node_states",
     "validate_state_machine_closure",
+    # --- S1 (Oracle+Plan 立靶子) — running logic, not new S0 wire contracts ---
+    # plan draft → owner-approve → lock-hash
+    "PlanDraft",
+    "LockedPlan",
+    "draft_plan",
+    "approve_plan",
+    "amend_locked_plan",
+    "verify_lock",
+    "is_lock_valid",
+    "plan_hash",
+    "oracle_hash",
+    "canonical_bytes",
+    # oracle runner
+    "OracleRunner",
+    "OracleOutcome",
+    "OracleRunResult",
+    "CriterionResult",
+    "aggregate_outcome",
+    "CriterionExecutor",
+    "SandboxDb",
+    "RawExecution",
+    "SubprocessExecutor",
+    "PsqlSandboxDb",
+    "LIVE_DB_DENYLIST",
+    "LiveDbError",
 ]
