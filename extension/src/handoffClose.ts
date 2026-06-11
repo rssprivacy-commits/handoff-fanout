@@ -22,6 +22,12 @@ export interface HandoffCloseParams {
   // Optional: legacy / singlepane URIs don't carry them (parseQuery sets null).
   role?: string | null; // "worker" | "supervisor_succession"
   predecessorNonce?: string | null; // the OLD supervisor window's spawn_nonce to close
+  // §6c reclaim params (contract v4 C3). Only the reclaim producer emits them; a
+  // legacy succession URI has them null, which is what routes it to handleAutoclose.
+  reason?: string | null; // "reclaim" (worker row) | "close_predecessor" (succession row)
+  runId?: string | null; // per-request CSPRNG id — binds acks to ONE reclaim run
+  issuedAt?: string | null; // ISO timestamp; expiry-checked BEFORE any side effect
+  ackTimeout?: string | null; // producer's reclaim_ack_timeout (seconds; capped receiver-side)
 }
 
 // Canonical URI contract (settled in D-2):
@@ -49,6 +55,10 @@ export function parseQuery(query: string): HandoffCloseParams {
     project: p.get("project"),
     role: p.get("role"),
     predecessorNonce: p.get("predecessor_nonce"),
+    reason: p.get("reason"),
+    runId: p.get("run_id"),
+    issuedAt: p.get("issued_at"),
+    ackTimeout: p.get("ack_timeout"),
   };
 }
 
@@ -138,12 +148,13 @@ export async function handleHandoffClose(
 }
 
 // The actual close mechanics, factored out of handleHandoffClose so the
-// role-gated succession path (handleAutoclose) can reuse the exact same
-// dirty-safe, retry-once behavior without re-validating params it doesn't have.
+// role-gated succession path (handleAutoclose) — and the §6c reclaim path
+// (handoffReclaim.ts), hence the export — can reuse the exact same dirty-safe,
+// retry-once behavior without re-validating params they don't have.
 // Flow: flatten tabs → skip dirty (A4) → close the rest → on `close()===false`,
 // wait 500ms, RE-FETCH + RE-FILTER (closed handles go invalid; a tab may have
 // turned dirty during the delay), and retry once (A3). Pure: no nonce/role logic.
-async function closeNonDirtyWithRetry(deps: CloseDeps): Promise<CloseMechanicsResult> {
+export async function closeNonDirtyWithRetry(deps: CloseDeps): Promise<CloseMechanicsResult> {
   const allTabs = deps.getAllTabs();
   const dirty = allTabs.filter((t) => t.isDirty);
   let closeable = allTabs.filter((t) => !t.isDirty);

@@ -942,9 +942,19 @@ def main() -> int:
         except Exception as e:
             print(f"[watchdog] v4.1 heartbeat scan error: {e}", file=sys.stderr)
             stale_v41 = 0
+        # §6c worker-worktree reclaim producer (contract v4): sentinel-triggered only
+        # (`ack/<id>.reclaim_requested`); a tick with no sentinel/pending is a no-op.
+        # Lazy import keeps the legacy watchdog paths' import surface unchanged.
+        try:
+            from handoff_fanout import reclaim as _reclaim
+
+            reclaim_active = _reclaim.tick(cfg)
+        except Exception as e:
+            print(f"[watchdog] reclaim tick error: {e}", file=sys.stderr)
+            reclaim_active = 0
         print(
             f"[watchdog] scanned {scanned} batches / {orphans} orphans / "
-            f"{stale_v41} stale v4.1 heartbeats"
+            f"{stale_v41} stale v4.1 heartbeats / {reclaim_active} reclaim-active"
         )
     finally:
         release_lock(fd)

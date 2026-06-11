@@ -203,6 +203,22 @@ class Config:
     worktree_link_venv: bool = True
     worktree_default_branch: str | None = None  # explicit integration-branch override
     worktree_projects: list[str] = field(default_factory=list)
+    # ── §6c worker worktree reclaim (contract v4, frozen 2026-06-10) ────────────
+    # ``reclaim_ack_timeout``: seconds the producer waits (cross-tick, never a sleep)
+    # for the extension's done/failed ack before releasing the lock with
+    # ``reclaim_failed(reason=ack-timeout)`` (C6; configurable per gemini SHOULD —
+    # remote/SSH high-latency hosts raise it). ``canonical_remote``: explicit remote
+    # whose ``refs/remotes/<remote>/<int>`` is the merged-judgment truth (C1 gemini M1:
+    # never hardcode origin under fork workflows; resolution order config >
+    # ``branch.<int>.remote`` > origin). ``reclaim_probe_idle_sec``: a transcript
+    # *.jsonl mtime younger than this ⇒ LIVE session, never close (C6).
+    # ``reclaim_probe_disabled``: explicit owner opt-out of the live probe (gemini
+    # SHOULD: the probe depends on Claude's local dir layout; disabling is the owner
+    # accepting force-close risk — never a silent fallback).
+    reclaim_ack_timeout: float = 30.0
+    canonical_remote: str | None = None
+    reclaim_probe_idle_sec: float = 600.0
+    reclaim_probe_disabled: bool = False
 
     def inject_blocks_for(self, project: str) -> list[str]:
         """Effective inject blocks for ``project`` = global + this project's blocks.
@@ -362,6 +378,7 @@ def _from_dict(data: dict, home: Path) -> Config:
         audit_code_roots_configured="audit_code_repo_roots" in data,
         **_parse_mandate_projects(data),
         **_parse_worktree(data),
+        **_parse_reclaim(data),
     )
 
 
@@ -497,6 +514,39 @@ def _parse_worktree(data: dict) -> dict:
         "worktree_link_venv": bool(data.get("worktree_link_venv", True)),
         "worktree_default_branch": default_branch,
         "worktree_projects": projects,
+    }
+
+
+def _parse_reclaim(data: dict) -> dict:
+    """Parse the §6c reclaim config block (all optional, safe defaults).
+
+    ``reclaim_ack_timeout`` is clamped to a sane positive range (a zero/negative or
+    unparseable value would make every reclaim instantly ``ack-timeout`` — fail back to
+    the 30s default instead). ``canonical_remote`` accepts only a non-empty string
+    (anything else → None → dynamic resolution). ``reclaim_probe_disabled`` must be an
+    explicit JSON ``true`` — the probe is a safety gate, so a typo can never disable it.
+    """
+    timeout_raw = data.get("reclaim_ack_timeout", 30.0)
+    try:
+        timeout = float(timeout_raw)
+    except (TypeError, ValueError):
+        timeout = 30.0
+    if not (0 < timeout <= 3600):
+        timeout = 30.0
+    remote_raw = data.get("canonical_remote")
+    remote = str(remote_raw) if isinstance(remote_raw, str) and remote_raw.strip() else None
+    idle_raw = data.get("reclaim_probe_idle_sec", 600.0)
+    try:
+        idle = float(idle_raw)
+    except (TypeError, ValueError):
+        idle = 600.0
+    if idle <= 0:
+        idle = 600.0
+    return {
+        "reclaim_ack_timeout": timeout,
+        "canonical_remote": remote,
+        "reclaim_probe_idle_sec": idle,
+        "reclaim_probe_disabled": data.get("reclaim_probe_disabled") is True,
     }
 
 

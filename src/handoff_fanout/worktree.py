@@ -1406,6 +1406,21 @@ def _iter_projects(cfg: _config.Config) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # §6c reclaim subcommands (contract v4) are dispatched BEFORE the legacy argparse so
+    # their own parsers own their flags; the reclaim module is imported lazily to keep
+    # the gc/list paths' import surface unchanged.
+    _RECLAIM_SUBCOMMANDS = {
+        "abandon": "cli_abandon",
+        "record-head": "cli_record_head",
+        "wave-freeze": "cli_wave_freeze",
+        "reclaim-request": "cli_reclaim_request",
+        "reclaim-report": "cli_reclaim_report",
+    }
+    if argv and argv[0] in _RECLAIM_SUBCOMMANDS:
+        from handoff_fanout import reclaim as _reclaim
+
+        return getattr(_reclaim, _RECLAIM_SUBCOMMANDS[argv[0]])(argv[1:])
+
     ap = argparse.ArgumentParser(
         prog="handoff worktree",
         description="Inspect / reclaim per-session git worktrees.",
@@ -1416,6 +1431,11 @@ def main(argv: list[str] | None = None) -> int:
     p_gc = sub.add_parser("gc", help="Reclaim terminal-task worktrees (dry-run default).")
     p_gc.add_argument("--project", default=None)
     p_gc.add_argument("--execute", action="store_true", help="Actually remove (default: dry-run).")
+    sub.add_parser("abandon", help="Explicitly abandon a worktree (§6c C4; control-plane record).")
+    sub.add_parser("record-head", help="Record a worker's closing head SHA (§6c C1 evidence).")
+    sub.add_parser("wave-freeze", help="Freeze a wave membership manifest (§6c C5; O_EXCL).")
+    sub.add_parser("reclaim-request", help="Request window reclaim for a task/wave (§6c C2).")
+    sub.add_parser("reclaim-report", help="Read-only reclaim candidates + blockers (§6c).")
     args = ap.parse_args(argv)
     cfg = _config.load()
 

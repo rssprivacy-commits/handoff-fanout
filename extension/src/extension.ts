@@ -1,3 +1,6 @@
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 import * as vscode from "vscode";
 import {
   AutocloseDeps,
@@ -11,6 +14,27 @@ import {
   parseQuery,
   runStartupSinglePane,
 } from "./handoffClose";
+import { AckIntent, ReclaimDeps, handleReclaim } from "./handoffReclaim";
+
+// §6c reclaim ack sink (contract C2/C6): the watchdog producer resolves its
+// cross-tick pending state by reading `~/.claude-handoff/<project>/ack/
+// <task>.reclaim_ack.json`. The DECISION logic stays pure (handoffReclaim.ts
+// returns a fully computed AckIntent); this glue only lands the bytes —
+// temp + rename so the producer can never read a torn ack. relPath components
+// were slug-validated by the pure layer before the intent was ever produced.
+function writeReclaimAck(intent: AckIntent, log: (msg: string) => void): void {
+  try {
+    const root = path.join(os.homedir(), ".claude-handoff");
+    const target = path.join(root, intent.relPath);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    const tmp = `${target}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(intent.payload) + "\n");
+    fs.renameSync(tmp, target);
+    log(`[handoff-helper] reclaim ack written: ${target} (${intent.payload.result})`);
+  } catch (err) {
+    log(`[handoff-helper] reclaim ack write failed: ${String(err)}`);
+  }
+}
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Handoff Helper");
@@ -44,6 +68,40 @@ export function activate(context: vscode.ExtensionContext): void {
           output.appendLine(`[handoff-helper] singlepane internal error: ${String(err)}`);
         }
         return;
+      }
+
+      // /autoclose with a `reason` param — the §6c role×reason-matrixed path (contract
+      // v4 C3/C7). worker+reclaim → the nonce-self-targeting reclaim close (expiry-
+      // checked BEFORE any side effect; acks written for the producer's state machine);
+      // succession+close_predecessor → delegated to the legacy handleAutoclose below;
+      // any other combo → fail-closed + role-reason-rejected ack. A URI WITHOUT a
+      // reason keeps the pre-§6c legacy route byte-identical.
+      if (isClosePath(uri.path) && params.reason != null) {
+        const deps: ReclaimDeps = {
+          getAllTabs: () =>
+            vscode.window.tabGroups.all.flatMap((g) => g.tabs) as unknown as TabLike[],
+          closeTabs: (tabs) =>
+            Promise.resolve(
+              vscode.window.tabGroups.close(tabs as unknown as vscode.Tab[], true),
+            ),
+          delay: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+          log: (msg) => output.appendLine(msg),
+          windowTitle: () => vscode.workspace.getConfiguration("window").get<string>("title"),
+          now: () => Date.now(),
+        };
+        try {
+          const res = await handleReclaim(params, deps);
+          if (res.ack) {
+            writeReclaimAck(res.ack, deps.log);
+          }
+          if (res.reason !== "delegate-legacy") {
+            return;
+          }
+          // fall through: succession+close_predecessor rides the legacy §6 gates below.
+        } catch (err) {
+          output.appendLine(`[handoff-helper] reclaim internal error: ${String(err)}`);
+          return;
+        }
       }
 
       // /autoclose — role-gated supervisor-succession close (Phase 4). worker → never

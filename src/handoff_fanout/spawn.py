@@ -125,23 +125,27 @@ def _write_sidecar(
     spawn_nonce: str,
     isolation: str,
     predecessor_nonce: str | None,
+    wave_id: str | None = None,
 ) -> None:
     """``queue/<task>.singlepane`` — COMPACT single-line JSON (the watchdog's line-oriented
     ``json_get`` reader + the autoclose ``role``/``predecessor_nonce`` extraction depend on the flat
     one-line shape; do NOT ``indent=`` here). Mirrors ``dump.maybe_write_singlepane_sidecar``'s keys
-    + the additive ``isolation`` field."""
+    + the additive ``isolation`` field. ``wave_id`` (§6c C5) is written ONLY when the dispatch
+    belongs to a wave — a non-wave sidecar stays byte-identical to the pre-§6c shape."""
+    payload = {
+        "workspace": str(workspace),
+        "role": role,
+        "close_policy": close_policy,
+        "spawn_nonce": spawn_nonce,
+        "isolation": isolation,
+        "predecessor_nonce": predecessor_nonce,
+    }
+    if wave_id is not None:
+        payload["wave_id"] = wave_id  # additive; json_get readers ignore unknown keys
     atomic.atomic_replace(
         queue_dir / f"{task}.singlepane",
-        json.dumps(
-            {
-                "workspace": str(workspace),
-                "role": role,
-                "close_policy": close_policy,
-                "spawn_nonce": spawn_nonce,
-                "isolation": isolation,
-                "predecessor_nonce": predecessor_nonce,
-            }
-        ),  # ← no indent= on purpose: single-line contract for the bash json_get reader
+        json.dumps(payload),
+        # ← no indent= on purpose: single-line contract for the bash json_get reader
     )
 
 
@@ -253,7 +257,8 @@ def _active_singlepane_worker(
 
 
 def _spawn_singlepane(
-    *, cfg, project, task, role, src, nonce, close_policy, predecessor_nonce, prompt_text, queue_dir
+    *, cfg, project, task, role, src, nonce, close_policy, predecessor_nonce, prompt_text,
+    queue_dir, wave_id=None,
 ) -> int:
     """Gate + produce. MUST 3 (p6a-fix1 / design §5.4): ``handoff spawn`` is a PUBLIC entry
     that bypasses ``dump``'s Task5.1 singlepane guard, so it must carry its own hard REJECT:
@@ -293,6 +298,7 @@ def _spawn_singlepane(
                 predecessor_nonce=predecessor_nonce,
                 prompt_text=prompt_text,
                 queue_dir=queue_dir,
+                wave_id=wave_id,
             )
     except LockHeld as e:
         _err(
@@ -303,7 +309,8 @@ def _spawn_singlepane(
 
 
 def _produce_singlepane(
-    *, cfg, project, task, role, src, nonce, close_policy, predecessor_nonce, prompt_text, queue_dir
+    *, cfg, project, task, role, src, nonce, close_policy, predecessor_nonce, prompt_text,
+    queue_dir, wave_id=None,
 ) -> int:
     sp_dir = cfg.home / project / "singlepane"
     ws_file = sp_dir / f"{task}.handoff.code-workspace"
@@ -322,6 +329,7 @@ def _produce_singlepane(
             spawn_nonce=nonce,
             isolation=ISOLATION_SINGLEPANE,
             predecessor_nonce=predecessor_nonce,
+            wave_id=wave_id,
         )
         _write_uri(queue_dir, task, workspace=src, uri=uri)  # WORKSPACE=real repo ⇒ SINGLEPANE path
     except Exception as e:
@@ -343,7 +351,8 @@ _WORKTREE_LOCK_WAIT = 120.0
 
 
 def _spawn_worktree(
-    *, cfg, project, task, role, src, nonce, close_policy, predecessor_nonce, prompt_text, queue_dir
+    *, cfg, project, task, role, src, nonce, close_policy, predecessor_nonce, prompt_text,
+    queue_dir, wave_id=None,
 ) -> int:
     """Serialize create+publish under the project spawn lock (one critical section).
 
@@ -365,6 +374,7 @@ def _spawn_worktree(
                 predecessor_nonce=predecessor_nonce,
                 prompt_text=prompt_text,
                 queue_dir=queue_dir,
+                wave_id=wave_id,
             )
     except LockHeld as e:
         _err(
@@ -376,7 +386,8 @@ def _spawn_worktree(
 
 
 def _produce_worktree(
-    *, cfg, project, task, role, src, nonce, close_policy, predecessor_nonce, prompt_text, queue_dir
+    *, cfg, project, task, role, src, nonce, close_policy, predecessor_nonce, prompt_text,
+    queue_dir, wave_id=None,
 ) -> int:
     result = _worktree.create_worktree(
         source_workspace=src,
@@ -431,6 +442,7 @@ def _produce_worktree(
             spawn_nonce=nonce,
             isolation=ISOLATION_WORKTREE,
             predecessor_nonce=predecessor_nonce,
+            wave_id=wave_id,
         )
         _write_uri(queue_dir, task, workspace=wt, uri=uri)  # WORKSPACE=worktree dir ⇒ COLD path
     except Exception as e:
@@ -462,6 +474,7 @@ def run_spawn(
     close_policy: str | None = None,
     predecessor_nonce: str | None = None,
     succession_token: str | None = None,
+    wave_id: str | None = None,
 ) -> int:
     """Orchestrate one fresh spawn. Returns ``0`` on success, ``2`` fail-closed (never raises for a
     semantic error; never returns the retro RETRY code 4).
@@ -483,6 +496,15 @@ def run_spawn(
         return EXIT_FAIL_CLOSED
     if predecessor_nonce is not None and not _NONCE_RE.match(predecessor_nonce):
         _err(f"--predecessor-nonce must be lowercase hex: {predecessor_nonce!r}")
+        return EXIT_FAIL_CLOSED
+    # §6c C5: a wave member's sidecar carries its wave_id so the reclaim producer can
+    # detect attempted late-adds against the frozen manifest. Worker-only: a wave is a
+    # parallel WORKER dispatch batch; a succession relay is never a wave member.
+    if wave_id is not None and (not _SLUG_RE.match(wave_id) or len(wave_id) > 60):
+        _err(f"--wave-id must be kebab-case (a-z 0-9 -), ≤60: {wave_id!r}")
+        return EXIT_FAIL_CLOSED
+    if wave_id is not None and role != ROLE_WORKER:
+        _err("--wave-id is only valid for --role worker (a wave is a worker batch)")
         return EXIT_FAIL_CLOSED
     # SHOULD (p6a-fix1): close_policy is an enum the watchdog acts on; an unknown value in
     # the sidecar would be silently unactionable downstream — reject it here instead.
@@ -575,6 +597,7 @@ def run_spawn(
         predecessor_nonce=predecessor_nonce,
         prompt_text=prompt_text,
         queue_dir=queue_dir,
+        wave_id=wave_id,
     )
     if isolation == ISOLATION_WORKTREE:
         rc = _spawn_worktree(**common)
@@ -618,6 +641,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="nonce of the predecessor window a supervisor_succession closes",
     )
     p.add_argument(
+        "--wave-id",
+        default=None,
+        dest="wave_id",
+        help="wave id this worker dispatch belongs to (§6c C5; the coordinator freezes "
+        "the membership manifest afterwards via `handoff worktree wave-freeze`)",
+    )
+    p.add_argument(
         "--succession-token",
         default=None,
         dest="succession_token",
@@ -641,6 +671,7 @@ def main(argv: list[str] | None = None) -> int:
         close_policy=args.close_policy,
         predecessor_nonce=args.predecessor_nonce,
         succession_token=args.succession_token,
+        wave_id=args.wave_id,
     )
 
 
