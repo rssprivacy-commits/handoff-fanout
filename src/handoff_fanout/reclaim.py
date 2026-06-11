@@ -15,10 +15,18 @@ Implements the full reclaim chain for worker worktree windows:
     starts from the coordinator's explicit ``ack/<id>.reclaim_requested`` sentinel
     (JSON ``{run_id, ts}``). Replay-guarded (done markers bind ``run_id``), aged out
     at 24h (``stale-request``), and consumed (``mv → processed/``) on terminal.
-  * **C3** the close URI carries ``role=worker&reason=reclaim&nonce=<spawn_nonce>``
-    plus ``run_id`` + ``issued_at`` (+ the configured ``ack_timeout``) so the
-    extension can reject a late-delivered close with ``close-command-expired``
-    BEFORE any side effect. The nonce is the auth token (CSPRNG, 64-bit hex16 —
+  * **C3** the producer no longer PUSHES a close URI (A-poll revision 2026-06-12):
+    ``open vscode://…`` could only be delivered to ONE window — VS Code routes it to
+    the active/focused window, so a worker window on another desktop never received
+    it and the reclaim died ``ack-timeout``. Reversed to PULL: tick N writes the
+    ``ack/<task>.reclaim_pending.json`` authorization (it carries
+    ``role=worker``, ``reason=reclaim``, ``nonce=<spawn_nonce>``, ``run_id``,
+    ``issued_at`` + the configured ``ack_timeout``) and the TARGET window's extension
+    polls its OWN pending file, rebuilds the same params, and self-closes — so window
+    targeting is intrinsic (each extension only reads its own task's pending), no
+    matter where the window lives. The extension still rejects a stale poll with
+    ``close-command-expired`` (``now - issued_at > ack_timeout``) BEFORE any side
+    effect. The nonce is the auth token (CSPRNG, 64-bit hex16 —
     ``spawn_nonce.new_nonce``'s shape, hard-validated at both ends).
   * **C4** ``abandoned`` is authoritative ONLY in the control plane
     (``<project>/abandoned/<task>.json``, written by ``handoff worktree abandon``);
@@ -28,12 +36,13 @@ Implements the full reclaim chain for worker worktree windows:
     ``<project>/waves/<wave_id>.manifest.json``; same-wave sidecars not in the
     manifest are ignored + audit-marked (attempted late-add); a missing/corrupt
     manifest fails the WHOLE wave closed; a single worker needs no manifest.
-  * **C6** the close window is TOCTOU-free: probe → URI → ack/timeout all happen
-    under the project ``.spawn.lock`` (the same lock every spawn-intent producer
-    holds), held ACROSS ticks via a cross-tick state machine — the watchdog never
-    sleeps in-tick. Tick N fires the URI + writes ``reclaim_pending`` + renews the
-    lock; tick N+1 consumes the extension's ack / enforces the deadline. A crashed
-    holder is reaped by the lock TTL; its pending state is then treated stale.
+  * **C6** the close window is TOCTOU-free: probe → write ``reclaim_pending`` →
+    ack/timeout all happen under the project ``.spawn.lock`` (the same lock every
+    spawn-intent producer holds), held ACROSS ticks via a cross-tick state machine —
+    the watchdog never sleeps in-tick. Tick N writes ``reclaim_pending`` (the
+    extension's poll authorization) + renews the lock; tick N+1 consumes the
+    extension's self-close ack / enforces the deadline. A crashed holder is reaped by
+    the lock TTL; its pending state is then treated stale.
     The live-session probe (transcript mtime) fails CLOSED: any read anomaly ⇒
     unconditionally alive ⇒ never close.
   * **C7** the role×reason whitelist matrix is enforced producer-side here (and
@@ -55,10 +64,8 @@ import json
 import os
 import re
 import secrets
-import subprocess
 import sys
 import time
-import urllib.parse
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -131,7 +138,7 @@ _HEX16_RE = re.compile(r"^[0-9a-f]{16}$")
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$")
 
 ROLE_WORKER = "worker"
-URI_REASON_RECLAIM = "reclaim"
+RECLAIM_REASON = "reclaim"  # the worker×reclaim matrix row; written into the pending
 
 
 def _now_iso() -> str:
@@ -931,27 +938,6 @@ def _maybe_finalize_after_member(
 # ─── request processing (tick N) ─────────────────────────────────────────────────
 
 
-def _open_cmd() -> str:
-    return os.environ.get("HANDOFF_OPEN_CMD", "/usr/bin/open")
-
-
-def build_reclaim_uri(
-    *, project: str, task: str, nonce: str, run_id: str, issued_at: str, ack_timeout: float
-) -> str:
-    """C3 URI. task/project are validated slugs, nonce/run_id hex16; issued_at is
-    percent-encoded (ISO contains ``:`` and ``+``)."""
-    return (
-        "vscode://dharmaxis.handoff-helper/autoclose"
-        f"?task_id={task}&role={ROLE_WORKER}&reason={URI_RECLAIM_REASON}"
-        f"&nonce={nonce}&project={project}&run_id={run_id}"
-        f"&issued_at={urllib.parse.quote(issued_at, safe='')}"
-        f"&ack_timeout={ack_timeout:g}"
-    )
-
-
-URI_RECLAIM_REASON = URI_REASON_RECLAIM  # alias kept near build_reclaim_uri for clarity
-
-
 def _process_request(
     cfg: _config.Config,
     project: str,
@@ -1063,40 +1049,22 @@ def _process_request(
             return
 
         _reset_backoff(cfg, project)
-        # All gates passed under the lock → fire the close URI and transition to the
-        # cross-tick pending state WITHOUT releasing (C6 TOCTOU closure). No sleep.
+        # All gates passed under the lock → write the close AUTHORIZATION (pending) and
+        # transition to the cross-tick pending state WITHOUT releasing (C6 TOCTOU
+        # closure). No sleep, NO push: the producer no longer ``open vscode://…`` (an
+        # untargetable URI — A-poll revision 2026-06-12). The TARGET window's extension
+        # polls this very file, rebuilds the same params, and self-closes — so window
+        # targeting is intrinsic regardless of which desktop the window is on. The
+        # pending therefore carries the full close-param set the extension reconstructs:
+        # role/reason (the C7 worker×reclaim row), nonce (C3 auth, self-targeting
+        # against the window title), run_id + issued_at + ack_timeout (C3 freshness,
+        # reused via the extension's effectiveAckTimeoutMs — a poll past issued_at +
+        # ack_timeout is rejected close-command-expired, so a stale pending can never
+        # close a window a new spawn now occupies).
         with contextlib.suppress(OSError):
             ack_file_path(cfg, project, task).unlink()  # clear any stale ack first
         issued_at = _now_iso()
         ack_timeout = min(cfg.reclaim_ack_timeout, EXT_ACK_TIMEOUT_CAP)
-        uri = build_reclaim_uri(
-            project=project,
-            task=task,
-            nonce=verdict.nonce or "",
-            run_id=run_id,
-            issued_at=issued_at,
-            ack_timeout=ack_timeout,
-        )
-        try:
-            rc = subprocess.run(
-                [_open_cmd(), uri], check=False, timeout=15, capture_output=True
-            ).returncode
-        except (OSError, subprocess.TimeoutExpired):
-            rc = 127
-        if rc != 0:
-            # No URI in flight ⇒ no ack will ever come; enum has no open-failure
-            # member, so this terminal-fails as ack-timeout with an explicit detail
-            # (surfaced in the delivery report as an enum gap).
-            _write_failed(
-                cfg,
-                project,
-                task,
-                reason=REASON_ACK_TIMEOUT,
-                run_id=run_id,
-                detail=f"open_uri_failed rc={rc} — close never dispatched",
-            )
-            _finalize_request_if_terminal(cfg, project, request_id, run_id, members, is_wave)
-            return
         atomic.atomic_replace(
             pending_path(cfg, project, task),
             json.dumps(
@@ -1105,7 +1073,10 @@ def _process_request(
                     "request_id": request_id,
                     "task": task,
                     "project": project,
+                    "role": ROLE_WORKER,
+                    "reason": RECLAIM_REASON,
                     "nonce": verdict.nonce,
+                    "ack_timeout": ack_timeout,
                     "path": verdict.path,
                     "issued_at": issued_at,
                     "deadline_epoch": time.time() + ack_timeout,
@@ -1116,7 +1087,7 @@ def _process_request(
         )
         _renew_lock(cfg, project, run_id)
         hold = True  # ← the ONE exit that keeps the lock (cross-tick state machine)
-        _log(f"{project}/{task}: close URI fired run={run_id}; pending until ack/deadline")
+        _log(f"{project}/{task}: reclaim_pending written run={run_id}; awaiting poll ack/deadline")
     finally:
         if not hold:
             _release_lock(cfg, project)
@@ -1407,7 +1378,6 @@ def cli_reclaim_report(argv: list[str] | None = None) -> int:
 __all__ = [
     "REASONS",
     "tick",
-    "build_reclaim_uri",
     "cli_abandon",
     "cli_record_head",
     "cli_wave_freeze",

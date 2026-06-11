@@ -45,6 +45,11 @@ export const ROLE_SUCCESSION = "supervisor_succession";
 export const REASON_RECLAIM = "reclaim";
 export const REASON_CLOSE_PREDECESSOR = "close_predecessor";
 
+// Coordinator (🧭中枢) windows carry this title prefix and are NEVER §6c reclaim
+// targets (they retire via the succession close_predecessor leg, not reclaim) — so
+// the poller never arms for them. Must match worktree.py ``_COORDINATOR_TITLE_PREFIX``.
+export const COORDINATOR_TITLE_PREFIX = "🧭中枢·";
+
 // Producer-config ack timeout arrives in the URI; cap it so a forged/buggy URI
 // can't declare itself fresh for hours (mirrors reclaim.EXT_ACK_TIMEOUT_CAP).
 export const ACK_TIMEOUT_CAP_S = 600;
@@ -52,6 +57,12 @@ export const ACK_TIMEOUT_DEFAULT_S = 30;
 
 const SLUG_RE = /^[a-z0-9][a-z0-9-]*[a-z0-9]$/;
 const RUN_ID_RE = /^[0-9a-f]{16}$/;
+
+/** A reclaim run_id is the CSPRNG hex16 the producer minted; the dedupe set (and any
+ *  "never write an ack under a forged run" guard) keys on it. */
+export function isValidRunId(runId: string | null | undefined): runId is string {
+  return typeof runId === "string" && RUN_ID_RE.test(runId);
+}
 
 /** The producer-facing ack payload (subset of reclaim.py's 18-reason enum). */
 export interface AckIntent {
@@ -244,4 +255,119 @@ export async function handleReclaim(
     }),
     close.closedCount,
   );
+}
+
+// ── A-poll revision (2026-06-12): the producer no longer PUSHES a close URI ───────
+//
+// Root cause it fixes: `open vscode://…` is delivered to ONE window (VS Code routes
+// it to the active/focused window), so a worker window on another desktop never
+// received its reclaim and the producer always timed out `ack-timeout`. The fix
+// reverses push→pull: the producer writes `ack/<task>.reclaim_pending.json` (its
+// post-gate authorization), and THIS window's extension polls its OWN pending file,
+// rebuilds the same close params, and runs the UNCHANGED `handleReclaim` decision
+// core. Window targeting is now intrinsic — an extension only ever reads its own
+// task's pending — so it works regardless of which desktop the window is on.
+//
+// All four §6c invariants are preserved because the poll path funnels into the same
+// `handleReclaim`: (C3) nonce self-targeting against the window title; (C3 M4)
+// freshness — a pending polled past `issued_at + ack_timeout` is rejected
+// `close-command-expired`, so a STALE pending can never close a window a new spawn
+// now occupies (and even a lingering pending carries the OLD nonce, which a new
+// window's title won't match → `not-this-window`); (C7) fail-closed — a mechanically
+// failed close writes NO `done`, so the producer's `ack-timeout` still decides; the
+// dirty gate still refuses any window with unsaved work.
+
+/** This window's identity, parsed from its title, IFF it is a worker WORKTREE window
+ *  (the only §6c reclaim target). */
+export interface WorktreeWorkerIdentity {
+  project: string;
+  task: string;
+}
+
+/**
+ * Parse a worker-worktree identity from the window title, or null if this window is
+ * not a §6c reclaim target. The engine's `worktree.inject_vscode_workspace` writes
+ * the title as `spawn_nonce.title_for` + the worktree marker:
+ *   "<project> · <task> · <role> · <nonce> [worktree]${separator}${activeEditorShort}"
+ * Coordinator windows are `🧭中枢·`-prefixed (succession leg, not reclaim) → null.
+ * Non-worker roles, non-worktree titles, or malformed slugs/nonce → null (no poller).
+ * Pure: only the identity needed to LOCATE the pending file; the nonce auth check
+ * stays in `handleReclaim` (re-read from the live title at close time).
+ */
+export function parseWorktreeWorkerIdentity(
+  title: string | undefined,
+): WorktreeWorkerIdentity | null {
+  if (typeof title !== "string") return null;
+  if (title.startsWith(COORDINATOR_TITLE_PREFIX)) return null; // 🧭中枢 → not a worker
+  if (!title.includes("[worktree]")) return null; // worktree-isolation windows only
+  const segs = title.split(" · ");
+  if (segs.length < 4) return null;
+  const project = segs[0];
+  const task = segs[1];
+  const role = segs[2];
+  const nonce = (segs[3] ?? "").split(/\s/)[0] ?? ""; // strip " [worktree]…" suffix
+  if (role !== ROLE_WORKER) return null;
+  if (!SLUG_RE.test(project) || !SLUG_RE.test(task) || !isValidNonce(nonce)) return null;
+  return { project, task };
+}
+
+/**
+ * Reconstruct close params from a polled `reclaim_pending` payload, or null if it is
+ * missing a field the gate chain needs (a torn write / a pre-A-poll pending). The
+ * pending is the producer's authorization signal; it carries the exact param set the
+ * removed URI used to (role/reason/nonce/run_id/issued_at/ack_timeout) so the poll
+ * path runs `handleReclaim`'s FULL matrix + freshness + nonce + dirty unchanged.
+ */
+export function pendingToParams(pending: unknown): HandoffCloseParams | null {
+  if (!pending || typeof pending !== "object") return null;
+  const p = pending as Record<string, unknown>;
+  const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
+  const task = str(p.task);
+  const project = str(p.project);
+  const runId = str(p.run_id);
+  if (!task || !project || !runId) return null;
+  return {
+    task,
+    project,
+    nonce: str(p.nonce),
+    role: str(p.role),
+    reason: str(p.reason),
+    runId,
+    issuedAt: str(p.issued_at),
+    ackTimeout: p.ack_timeout != null ? String(p.ack_timeout) : null,
+    predecessorNonce: null,
+  };
+}
+
+/** Injected side effects for one poll pass — keeps the loop logic pure/testable
+ *  (no fs, no vscode, no timers). The glue supplies the real reads/writes. */
+export interface PollReclaimDeps extends ReclaimDeps {
+  /** The parsed `reclaim_pending.json` for THIS window's task, or null if absent. */
+  readPending: () => unknown | null;
+  /** Land the producer-facing ack bytes (temp+rename in the glue). */
+  writeAck: (ack: AckIntent) => void;
+  /** run_ids already acted on — shared with the legacy URI leg so a run is closed
+   *  by EXACTLY one path (the pending lingers until the producer consumes the ack,
+   *  so the next poll would otherwise re-fire). */
+  handled: Set<string>;
+}
+
+/**
+ * One poll pass: if THIS window's pending names a not-yet-handled run, run the close
+ * decision and land its ack. Returns the ReclaimResult, or null when there is nothing
+ * to do (no pending / unparseable / already handled). Idempotent and re-entrancy-safe
+ * to call repeatedly. The `handled` set is updated BEFORE the (async) close so an
+ * overlapping pass can never double-fire the same run.
+ */
+export async function pollReclaimOnce(deps: PollReclaimDeps): Promise<ReclaimResult | null> {
+  const pending = deps.readPending();
+  if (pending == null) return null;
+  const params = pendingToParams(pending);
+  if (!params || !isValidRunId(params.runId)) return null;
+  if (deps.handled.has(params.runId)) return null; // already closed by poll or URI
+  deps.handled.add(params.runId);
+  const res = await handleReclaim(params, deps);
+  deps.log(`[handoff-helper] reclaim poll: run=${params.runId} → ${res.reason}`);
+  if (res.ack) deps.writeAck(res.ack);
+  return res;
 }

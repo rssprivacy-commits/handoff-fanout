@@ -14,7 +14,20 @@ import {
   parseQuery,
   runStartupSinglePane,
 } from "./handoffClose";
-import { AckIntent, ReclaimDeps, handleReclaim } from "./handoffReclaim";
+import {
+  AckIntent,
+  ReclaimDeps,
+  handleReclaim,
+  isValidRunId,
+  parseWorktreeWorkerIdentity,
+  pollReclaimOnce,
+} from "./handoffReclaim";
+
+// §6c A-poll: how often each worker-worktree window polls its own reclaim_pending
+// file. 7s sits inside the contract's 5–10s band and gives ~4 attempts inside the
+// 30s default reclaim_ack_timeout (the freshness window the producer grants), so a
+// non-throttled background window reliably self-closes before its deadline.
+const RECLAIM_POLL_INTERVAL_MS = 7_000;
 
 // §6c reclaim ack sink (contract C2/C6): the watchdog producer resolves its
 // cross-tick pending state by reading `~/.claude-handoff/<project>/ack/
@@ -36,8 +49,96 @@ function writeReclaimAck(intent: AckIntent, log: (msg: string) => void): void {
   }
 }
 
+// §6c A-poll (2026-06-12): start the per-window reclaim poller. If THIS window is a
+// worker WORKTREE window (its title parses to a worker identity), it polls its OWN
+// `~/.claude-handoff/<project>/ack/<task>.reclaim_pending.json` every interval; when
+// the producer authorizes a reclaim (writes that pending), the window self-closes via
+// the unchanged handleReclaim core and lands the ack the watchdog consumes. A
+// `busy` guard makes overlapping ticks a no-op (a slow close never double-runs); the
+// shared `handled` set (with the legacy URI leg) makes each run close exactly once.
+// Returns a Disposable that clears the interval on deactivate. Non-worker/coordinator
+// windows get an inert disposable — the poller never arms for them.
+function startReclaimPoller(
+  makeReclaimDeps: () => ReclaimDeps,
+  reclaimHandled: Set<string>,
+  log: (msg: string) => void,
+): vscode.Disposable {
+  const title = vscode.workspace.getConfiguration("window").get<string>("title");
+  const identity = parseWorktreeWorkerIdentity(title);
+  if (!identity) {
+    log("[handoff-helper] reclaim poll: not a worker worktree window — poller inert");
+    return { dispose() {} };
+  }
+  const pendingPath = path.join(
+    os.homedir(),
+    ".claude-handoff",
+    identity.project,
+    "ack",
+    `${identity.task}.reclaim_pending.json`,
+  );
+  log(
+    `[handoff-helper] reclaim poll: ${identity.project}/${identity.task} watching ` +
+      `${pendingPath} every ${RECLAIM_POLL_INTERVAL_MS}ms`,
+  );
+  let busy = false;
+  const tick = async (): Promise<void> => {
+    if (busy) return; // a slow close must not overlap the next interval
+    busy = true;
+    try {
+      await pollReclaimOnce({
+        ...makeReclaimDeps(),
+        handled: reclaimHandled,
+        readPending: () => {
+          let raw: string;
+          try {
+            raw = fs.readFileSync(pendingPath, "utf8");
+          } catch {
+            return null; // absent/unreadable → nothing to do this tick
+          }
+          try {
+            return JSON.parse(raw);
+          } catch {
+            return null; // torn write mid-rename → next tick re-reads
+          }
+        },
+        writeAck: (ack) => writeReclaimAck(ack, log),
+      });
+    } catch (err) {
+      log(`[handoff-helper] reclaim poll error: ${String(err)}`);
+    } finally {
+      busy = false;
+    }
+  };
+  const timer = setInterval(() => {
+    void tick();
+  }, RECLAIM_POLL_INTERVAL_MS);
+  return {
+    dispose() {
+      clearInterval(timer);
+    },
+  };
+}
+
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Handoff Helper");
+  const log = (msg: string) => output.appendLine(msg);
+
+  // §6c reclaim run_ids already acted on. SHARED between the poll path (primary, since
+  // the A-poll revision) and the legacy URI path (now producerless — the engine polls
+  // instead of pushing), so a run is closed + acked by EXACTLY one path. The poll
+  // re-reads the lingering pending every interval until the producer consumes the ack,
+  // so without this it would re-fire; and a stray URI for an already-handled run no-ops.
+  const reclaimHandled = new Set<string>();
+  const makeReclaimDeps = (): ReclaimDeps => ({
+    getAllTabs: () =>
+      vscode.window.tabGroups.all.flatMap((g) => g.tabs) as unknown as TabLike[],
+    closeTabs: (tabs) =>
+      Promise.resolve(vscode.window.tabGroups.close(tabs as unknown as vscode.Tab[], true)),
+    delay: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    log,
+    windowTitle: () => vscode.workspace.getConfiguration("window").get<string>("title"),
+    now: () => Date.now(),
+  });
 
   // SINGLE-PANE ON STARTUP (onStartupFinished): if THIS window is a handoff worktree, collapse its side bars as
   // soon as it finishes loading — so a cold-spawned window is single-pane on load, not after the submit. Guarded
@@ -71,30 +172,27 @@ export function activate(context: vscode.ExtensionContext): void {
       }
 
       // /autoclose with a `reason` param — the §6c role×reason-matrixed path (contract
-      // v4 C3/C7). worker+reclaim → the nonce-self-targeting reclaim close (expiry-
-      // checked BEFORE any side effect; acks written for the producer's state machine);
+      // v4 C3/C7). worker+reclaim → the nonce-self-targeting reclaim close;
       // succession+close_predecessor → delegated to the legacy handleAutoclose below;
       // any other combo → fail-closed + role-reason-rejected ack. A URI WITHOUT a
       // reason keeps the pre-§6c legacy route byte-identical.
+      //
+      // A-poll note (2026-06-12): the engine no longer PUSHES this URI for reclaim (it
+      // writes a pending the window polls instead), so this leg is now reached in
+      // production only by the succession delegate (close_predecessor). It is kept for
+      // that delegation + as a defence-in-depth receiver for any stray reclaim URI,
+      // sharing `reclaimHandled` with the poll path so a run is never double-closed.
       if (isClosePath(uri.path) && params.reason != null) {
-        const deps: ReclaimDeps = {
-          getAllTabs: () =>
-            vscode.window.tabGroups.all.flatMap((g) => g.tabs) as unknown as TabLike[],
-          closeTabs: (tabs) =>
-            Promise.resolve(
-              vscode.window.tabGroups.close(tabs as unknown as vscode.Tab[], true),
-            ),
-          delay: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-          log: (msg) => output.appendLine(msg),
-          windowTitle: () => vscode.workspace.getConfiguration("window").get<string>("title"),
-          now: () => Date.now(),
-        };
+        if (isValidRunId(params.runId) && reclaimHandled.has(params.runId)) {
+          log(`[handoff-helper] reclaim URI: run ${params.runId} already handled (poll) — ignoring`);
+          return;
+        }
+        const deps = makeReclaimDeps();
         try {
           const res = await handleReclaim(params, deps);
-          if (res.ack) {
-            writeReclaimAck(res.ack, deps.log);
-          }
           if (res.reason !== "delegate-legacy") {
+            if (isValidRunId(params.runId)) reclaimHandled.add(params.runId);
+            if (res.ack) writeReclaimAck(res.ack, deps.log);
             return;
           }
           // fall through: succession+close_predecessor rides the legacy §6 gates below.
@@ -134,8 +232,17 @@ export function activate(context: vscode.ExtensionContext): void {
     },
   };
 
-  context.subscriptions.push(vscode.window.registerUriHandler(handler), output);
-  output.appendLine("[handoff-helper] activated, URI handler registered");
+  // §6c A-poll: arm the reclaim poller for THIS window (inert unless it is a worker
+  // worktree window). Disposed via subscriptions → its interval is cleared on
+  // deactivate / window close.
+  const reclaimPoller = startReclaimPoller(makeReclaimDeps, reclaimHandled, log);
+
+  context.subscriptions.push(
+    vscode.window.registerUriHandler(handler),
+    reclaimPoller,
+    output,
+  );
+  output.appendLine("[handoff-helper] activated, URI handler + reclaim poller registered");
 }
 
 export function deactivate(): void {

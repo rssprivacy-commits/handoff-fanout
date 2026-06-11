@@ -45,9 +45,11 @@ def _commit_file(repo: Path, name: str, content: str = "x") -> str:
 
 @pytest.fixture
 def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
-    """A real origin (bare) + project repo + handoff home, with the open(1) command
-    stubbed to a recorder so a fired close URI is observable, and no probe by
-    default in callers (tests pass an explicit adapter)."""
+    """A real origin (bare) + project repo + handoff home. Since the A-poll revision
+    (2026-06-12) the producer no longer PUSHES a close URI — it writes the
+    ``reclaim_pending`` authorization that the TARGET window's extension polls — so the
+    "close authorized" signal is the pending file (``_pending``), not a fired URI. No
+    probe by default in callers (tests pass an explicit adapter)."""
     home = tmp_path / "handoff"
     home.mkdir()
     monkeypatch.setenv("HANDOFF_HOME", str(home))
@@ -69,12 +71,6 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     (home / "config.json").write_text(json.dumps({"workspace_root": str(ws_root)}))
     cfg = _config.load()
 
-    opened = tmp_path / "opened.txt"
-    stub = tmp_path / "open.sh"
-    stub.write_text(f'#!/bin/sh\necho "$1" >> "{opened}"\n')
-    stub.chmod(0o755)
-    monkeypatch.setenv("HANDOFF_OPEN_CMD", str(stub))
-
     claude_root = tmp_path / "claude-projects"
     claude_root.mkdir()
     probe = reclaim.TranscriptProbeAdapter(idle_sec=600.0, projects_root=claude_root)
@@ -84,7 +80,6 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         cfg=cfg,
         repo=repo,
         origin=origin,
-        opened=opened,
         probe=probe,
         claude_root=claude_root,
         tmp=tmp_path,
@@ -201,7 +196,7 @@ def test_requested_sentinel_required_no_sweep(env):
     _make_worker(env)
     assert _tick(env) == 0  # no sentinel → the watchdog NEVER sweeps on its own
     assert _failed(env) is None and _done(env) is None
-    assert not env.opened.exists()
+    assert _pending(env) is None  # no close authorized (no pending written)
 
 
 def test_full_merged_reclaim_happy_path(env):
@@ -209,14 +204,15 @@ def test_full_merged_reclaim_happy_path(env):
     _request(env)
     _tick(env)
 
-    # Tick N: URI fired, pending written, lock HELD (C6 — no sleep, no release).
-    assert env.opened.exists()
-    uri = env.opened.read_text().strip()
-    assert "role=worker" in uri and "reason=reclaim" in uri
-    assert f"nonce={NONCE}" in uri and f"run_id={RUN_ID}" in uri
-    assert "issued_at=" in uri and "ack_timeout=30" in uri
+    # Tick N: reclaim_pending written (the poll authorization — A-poll, no push URI),
+    # lock HELD (C6 — no sleep, no release). The pending carries the FULL close-param
+    # set the extension reconstructs: role/reason (C7 row), nonce (C3 auth), run_id +
+    # issued_at + ack_timeout (C3 freshness — reused via effectiveAckTimeoutMs).
     pending = _pending(env)
     assert pending and pending["run_id"] == RUN_ID
+    assert pending["role"] == "worker" and pending["reason"] == "reclaim"
+    assert pending["nonce"] == NONCE
+    assert pending["issued_at"] and pending["ack_timeout"] == 30
     assert (env.home / PROJECT / ".spawn.lock").is_dir()
 
     # Extension acks done → tick N+1 finalizes: done marker carries the C1 evidence
@@ -241,10 +237,9 @@ def test_replay_same_run_id_skipped(env):
     _ext_ack(env, run_id=RUN_ID, result="done")
     _tick(env)
     assert _done(env)
-    env.opened.unlink()
     _request(env, run_id=RUN_ID)  # replayed sentinel, SAME run_id
     _tick(env)
-    assert not env.opened.exists()  # no second close fired
+    assert _pending(env) is None  # no second authorization written (replay guard)
     assert not reclaim.requested_path(env.cfg, PROJECT, TASK).exists()  # consumed
 
 
@@ -257,7 +252,7 @@ def test_stale_sentinel_24h_invalidated(env):
     failed = _failed(env)
     assert failed and failed["reason"] == "stale-request"
     assert not sent.exists()  # consumed → never re-alerts
-    assert not env.opened.exists()
+    assert _pending(env) is None  # no close authorized (no pending written)
 
 
 def test_malformed_sentinel_consumed_as_stale(env):
@@ -285,7 +280,7 @@ def test_p0_1_stale_tracking_ref_not_misjudged(env):
     _tick(env)
     failed = _failed(env)
     assert failed and failed["reason"] == "not-merged"
-    assert not env.opened.exists()
+    assert _pending(env) is None  # no close authorized (no pending written)
 
 
 def test_p0_2_forged_old_ready_sha_head_drift(env):
@@ -300,7 +295,7 @@ def test_p0_2_forged_old_ready_sha_head_drift(env):
     _tick(env)
     failed = _failed(env)
     assert failed and failed["reason"] == "head-drift"
-    assert not env.opened.exists()
+    assert _pending(env) is None  # no close authorized (no pending written)
 
 
 def test_p0_3_head_moved_after_record_head_drift(env):
@@ -365,7 +360,7 @@ def test_canonical_remote_unresolvable_fail_closed(env):
     failed = _failed(env)
     assert failed and failed["reason"] == "ref-fetch-failed"
     assert "canonical remote" in failed["detail"]
-    assert not env.opened.exists()
+    assert _pending(env) is None  # no close authorized (no pending written)
 
 
 def test_fetch_failure_nonterminal_with_backoff(env):
@@ -381,9 +376,9 @@ def test_fetch_failure_nonterminal_with_backoff(env):
     assert failed["terminal"] is False
     assert reclaim.requested_path(env.cfg, PROJECT, TASK).exists()  # not consumed
     assert reclaim._backoff_active(env.cfg, PROJECT)
-    env.opened.write_text("") if env.opened.exists() else None
-    _tick(env)  # within the backoff window → no new fetch attempt / no URI
-    assert not env.opened.read_text() if env.opened.exists() else True
+    assert _pending(env) is None  # fetch failed before any authorization
+    _tick(env)  # within the backoff window → no new fetch attempt / no authorization
+    assert _pending(env) is None
 
 
 # ─── C4: abandoned path (incl. P0 #4) ────────────────────────────────────────────
@@ -401,7 +396,7 @@ def test_p0_4_forged_worktree_abandon_marker_rejected(env):
     _tick(env)
     failed = _failed(env)
     assert failed and failed["reason"] == "abandon-authority-invalid"
-    assert not env.opened.exists()
+    assert _pending(env) is None  # no close authorized (no pending written)
     assert wt.exists()
 
 
@@ -415,7 +410,7 @@ def test_abandon_cli_grants_eligibility_and_reclaim_force_removes(env):
     assert (wt / ".handoff-abandoned.json").exists()  # audit copy
     _request(env)
     _tick(env)
-    assert env.opened.exists()  # eligible via the abandoned path
+    assert _pending(env) is not None  # eligible via the abandoned path → authorized
     _ext_ack(env, run_id=RUN_ID, result="done")
     _tick(env)
     done = _done(env)
@@ -479,7 +474,7 @@ def test_sidecar_missing_fail_closed(env):
     _tick(env)
     failed = _failed(env)
     assert failed and failed["reason"] == "manifest-missing"
-    assert not env.opened.exists()
+    assert _pending(env) is None  # no close authorized (no pending written)
 
 
 def test_wave_member_sidecar_missing_nonce_mismatch(env):
@@ -503,7 +498,7 @@ def test_sidecar_malformed_nonce_rejected(env):
     _tick(env)
     failed = _failed(env)
     assert failed and failed["reason"] == "nonce-mismatch"
-    assert not env.opened.exists()
+    assert _pending(env) is None  # no close authorized (no pending written)
 
 
 def test_non_worker_or_non_worktree_matrix_rejected(env):
@@ -528,7 +523,7 @@ def test_dirty_gate_covers_untracked(env):
     _tick(env)
     failed = _failed(env)
     assert failed and failed["reason"] == "dirty"
-    assert not env.opened.exists()
+    assert _pending(env) is None  # no close authorized (no pending written)
 
 
 def test_probe_live_session_blocks_close(env):
@@ -538,7 +533,7 @@ def test_probe_live_session_blocks_close(env):
     _tick(env)
     failed = _failed(env)
     assert failed and failed["reason"] == "live-session"
-    assert not env.opened.exists()
+    assert _pending(env) is None  # no close authorized (no pending written)
 
 
 def test_probe_missing_dir_probe_error_no_close(env):
@@ -553,7 +548,7 @@ def test_probe_missing_dir_probe_error_no_close(env):
     _tick(env)
     failed = _failed(env)
     assert failed and failed["reason"] == "probe-error"
-    assert not env.opened.exists()
+    assert _pending(env) is None  # no close authorized (no pending written)
 
 
 def test_probe_disabled_config_skips_probe(env):
@@ -565,7 +560,7 @@ def test_probe_disabled_config_skips_probe(env):
     _make_transcript(env, wt, age_sec=10)  # would be LIVE — but the owner disabled it
     _request(env)
     _tick(env)
-    assert env.opened.exists()  # proceeded (owner accepted the risk explicitly)
+    assert _pending(env) is not None  # proceeded (owner accepted the risk explicitly)
 
 
 # ─── C6: cross-tick state machine + lock discipline ──────────────────────────────
@@ -801,7 +796,7 @@ def test_reclaim_report_read_only(env, capsys):
     out = capsys.readouterr().out
     assert f"{PROJECT}/{TASK}" in out
     assert "no reclaim_requested sentinel" in out
-    assert not env.opened.exists()  # READ-ONLY: never fires
+    assert _pending(env) is None  # READ-ONLY: never authorizes a close
     assert not (env.home / PROJECT / ".spawn.lock").exists()
 
 
