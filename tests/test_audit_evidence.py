@@ -124,7 +124,9 @@ def test_fail_when_changed_files_differ(repo_with_range, tmp_path):
     audits = tmp_path / "audits"
     _write_evidence(
         audits,
+        reviewed_base_sha=base,
         reviewed_patch_id=facts.patch_id,
+        diff_sha256=facts.diff_sha256,
         changed_files=["some/other/file.py"],
     )
     r = check_range(repo, base, head, audits, env={})
