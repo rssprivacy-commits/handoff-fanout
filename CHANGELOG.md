@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — delivery-audit machine gate (2026-06-12, hf pilot)
+- **`handoff audit-check`** (`src/handoff_fanout/audit_evidence.py`): verifies a git range
+  against machine audit evidence (`~/.claude-handoff/<project>/audits/*.evidence.json`).
+  Match paths: head_sha (base must be present AND equal) / patch-id (base presence required;
+  same-base additionally binds `diff_sha256` byte-exact; cross-base keeps cherry-pick/rebase
+  tolerance via patch-id + changed_files). Verdict ruling is full-scan priority:
+  RED-without-override FAILs even with coexisting GREEN; MIXED/ERROR is a conflict
+  (only `audit_unavailable` bypass clears it, never RED); then override > GREEN > bypass.
+- **`handoff audit-override`**: owner-only RED override — tty-gated (double isatty + typed
+  OVERRIDE confirm), writes checksum-bound `owner_ack` (tamper-evident friction binding,
+  NOT a cryptographic signature). AI sessions cannot run it.
+- **Three git hooks** (`install/git-hooks/`, wired by `install.sh`): `pre-push` blocks
+  un-audited pushes to main (fail-closed when the CLI is missing; one-shot range-scoped
+  bypass with five mandatory trail fields); `post-merge` warns + writes `.audit_pending`
+  (never blocks, exit 0); `post-commit` gains a deploy gate — launcher auto-deploy is
+  skipped (loudly) when the deploy-asset range lacks evidence.
+- Companion (dharmaxis repo): `dual-brain-runner.py` evidence-v1 — always writes
+  `<out>.evidence.json` sidecar (brain verdicts, overall_verdict, brief_sha256, git
+  binding fields via `--evidence-repo/--evidence-range`); explicit evidence mode exits 5
+  if the sidecar cannot be written. Ops runbook: dharmaxis
+  `project-files/handoff/audit-gate-runbook.md`.
+- 59 new tests (full suite 1590 passed / 3 skipped). Pilot scope = this repo only,
+  one-week observation to 2026-06-19 before any rollout.
+
+> Note: chain work 1.12.0→here (spawn-window go-live, warmgap-C, §6c reclaim, watchdog
+> mode-5 fix) shipped without CHANGELOG entries during the ops sprint — backfill tracked
+> in project memory open-loops.
+
 ## [1.12.0] — 2026-06-08
 
 MINOR — **per-project gating of ALL injection vectors** (closes a cross-project leak) +
