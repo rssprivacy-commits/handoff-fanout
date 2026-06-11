@@ -77,7 +77,7 @@ def _owner_ack(patch_id: str, reason: str = "owner accepts residual risk") -> di
 def test_pass_on_head_sha_match(repo_with_range, tmp_path):
     repo, base, head = repo_with_range
     audits = tmp_path / "audits"
-    _write_evidence(audits, reviewed_head_sha=head)
+    _write_evidence(audits, reviewed_base_sha=base, reviewed_head_sha=head)
     r = check_range(repo, base, head, audits, env={})
     assert r.ok and r.status == "PASS"
 
@@ -161,13 +161,17 @@ def test_head_sha_passes_when_base_bound_and_equal(repo_with_range, tmp_path):
     assert r.ok and "head_sha" in r.reason
 
 
-def test_head_sha_legacy_evidence_without_base_still_passes(repo_with_range, tmp_path):
-    """Backward compat: evidence predating reviewed_base_sha keeps the direct path."""
+def test_head_sha_evidence_without_base_fails_closed(repo_with_range, tmp_path):
+    """MUST-A (sw-ag-fix2): NO legacy evidence exists — the evidence-v1 runner
+    (the first and only producer) has always emitted reviewed_base_sha alongside
+    reviewed_head_sha, so a record missing the base is suspect, not legacy.
+    head_sha alone must NOT take the direct path; with no patch-id either the
+    record matches nothing."""
     repo, base, head = repo_with_range
     audits = tmp_path / "audits"
     _write_evidence(audits, reviewed_head_sha=head)
     r = check_range(repo, base, head, audits, env={})
-    assert r.ok and r.status == "PASS"
+    assert not r.ok and "无匹配" in r.reason
 
 
 # ─── same-base byte binding (MUST-3: patch-id ignores whitespace) ────────────
@@ -199,6 +203,25 @@ def test_same_base_whitespace_tamper_fails(git_repo: Path, tmp_path):
         changed_files=reviewed.changed_files,
     )
     r = check_range(git_repo, base, tampered_head, audits, env={})
+    assert not r.ok and "无匹配" in r.reason
+
+
+def test_same_base_evidence_missing_diff_sha256_fails_closed(repo_with_range, tmp_path):
+    """MUST-B (sw-ag-fix2): on the SAME base the byte-exact diff_sha256 bind is
+    mandatory — evidence-v1 always emits it, so a same-base record missing it is
+    suspect, not legacy («有则校验无则放过» would let a whitespace-tampered diff
+    ride through on patch-id alone)."""
+    repo, base, head = repo_with_range
+    facts = range_facts(repo, base, head)
+    audits = tmp_path / "audits"
+    _write_evidence(
+        audits,
+        reviewed_base_sha=facts.base_sha,
+        reviewed_patch_id=facts.patch_id,
+        changed_files=facts.changed_files,
+        # no reviewed_head_sha → forces the patch-id path; no diff_sha256
+    )
+    r = check_range(repo, base, head, audits, env={})
     assert not r.ok and "无匹配" in r.reason
 
 
@@ -235,7 +258,7 @@ def test_cross_base_cherry_pick_still_passes_with_full_evidence(git_repo: Path, 
 def test_red_fails_without_override(repo_with_range, tmp_path):
     repo, base, head = repo_with_range
     audits = tmp_path / "audits"
-    _write_evidence(audits, reviewed_head_sha=head, overall_verdict="RED")
+    _write_evidence(audits, reviewed_base_sha=base, reviewed_head_sha=head, overall_verdict="RED")
     r = check_range(repo, base, head, audits, env={})
     assert not r.ok and "RED" in r.reason and "audit-override" in r.reason
 
@@ -246,6 +269,7 @@ def test_red_passes_with_valid_override_highlighted(repo_with_range, tmp_path):
     audits = tmp_path / "audits"
     _write_evidence(
         audits,
+        reviewed_base_sha=base,
         reviewed_head_sha=head,
         reviewed_patch_id=facts.patch_id,
         overall_verdict="RED",
@@ -266,6 +290,7 @@ def test_red_fails_with_tampered_checksum(repo_with_range, tmp_path):
     audits = tmp_path / "audits"
     _write_evidence(
         audits,
+        reviewed_base_sha=base,
         reviewed_head_sha=head,
         reviewed_patch_id=facts.patch_id,
         overall_verdict="RED",
@@ -301,9 +326,25 @@ def test_fail_no_evidence_with_guidance(repo_with_range, tmp_path, capsys):
 def test_mixed_or_error_verdict_fails_closed(repo_with_range, tmp_path, verdict):
     repo, base, head = repo_with_range
     audits = tmp_path / "audits"
-    _write_evidence(audits, reviewed_head_sha=head, overall_verdict=verdict)
+    _write_evidence(audits, reviewed_base_sha=base, reviewed_head_sha=head, overall_verdict=verdict)
     r = check_range(repo, base, head, audits, env={})
     assert not r.ok and verdict in r.reason
+
+
+def test_green_plus_mixed_conflict_fails(repo_with_range, tmp_path):
+    """P2 (sw-ag-fix2): a matched-but-never-completed audit (MIXED/ERROR) is a
+    conflict even when a GREEN also matches — same「冲突即拒」semantics as the
+    RED priority; a GREEN must not outvote a half-dead audit of the same content."""
+    repo, base, head = repo_with_range
+    audits = tmp_path / "audits"
+    _write_evidence(audits, name="green", reviewed_base_sha=base, reviewed_head_sha=head)
+    _write_evidence(
+        audits, name="mixed",
+        reviewed_base_sha=base, reviewed_head_sha=head, overall_verdict="MIXED",
+    )
+    r = check_range(repo, base, head, audits, env={})
+    assert not r.ok and r.status == "FAIL"
+    assert "MIXED" in r.reason and "冲突" in r.reason
 
 
 @pytest.mark.parametrize(
@@ -319,8 +360,12 @@ def test_red_without_override_fails_regardless_of_green(repo_with_range, tmp_pat
     matches a RED is unfixed content.)"""
     repo, base, head = repo_with_range
     audits = tmp_path / "audits"
-    p_old = _write_evidence(audits, name="older", reviewed_head_sha=head, overall_verdict=older)
-    _write_evidence(audits, name="newer", reviewed_head_sha=head, overall_verdict=newer)
+    p_old = _write_evidence(
+        audits, name="older", reviewed_base_sha=base, reviewed_head_sha=head, overall_verdict=older
+    )
+    _write_evidence(
+        audits, name="newer", reviewed_base_sha=base, reviewed_head_sha=head, overall_verdict=newer
+    )
     # pin mtime ordering so the test exercises recency in the direction it claims
     import os as _os
     old_stat = p_old.stat()
@@ -336,9 +381,12 @@ def test_red_with_valid_override_outranks_plain_green(repo_with_range, tmp_path)
     repo, base, head = repo_with_range
     facts = range_facts(repo, base, head)
     audits = tmp_path / "audits"
-    _write_evidence(audits, name="green", reviewed_head_sha=head, overall_verdict="GREEN")
+    _write_evidence(
+        audits, name="green", reviewed_base_sha=base, reviewed_head_sha=head, overall_verdict="GREEN"
+    )
     _write_evidence(
         audits, name="red-ov",
+        reviewed_base_sha=base,
         reviewed_head_sha=head,
         reviewed_patch_id=facts.patch_id,
         overall_verdict="RED",
@@ -370,7 +418,7 @@ def test_override_writes_valid_ack(repo_with_range, tmp_path, monkeypatch):
     facts = range_facts(repo, base, head)
     audits = tmp_path / "audits"
     ev = _write_evidence(
-        audits, reviewed_head_sha=head,
+        audits, reviewed_base_sha=base, reviewed_head_sha=head,
         reviewed_patch_id=facts.patch_id, overall_verdict="RED",
     )
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
@@ -477,7 +525,7 @@ def test_bypass_does_not_clear_matched_red(repo_with_range, tmp_path):
     a matched RED verdict can never be washed away by the emergency bypass."""
     repo, base, head = repo_with_range
     audits = tmp_path / "audits"
-    _write_evidence(audits, reviewed_head_sha=head, overall_verdict="RED")
+    _write_evidence(audits, reviewed_base_sha=base, reviewed_head_sha=head, overall_verdict="RED")
     _write_bypass(audits, _bypass_record(repo, base, head))
     r = check_range(repo, base, head, audits, env={BYPASS_ENV: "1"})
     assert not r.ok and "RED" in r.reason
@@ -508,7 +556,7 @@ def test_bypass_bare_head_scope_rejected(repo_with_range, tmp_path):
 def test_cli_audit_check_dispatch(repo_with_range, tmp_path, capsys):
     repo, base, head = repo_with_range
     audits = tmp_path / "audits"
-    _write_evidence(audits, reviewed_head_sha=head)
+    _write_evidence(audits, reviewed_base_sha=base, reviewed_head_sha=head)
     rc = cli_main(
         ["audit-check", "--repo", str(repo), "--range", f"{base}..{head}",
          "--audits-dir", str(audits)]
@@ -533,7 +581,7 @@ def test_pending_marker_written_on_fail_and_cleared_on_pass(repo_with_range, tmp
     marker = audits / ".audit_pending"
     assert marker.exists()
     assert f"{base}..{head}" in marker.read_text(encoding="utf-8")
-    _write_evidence(audits, reviewed_head_sha=head)
+    _write_evidence(audits, reviewed_base_sha=base, reviewed_head_sha=head)
     assert main_check(args) == 0
     assert not marker.exists(), "a passing check must clear the pending marker"
 
@@ -551,7 +599,7 @@ def test_default_audits_dir_honours_handoff_home(repo_with_range, isolated_hando
     """Without --audits-dir the checker resolves $HANDOFF_HOME/<project>/audits."""
     repo, base, head = repo_with_range
     audits = isolated_handoff_home / repo.name / "audits"
-    _write_evidence(audits, reviewed_head_sha=head)
+    _write_evidence(audits, reviewed_base_sha=base, reviewed_head_sha=head)
     rc = main_check(["--repo", str(repo), "--range", f"{base}..{head}"])
     assert rc == 0
 
@@ -560,7 +608,7 @@ def test_empty_tree_base_supported(git_repo: Path, tmp_path):
     """First-push case: the empty-tree sha works as the diff base."""
     head = _commit(git_repo, "a.txt", "x\n", "root")
     audits = tmp_path / "audits"
-    _write_evidence(audits, reviewed_head_sha=head)
+    _write_evidence(audits, reviewed_base_sha=audit_evidence.EMPTY_TREE_SHA, reviewed_head_sha=head)
     r = check_range(git_repo, audit_evidence.EMPTY_TREE_SHA, head, audits, env={})
     assert r.ok
 

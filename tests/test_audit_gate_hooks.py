@@ -25,6 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PRE_PUSH = REPO_ROOT / "install" / "git-hooks" / "pre-push"
 POST_MERGE = REPO_ROOT / "install" / "git-hooks" / "post-merge"
 ZERO = "0" * 40
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -67,13 +68,22 @@ def gate_env(tmp_path: Path, stub_handoff: Path):
     return home, env
 
 
-def _write_evidence(home: Path, project: str, head_sha: str, verdict: str = "GREEN") -> Path:
+def _write_evidence(
+    home: Path, project: str, base_sha: str, head_sha: str, verdict: str = "GREEN"
+) -> Path:
+    """Runner-style evidence: the head-sha match path requires the base bound too
+    (fail-closed since sw-ag-fix2 — evidence-v1 always emits both)."""
     audits = home / project / "audits"
     audits.mkdir(parents=True, exist_ok=True)
     p = audits / "t.evidence.json"
     p.write_text(
         json.dumps(
-            {"schema_version": 1, "overall_verdict": verdict, "reviewed_head_sha": head_sha}
+            {
+                "schema_version": 1,
+                "overall_verdict": verdict,
+                "reviewed_base_sha": base_sha,
+                "reviewed_head_sha": head_sha,
+            }
         ),
         encoding="utf-8",
     )
@@ -104,7 +114,7 @@ def test_prepush_passes_with_evidence(git_repo: Path, gate_env):
     home, env = gate_env
     base = _commit(git_repo, "a.txt", "1\n", "seed")
     head = _commit(git_repo, "b.txt", "2\n", "feature")
-    _write_evidence(home, git_repo.name, head)
+    _write_evidence(home, git_repo.name, base, head)
     r = _run_pre_push(git_repo, env, f"refs/heads/main {head} refs/heads/main {base}")
     assert r.returncode == 0, r.stderr
 
@@ -122,7 +132,7 @@ def test_prepush_ignores_non_main_refs(git_repo: Path, gate_env):
 def test_prepush_first_push_uses_empty_tree_base(git_repo: Path, gate_env):
     home, env = gate_env
     head = _commit(git_repo, "a.txt", "1\n", "root")
-    _write_evidence(home, git_repo.name, head)
+    _write_evidence(home, git_repo.name, EMPTY_TREE, head)
     r = _run_pre_push(git_repo, env, f"refs/heads/main {head} refs/heads/main {ZERO}")
     assert r.returncode == 0, r.stderr
     # ...and without evidence the very same first push is refused
@@ -152,7 +162,7 @@ def test_prepush_blocks_red_without_override_passes_with_it(git_repo: Path, gate
     home, env = gate_env
     base = _commit(git_repo, "a.txt", "1\n", "seed")
     head = _commit(git_repo, "b.txt", "2\n", "feature")
-    ev = _write_evidence(home, git_repo.name, head, verdict="RED")
+    ev = _write_evidence(home, git_repo.name, base, head, verdict="RED")
     r = _run_pre_push(git_repo, env, f"refs/heads/main {head} refs/heads/main {base}")
     assert r.returncode == 1
     # owner override (forged here directly — the CLI path is unit-tested) flips it,
@@ -211,11 +221,11 @@ def test_postmerge_warns_and_writes_pending(git_repo: Path, gate_env):
 
 def test_postmerge_quiet_with_evidence_and_clears_pending(git_repo: Path, gate_env):
     home, env = gate_env
-    _pre, post = _merge_feature(git_repo)
+    pre, post = _merge_feature(git_repo)
     marker = home / git_repo.name / "audits" / ".audit_pending"
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text("{}", encoding="utf-8")
-    _write_evidence(home, git_repo.name, post)
+    _write_evidence(home, git_repo.name, pre, post)
     r = _run_post_merge(git_repo, env)
     assert r.returncode == 0, r.stderr
     assert "⚠️⚠️⚠️" not in r.stderr

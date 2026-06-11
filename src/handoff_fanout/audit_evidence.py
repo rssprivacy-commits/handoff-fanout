@@ -9,26 +9,29 @@ module is the A half: given a repo + commit range, decide whether matching audit
 evidence exists under ``$HANDOFF_HOME/<project>/audits/``.
 
 Match paths (design ruled by codex+gemini dual-brain GREEN, 2026-06-12;
-hardened per gate re-review sw-ag-fix1):
+hardened per gate re-review sw-ag-fix1, tightened fail-closed per final-state
+re-review sw-ag-fix2 — the evidence-v1 runner always emits the full git-binding
+field set, so「missing optional field」is suspect, never legacy):
 
-  1. ``target_head_sha == reviewed_head_sha`` — and, when the evidence
-     carries ``reviewed_base_sha``, that base must equal the target
-     range's base too (a narrow head^..head audit must not clear a
-     wider origin/main..head push range); base mismatch falls through
-     to the patch-id path
+  1. ``target_head_sha == reviewed_head_sha`` AND ``reviewed_base_sha``
+     present and equal to the target range's base (a narrow head^..head
+     audit must not clear a wider origin/main..head push range); missing
+     or mismatching base falls through to the patch-id path
   2. patch-id equivalence: ``git patch-id --stable`` of the target
      range matches ``reviewed_patch_id`` AND the changed-file sets
      are identical (tolerates cherry-pick / rebase — the audited
      content is equivalent even though SHAs moved). Same-base ranges
-     with a ``diff_sha256`` in the evidence are additionally bound
-     byte-exactly (patch-id ignores whitespace; Python indentation IS
-     semantics); cross-base ranges keep whitespace tolerance by design
+     additionally REQUIRE a matching ``diff_sha256`` byte-exact bind
+     (patch-id ignores whitespace; Python indentation IS semantics);
+     cross-base ranges keep whitespace tolerance by design
 
 Verdict ruling over ALL matched evidence (priority, fail-closed):
 
   FAIL  — any matched RED without a valid owner override, regardless of
           other matched GREENs (conflicting verdicts on the same content
-          = fail-closed; the only door out is the owner red-override)
+          = fail-closed; the only door out is the owner red-override);
+          likewise any matched MIXED/ERROR conflicts even with a GREEN
+          (only door: the audit_unavailable bypass)
   PASS_OVERRIDE — matched RED carrying ``decision=accept_with_red_override``
           plus a valid ``owner_ack`` (only producible by a human running
           ``handoff audit-override`` on a tty — AI sessions have no tty);
@@ -152,24 +155,25 @@ def _matches(evidence: dict, facts: RangeFacts) -> str | None:
     if evidence.get("reviewed_head_sha") and evidence["reviewed_head_sha"] == facts.head_sha:
         # head_sha alone is necessary but not sufficient: a narrow audit
         # (head^..head) must not clear a wider push range (origin/main..head).
-        # Evidence carrying reviewed_base_sha must bind the base too; on
-        # mismatch fall through to the patch-id path (legacy evidence without
-        # reviewed_base_sha keeps the direct path).
-        rb = evidence.get("reviewed_base_sha")
-        if not rb or rb == facts.base_sha:
+        # The base must be bound too — present AND equal. Every evidence-v1
+        # producer emits reviewed_base_sha alongside reviewed_head_sha, so a
+        # missing base is suspect, not legacy: no direct pass-through, fall
+        # through to the patch-id path (fail-closed, sw-ag-fix2 MUST-A).
+        if evidence.get("reviewed_base_sha") == facts.base_sha:
             return "head_sha"
     pid = evidence.get("reviewed_patch_id")
     if pid and facts.patch_id and pid == facts.patch_id:
         reviewed_files = sorted(evidence.get("changed_files") or [])
         if reviewed_files != facts.changed_files:
             return None
-        # Same-base + diff_sha256 present → bind the diff byte-exactly:
-        # patch-id ignores whitespace, but Python indentation IS semantics.
+        # Same base → bind the diff byte-exactly: diff_sha256 must be present
+        # AND equal (patch-id ignores whitespace, but Python indentation IS
+        # semantics; evidence-v1 always emits diff_sha256, so a same-base
+        # record missing it is suspect — fail-closed, sw-ag-fix2 MUST-B).
         # Cross-base (cherry-pick/rebase) keeps patch-id tolerance by design.
-        if (
-            evidence.get("reviewed_base_sha") == facts.base_sha
-            and evidence.get("diff_sha256")
-            and evidence["diff_sha256"] != facts.diff_sha256
+        if evidence.get("reviewed_base_sha") == facts.base_sha and (
+            not evidence.get("diff_sha256")
+            or evidence["diff_sha256"] != facts.diff_sha256
         ):
             return None
         return "patch_id"
@@ -269,6 +273,7 @@ def check_range(
     greens: list[tuple[Path, dict, str]] = []
     red_overridden: list[tuple[Path, dict, str]] = []
     red_plain: list[tuple[Path, dict, str]] = []
+    incomplete: list[tuple[Path, dict, str]] = []  # MIXED / ERROR / anything else
     for f, data, path_kind in matched:
         verdict = data.get("overall_verdict")
         if verdict == "GREEN":
@@ -278,6 +283,8 @@ def check_range(
                 red_overridden.append((f, data, path_kind))
             else:
                 red_plain.append((f, data, path_kind))
+        else:
+            incomplete.append((f, data, path_kind))
 
     if red_plain:
         return CheckResult(
@@ -285,6 +292,22 @@ def check_range(
             f"匹配到 RED verdict 的审计 evidence 且无合法 owner red-override（{red_plain[0][0].name}）— 拒"
             + ("（同区间另有 GREEN evidence——同内容两次审出冲突 verdict，fail-closed 拒）" if greens else "")
             + "。唯一放行路径：owner 亲手在 tty 跑 `handoff audit-override`（AI 会话禁代跑）。",
+        )
+    if incomplete:
+        # P2 (sw-ag-fix2): a matched-but-never-completed audit (MIXED/ERROR)
+        # is a conflict even when a GREEN also matches — same「冲突即拒」
+        # semantics as the RED priority above. The only door out here is the
+        # audit_unavailable bypass (never available for RED).
+        bypass = _try_bypass(audits_dir, facts, env)
+        if bypass is not None:
+            return bypass
+        f, data, _ = incomplete[0]
+        return CheckResult(
+            False, "FAIL",
+            f"匹配到的审计 evidence verdict={data.get('overall_verdict')}（非 GREEN）— "
+            f"fail-closed 拒（{f.name}）"
+            + ("（同区间另有 GREEN evidence——同内容审出冲突 verdict，fail-closed 拒）" if greens else "")
+            + "。审计未完成/不可解析不等于审过。" + _GUIDANCE,
         )
     if red_overridden:
         f = red_overridden[0][0]
@@ -306,13 +329,6 @@ def check_range(
     if bypass is not None:
         return bypass
 
-    if matched:
-        worst = matched[0]
-        return CheckResult(
-            False, "FAIL",
-            f"匹配到的审计 evidence verdict={worst[1].get('overall_verdict')}（非 GREEN）— "
-            f"fail-closed 拒（{worst[0].name}）。审计未完成/不可解析不等于审过。" + _GUIDANCE,
-        )
     return CheckResult(
         False, "FAIL",
         f"无匹配本区间的审计 evidence（target_head={facts.head_sha[:12]} "

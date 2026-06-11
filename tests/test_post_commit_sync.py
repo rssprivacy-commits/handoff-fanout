@@ -76,23 +76,39 @@ def _stub_handoff(tmp_path: Path) -> Path:
     return stub
 
 
-def _write_evidence(home: Path, project: str, head_sha: str) -> None:
-    """A matching GREEN dual-brain evidence — the audit gate's legitimate pass condition."""
+def _write_evidence(home: Path, project: str, base_sha: str, head_sha: str) -> None:
+    """A matching GREEN dual-brain evidence — the audit gate's legitimate pass condition.
+    Carries the base too: the head-sha match path is base-bound fail-closed (sw-ag-fix2)."""
     audits = home / project / "audits"
     audits.mkdir(parents=True, exist_ok=True)
     (audits / "t.evidence.json").write_text(
         json.dumps(
-            {"schema_version": 1, "overall_verdict": "GREEN", "reviewed_head_sha": head_sha}
+            {
+                "schema_version": 1,
+                "overall_verdict": "GREEN",
+                "reviewed_base_sha": base_sha,
+                "reviewed_head_sha": head_sha,
+            }
         ),
         encoding="utf-8",
     )
 
 
 def _audited(repo: Path, home: Path) -> None:
-    head = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
-    ).stdout.strip()
-    _write_evidence(home, repo.name, head)
+    def _rev(spec: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", spec], capture_output=True, text=True
+        )
+
+    head = _rev("HEAD").stdout.strip()
+    parent = _rev("HEAD^")
+    # the post-commit gate diffs HEAD^..HEAD (the empty tree for a root commit)
+    base = (
+        parent.stdout.strip()
+        if parent.returncode == 0
+        else "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    )
+    _write_evidence(home, repo.name, base, head)
 
 
 def _run_hook(repo: Path, installer: Path, tmp_path: Path) -> subprocess.CompletedProcess:
