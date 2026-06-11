@@ -16,6 +16,9 @@
 # NON-FATAL by contract: a post-commit hook must never fail the commit (which already happened) — a sync
 # failure only warns with the manual remedy. Honors HANDOFF_INSTALL_SH (tests stub it so they never touch
 # ~/.local/bin or ~/.claude-handoff).
+#
+# 2026-06-12 delivery-audit deploy gate: the auto-sync now ALSO requires matching dual-brain audit
+# evidence (`handoff audit-check`) before deploying — see _audit_gate below and install/git-hooks/pre-push.
 set -u
 
 repo="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
@@ -26,6 +29,37 @@ installer="${HANDOFF_INSTALL_SH:-$repo/install/install.sh}"
 # Files changed in the just-made commit (HEAD). --root so the repo's very first (parentless) commit is
 # covered too; for a normal commit --root is a no-op (still diffs against the parent).
 changed="$(git diff-tree --root --no-commit-id --name-only -r HEAD 2>/dev/null)" || exit 0
+
+# ─── delivery-audit deploy gate (2026-06-12 / codex MUST: gating push but not deploy
+# leaves a「合了没推已 live」window — the deploy entry must check the SAME evidence the
+# pre-push gate checks). Auto-deploying the launcher/dump runtime copy is a LIVE action:
+# require matching dual-brain audit evidence (`handoff audit-check`) for the just-made
+# commit. No evidence → loud WARN + skip the auto-sync (fail-closed; still exit 0 —
+# post-commit never fails the commit). The deliberate HUMAN remedy stays ungated:
+# `install.sh --sync-launcher / --sync-dump` after the gate is satisfied (mirrors the
+# C′ red line: keep the last live step on a human key).
+EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+_audit_gate() {   # returns 0 = deploy allowed, 1 = blocked (fail-closed)
+    case "$changed" in
+        *"install/auto-continue.sh"*|*"install/dump-handoff.py"*) ;;
+        *) return 0 ;;   # no deployable asset in this commit — gate not in play
+    esac
+    local hbin="${HANDOFF_BIN:-handoff}"
+    if ! command -v "$hbin" >/dev/null 2>&1; then
+        echo "⚠️⚠️ handoff post-commit audit gate: '$hbin' CLI 不可用 — fail-closed，不自动部署。" >&2
+        echo "    人工补救（owner deliberate）: bash $installer --sync-launcher / --sync-dump" >&2
+        return 1
+    fi
+    local base
+    base="$(git rev-parse -q --verify HEAD^ 2>/dev/null)" || base="$EMPTY_TREE"
+    if ! "$hbin" audit-check --repo "$repo" --range "$base..$(git rev-parse HEAD)"; then
+        echo "⚠️⚠️⚠️ handoff post-commit audit gate: 本 commit 改了部署资产但无匹配审计 evidence — 不自动部署（fail-closed）。" >&2
+        echo "    正路：中枢 gate GREEN（dual-brain evidence 落 audits/）后人工 bash $installer --sync-*" >&2
+        return 1
+    fi
+    return 0
+}
+_audit_gate || exit 0
 
 _sync() {  # $1 = path substring to match in the changed set, $2 = installer flag, $3 = human label
     case "$changed" in

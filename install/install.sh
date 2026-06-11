@@ -211,6 +211,11 @@ if [[ $INSTALL_HOOKS -eq 1 ]]; then
         }
         _link_hook pre-commit
         _link_hook post-commit
+        # delivery-audit machine gate (2026-06-12, hf pilot): block un-audited pushes to
+        # main (pre-push) + warn-only audit_pending marker on un-audited main merges
+        # (post-merge). Policy lives in `handoff audit-check`.
+        _link_hook pre-push
+        _link_hook post-merge
     else
         echo "⊘ git hooks skipped (not in a git repo)"
     fi

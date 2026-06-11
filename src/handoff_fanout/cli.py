@@ -67,6 +67,16 @@ def main(argv: list[str] | None = None) -> int:
         "retro-gated, and the sole issuer of the one-time succession authority token",
     )
     sub.add_parser(
+        "audit-check",
+        help="Delivery-audit machine gate: verify dual-brain evidence exists for a "
+        "repo+range (used by pre-push / post-merge / post-commit hooks)",
+    )
+    sub.add_parser(
+        "audit-override",
+        help="OWNER-ONLY (tty-gated): accept a RED-verdict audit evidence with a "
+        "checksummed override record — AI sessions cannot run this",
+    )
+    sub.add_parser(
         "worktree",
         help="Inspect / reclaim per-session git worktrees (see `handoff worktree --help`)",
     )
@@ -146,6 +156,14 @@ def main(argv: list[str] | None = None) -> int:
         from handoff_fanout import codex_audit
 
         return codex_audit.main_audit_close(rest)
+    if args.subcommand == "audit-check":
+        from handoff_fanout import audit_evidence
+
+        return audit_evidence.main_check(rest)
+    if args.subcommand == "audit-override":
+        from handoff_fanout import audit_evidence
+
+        return audit_evidence.main_override(rest)
     if args.subcommand == "worktree":
         from handoff_fanout import worktree
 

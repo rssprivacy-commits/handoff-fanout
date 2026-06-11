@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# post-merge — delivery-audit gate, WARN-ONLY companion to the pre-push gate
+# (gemini ruling: do NOT block local merges — the physical gate is on publish
+# (pre-push) and deploy (post-commit); this hook only closes the awareness gap of
+# the「合了没推已 editable-live」window on the main checkout).
+#
+# On the protected branch (main), after a merge brings in a range with no matching
+# audit evidence: print a loud warning and write $HANDOFF_HOME/<project>/audits/
+# .audit_pending (via `handoff audit-check --pending-marker-on-fail`; a later
+# passing check clears the marker). ALWAYS exits 0 by contract.
+set -u
+
+branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || exit 0
+[ "$branch" = "main" ] || exit 0
+base="$(git rev-parse -q --verify ORIG_HEAD 2>/dev/null)" || exit 0
+head="$(git rev-parse HEAD 2>/dev/null)" || exit 0
+[ "$base" = "$head" ] && exit 0
+
+repo="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+HBIN="${HANDOFF_BIN:-handoff}"
+if ! command -v "$HBIN" >/dev/null 2>&1; then
+    echo "⚠️⚠️ handoff post-merge audit gate: '$HBIN' CLI 不可用，无法校验合并区间的审计 evidence（推 main 时 pre-push 闸仍会拦）。" >&2
+    exit 0
+fi
+
+if ! "$HBIN" audit-check --repo "$repo" --range "$base..$head" --pending-marker-on-fail; then
+    cat >&2 <<EOF
+
+⚠️⚠️⚠️  main 刚合并了【无匹配审计 evidence】的区间 ${base:0:12}..${head:0:12}
+        已写 audits/.audit_pending 标志。本 hook 不拦本地合并；
+        推 origin/main 时 pre-push 闸会物理拒推。
+        正路：中枢对该区间跑 dual-brain-runner（--evidence-repo/--evidence-range）
+        产 evidence 后再推/部署。
+EOF
+fi
+exit 0
