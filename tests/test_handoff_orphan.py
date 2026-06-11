@@ -388,3 +388,147 @@ def test_watchdog_orphan_scan_mixed_active_and_legacy_orphan(isolated_handoff_ho
     assert (p["queue"] / "legacy.BLOCKED.md").exists()
     assert not (p["queue"] / "alive.BLOCKED.md").exists()
     assert not (p["queue"] / "alive.stale-spawn").exists()
+
+
+# ─── fix1 MUST#1: the `.singlepane` sidecar is NOT spawn-exclusive ────────────
+# dump.py's singlepane/coordinator path writes a `.singlepane` sidecar too — same keys
+# but NO `isolation` field (that stamp is spawn.py-exclusive, see spawn._write_sidecar).
+# A dump task's liveness contract IS its `queue/.md`; its sidecar + workspace routinely
+# outlive a cleaned/crashed `.md`, so they must never mask the legacy orphan verdict.
+
+
+def _write_dump_sidecar(
+    queue: Path,
+    task: str,
+    *,
+    workspace: Path,
+    is_coordinator: bool = False,
+) -> Path:
+    """Mirror ``dump.maybe_write_singlepane_sidecar``'s payload: compact single-line JSON
+    with workspace / role / close_policy / spawn_nonce / predecessor_nonce
+    (+ ``is_coordinator`` only when true) and — crucially — NO ``isolation`` key."""
+    payload: dict[str, object] = {
+        "workspace": str(workspace),
+        "role": "worker",
+        "close_policy": "keep",
+        "spawn_nonce": "cafebabe",
+        "predecessor_nonce": None,
+    }
+    if is_coordinator:
+        payload["is_coordinator"] = True
+    sidecar = queue / f"{task}.singlepane"
+    sidecar.write_text(json.dumps(payload))
+    return sidecar
+
+
+def test_watchdog_orphan_scan_dump_sidecar_missing_md_is_legacy_orphan(isolated_handoff_home):
+    """Regression lock (codex MUST#1): a dump task whose ``.md`` is gone but whose
+    dump-format sidecar + workspace file BOTH survive must still take the byte-identical
+    legacy orphan path (BLOCKED.md + counted) — not be masked as an ACTIVE spawn."""
+    p = _setup_project(isolated_handoff_home)
+    ws = p["proj"] / ".handoff.code-workspace"
+    ws.write_text("{}")  # survives the lost .md — proves nothing about dump-task liveness
+    (p["ack"] / "d1.spawned").write_text("(test)")
+    _write_dump_sidecar(p["queue"], "d1", workspace=ws)
+    _stale(p["ack"] / "d1.spawned", seconds_ago=watchdog.ORPHAN_GRACE_SECONDS + 60)
+
+    assert watchdog.scan_orphan_spawns() == 1
+    assert (p["queue"] / "d1.BLOCKED.md").exists()
+    assert not (p["queue"] / "d1.stale-spawn").exists()
+
+
+def test_watchdog_orphan_scan_coordinator_dump_sidecar_is_legacy_orphan(isolated_handoff_home):
+    """Coordinator dumps add ``is_coordinator: true`` to the same isolation-less payload;
+    with the workspace gone they must fall to the legacy orphan path, not ``.stale-spawn``."""
+    p = _setup_project(isolated_handoff_home)
+    ws = p["proj"] / ".handoff.code-workspace"  # deliberately never created
+    (p["ack"] / "d2.spawned").write_text("(test)")
+    _write_dump_sidecar(p["queue"], "d2", workspace=ws, is_coordinator=True)
+    _stale(p["ack"] / "d2.spawned", seconds_ago=watchdog.ORPHAN_GRACE_SECONDS + 60)
+
+    assert watchdog.scan_orphan_spawns() == 1
+    assert (p["queue"] / "d2.BLOCKED.md").exists()
+    assert not (p["queue"] / "d2.stale-spawn").exists()
+
+
+def test_watchdog_orphan_scan_unknown_isolation_value_falls_to_legacy(isolated_handoff_home):
+    """``isolation`` is enum-locked to spawn.py's {worktree, singlepane}: any other value
+    is no writer's legal product ⇒ not a recognised unified spawn ⇒ legacy orphan path."""
+    p = _setup_project(isolated_handoff_home)
+    ws = p["proj"] / "worktrees" / "d3" / ".handoff.code-workspace"
+    ws.parent.mkdir(parents=True)
+    ws.write_text("{}")
+    (p["ack"] / "d3.spawned").write_text("(test)")
+    _write_spawn_sidecar(p["queue"], "d3", workspace=ws, isolation="tmux")
+    _stale(p["ack"] / "d3.spawned", seconds_ago=watchdog.ORPHAN_GRACE_SECONDS + 60)
+
+    assert watchdog.scan_orphan_spawns() == 1
+    assert (p["queue"] / "d3.BLOCKED.md").exists()
+    assert not (p["queue"] / "d3.stale-spawn").exists()
+
+
+def test_watchdog_orphan_scan_skips_active_singlepane_isolation_spawn(isolated_handoff_home):
+    """The OTHER valid spawn ``isolation`` value ("singlepane") must also be recognised as
+    a unified spawn — a live singlepane worker is skipped, never legacy-routed."""
+    p = _setup_project(isolated_handoff_home)
+    ws = p["proj"] / ".handoff.code-workspace"
+    ws.write_text("{}")  # singlepane spawns target the real repo's workspace file
+    (p["ack"] / "s1.spawned").write_text("(test)")
+    _write_spawn_sidecar(p["queue"], "s1", workspace=ws, isolation="singlepane")
+    _stale(p["ack"] / "s1.spawned", seconds_ago=watchdog.ORPHAN_GRACE_SECONDS + 60)
+
+    assert watchdog.scan_orphan_spawns() == 0
+    assert not (p["queue"] / "s1.BLOCKED.md").exists()
+    assert not (p["queue"] / "s1.stale-spawn").exists()
+
+
+# ─── fix1 MUST#2: `.stale-spawn` marker is either ABSENT or COMPLETE ──────────
+# The old two-step (atomic_create empty file → write content) could crash in between,
+# leaving a permanent EMPTY marker that made every later tick early-return — losing the
+# cleanup note (the marker's entire value) forever.
+
+
+def test_watchdog_stale_spawn_marker_absent_after_write_failure(isolated_handoff_home, monkeypatch):
+    """If landing the marker content fails, NOTHING may remain at the marker path (no
+    empty-file residue, no temp litter) — and the next healthy tick writes the full note."""
+    p = _setup_project(isolated_handoff_home)
+    ws = p["proj"] / "worktrees" / "m1" / ".handoff.code-workspace"  # gone ⇒ STALE
+    (p["ack"] / "m1.spawned").write_text("(test)")
+    _write_spawn_sidecar(p["queue"], "m1", workspace=ws)
+    _stale(p["ack"] / "m1.spawned", seconds_ago=watchdog.ORPHAN_GRACE_SECONDS + 60)
+
+    def _boom(src, dst):
+        raise OSError("simulated crash while landing the marker")
+
+    # context(): scoped patch — a bare monkeypatch.undo() would also tear down the
+    # isolated_handoff_home fixture's HANDOFF_HOME patch (same function-scoped instance)
+    # and point the recovery scan below at the REAL user tree.
+    with monkeypatch.context() as mp:
+        mp.setattr(os, "replace", _boom)
+        with pytest.raises(OSError):
+            watchdog.scan_orphan_spawns()
+
+    marker = p["queue"] / "m1.stale-spawn"
+    assert not marker.exists()  # either absent or complete — never an empty marker
+    assert not list(p["queue"].glob(".m1.stale-spawn.tmp.*"))  # temp cleaned up too
+
+    watchdog.scan_orphan_spawns()  # nothing was poisoned: the next tick lands the note
+    assert "task_id: m1" in marker.read_text()
+
+
+def test_watchdog_stale_spawn_empty_marker_residue_is_healed(isolated_handoff_home):
+    """A zero-byte ``.stale-spawn`` (exactly the residue the old create-then-write crash
+    left behind) must not wedge: the next tick rewrites the COMPLETE note instead of
+    early-returning forever on mere existence."""
+    p = _setup_project(isolated_handoff_home)
+    ws = p["proj"] / "worktrees" / "m2" / ".handoff.code-workspace"  # gone ⇒ STALE
+    (p["ack"] / "m2.spawned").write_text("(test)")
+    _write_spawn_sidecar(p["queue"], "m2", workspace=ws)
+    _stale(p["ack"] / "m2.spawned", seconds_ago=watchdog.ORPHAN_GRACE_SECONDS + 60)
+    marker = p["queue"] / "m2.stale-spawn"
+    marker.write_text("")  # pre-fix crash residue: marker exists but the note is lost
+
+    watchdog.scan_orphan_spawns()
+    text = marker.read_text()
+    assert "task_id: m2" in text
+    assert "## Cleanup" in text and "rm " in text  # the cleanup note IS the marker's value

@@ -712,26 +712,42 @@ def _format_enforcement_block(
 
 # A unified ``handoff spawn`` dispatch (spawn.py) publishes a ``queue/<task>.singlepane``
 # sidecar + a ``.uri`` and, by contract, NEVER a ``queue/<task>.md`` (that is the legacy
-# dump path's product). So once the legacy ``.md``-missing orphan predicate would fire, the
-# sidecar's presence is what tells mode 5 this is a KNOWN unified-spawn dispatch — not a
-# stray orphan. These three states drive the differential treatment below.
-_SPAWN_STATE_NONE = "none"  # no sidecar → genuine legacy orphan path (unchanged)
-_SPAWN_STATE_ACTIVE = "active"  # valid sidecar + workspace still on disk → live dispatch
-_SPAWN_STATE_STALE = "stale"  # sidecar present but no live signal → residue (surfaced, not masked)
+# dump path's product). But the sidecar alone is NOT spawn-exclusive: ``dump.py``'s
+# singlepane/coordinator path writes a ``.singlepane`` sidecar too (payload WITHOUT an
+# ``isolation`` key), while spawn.py always stamps ``isolation`` ∈ _SPAWN_ISOLATIONS
+# (``spawn._write_sidecar``). So once the legacy ``.md``-missing orphan predicate would
+# fire, it is the sidecar's ``isolation`` field — not its mere presence — that tells
+# mode 5 this is a KNOWN unified-spawn dispatch. A dump-path sidecar must keep the
+# byte-identical legacy orphan verdict (a dump task's liveness contract IS its ``.md``;
+# its sidecar+workspace routinely outlive a cleaned/crashed ``.md``, so they prove
+# nothing about the dispatch being alive).
+_SPAWN_ISOLATIONS = frozenset({"worktree", "singlepane"})  # spawn.py's exclusive stamp
+_SPAWN_STATE_NONE = "none"  # no sidecar / dump-path sidecar → legacy orphan path (unchanged)
+_SPAWN_STATE_ACTIVE = "active"  # valid spawn sidecar + workspace still on disk → live dispatch
+_SPAWN_STATE_STALE = "stale"  # spawn sidecar but no live signal → residue (surfaced, not masked)
 
 
 def _unified_spawn_state(queue_dir: Path, task_id: str) -> str:
     """Classify a ``.md``-less ``ack/<task>.spawned`` against its ``queue/<task>.singlepane``
     sidecar (see the ``_SPAWN_STATE_*`` constants).
 
-    ACTIVE — the false-positive the bug was about — is a parseable sidecar carrying a
+    Only a sidecar carrying spawn.py's exclusive ``isolation`` stamp counts as a unified
+    spawn. A parseable sidecar WITHOUT it is the dump path's product ⇒ NONE: the legacy
+    orphan verdict must stay byte-identical for dump/coordinator tasks, whose sidecar +
+    workspace routinely survive a cleaned/crashed ``.md`` and say nothing about liveness.
+
+    For a spawn sidecar, ACTIVE — the false-positive the bug was about — carries a
     non-empty ``workspace`` whose file still exists: a live ``handoff spawn`` worker holds
     that workspace open, so mode 5 must leave it alone. The sidecar is static (a unified
     spawn worker emits no heartbeat and has no ``.md``), so the only deterministic
     dead-signal a file scanner has is the workspace being GONE — that is the STALE residue
-    we surface distinctly rather than mask. A sidecar that is present but unparseable or
-    missing its ``workspace`` field is itself anomalous residue ⇒ STALE (never the legacy
-    orphan path, which would mislead on a possibly-live worker)."""
+    we surface distinctly rather than mask. An unparseable/non-dict sidecar is kept STALE,
+    not NONE: it is a LEGAL product of neither writer, so provenance is unknowable, and the
+    failure costs are asymmetric — a false legacy verdict writes a BLOCKED.md that tells the
+    owner to close a possibly-LIVE spawn worker's tab (the original bug, destructive), while
+    a false ``.stale-spawn`` on dead dump residue is still a visible, auditable cleanup note
+    (never masked). Ambiguity therefore fails toward STALE. Same for a spawn sidecar whose
+    ``workspace`` field is missing/empty."""
     sidecar = queue_dir / f"{task_id}.singlepane"
     if not sidecar.exists():
         return _SPAWN_STATE_NONE
@@ -741,6 +757,8 @@ def _unified_spawn_state(queue_dir: Path, task_id: str) -> str:
         return _SPAWN_STATE_STALE
     if not isinstance(data, dict):
         return _SPAWN_STATE_STALE
+    if data.get("isolation") not in _SPAWN_ISOLATIONS:
+        return _SPAWN_STATE_NONE  # dump-path sidecar → legacy orphan path, untouched
     ws = data.get("workspace")
     if not isinstance(ws, str) or not ws:
         return _SPAWN_STATE_STALE
@@ -836,32 +854,43 @@ def _mark_stale_spawn(proj_dir: Path, task_id: str, age_seconds: float) -> None:
     idempotent ``.stale-spawn`` note (no Basso) so the residue is visible/auditable yet never
     mistaken for a 'close your tab' instruction. Stale/hung detection of a LIVE worker is out
     of mode 5's reach (it scans files, not processes) and a unified-spawn worker emits no
-    heartbeat, so this marker is a cleanup hint, not a liveness verdict."""
+    heartbeat, so this marker is a cleanup hint, not a liveness verdict.
+
+    Durability invariant: the marker either does not exist or holds the COMPLETE note —
+    its entire value IS the cleanup text, so the content is built fully in memory and
+    landed in one ``atomic_replace`` (temp+fsync+rename; a crash leaves NOTHING at the
+    marker path, never an empty file that would make later ticks early-return and lose
+    the note forever). Idempotence is a size-checked stat, not exclusive-create: a
+    zero-byte marker can only be pre-fix crash residue, so it is healed by falling
+    through to a full write. The stat→replace TOCTOU is acceptable at this detection
+    layer — worst case two concurrent ticks each replace the marker with a complete,
+    semantically identical note (``os.replace`` is atomic, no torn state)."""
     project = proj_dir.name
     queue_dir = proj_dir / "queue"
     queue_dir.mkdir(parents=True, exist_ok=True)
     marker = queue_dir / f"{task_id}.stale-spawn"
-    if not atomic.atomic_create(marker):
-        return  # idempotent — already noted on an earlier tick
+    try:
+        if marker.stat().st_size > 0:
+            return  # idempotent — already noted on an earlier tick
+    except FileNotFoundError:
+        pass
     spawned_path = shlex.quote(str(proj_dir / "ack" / f"{task_id}.spawned"))
     sidecar_path = shlex.quote(str(queue_dir / f"{task_id}.singlepane"))
     marker_path = shlex.quote(str(marker))
-    atomic.write_with_fsync(
-        marker,
-        (
-            f"task_id: {task_id}\n"
-            f"detected_at: {dump.now_iso()}\n"
-            f"age_seconds: {age_seconds:.0f}\n"
-            f"kind: unified-spawn stale residue\n\n"
-            "## What this is\n"
-            "A `handoff spawn` dispatch left ack/<task>.spawned + queue/<task>.singlepane,\n"
-            "but its workspace is gone (torn-down worktree) or the sidecar is unreadable.\n"
-            "This is residue to clean up — NOT a live orphan, and NOT an instruction to\n"
-            "close any tab.\n\n"
-            "## Cleanup (only if you've confirmed no tab is still working this task)\n"
-            f"  rm {spawned_path} {sidecar_path} {marker_path}\n"
-        ),
+    content = (
+        f"task_id: {task_id}\n"
+        f"detected_at: {dump.now_iso()}\n"
+        f"age_seconds: {age_seconds:.0f}\n"
+        f"kind: unified-spawn stale residue\n\n"
+        "## What this is\n"
+        "A `handoff spawn` dispatch left ack/<task>.spawned + queue/<task>.singlepane,\n"
+        "but its workspace is gone (torn-down worktree) or the sidecar is unreadable.\n"
+        "This is residue to clean up — NOT a live orphan, and NOT an instruction to\n"
+        "close any tab.\n\n"
+        "## Cleanup (only if you've confirmed no tab is still working this task)\n"
+        f"  rm {spawned_path} {sidecar_path} {marker_path}\n"
     )
+    atomic.atomic_replace(marker, content)
     print(
         f"  [watchdog mode 5] stale unified-spawn residue: "
         f"{project}/{task_id} (age={age_seconds:.0f}s)"
