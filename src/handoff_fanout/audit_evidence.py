@@ -163,6 +163,14 @@ def _matches(evidence: dict, facts: RangeFacts) -> str | None:
             return "head_sha"
     pid = evidence.get("reviewed_patch_id")
     if pid and facts.patch_id and pid == facts.patch_id:
+        # reviewed_base_sha must be PRESENT before any patch-id tolerance
+        # applies: every evidence-v1 producer emits it, so a patch-id record
+        # missing the base has no legitimate production path — malformed,
+        # fail-closed (sw-ag-fix3). Missing ≠ unequal: a real cherry-pick
+        # evidence carries the OLD base (present but unequal), which keeps
+        # the cross-base tolerance below intact.
+        if not evidence.get("reviewed_base_sha"):
+            return None
         reviewed_files = sorted(evidence.get("changed_files") or [])
         if reviewed_files != facts.changed_files:
             return None

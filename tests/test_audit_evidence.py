@@ -85,14 +85,19 @@ def test_pass_on_head_sha_match(repo_with_range, tmp_path):
 # ─── decision path 2: patch-id equivalence (cherry-pick survives) ────────────
 
 
-def test_pass_on_patch_id_after_cherry_pick(git_repo: Path, tmp_path):
+def test_patch_id_evidence_missing_base_fails_closed(git_repo: Path, tmp_path):
+    """A patch-id evidence record without reviewed_base_sha is malformed, not
+    legacy: evidence-v1 always emits the base, so such a record has no
+    legitimate production path — fail-closed (sw-ag-fix3). The real
+    cherry-pick PASS behaviour (full evidence, old base present-but-unequal)
+    is pinned by test_cross_base_cherry_pick_still_passes_with_full_evidence."""
     base = _commit(git_repo, "README.md", "seed\n", "seed")
     reviewed_head = _commit(git_repo, "src/feature.py", "x = 1\n", "feature")
     reviewed = range_facts(git_repo, base, reviewed_head)
 
-    # Simulate the real-world case (审 ed2f295 → cherry-pick 成 ae37183): main moved on
-    # with an unrelated commit, then the reviewed commit is cherry-picked → new SHA,
-    # identical content.
+    # Same cherry-pick setup as the legitimate-tolerance test: main moved on
+    # with an unrelated commit, then the reviewed commit is cherry-picked →
+    # new SHA, identical content.
     _git(git_repo, "checkout", "-q", base)
     _git(git_repo, "checkout", "-q", "-b", "rebased-main")
     drift = _commit(git_repo, "docs/other.md", "drift\n", "unrelated drift")
@@ -106,9 +111,10 @@ def test_pass_on_patch_id_after_cherry_pick(git_repo: Path, tmp_path):
         reviewed_head_sha=reviewed_head,
         reviewed_patch_id=reviewed.patch_id,
         changed_files=reviewed.changed_files,
+        # no reviewed_base_sha, no diff_sha256 → malformed → reject
     )
     r = check_range(git_repo, drift, new_head, audits, env={})
-    assert r.ok and r.status == "PASS", r.reason
+    assert not r.ok and "无匹配" in r.reason
 
 
 def test_fail_when_changed_files_differ(repo_with_range, tmp_path):
