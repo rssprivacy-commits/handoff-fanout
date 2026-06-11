@@ -235,6 +235,16 @@ def test_dump_cli_has_no_suppress_flag():
             lambda home: _forge_predecessor_sidecar(home, nonce="NOT-HEX"),
             id="nonce-not-hex",
         ),
+        # fix1 MUST-2: the probe is hex16-exact (watchdog ``is_hex16`` contract) — hex
+        # strings of the wrong LENGTH must route legacy, not succession.
+        pytest.param(
+            lambda home: _forge_predecessor_sidecar(home, nonce="a"),
+            id="nonce-hex-too-short",
+        ),
+        pytest.param(
+            lambda home: _forge_predecessor_sidecar(home, nonce="ab12cd34ef567890" * 2 + "ab"),
+            id="nonce-hex-too-long-34",
+        ),
         pytest.param(
             lambda home: _forge_predecessor_sidecar(home).write_text(json.dumps(["list"])),
             id="payload-not-dict",
@@ -307,6 +317,42 @@ def test_succession_route_e2e(tmp_path, monkeypatch, notify_calls, capsys):
     out = capsys.readouterr()
     assert "succession-spawned" in out.out
     assert "spawn artifacts suppressed" in out.out
+    assert "legacy-relay" not in out.err
+
+
+def test_succession_route_worktree_mode_on_never_creates_worktree(
+    tmp_path, monkeypatch, notify_calls, capsys
+):
+    """fix1 MUST-1: a MODE_ON project (config ``worktree_projects``) closing via the
+    succession route must NOT resolve a successor worktree — the succession spawn is
+    invariantly a singlepane window on the SOURCE tree (warmgap design Q3), so a
+    worktree here would split the ledger from the window and orphan the worktree.
+    Reachable paths: a singlepane→worktree config migration, or the healthy leg after
+    a degraded-worktree leg."""
+    home = _home(tmp_path, monkeypatch, config=json.dumps({"worktree_projects": [PROJECT]}))
+    ws = _git_repo(tmp_path)
+    # Step1 A-收口 MUST 3 fail-closes a MODE_ON coordinator close on a no-remote repo
+    # BEFORE routing — real MODE_ON projects have an origin, so stub one (name-only
+    # check; nothing fetches it on the succession route since no worktree is made).
+    _run(["git", "remote", "add", "origin", str(tmp_path / "origin-stub")], ws)
+    _forge_predecessor_sidecar(home)
+
+    rc = codex_audit.main_audit_close(_close_argv(ws))
+
+    assert rc == 0
+    assert not (home / PROJECT / "worktrees").exists(), "no successor worktree created"
+    assert not (home / PROJECT / "ack" / f"{TASK}.worktree").exists(), "no .worktree ack"
+    # the ledger .md points at the SOURCE tree (no worktree banner / path anywhere)
+    md_text = (home / PROJECT / "queue" / f"{TASK}.md").read_text()
+    assert f"cd {ws}" in md_text
+    assert "worktrees" not in md_text
+    # window intent: spawn-shaped singlepane sidecar + .uri on the source tree
+    sidecar = json.loads((home / PROJECT / "queue" / f"{TASK}.singlepane").read_text())
+    assert sidecar["role"] == "supervisor_succession"
+    assert sidecar["isolation"] == "singlepane"
+    assert f"WORKSPACE={ws}" in (home / PROJECT / "queue" / f"{TASK}.uri").read_text()
+    out = capsys.readouterr()
+    assert "succession-spawned" in out.out
     assert "legacy-relay" not in out.err
 
 

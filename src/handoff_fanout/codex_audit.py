@@ -2126,9 +2126,12 @@ def _report_g3_sedimentation(self_task: str | None, project: str, workspace: Pat
 
 # ─── warmgap-C: succession routing (token 闸凭证 → 路由凭证) ──────────────────
 
-# Mirrors ``spawn._NONCE_RE`` (the engine's hex spawn-nonce shape); kept local so the
-# routing probe never needs a module-level ``spawn`` import.
-_HEX_NONCE_RE = re.compile(r"^[0-9a-f]+$")
+# fix1 MUST-2: exactly 16 lowercase hex chars — the engine's spawn-nonce contract is
+# ``secrets.token_hex(8)`` (spawn_nonce.py) and the watchdog's autoclose role gate
+# validates with ``is_hex16`` (install/auto-continue.sh); a looser probe here would
+# route a nonce the watchdog later rejects (failed marker). Kept local so the routing
+# probe never needs a module-level ``spawn`` import.
+_HEX_NONCE_RE = re.compile(r"^[0-9a-f]{16}$")
 
 
 def _predecessor_spawn_nonce(project: str, self_task: str | None) -> str | None:

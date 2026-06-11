@@ -794,8 +794,9 @@ def write_active_dump(
     # warmgap-C §1a: ``suppress_spawn_artifacts=True`` (Python-keyword-only, NEVER a CLI
     # flag — a public flag would be a legal bypass of the spawn-side G4 contract) keeps
     # the LEDGER half of an active dump (queue/<task>.md / BLOCKED supersede / .queued /
-    # old_ready / .worktree ack / pbcopy) and SKIPS the WINDOW-INTENT half (singlepane
-    # sidecar+workspace / coordinator memory baseline / .uri publish / notification) —
+    # old_ready / pbcopy) and SKIPS the WINDOW-INTENT half (worktree resolution — see
+    # main(), fix1 MUST-1 — / singlepane sidecar+workspace / coordinator memory
+    # baseline / .uri publish / notification) —
     # the retro-gated ``audit-close --coordinator --status active`` succession route
     # publishes those via ``spawn --role supervisor_succession`` instead (codex_audit
     # ``_succession_relay``; the spawn writes the baseline itself, audit-close sends the
@@ -1870,7 +1871,15 @@ def main(argv: list[str] | None = None, *, suppress_spawn_artifacts: bool = Fals
     # explicitly here — the source tree is never moved by worktree creation, so this
     # is the same SHA, but the explicit anchor documents R1-C1.
     old_head: str | None = None
-    if args.status == "active" and not args.dry_run:
+    # warmgap-C fix1 MUST-1: worktree resolution is a WINDOW-INTENT step, so the
+    # suppressed (succession-route) dump must skip it entirely — the succession spawn
+    # always opens a singlepane window on the SOURCE tree (coordinator invariant,
+    # warmgap design Q3), and resolving a worktree here would split the ledger
+    # (.md / .worktree ack pointing at a worktree) from the actual window (source
+    # tree) and orphan the worktree. spawn_workspace stays the source tree,
+    # worktree_info stays None, old_head stays None (old_ready lazily reads the
+    # source-tree HEAD — same value either way).
+    if args.status == "active" and not args.dry_run and not suppress_spawn_artifacts:
         spawn_workspace, worktree_info, block_rc = resolve_spawn_workspace(
             args=args,
             cfg=cfg,
