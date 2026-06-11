@@ -125,6 +125,110 @@ def test_fail_when_changed_files_differ(repo_with_range, tmp_path):
     assert not r.ok and "无匹配" in r.reason
 
 
+# ─── head-sha path base binding (MUST-2: narrow audit ≠ wide range) ─────────
+
+
+def test_narrow_evidence_does_not_clear_wider_range(git_repo: Path, tmp_path):
+    """Evidence for head^..head (same head, narrower base) must NOT pass the
+    head_sha direct path for an origin/main..head push range — the unreviewed
+    middle commit would ride through unaudited."""
+    root = _commit(git_repo, "README.md", "seed\n", "seed")
+    middle = _commit(git_repo, "src/unreviewed.py", "evil = 1\n", "unreviewed middle")
+    head = _commit(git_repo, "src/feature.py", "x = 1\n", "feature")
+    narrow = range_facts(git_repo, middle, head)  # what the narrow audit saw
+
+    audits = tmp_path / "audits"
+    _write_evidence(
+        audits,
+        reviewed_base_sha=narrow.base_sha,
+        reviewed_head_sha=narrow.head_sha,
+        reviewed_patch_id=narrow.patch_id,
+        diff_sha256=narrow.diff_sha256,
+        changed_files=narrow.changed_files,
+    )
+    # wide range root..head: same head, different base → no head_sha pass-through,
+    # and the patch-id path fails too (different diff)
+    r = check_range(git_repo, root, head, audits, env={})
+    assert not r.ok and "无匹配" in r.reason
+
+
+def test_head_sha_passes_when_base_bound_and_equal(repo_with_range, tmp_path):
+    repo, base, head = repo_with_range
+    facts = range_facts(repo, base, head)
+    audits = tmp_path / "audits"
+    _write_evidence(audits, reviewed_base_sha=facts.base_sha, reviewed_head_sha=head)
+    r = check_range(repo, base, head, audits, env={})
+    assert r.ok and "head_sha" in r.reason
+
+
+def test_head_sha_legacy_evidence_without_base_still_passes(repo_with_range, tmp_path):
+    """Backward compat: evidence predating reviewed_base_sha keeps the direct path."""
+    repo, base, head = repo_with_range
+    audits = tmp_path / "audits"
+    _write_evidence(audits, reviewed_head_sha=head)
+    r = check_range(repo, base, head, audits, env={})
+    assert r.ok and r.status == "PASS"
+
+
+# ─── same-base byte binding (MUST-3: patch-id ignores whitespace) ────────────
+
+
+def test_same_base_whitespace_tamper_fails(git_repo: Path, tmp_path):
+    """Same base, whitespace-only divergence: patch-id and changed_files both
+    match, but diff_sha256 differs → no match (Python indentation IS semantics)."""
+    base = _commit(git_repo, "README.md", "seed\n", "seed")
+    reviewed_head = _commit(git_repo, "src/feature.py", "x = 1\n", "feature")
+    reviewed = range_facts(git_repo, base, reviewed_head)
+
+    # sibling branch off the same base: identical modulo whitespace
+    _git(git_repo, "checkout", "-q", base)
+    _git(git_repo, "checkout", "-q", "-b", "tampered")
+    tampered_head = _commit(git_repo, "src/feature.py", "x  =  1\n", "feature ws-tampered")
+    tampered = range_facts(git_repo, base, tampered_head)
+    # sanity: this IS the hole being closed — patch-id can't tell them apart
+    assert tampered.patch_id == reviewed.patch_id
+    assert tampered.diff_sha256 != reviewed.diff_sha256
+
+    audits = tmp_path / "audits"
+    _write_evidence(
+        audits,
+        reviewed_base_sha=reviewed.base_sha,
+        reviewed_head_sha=reviewed.head_sha,
+        reviewed_patch_id=reviewed.patch_id,
+        diff_sha256=reviewed.diff_sha256,
+        changed_files=reviewed.changed_files,
+    )
+    r = check_range(git_repo, base, tampered_head, audits, env={})
+    assert not r.ok and "无匹配" in r.reason
+
+
+def test_cross_base_cherry_pick_still_passes_with_full_evidence(git_repo: Path, tmp_path):
+    """MUST-3 keeps cherry-pick/rebase tolerance: across DIFFERENT bases the
+    diff_sha256 binding is deliberately not enforced (full runner-style evidence
+    including reviewed_base_sha + diff_sha256 must still pass)."""
+    base = _commit(git_repo, "README.md", "seed\n", "seed")
+    reviewed_head = _commit(git_repo, "src/feature.py", "x = 1\n", "feature")
+    reviewed = range_facts(git_repo, base, reviewed_head)
+
+    _git(git_repo, "checkout", "-q", base)
+    _git(git_repo, "checkout", "-q", "-b", "rebased-main")
+    drift = _commit(git_repo, "docs/other.md", "drift\n", "unrelated drift")
+    _git(git_repo, "cherry-pick", reviewed_head)
+    new_head = _git(git_repo, "rev-parse", "HEAD")
+
+    audits = tmp_path / "audits"
+    _write_evidence(
+        audits,
+        reviewed_base_sha=reviewed.base_sha,
+        reviewed_head_sha=reviewed.head_sha,
+        reviewed_patch_id=reviewed.patch_id,
+        diff_sha256=reviewed.diff_sha256,
+        changed_files=reviewed.changed_files,
+    )
+    r = check_range(git_repo, drift, new_head, audits, env={})
+    assert r.ok and r.status == "PASS", r.reason
+
+
 # ─── decision path 3: RED verdict / owner override ───────────────────────────
 
 
@@ -202,14 +306,47 @@ def test_mixed_or_error_verdict_fails_closed(repo_with_range, tmp_path, verdict)
     assert not r.ok and verdict in r.reason
 
 
-def test_newer_green_evidence_wins_over_older_red(repo_with_range, tmp_path):
-    """Re-audit after fixes: a matching GREEN passes even if an older RED also matches."""
+@pytest.mark.parametrize(
+    ("older", "newer"),
+    [("GREEN", "RED"), ("RED", "GREEN")],
+    ids=["old-green-new-red", "old-red-new-green"],
+)
+def test_red_without_override_fails_regardless_of_green(repo_with_range, tmp_path, older, newer):
+    """MUST-1: conflicting verdicts on the SAME content fail-closed in BOTH
+    directions — a GREEN (older or newer) never washes a matching un-overridden
+    RED. Only door out: owner red-override. (A real fix changes the content,
+    hence patch-id/head-sha, so the old RED stops matching — content that still
+    matches a RED is unfixed content.)"""
     repo, base, head = repo_with_range
     audits = tmp_path / "audits"
-    _write_evidence(audits, name="old-red", reviewed_head_sha=head, overall_verdict="RED")
-    _write_evidence(audits, name="new-green", reviewed_head_sha=head, overall_verdict="GREEN")
+    p_old = _write_evidence(audits, name="older", reviewed_head_sha=head, overall_verdict=older)
+    _write_evidence(audits, name="newer", reviewed_head_sha=head, overall_verdict=newer)
+    # pin mtime ordering so the test exercises recency in the direction it claims
+    import os as _os
+    old_stat = p_old.stat()
+    _os.utime(p_old, (old_stat.st_atime - 100, old_stat.st_mtime - 100))
     r = check_range(repo, base, head, audits, env={})
-    assert r.ok and r.status == "PASS"
+    assert not r.ok and r.status == "FAIL"
+    assert "RED" in r.reason and "冲突" in r.reason and "audit-override" in r.reason
+
+
+def test_red_with_valid_override_outranks_plain_green(repo_with_range, tmp_path):
+    """Priority pin: PASS_OVERRIDE (RED + owner ack) > PASS — the loud override
+    label must survive even when a GREEN also matches."""
+    repo, base, head = repo_with_range
+    facts = range_facts(repo, base, head)
+    audits = tmp_path / "audits"
+    _write_evidence(audits, name="green", reviewed_head_sha=head, overall_verdict="GREEN")
+    _write_evidence(
+        audits, name="red-ov",
+        reviewed_head_sha=head,
+        reviewed_patch_id=facts.patch_id,
+        overall_verdict="RED",
+        decision="accept_with_red_override",
+        owner_ack=_owner_ack(facts.patch_id),
+    )
+    r = check_range(repo, base, head, audits, env={})
+    assert r.ok and r.status == "PASS_OVERRIDE"
 
 
 # ─── owner override CLI (tty-gated) ──────────────────────────────────────────
@@ -350,6 +487,17 @@ def test_bypass_scope_mismatch_rejected(repo_with_range, tmp_path):
     repo, base, head = repo_with_range
     audits = tmp_path / "audits"
     _write_bypass(audits, _bypass_record(repo, base, head, scope="deadbeef..cafebabe"))
+    r = check_range(repo, base, head, audits, env={BYPASS_ENV: "1"})
+    assert not r.ok and "无 scope 匹配" in r.reason
+
+
+def test_bypass_bare_head_scope_rejected(repo_with_range, tmp_path):
+    """P2-1: only the full base..head scope authorizes — a bare head sha would
+    cover ANY base ending at that head (too wide for a one-time bypass)."""
+    repo, base, head = repo_with_range
+    facts = range_facts(repo, base, head)
+    audits = tmp_path / "audits"
+    _write_bypass(audits, _bypass_record(repo, base, head, scope=facts.head_sha))
     r = check_range(repo, base, head, audits, env={BYPASS_ENV: "1"})
     assert not r.ok and "无 scope 匹配" in r.reason
 

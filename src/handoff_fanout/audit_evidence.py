@@ -8,20 +8,34 @@ machine-readable ``<out>.evidence.json`` sidecar (the B half, in dharmaxis); thi
 module is the A half: given a repo + commit range, decide whether matching audit
 evidence exists under ``$HANDOFF_HOME/<project>/audits/``.
 
-Decision paths (design ruled by codex+gemini dual-brain GREEN, 2026-06-12):
+Match paths (design ruled by codex+gemini dual-brain GREEN, 2026-06-12;
+hardened per gate re-review sw-ag-fix1):
 
-  1. ``target_head_sha == reviewed_head_sha``                         → PASS
+  1. ``target_head_sha == reviewed_head_sha`` — and, when the evidence
+     carries ``reviewed_base_sha``, that base must equal the target
+     range's base too (a narrow head^..head audit must not clear a
+     wider origin/main..head push range); base mismatch falls through
+     to the patch-id path
   2. patch-id equivalence: ``git patch-id --stable`` of the target
      range matches ``reviewed_patch_id`` AND the changed-file sets
      are identical (tolerates cherry-pick / rebase — the audited
-     content is byte-equivalent even though SHAs moved)              → PASS
-  3. ``overall_verdict`` RED → FAIL, unless the evidence carries
-     ``decision=accept_with_red_override`` plus a valid ``owner_ack``
-     block (only producible by a human running ``handoff
-     audit-override`` on a tty — AI sessions have no tty). Such a
-     pass is loudly labelled PASS-with-override, never rewritten
-     to GREEN.                                                       → PASS*/FAIL
-  4. no matching evidence at all → FAIL with guidance               → FAIL
+     content is equivalent even though SHAs moved). Same-base ranges
+     with a ``diff_sha256`` in the evidence are additionally bound
+     byte-exactly (patch-id ignores whitespace; Python indentation IS
+     semantics); cross-base ranges keep whitespace tolerance by design
+
+Verdict ruling over ALL matched evidence (priority, fail-closed):
+
+  FAIL  — any matched RED without a valid owner override, regardless of
+          other matched GREENs (conflicting verdicts on the same content
+          = fail-closed; the only door out is the owner red-override)
+  PASS_OVERRIDE — matched RED carrying ``decision=accept_with_red_override``
+          plus a valid ``owner_ack`` (only producible by a human running
+          ``handoff audit-override`` on a tty — AI sessions have no tty);
+          loudly labelled, never rewritten to GREEN
+  PASS  — matched GREEN(s) and no RED at all
+  PASS_BYPASS — emergency bypass (see below)
+  FAIL  — no matching evidence / matched but never completed (MIXED/ERROR)
 
 Fail-closed posture: MIXED / ERROR overall verdicts also FAIL (an unparseable or
 half-dead audit is not an audit). The emergency bypass (env + a one-time fully
@@ -136,12 +150,29 @@ def validate_owner_ack(evidence: dict) -> bool:
 def _matches(evidence: dict, facts: RangeFacts) -> str | None:
     """Return the match path ('head_sha' | 'patch_id') or None."""
     if evidence.get("reviewed_head_sha") and evidence["reviewed_head_sha"] == facts.head_sha:
-        return "head_sha"
+        # head_sha alone is necessary but not sufficient: a narrow audit
+        # (head^..head) must not clear a wider push range (origin/main..head).
+        # Evidence carrying reviewed_base_sha must bind the base too; on
+        # mismatch fall through to the patch-id path (legacy evidence without
+        # reviewed_base_sha keeps the direct path).
+        rb = evidence.get("reviewed_base_sha")
+        if not rb or rb == facts.base_sha:
+            return "head_sha"
     pid = evidence.get("reviewed_patch_id")
     if pid and facts.patch_id and pid == facts.patch_id:
         reviewed_files = sorted(evidence.get("changed_files") or [])
-        if reviewed_files == facts.changed_files:
-            return "patch_id"
+        if reviewed_files != facts.changed_files:
+            return None
+        # Same-base + diff_sha256 present → bind the diff byte-exactly:
+        # patch-id ignores whitespace, but Python indentation IS semantics.
+        # Cross-base (cherry-pick/rebase) keeps patch-id tolerance by design.
+        if (
+            evidence.get("reviewed_base_sha") == facts.base_sha
+            and evidence.get("diff_sha256")
+            and evidence["diff_sha256"] != facts.diff_sha256
+        ):
+            return None
+        return "patch_id"
     return None
 
 
@@ -174,17 +205,16 @@ def _try_bypass(audits_dir: Path, facts: RangeFacts, env: dict) -> CheckResult |
     if env.get(BYPASS_ENV) != "1":
         return None
     bdir = audits_dir / "bypasses"
-    scopes = {
-        facts.head_sha,
-        f"{facts.base_sha}..{facts.head_sha}",
-    }
+    # Design MUST: one-time, range-scoped. Only the full base..head form is
+    # accepted — a bare head sha would authorize any base, i.e. too wide.
+    scope = f"{facts.base_sha}..{facts.head_sha}"
     candidates = sorted(bdir.glob("*.json")) if bdir.is_dir() else []
     for f in candidates:
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if not isinstance(data, dict) or data.get("scope") not in scopes:
+        if not isinstance(data, dict) or data.get("scope") != scope:
             continue
         # A scope-matching record is THE record for this range — any defect rejects
         # outright (no silent fall-through to a different file).
@@ -232,30 +262,44 @@ def check_range(
             if path_kind:
                 matched.append((f, data, path_kind))
 
-    matched_red = False
+    # Full scan, then priority ruling (never first-match): a RED without a
+    # valid owner override FAILs no matter how many GREENs also match — two
+    # audits of the same content with conflicting verdicts is a conflict, and
+    # fail-closed means the conflict rejects. Order/mtime plays no part.
+    greens: list[tuple[Path, dict, str]] = []
+    red_overridden: list[tuple[Path, dict, str]] = []
+    red_plain: list[tuple[Path, dict, str]] = []
     for f, data, path_kind in matched:
         verdict = data.get("overall_verdict")
         if verdict == "GREEN":
-            return CheckResult(
-                True, "PASS",
-                f"✅ audit evidence 匹配（{path_kind}）：{f.name} verdict=GREEN",
-                evidence_path=str(f),
-            )
-        if verdict == "RED":
-            matched_red = True
+            greens.append((f, data, path_kind))
+        elif verdict == "RED":
             if data.get("decision") == "accept_with_red_override" and validate_owner_ack(data):
-                return CheckResult(
-                    True, "PASS_OVERRIDE",
-                    f"🟥➡️ PASS-with-override：{f.name} verdict=RED，owner red-override 放行"
-                    "（这不是 GREEN——RED 结论保留在案，放行属 owner 例外批准）",
-                    evidence_path=str(f),
-                )
+                red_overridden.append((f, data, path_kind))
+            else:
+                red_plain.append((f, data, path_kind))
 
-    if matched_red:
+    if red_plain:
         return CheckResult(
             False, "FAIL",
-            "匹配到 RED verdict 的审计 evidence 且无合法 owner red-override — 拒。"
-            "唯一放行路径：owner 亲手在 tty 跑 `handoff audit-override`（AI 会话禁代跑）。",
+            f"匹配到 RED verdict 的审计 evidence 且无合法 owner red-override（{red_plain[0][0].name}）— 拒"
+            + ("（同区间另有 GREEN evidence——同内容两次审出冲突 verdict，fail-closed 拒）" if greens else "")
+            + "。唯一放行路径：owner 亲手在 tty 跑 `handoff audit-override`（AI 会话禁代跑）。",
+        )
+    if red_overridden:
+        f = red_overridden[0][0]
+        return CheckResult(
+            True, "PASS_OVERRIDE",
+            f"🟥➡️ PASS-with-override：{f.name} verdict=RED，owner red-override 放行"
+            "（这不是 GREEN——RED 结论保留在案，放行属 owner 例外批准）",
+            evidence_path=str(f),
+        )
+    if greens:
+        f, _, path_kind = greens[0]
+        return CheckResult(
+            True, "PASS",
+            f"✅ audit evidence 匹配（{path_kind}）：{f.name} verdict=GREEN",
+            evidence_path=str(f),
         )
 
     bypass = _try_bypass(audits_dir, facts, env)
