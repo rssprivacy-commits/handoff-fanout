@@ -28,6 +28,21 @@ Implements the full reclaim chain for worker worktree windows:
     ``close-command-expired`` (``now - issued_at > ack_timeout``) BEFORE any side
     effect. The nonce is the auth token (CSPRNG, 64-bit hex16 —
     ``spawn_nonce.new_nonce``'s shape, hard-validated at both ends).
+
+    Window-close split (sw-6c-winclose, method D): ``closeTabs`` only closes editor
+    tabs — VS Code has no closeWindow tab API — so the extension's success ack is
+    ``close_issued`` (tabs closed + ``workbench.action.closeWindow`` issued), NOT a
+    terminal ``done``. ``closeWindow`` kills the extension host, so the extension cannot
+    itself observe its window die. The producer therefore OWNS ``done``: on reading a
+    ``close_issued`` ack it polls the window's extension-host PID (the worker writes it to
+    ``ack/<task>.host_pid.json`` on activate) via ``os.kill(pid, 0)`` and only reclaims
+    the worktree once that pid is ESRCH-gone (``_resolve_close_issued`` →
+    ``_host_pid_liveness``). PID reuse is fail-closed-safe (a recycled pid reads alive →
+    wait → deadline fail-closed, worktree retained); the only residual is a host
+    crash/reload landing in the sub-millisecond window between the ack write and
+    ``closeWindow`` — negligible, and a reload's re-activate rewrites host_pid with the
+    live pid. ``window-close-unconfirmed`` (the +1 enum reason) records any close_issued
+    that never confirms; the worktree is retained either way (C7).
   * **C4** ``abandoned`` is authoritative ONLY in the control plane
     (``<project>/abandoned/<task>.json``, written by ``handoff worktree abandon``);
     the in-worktree ``.handoff-abandoned.json`` is an audit copy. A copy without a
@@ -47,7 +62,7 @@ Implements the full reclaim chain for worker worktree windows:
     unconditionally alive ⇒ never close.
   * **C7** the role×reason whitelist matrix is enforced producer-side here (and
     mirrored extension-side), with rejection BEFORE any side effect, and the
-    18-reason ``reclaim_failed.json`` enum below.
+    19-reason ``reclaim_failed.json`` enum below (18 v4 + ``window-close-unconfirmed``).
 
 Scope red line (contract §范围边界): this module is PARALLEL to the existing
 succession autoclose (``install/auto-continue.sh try_autoclose``) and mirrors its
@@ -74,7 +89,7 @@ from handoff_fanout import atomic
 from handoff_fanout import config as _config
 from handoff_fanout import worktree as _worktree
 
-# ── C7: the unified reclaim_failed reason enum (v4 — exactly these 18) ─────────
+# ── C7: the unified reclaim_failed reason enum (v4 + sw-6c-winclose — exactly 19) ──
 REASON_REF_FETCH_FAILED = "ref-fetch-failed"
 REASON_INT_BRANCH_MISSING = "int-branch-missing"
 REASON_SHA_UNRESOLVABLE = "sha-unresolvable"
@@ -93,6 +108,14 @@ REASON_ACK_TIMEOUT = "ack-timeout"
 REASON_CLOSE_COMMAND_EXPIRED = "close-command-expired"
 REASON_ROLE_REASON_REJECTED = "role-reason-rejected"
 REASON_STALE_REQUEST = "stale-request"
+# sw-6c-winclose (method D): the extension's ``close_issued`` ack means tabs closed +
+# closeWindow issued, NOT that the window is gone. The producer owns the terminal
+# ``done``, written only after it confirms the window's extension-host PID left the
+# process table. This reason fires when that confirmation never lands — the host is still
+# alive at the deadline, or the dead-man token (``host_pid.json``) is missing / nonce-
+# mismatched / unreadable. Fail-closed: the worktree is RETAINED (never deleted on a mere
+# close intent), so it is safe by construction.
+REASON_WINDOW_CLOSE_UNCONFIRMED = "window-close-unconfirmed"
 
 REASONS: tuple[str, ...] = (
     REASON_REF_FETCH_FAILED,
@@ -113,6 +136,7 @@ REASONS: tuple[str, ...] = (
     REASON_CLOSE_COMMAND_EXPIRED,
     REASON_ROLE_REASON_REJECTED,
     REASON_STALE_REQUEST,
+    REASON_WINDOW_CLOSE_UNCONFIRMED,
 )
 
 # Reasons the EXTENSION may legitimately put in its ack file. Anything else in an
@@ -174,6 +198,14 @@ def pending_path(cfg: _config.Config, project: str, task: str) -> Path:
 
 def ack_file_path(cfg: _config.Config, project: str, task: str) -> Path:
     return cfg.ack_dir(project) / f"{task}.reclaim_ack.json"
+
+
+def host_pid_path(cfg: _config.Config, project: str, task: str) -> Path:
+    """The §6c window-close dead-man token (sw-6c-winclose): the worker window's
+    extension writes its OWN extension-host PID here on activate; the producer polls
+    ``os.kill(pid, 0)`` against it to confirm the window physically closed (its host
+    process left the table) before reclaiming the worktree."""
+    return cfg.ack_dir(project) / f"{task}.host_pid.json"
 
 
 def done_path(cfg: _config.Config, project: str, task: str) -> Path:
@@ -806,7 +838,9 @@ def _finalize_request_if_terminal(
 def _reclaim_worktree_resources(
     cfg: _config.Config, project: str, task: str, verdict_path: str, evidence: dict
 ) -> dict:
-    """After the window closed (done ack), reclaim the worktree + branch.
+    """After the window is CONFIRMED closed (its extension-host PID left the process
+    table — method D dead-man switch, not a mere ``close_issued`` intent), reclaim the
+    worktree + branch.
 
     merged path → the fail-safe ``remove_worktree`` (clean+published only).
     abandoned path → force-remove, but ONLY after re-verifying the head SHA still
@@ -840,6 +874,128 @@ def _reclaim_worktree_resources(
         repo, wt, branch, int_branch, _worktree._link_names(cfg)
     )
     return {"worktree_removed": removed, "remove_detail": reason}
+
+
+# ─── method D: PID dead-man verification of the window close ─────────────────────
+
+
+def _host_pid_liveness(host: dict | None, expected_nonce: str | None) -> str:
+    """Probe the worker window's extension-host PID (sw-6c-winclose method D). Returns:
+
+      * ``"dead"``    — ``os.kill(pid, 0)`` raised ESRCH: NO process holds this pid, so
+                        the window's host is gone ⇒ the window is confirmed closed.
+      * ``"alive"``   — the process exists (signal sent, or EPERM = exists but owned by
+                        another uid) ⇒ keep waiting.
+      * ``"unknown"`` — token missing / unreadable pid / nonce-mismatch / any other kill
+                        error ⇒ fail-closed (NEVER reclaim).
+
+    PID-reuse safety: a recycled pid returns ``"alive"`` (false-ALIVE) → the caller waits
+    to the deadline then fail-closes with the worktree RETAINED (no data loss). ``ESRCH``
+    fires ONLY when nothing holds the pid = the window is truly gone, the correct signal.
+    The nonce binds the token to THIS spawn: a leftover ``host_pid.json`` from a previous
+    spawn of the same task carries a different nonce → ``"unknown"`` (never trusted)."""
+    if not isinstance(host, dict):
+        return "unknown"
+    pid = host.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return "unknown"
+    if expected_nonce is not None and host.get("nonce") != expected_nonce:
+        return "unknown"
+    try:
+        os.kill(pid, 0)
+        return "alive"
+    except ProcessLookupError:
+        return "dead"  # ESRCH — the host process is gone → window confirmed closed
+    except PermissionError:
+        return "alive"  # EPERM — the process EXISTS (other uid) → still alive
+    except OSError:
+        return "unknown"  # any other kill error → fail-closed
+
+
+def _terminate_pending_state(
+    cfg: _config.Config, project: str, task: str, request_id: str, run_id: str, pf: Path
+) -> None:
+    """Common terminal cleanup for a resolved pending: drop the extension ack + the
+    pending state file, finalize the (possibly multi-member) request, release the lock."""
+    with contextlib.suppress(OSError):
+        ack_file_path(cfg, project, task).unlink()
+    with contextlib.suppress(OSError):
+        pf.unlink()
+    _maybe_finalize_after_member(cfg, project, request_id, run_id)
+    _release_lock(cfg, project)
+
+
+def _resolve_close_issued(
+    cfg: _config.Config,
+    project: str,
+    task: str,
+    *,
+    run_id: str,
+    request_id: str,
+    pending: dict,
+    pf: Path,
+) -> bool:
+    """Method D terminal arbitration after a ``close_issued`` ack. The extension closed
+    the tabs + issued ``workbench.action.closeWindow`` — but closeWindow kills the
+    extension host, so the extension cannot itself confirm the window died. The producer
+    owns the terminal ``done``: independently verify the window's host PID physically left
+    the process table before reclaiming the worktree (C7: never delete on a close intent).
+
+    Returns True iff the run reached a TERMINAL state THIS tick (``done`` or fail-closed —
+    markers written, ack+pending cleaned, request finalized, lock released). Returns False
+    iff the window's host is still alive AND within the deadline (the caller renews the
+    lock and keeps the cross-tick pending so the next tick re-checks)."""
+    host = _read_json(host_pid_path(cfg, project, task))
+    liveness = _host_pid_liveness(host, pending.get("nonce"))
+
+    if liveness == "dead":
+        removal = _reclaim_worktree_resources(
+            cfg, project, task, pending.get("path", "merged"), pending.get("evidence", {})
+        )
+        _write_done(
+            cfg,
+            project,
+            task,
+            run_id=run_id,
+            payload={
+                **pending.get("evidence", {}),
+                **removal,
+                "nonce": pending.get("nonce"),
+                "window_close_confirmed": "host-pid-gone",
+            },
+        )
+        _terminate_pending_state(cfg, project, task, request_id, run_id, pf)
+        return True
+
+    if liveness == "unknown":
+        _write_failed(
+            cfg,
+            project,
+            task,
+            reason=REASON_WINDOW_CLOSE_UNCONFIRMED,
+            run_id=run_id,
+            detail="close_issued but host_pid token missing / nonce-mismatch / unreadable "
+            "— cannot confirm the window closed; worktree retained",
+        )
+        _terminate_pending_state(cfg, project, task, request_id, run_id, pf)
+        return True
+
+    # alive → bounded by the same ack-window deadline as the close_issued wait.
+    deadline = pending.get("deadline_epoch")
+    if not isinstance(deadline, (int, float)) or time.time() > deadline:
+        _write_failed(
+            cfg,
+            project,
+            task,
+            reason=REASON_WINDOW_CLOSE_UNCONFIRMED,
+            run_id=run_id,
+            detail="close_issued but the window's host process is still alive at the "
+            "deadline — window not confirmed closed; worktree retained",
+        )
+        _terminate_pending_state(cfg, project, task, request_id, run_id, pf)
+        return True
+
+    return False  # still alive, within the deadline → caller renews + re-polls next tick
 
 
 # ─── pending resolution (tick N+1+) ──────────────────────────────────────────────
@@ -877,30 +1033,26 @@ def _resolve_pending(cfg: _config.Config, project: str, pf: Path) -> bool:
     ack = _read_json(ack_file_path(cfg, project, task))
     if ack and ack.get("run_id") == run_id:
         result = ack.get("result")
-        if result == "done":
-            removal = _reclaim_worktree_resources(
-                cfg, project, task, pending.get("path", "merged"), pending.get("evidence", {})
-            )
-            _write_done(
-                cfg,
-                project,
-                task,
-                run_id=run_id,
-                payload={**pending.get("evidence", {}), **removal, "nonce": pending.get("nonce")},
-            )
-        else:
-            reason = ack.get("reason")
-            detail = str(ack.get("detail", ""))
-            if reason not in _EXTENSION_ACK_REASONS:
-                detail = f"extension ack reason {reason!r} not in enum; {detail}".strip("; ")
-                reason = REASON_ACK_TIMEOUT
-            _write_failed(cfg, project, task, reason=reason, run_id=run_id, detail=detail)
-        with contextlib.suppress(OSError):
-            ack_file_path(cfg, project, task).unlink()
-        with contextlib.suppress(OSError):
-            pf.unlink()
-        _maybe_finalize_after_member(cfg, project, request_id, run_id)
-        _release_lock(cfg, project)
+        if result == "close_issued":
+            # Method D: the ack is a close INTENT, not a terminal done. Enter the PID
+            # dead-man phase — only confirm-then-reclaim once the window's host is gone.
+            # If still alive within the deadline, keep the ack+pending and re-poll.
+            if _resolve_close_issued(
+                cfg, project, task, run_id=run_id, request_id=request_id,
+                pending=pending, pf=pf,
+            ):
+                return False  # terminal (done / fail-closed) handled inside
+            _renew_lock(cfg, project, run_id)  # host still alive, within deadline → hold
+            return True
+        # Any non-close_issued ack is an extension FAILURE ack (the extension never writes
+        # a terminal done — the producer owns it). Map to the enum + record terminal.
+        reason = ack.get("reason")
+        detail = str(ack.get("detail", ""))
+        if reason not in _EXTENSION_ACK_REASONS:
+            detail = f"extension ack reason {reason!r} not in enum; {detail}".strip("; ")
+            reason = REASON_ACK_TIMEOUT
+        _write_failed(cfg, project, task, reason=reason, run_id=run_id, detail=detail)
+        _terminate_pending_state(cfg, project, task, request_id, run_id, pf)
         return False
 
     deadline = pending.get("deadline_epoch")

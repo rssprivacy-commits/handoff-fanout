@@ -4,6 +4,7 @@ import {
   AckIntent,
   PollReclaimDeps,
   ReclaimResult,
+  decideCloseWindow,
   parseWorktreeWorkerIdentity,
   pendingToParams,
   pollReclaimOnce,
@@ -80,10 +81,11 @@ function makePollDeps(opts: {
 }
 
 describe("parseWorktreeWorkerIdentity", () => {
-  it("parses project/task from a worker worktree title", () => {
+  it("parses project/task/nonce from a worker worktree title", () => {
     assert.deepStrictEqual(parseWorktreeWorkerIdentity(TITLE), {
       project: "handoff-fanout",
       task: "sw-w1",
+      nonce: NONCE,
     });
   });
 
@@ -137,15 +139,18 @@ describe("pendingToParams", () => {
 });
 
 describe("pollReclaimOnce — happy path + idempotency", () => {
-  it("a fresh pending for THIS window → closes + done ack + marks run handled", async () => {
+  it("a fresh pending for THIS window → closes tabs + close_issued INTENT (ack deferred to the glue) + marks run handled", async () => {
     const handled = new Set<string>();
     const { deps, calls } = makePollDeps({ handled });
     const res = (await pollReclaimOnce(deps)) as ReclaimResult;
-    assert.strictEqual(res.reason, "closed");
+    assert.strictEqual(res.reason, "close-issued");
     assert.strictEqual(res.ok, true);
-    assert.strictEqual(calls.acks.length, 1);
-    assert.strictEqual(calls.acks[0].payload.result, "done");
-    assert.strictEqual(calls.acks[0].payload.run_id, RUN_ID);
+    // The close_issued ack is NOT written by the poll — the glue lands it after a second
+    // dirty re-check, immediately before closeWindow. So writeAck was NOT called here.
+    assert.strictEqual(calls.acks.length, 0, "close_issued ack is deferred to the glue");
+    assert.ok(res.ack, "the close_issued ack INTENT is returned for the glue to write");
+    assert.strictEqual(res.ack?.payload.result, "close_issued");
+    assert.strictEqual(res.ack?.payload.run_id, RUN_ID);
     assert.ok(handled.has(RUN_ID), "run must be marked handled");
   });
 
@@ -219,5 +224,52 @@ describe("pollReclaimOnce — the four §6c invariants under pull", () => {
     const res = (await pollReclaimOnce(deps)) as ReclaimResult;
     assert.strictEqual(res.reason, "nonce-mismatch");
     assert.strictEqual(calls.closed.length, 0);
+  });
+});
+
+// ── decideCloseWindow: the method-D closeWindow glue decision (pure) ───────────────
+// After pollReclaimOnce returns close-issued (tabs closed), the glue must: re-scan dirty
+// (race after gate 6), and only on a clean window land the durable ack + closeWindow. A
+// dirty tab that reappeared aborts to abandon-dirty: NO ack, NO closeWindow, drop from
+// `handled` so a later poll retries (producer's PID dead-man times out fail-closed mean-
+// while). Anything that is not a close-issued result is action:none.
+describe("decideCloseWindow — second dirty re-check before closeWindow", () => {
+  function closeIssued(): ReclaimResult {
+    return {
+      ok: true,
+      reason: "close-issued",
+      closedCount: 2,
+      ack: {
+        relPath: "handoff-fanout/ack/sw-w1.reclaim_ack.json",
+        payload: { task: "sw-w1", run_id: RUN_ID, result: "close_issued", ts: "x" },
+      },
+    };
+  }
+
+  it("clean window → action close-window with the ack to land before closeWindow", () => {
+    const d = decideCloseWindow(closeIssued(), () => [tab("a"), tab("b")]);
+    assert.strictEqual(d.action, "close-window");
+    if (d.action === "close-window") {
+      assert.strictEqual(d.ack.payload.result, "close_issued");
+    }
+  });
+
+  it("a dirty tab reappeared after gate 6 → abandon-dirty (no ack, no closeWindow), carrying the runId to drop", () => {
+    const d = decideCloseWindow(closeIssued(), () => [tab("a"), tab("wip", true)]);
+    assert.strictEqual(d.action, "abandon-dirty");
+    if (d.action === "abandon-dirty") {
+      assert.strictEqual(d.runId, RUN_ID);
+    }
+  });
+
+  it("a non-close-issued result (e.g. a failure or null) → action none", () => {
+    assert.strictEqual(decideCloseWindow(null, () => []).action, "none");
+    const dirtyFail: ReclaimResult = { ok: false, reason: "dirty", closedCount: 0, ack: null };
+    assert.strictEqual(decideCloseWindow(dirtyFail, () => []).action, "none");
+  });
+
+  it("close-issued but a missing ack (defensive) → action none, never closes", () => {
+    const noAck: ReclaimResult = { ok: true, reason: "close-issued", closedCount: 0, ack: null };
+    assert.strictEqual(decideCloseWindow(noAck, () => [tab("a")]).action, "none");
   });
 });

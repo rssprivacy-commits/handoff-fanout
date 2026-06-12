@@ -2,7 +2,7 @@
   "name": "handoff-helper",
   "displayName": "DHARMAXIS Handoff Helper",
   "description": "Handoff helper for cold-spawned Claude Code worktree windows: collapses the side bars to a single editor pane natively (closeSidebar + closeAuxiliaryBar) via a URI from the launcher. (Also retains a dormant legacy autoclose route.)",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "publisher": "dharmaxis",
   "license": "MIT",
   "engines": {

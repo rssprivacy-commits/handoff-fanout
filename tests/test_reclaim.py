@@ -173,18 +173,44 @@ def _ext_ack(env: SimpleNamespace, task: str = TASK, *, run_id: str, result: str
     reclaim.ack_file_path(env.cfg, PROJECT, task).write_text(json.dumps(payload))
 
 
+def _dead_pid() -> int:
+    """A pid that is dead THIS instant: spawn a trivial child, reap it → ``os.kill(pid, 0)``
+    raises ESRCH immediately after. (The reuse window is negligible for a unit test.)"""
+    p = subprocess.Popen(["true"])
+    p.wait()
+    return p.pid
+
+
+def _host_pid(env: SimpleNamespace, task: str = TASK, *, pid: int, nonce: str = NONCE):
+    """Write the method-D dead-man token the worker extension drops on activate."""
+    reclaim.host_pid_path(env.cfg, PROJECT, task).write_text(
+        json.dumps({"pid": pid, "nonce": nonce, "project": PROJECT, "task": task})
+    )
+
+
+def _ext_close_issued(
+    env: SimpleNamespace, task: str = TASK, *, run_id: str, nonce: str = NONCE, pid: int | None = None
+):
+    """Simulate the extension's method-D close: the ``close_issued`` ack PLUS the host_pid
+    token. The default pid is a freshly-dead process, so the producer's PID dead-man
+    confirms the window is gone and reclaims (the old happy path's ``done`` ack)."""
+    _ext_ack(env, task, run_id=run_id, result="close_issued")
+    _host_pid(env, task, pid=_dead_pid() if pid is None else pid, nonce=nonce)
+
+
 # ─── C7 enum ─────────────────────────────────────────────────────────────────────
 
 
-def test_reason_enum_complete_18():
-    assert len(reclaim.REASONS) == 18
-    assert len(set(reclaim.REASONS)) == 18
+def test_reason_enum_complete_19():
+    assert len(reclaim.REASONS) == 19
+    assert len(set(reclaim.REASONS)) == 19
     for r in (
         "ref-fetch-failed", "int-branch-missing", "sha-unresolvable", "not-merged",
         "head-drift", "abandon-invalid", "abandon-sha-mismatch",
         "abandon-authority-invalid", "wave-incomplete", "manifest-missing",
         "live-session", "probe-error", "dirty", "nonce-mismatch", "ack-timeout",
         "close-command-expired", "role-reason-rejected", "stale-request",
+        "window-close-unconfirmed",
     ):
         assert r in reclaim.REASONS
 
@@ -215,13 +241,15 @@ def test_full_merged_reclaim_happy_path(env):
     assert pending["issued_at"] and pending["ack_timeout"] == 30
     assert (env.home / PROJECT / ".spawn.lock").is_dir()
 
-    # Extension acks done → tick N+1 finalizes: done marker carries the C1 evidence
-    # triple, the worktree is reclaimed, the sentinel is consumed, the lock released.
-    _ext_ack(env, run_id=RUN_ID, result="done")
+    # Extension acks close_issued + drops the host_pid dead-man token → tick N+1 confirms
+    # the window's host PID is gone (method D), finalizes: done marker carries the C1
+    # evidence triple, the worktree is reclaimed, the sentinel consumed, the lock released.
+    _ext_close_issued(env, run_id=RUN_ID)
     _tick(env)
     done = _done(env)
     assert done and done["run_id"] == RUN_ID
     assert done["pinned_head_sha"] and done["canonical_int_sha"] and done["fetched_at"]
+    assert done["window_close_confirmed"] == "host-pid-gone"
     assert done["worktree_removed"] is True
     assert not wt.exists()
     assert not reclaim.requested_path(env.cfg, PROJECT, TASK).exists()
@@ -234,7 +262,7 @@ def test_replay_same_run_id_skipped(env):
     _make_worker(env)
     _request(env)
     _tick(env)
-    _ext_ack(env, run_id=RUN_ID, result="done")
+    _ext_close_issued(env, run_id=RUN_ID)
     _tick(env)
     assert _done(env)
     _request(env, run_id=RUN_ID)  # replayed sentinel, SAME run_id
@@ -411,7 +439,7 @@ def test_abandon_cli_grants_eligibility_and_reclaim_force_removes(env):
     _request(env)
     _tick(env)
     assert _pending(env) is not None  # eligible via the abandoned path → authorized
-    _ext_ack(env, run_id=RUN_ID, result="done")
+    _ext_close_issued(env, run_id=RUN_ID)
     _tick(env)
     done = _done(env)
     assert done and done["worktree_removed"] is True
@@ -643,10 +671,121 @@ def test_stale_ack_with_wrong_run_id_ignored(env):
     _make_worker(env)
     _request(env)
     _tick(env)
-    _ext_ack(env, run_id="9999999999999999", result="done")
+    _ext_ack(env, run_id="9999999999999999", result="close_issued")
     _tick(env)
     assert _done(env) is None  # not consumed by the wrong-run ack
     assert _pending(env)  # still waiting (within deadline)
+
+
+# ─── sw-6c-winclose: method-D PID dead-man window-close confirmation ──────────────
+
+
+def test_close_issued_pid_dead_confirms_and_reclaims(env):
+    """close_issued + a DEAD host pid → the producer confirms the window's host left the
+    process table (method D) and reclaims — the done marker records the confirmation."""
+    wt = _make_worker(env)
+    _request(env)
+    _tick(env)
+    _ext_close_issued(env, run_id=RUN_ID)  # default pid = freshly-dead
+    _tick(env)
+    done = _done(env)
+    assert done and done["window_close_confirmed"] == "host-pid-gone"
+    assert done["worktree_removed"] is True
+    assert not wt.exists()
+    assert _pending(env) is None
+    assert not (env.home / PROJECT / ".spawn.lock").exists()  # lock released
+
+
+def test_close_issued_pid_alive_stays_pending_then_dies_reclaims(env):
+    """close_issued while the host is STILL ALIVE → the worktree is NOT reclaimed; the
+    pending is held across ticks (C7: never delete on a mere close intent). Once the host
+    process dies, the next tick confirms ESRCH and reclaims."""
+    wt = _make_worker(env)
+    _request(env)
+    _tick(env)
+    child = subprocess.Popen(["sleep", "30"])  # a live process standing in for the host
+    try:
+        _ext_ack(env, run_id=RUN_ID, result="close_issued")
+        _host_pid(env, pid=child.pid)
+        _tick(env)  # host alive → still pending, NOT reclaimed
+        assert _done(env) is None
+        assert wt.exists()
+        assert _pending(env)  # held across ticks within the deadline
+        assert (env.home / PROJECT / ".spawn.lock").is_dir()  # lock still held
+    finally:
+        child.terminate()
+        child.wait()
+    _tick(env)  # host now dead → ESRCH confirmed → reclaim
+    done = _done(env)
+    assert done and done["worktree_removed"] is True
+    assert not wt.exists()
+    assert _pending(env) is None
+
+
+def test_close_issued_host_alive_past_deadline_fail_closed(env):
+    """close_issued but the host never dies before the deadline → fail-closed with
+    window-close-unconfirmed; the worktree is RETAINED (no premature delete)."""
+    wt = _make_worker(env)
+    _request(env)
+    _tick(env)
+    child = subprocess.Popen(["sleep", "30"])
+    try:
+        _ext_ack(env, run_id=RUN_ID, result="close_issued")
+        _host_pid(env, pid=child.pid)
+        pf = reclaim.pending_path(env.cfg, PROJECT, TASK)
+        pending = json.loads(pf.read_text())
+        pending["deadline_epoch"] = time.time() - 1  # deadline already passed
+        pf.write_text(json.dumps(pending))
+        _tick(env)
+    finally:
+        child.terminate()
+        child.wait()
+    failed = _failed(env)
+    assert failed and failed["reason"] == "window-close-unconfirmed"
+    assert wt.exists()  # RETAINED — never deleted while the window may still be open
+    assert _pending(env) is None
+    assert not (env.home / PROJECT / ".spawn.lock").exists()  # lock released
+
+
+def test_close_issued_host_pid_missing_fail_closed(env):
+    """close_issued but NO host_pid token (the dead-man write failed / never landed) →
+    fail-closed window-close-unconfirmed; worktree retained (cannot confirm the close)."""
+    wt = _make_worker(env)
+    _request(env)
+    _tick(env)
+    _ext_ack(env, run_id=RUN_ID, result="close_issued")  # ack only, no host_pid token
+    _tick(env)
+    failed = _failed(env)
+    assert failed and failed["reason"] == "window-close-unconfirmed"
+    assert wt.exists()
+    assert _pending(env) is None
+
+
+def test_close_issued_host_pid_nonce_mismatch_fail_closed(env):
+    """A host_pid token from a DIFFERENT spawn (nonce ≠ pending nonce) is never trusted —
+    even a dead pid → fail-closed (the token may describe an unrelated/older window)."""
+    wt = _make_worker(env)
+    _request(env)
+    _tick(env)
+    _ext_ack(env, run_id=RUN_ID, result="close_issued")
+    _host_pid(env, pid=_dead_pid(), nonce="feedfacecafebeef")  # wrong nonce
+    _tick(env)
+    failed = _failed(env)
+    assert failed and failed["reason"] == "window-close-unconfirmed"
+    assert wt.exists()
+
+
+def test_host_pid_liveness_unit():
+    """Direct unit coverage of the dead-man probe's three states + PID-reuse safety."""
+    assert reclaim._host_pid_liveness({"pid": os.getpid(), "nonce": NONCE}, NONCE) == "alive"
+    assert reclaim._host_pid_liveness({"pid": _dead_pid(), "nonce": NONCE}, NONCE) == "dead"
+    # token shape / nonce defenses → unknown (fail-closed)
+    assert reclaim._host_pid_liveness(None, NONCE) == "unknown"
+    assert reclaim._host_pid_liveness({"nonce": NONCE}, NONCE) == "unknown"  # no pid
+    assert reclaim._host_pid_liveness({"pid": "x", "nonce": NONCE}, NONCE) == "unknown"
+    assert reclaim._host_pid_liveness({"pid": _dead_pid(), "nonce": "other"}, NONCE) == "unknown"
+    # expected_nonce None (single-worker, no manifest pin) → nonce check skipped
+    assert reclaim._host_pid_liveness({"pid": _dead_pid()}, None) == "dead"
 
 
 # ─── C5: wave manifest ───────────────────────────────────────────────────────────
@@ -718,12 +857,12 @@ def test_wave_per_member_close_and_late_add_ignored(env):
         (env.cfg.ack_dir(PROJECT) / "wave-1.reclaim_lateadd.json").read_text()
     )
     assert late["attempted_late_add"] == ["sw-late"]
-    _ext_ack(env, "sw-a", run_id=RUN_ID, result="done")
+    _ext_close_issued(env, "sw-a", run_id=RUN_ID, nonce="aaaaaaaaaaaaaaaa")
     _tick(env)  # member 1 done → lock released
     assert _done(env, "sw-a")
     _tick(env)  # member 2 fired
     assert _pending(env, "sw-b")
-    _ext_ack(env, "sw-b", run_id=RUN_ID, result="done")
+    _ext_close_issued(env, "sw-b", run_id=RUN_ID, nonce="bbbbbbbbbbbbbbbb")
     _tick(env)  # member 2 done → wave finalized next entry
     _tick(env)
     wave_done = _done(env, "wave-1")
@@ -743,7 +882,7 @@ def test_wave_incomplete_summary_on_member_failure(env):
     )
     _request(env, request_id="wave-1")
     _tick(env)
-    _ext_ack(env, "sw-a", run_id=RUN_ID, result="done")
+    _ext_close_issued(env, "sw-a", run_id=RUN_ID, nonce="aaaaaaaaaaaaaaaa")
     _tick(env)  # sw-a done
     _tick(env)  # sw-b evaluated → not-merged (terminal)
     failed_b = _failed(env, "sw-b")

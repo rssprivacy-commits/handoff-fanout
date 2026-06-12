@@ -83,14 +83,14 @@ describe("effectiveAckTimeoutMs", () => {
 });
 
 describe("handleReclaim — role×reason matrix (C7: rejection precedes side effects)", () => {
-  it("worker+reclaim on the target window → closes + done ack", async () => {
+  it("worker+reclaim on the target window → closes tabs + close_issued ack intent (NOT terminal done)", async () => {
     const { deps, calls } = makeDeps({});
     const res = await handleReclaim(params(), deps);
     assert.strictEqual(res.ok, true);
-    assert.strictEqual(res.reason, "closed");
+    assert.strictEqual(res.reason, "close-issued");
     assert.strictEqual(res.closedCount, 2);
-    assert.ok(res.ack, "done ack expected");
-    assert.strictEqual(res.ack?.payload.result, "done");
+    assert.ok(res.ack, "close_issued ack intent expected");
+    assert.strictEqual(res.ack?.payload.result, "close_issued");
     assert.strictEqual(res.ack?.payload.run_id, RUN_ID);
     assert.strictEqual(res.ack?.relPath, "handoff-fanout/ack/sw-w1.reclaim_ack.json");
   });
@@ -194,7 +194,7 @@ describe("handleReclaim — close-command-expired (P0 #5)", () => {
   it("a fresh close within the window proceeds", async () => {
     const { deps } = makeDeps({ nowMs: T0 + 5_000 });
     const res = await handleReclaim(params({ issuedAt: new Date(T0).toISOString() }), deps);
-    assert.strictEqual(res.reason, "closed");
+    assert.strictEqual(res.reason, "close-issued");
   });
 
   it("a FUTURE-dated issued_at beyond the window is rejected too (clock forgery)", async () => {
@@ -248,11 +248,11 @@ describe("handleReclaim — dirty gate + close mechanics", () => {
     assert.strictEqual(res.ack, null);
   });
 
-  it("an empty window (no tabs) acks done with closed_count 0", async () => {
+  it("an empty window (no tabs) acks close_issued with closed_count 0", async () => {
     const { deps } = makeDeps({ tabs: [] });
     const res = await handleReclaim(params(), deps);
     assert.strictEqual(res.ok, true);
-    assert.strictEqual(res.ack?.payload.result, "done");
+    assert.strictEqual(res.ack?.payload.result, "close_issued");
     assert.strictEqual(res.ack?.payload.closed_count, 0);
   });
 });

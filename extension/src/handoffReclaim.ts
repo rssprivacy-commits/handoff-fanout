@@ -28,13 +28,25 @@
 //   6. dirty gate: ANY dirty tab → refuse the whole close + ack `dirty` (stricter
 //      than succession's skip-dirty: a reclaim must never half-close a window
 //      holding unsaved work).
-//   7. close via the shared dirty-safe retry-once mechanics → ack `done`; a close
-//      that mechanically fails produces NO ack (fail toward the producer's
-//      ack-timeout, never a false `done`).
+//   7. close via the shared dirty-safe retry-once mechanics → a `close_issued` ack
+//      INTENT (NOT a terminal `done`); a close that mechanically fails produces NO ack
+//      (fail toward the producer's ack-timeout, never a false `done`).
+//
+// Window-close split (§6c sw-6c-winclose, method D): `closeTabs` only closes editor
+// tabs — it never closes the WINDOW (VS Code has no closeWindow tab API). So the pure
+// layer's success ack is `close_issued`, meaning only "target matched + authorized +
+// dirty-clean + tabs closed + closeWindow about to be issued". The actual
+// `workbench.action.closeWindow` + the durable `close_issued` ack-write happen in the
+// impure glue (extension.ts) — see `decideCloseWindow` below — because closeWindow kills
+// the extension host, so the host cannot itself observe its own window die. The producer
+// owns the terminal `done`: it reads `close_issued`, then independently confirms THIS
+// window's extension-host PID physically left the process table (a dead-man switch)
+// before it ever reclaims the worktree (C7: never delete on a mere close intent).
 
 import {
   CloseDeps,
   HandoffCloseParams,
+  TabLike,
   closeNonDirtyWithRetry,
   isValidNonce,
   titleHasNonce,
@@ -64,14 +76,16 @@ export function isValidRunId(runId: string | null | undefined): runId is string 
   return typeof runId === "string" && RUN_ID_RE.test(runId);
 }
 
-/** The producer-facing ack payload (subset of reclaim.py's 18-reason enum). */
+/** The producer-facing ack payload (subset of reclaim.py's 19-reason enum). The
+ *  success `result` is `close_issued` (NOT a terminal `done`): the producer owns
+ *  `done`, written only after it PID-confirms the window's host process is gone. */
 export interface AckIntent {
   /** Path RELATIVE to the handoff root (~/.claude-handoff). Glue joins + writes. */
   relPath: string;
   payload: {
     task: string;
     run_id: string;
-    result: "done" | "failed";
+    result: "close_issued" | "failed";
     reason?: string;
     detail?: string;
     closed_count?: number;
@@ -80,7 +94,7 @@ export interface AckIntent {
 }
 
 export type ReclaimReason =
-  | "closed" // done ack
+  | "close-issued" // tabs closed + closeWindow about to issue → close_issued ack (NOT terminal)
   | "delegate-legacy" // succession row → caller runs handleAutoclose
   | "invalid-params" // bad slugs — no ack possible
   | "role-reason-rejected"
@@ -237,20 +251,23 @@ export async function handleReclaim(
     );
   }
 
-  // 7. confirmed target + clean → shared close mechanics, then the done ack.
-  deps.log(`[handoff-helper] reclaim: confirmed target window → closing task=${task}`);
+  // 7. confirmed target + clean → shared close mechanics (TABS only), then the
+  //    `close_issued` ack INTENT. The intent is NOT written here and the window is NOT
+  //    closed here: the impure glue re-checks dirty, writes the durable close_issued ack,
+  //    and only then issues `workbench.action.closeWindow` (see decideCloseWindow).
+  deps.log(`[handoff-helper] reclaim: confirmed target window → closing tabs task=${task}`);
   const close = await closeNonDirtyWithRetry(deps);
   deps.log(`[handoff-helper] reclaim task=${task} close=${JSON.stringify(close)}`);
   if (!close.ok) {
-    // No ack: a false `done` would let the producer force-remove a worktree whose
-    // window is still open; the producer's ack-timeout is the honest fallback.
+    // No ack: a false `done`/`close_issued` would let the producer believe the window is
+    // closing; the producer's ack-timeout is the honest fallback.
     return result("close-failed", false, null, 0);
   }
   return result(
-    "closed",
+    "close-issued",
     true,
     ackIntent(project, task, runId, nowMs, {
-      result: "done",
+      result: "close_issued",
       closed_count: close.closedCount,
     }),
     close.closedCount,
@@ -278,10 +295,13 @@ export async function handleReclaim(
 // dirty gate still refuses any window with unsaved work.
 
 /** This window's identity, parsed from its title, IFF it is a worker WORKTREE window
- *  (the only §6c reclaim target). */
+ *  (the only §6c reclaim target). The `nonce` is carried so the glue can stamp it into
+ *  the `host_pid.json` dead-man token — binding the recorded PID to THIS spawn so a stale
+ *  pid file from a previous spawn of the same task is rejected producer-side. */
 export interface WorktreeWorkerIdentity {
   project: string;
   task: string;
+  nonce: string;
 }
 
 /**
@@ -308,7 +328,7 @@ export function parseWorktreeWorkerIdentity(
   const nonce = (segs[3] ?? "").split(/\s/)[0] ?? ""; // strip " [worktree]…" suffix
   if (role !== ROLE_WORKER) return null;
   if (!SLUG_RE.test(project) || !SLUG_RE.test(task) || !isValidNonce(nonce)) return null;
-  return { project, task };
+  return { project, task, nonce };
 }
 
 /**
@@ -368,6 +388,43 @@ export async function pollReclaimOnce(deps: PollReclaimDeps): Promise<ReclaimRes
   deps.handled.add(params.runId);
   const res = await handleReclaim(params, deps);
   deps.log(`[handoff-helper] reclaim poll: run=${params.runId} → ${res.reason}`);
-  if (res.ack) deps.writeAck(res.ack);
+  // Failure acks (dirty / expired / nonce-mismatch / role-reason-rejected) are terminal
+  // and written here. The `close_issued` SUCCESS ack is deliberately NOT written here:
+  // it must be re-dirty-checked then landed durably IMMEDIATELY before closeWindow by the
+  // glue (see decideCloseWindow), so a dirty tab that appeared after gate 6 aborts the
+  // close WITHOUT having written a misleading close_issued.
+  if (res.ack && res.reason !== "close-issued") deps.writeAck(res.ack);
   return res;
+}
+
+// ── close_issued → closeWindow decision (pure; the glue executes it) ──────────────
+//
+// closeNonDirtyWithRetry closed the editor TABS, but VS Code has no "close the window"
+// tab API — so the window is now empty-but-open. The glue must issue
+// `workbench.action.closeWindow`, but FIRST re-scan dirty: between gate 6's dirty check
+// and now, a new unsaved tab may have appeared, and closeWindow on a dirty window pops a
+// blocking "save?" modal that wedges the close. This pure decision encapsulates that
+// race check so it is unit-testable; extension.ts only executes the chosen action.
+
+export type CloseWindowDecision =
+  | { action: "close-window"; ack: AckIntent } // clean → write the ack THEN closeWindow
+  | { action: "abandon-dirty"; runId: string } // a dirty tab reappeared → don't close; retry/timeout
+  | { action: "none" }; // not a close_issued result → nothing to do
+
+/**
+ * Decide what the glue must do after a poll/URI pass. Only a `close-issued` result with an
+ * ack proceeds; a dirty re-check (race after gate 6) aborts to `abandon-dirty` so the glue
+ * writes NO close_issued ack and issues NO closeWindow — the producer's PID dead-man then
+ * times out fail-closed (worktree retained), and dropping the run from `handled` lets a
+ * later poll retry once the user saves. Pure: the dirty scan is injected via getAllTabs.
+ */
+export function decideCloseWindow(
+  res: ReclaimResult | null,
+  getAllTabs: () => TabLike[],
+): CloseWindowDecision {
+  if (!res || res.reason !== "close-issued" || !res.ack) return { action: "none" };
+  if (getAllTabs().some((t) => t.isDirty)) {
+    return { action: "abandon-dirty", runId: res.ack.payload.run_id };
+  }
+  return { action: "close-window", ack: res.ack };
 }

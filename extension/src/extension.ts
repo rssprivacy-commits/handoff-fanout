@@ -17,6 +17,9 @@ import {
 import {
   AckIntent,
   ReclaimDeps,
+  ReclaimResult,
+  WorktreeWorkerIdentity,
+  decideCloseWindow,
   handleReclaim,
   isValidRunId,
   parseWorktreeWorkerIdentity,
@@ -49,6 +52,70 @@ function writeReclaimAck(intent: AckIntent, log: (msg: string) => void): void {
   }
 }
 
+// §6c window-close (method D): the PID dead-man token. A worker WORKTREE window writes
+// its OWN extension-host pid (process.pid — one extension host per VS Code window) to
+// `~/.claude-handoff/<project>/ack/<task>.host_pid.json` on activate. After this window
+// issues `workbench.action.closeWindow`, the host process exits and this pid leaves the
+// OS process table; the producer polls `os.kill(pid, 0)` and reclaims the worktree ONLY
+// once that pid is gone — so a `close_issued` ack can never let it delete a worktree
+// whose window is still open. The nonce binds the token to THIS spawn (a stale file from
+// a prior spawn of the same task carries a different nonce → producer fail-closes). temp
+// + rename = the producer never reads a torn token; an fs failure is logged, not thrown
+// (a missing token simply makes the producer fail-closed, never over-eager).
+function writeHostPid(identity: WorktreeWorkerIdentity, log: (msg: string) => void): void {
+  try {
+    const target = path.join(
+      os.homedir(),
+      ".claude-handoff",
+      identity.project,
+      "ack",
+      `${identity.task}.host_pid.json`,
+    );
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    const payload = {
+      pid: process.pid,
+      nonce: identity.nonce,
+      project: identity.project,
+      task: identity.task,
+      ts: new Date().toISOString(),
+    };
+    const tmp = `${target}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(payload) + "\n");
+    fs.renameSync(tmp, target);
+    log(`[handoff-helper] host pid written: ${target} (pid=${process.pid})`);
+  } catch (err) {
+    log(`[handoff-helper] host pid write failed: ${String(err)}`);
+  }
+}
+
+// §6c window-close glue: run the pure decideCloseWindow verdict for a poll/URI pass. On a
+// clean close_issued → write the durable ack (temp+rename) IMMEDIATELY before issuing
+// `workbench.action.closeWindow` (closeWindow kills this host, so the ack MUST be on disk
+// first). On a dirty re-check → write NO ack, issue NO closeWindow, and drop the run from
+// `handled` so a later poll retries once the user saves (the producer's PID dead-man
+// times out fail-closed in the meantime — worktree retained either way).
+async function finishCloseWindow(
+  res: ReclaimResult | null,
+  getAllTabs: () => TabLike[],
+  reclaimHandled: Set<string>,
+  log: (msg: string) => void,
+): Promise<void> {
+  const decision = decideCloseWindow(res, getAllTabs);
+  if (decision.action === "abandon-dirty") {
+    reclaimHandled.delete(decision.runId);
+    log(
+      `[handoff-helper] reclaim: a dirty tab reappeared before closeWindow — abandoning ` +
+        `(no close_issued ack; will retry / producer times out). run=${decision.runId}`,
+    );
+    return;
+  }
+  if (decision.action === "close-window") {
+    writeReclaimAck(decision.ack, log); // durable BEFORE the window (and host) dies
+    log(`[handoff-helper] reclaim: close_issued ack landed → workbench.action.closeWindow`);
+    await vscode.commands.executeCommand("workbench.action.closeWindow");
+  }
+}
+
 // §6c A-poll (2026-06-12): start the per-window reclaim poller. If THIS window is a
 // worker WORKTREE window (its title parses to a worker identity), it polls its OWN
 // `~/.claude-handoff/<project>/ack/<task>.reclaim_pending.json` every interval; when
@@ -69,6 +136,9 @@ function startReclaimPoller(
     log("[handoff-helper] reclaim poll: not a worker worktree window — poller inert");
     return { dispose() {} };
   }
+  // This IS a worker worktree window → drop the PID dead-man token before arming the poll,
+  // so the producer can confirm the window's host died after closeWindow (method D).
+  writeHostPid(identity, log);
   const pendingPath = path.join(
     os.homedir(),
     ".claude-handoff",
@@ -85,8 +155,9 @@ function startReclaimPoller(
     if (busy) return; // a slow close must not overlap the next interval
     busy = true;
     try {
-      await pollReclaimOnce({
-        ...makeReclaimDeps(),
+      const deps = makeReclaimDeps();
+      const res = await pollReclaimOnce({
+        ...deps,
         handled: reclaimHandled,
         readPending: () => {
           let raw: string;
@@ -103,6 +174,8 @@ function startReclaimPoller(
         },
         writeAck: (ack) => writeReclaimAck(ack, log),
       });
+      // close_issued → second dirty re-check, durable ack, then closeWindow (method D).
+      await finishCloseWindow(res, deps.getAllTabs, reclaimHandled, log);
     } catch (err) {
       log(`[handoff-helper] reclaim poll error: ${String(err)}`);
     } finally {
@@ -192,7 +265,14 @@ export function activate(context: vscode.ExtensionContext): void {
           const res = await handleReclaim(params, deps);
           if (res.reason !== "delegate-legacy") {
             if (isValidRunId(params.runId)) reclaimHandled.add(params.runId);
-            if (res.ack) writeReclaimAck(res.ack, deps.log);
+            if (res.reason === "close-issued") {
+              // Same method-D glue as the poll path: re-check dirty, land the durable
+              // close_issued ack, then closeWindow (kept here so a stray reclaim URI also
+              // fully closes the window, not just its tabs).
+              await finishCloseWindow(res, deps.getAllTabs, reclaimHandled, log);
+            } else if (res.ack) {
+              writeReclaimAck(res.ack, deps.log);
+            }
             return;
           }
           // fall through: succession+close_predecessor rides the legacy §6 gates below.
