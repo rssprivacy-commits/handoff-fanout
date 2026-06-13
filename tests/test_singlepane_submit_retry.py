@@ -123,6 +123,9 @@ def _env(
     raise_sets_front: str | None = None,
     enum_hit_only_after_open: bool = False,
     retry_max: int | None = None,
+    gate_transient_reads: int | None = None,
+    gate_transient_state: str = "emptyinput",
+    reread_tries: int | None = None,
 ) -> dict:
     """Stub harness: env seams + PATH shadow over ``osascript``/``open``/``code``.
 
@@ -178,6 +181,13 @@ def _env(
         'case "$args" in\n'
         '  *"handoff-sp-retry-gate"*)\n'
         '      tok="${@: -2:1}"; marker="${@: -1}"\n'
+        # cold-render transient model (sw-sp-rc6-precision): the first _SP_GATE_TRANSIENT_READS
+        # focus reads come back not-ready (default emptyinput) REGARDLESS of the input — the AX
+        # tree has not settled — even though the 🆔 prompt is physically in the box. Later reads
+        # see the real input. A bare counter file ranks the reads across the whole run.
+        '      gc=$(cat "$_SP_GATE_COUNT" 2>/dev/null || echo 0); gc=$((gc+1)); echo "$gc" > "$_SP_GATE_COUNT"\n'
+        '      if [ -n "$_SP_GATE_TRANSIENT_READS" ] && [ "$gc" -le "$_SP_GATE_TRANSIENT_READS" ]; then\n'
+        '        echo "${_SP_GATE_TRANSIENT_STATE:-emptyinput}"; exit 0; fi\n'
         '      case "$(_front)" in\n'
         '        *"$tok"*)\n'
         '          v=$(cat "$_SP_INPUT_FILE" 2>/dev/null)\n'
@@ -242,7 +252,14 @@ def _env(
             # fast knobs for the machinery under test (1s×1 confirm poll)
             "HANDOFF_SP_POLL_SECS": "1",
             "HANDOFF_SP_POLL_TRIES": "1",
+            # re-read knobs: backoff 0 keeps the suite real-sleep-free (the recovery depends on
+            # the read COUNT the stub models, not on wall-clock); tries default to production (3).
+            "HANDOFF_SP_REREAD_BACKOFF": "0",
             **({"HANDOFF_SP_RETRY_MAX": str(retry_max)} if retry_max is not None else {}),
+            **({"HANDOFF_SP_REREAD_TRIES": str(reread_tries)} if reread_tries is not None else {}),
+            "_SP_GATE_COUNT": str(tmp_path / "gate_count.txt"),
+            "_SP_GATE_TRANSIENT_READS": str(gate_transient_reads) if gate_transient_reads else "",
+            "_SP_GATE_TRANSIENT_STATE": gate_transient_state,
             "_FRONT_WIN_FILE": str(front_file),
             "_CODE_WINS": "\n".join(code_wins) if code_wins else "",
             "_KEY_SINK": str(key_sink),
@@ -308,6 +325,13 @@ def _ack(home: Path, task: str, status: str) -> Path:
 
 def _presses(tmp_path: Path) -> int:
     return len(_read(tmp_path / "key.log"))
+
+
+def _gate_reads(tmp_path: Path) -> int:
+    """How many times the retry-gate osascript actually READ the focused element (the stub's
+    per-read counter). Proves boundedness of the re-read loop + that wronginput is terminal."""
+    raw = _read(tmp_path / "gate_count.txt").strip()
+    return int(raw) if raw else 0
 
 
 # ─── 1. mtime trap: an OLD jsonl carrying the SAME 🆔 must NEVER confirm ─────────────
@@ -551,3 +575,100 @@ def test_focus_giveup_never_invokes_submit_machinery(home, tmp_path):
     assert "SP-SUBMIT" not in log, "submit machinery must never engage (tripwire)"
     assert "handoff-sp-retry-gate" not in _read(tmp_path / "osa.log")
     assert _presses(tmp_path) == 0, "a visible-park window never receives an Enter"
+
+
+# ─── 9. cold-render false negative: a transient not-ready read is RE-READ → recovers ──
+
+
+def test_cold_render_transient_reread_recovers(home, tmp_path):
+    """THE rc=6 false negative (xunyin 2/2): during a cold heavy-render burst the first focus
+    reads come back not-ready (emptyinput) even though the 🆔 prompt is physically in the box.
+    The PRE-FIX single read judged that transient as 'input-not-ready' and, after the first
+    Enter was swallowed, gave up at rc=6 (failed ack) — the owner pressed Enter by hand. THE FIX:
+    on a transient read, re-read the focused value up to HANDOFF_SP_REREAD_TRIES times; the
+    later read sees role=AXTextArea ∧ Message-input ∧ 🆔 → marker-gated press → the NEW marked
+    jsonl appears → submitted. The press still happens ONLY on a positive marker read."""
+    task = "sp-cold-reread"
+    repo = _seed_singlepane(home, tmp_path, task)
+    tdir = _transcript_dir(tmp_path, repo)
+    env = _env(
+        home,
+        tmp_path,
+        front_window=f"{_sp_title(task)} - x.py",
+        input_value=f"🆔{task} the pasted prompt",  # prompt IS in the box the whole time
+        new_jsonl=tdir / "new-sess.jsonl",
+        new_jsonl_text=f'{{"text":"🆔{task} session started"}}',
+        jsonl_on_press=2,  # warm Enter #1 swallowed; the recovering retry press lands
+        gate_transient_reads=2,  # reads 1,2 read not-ready, read 3 sees the settled input
+        reread_tries=3,
+        retry_max=2,
+    )
+    assert _run(env, tmp_path).returncode == 0
+    sub = _ack(home, task, "submitted")
+    assert sub.exists(), "the bounded re-read must recover the cold-render false negative"
+    assert "verified" in sub.read_text()
+    assert _presses(tmp_path) == 2, "warm Enter + exactly ONE recovering marker-gated press"
+    log = _log(home)
+    assert "reread=" in log, "each re-read outcome must be observable (SP-SUBMIT: reread=N/M …)"
+    assert "outcome=confirmed" in log
+    assert not _ack(home, task, "failed").exists(), "no rc=6 — the false negative is gone"
+
+
+# ─── 10. red line + boundedness: EVERY read not-ready → NEVER a blind press, bounded ──
+
+
+def test_all_reads_transient_red_line_and_bounded(home, tmp_path):
+    """The 🔴 core safety red line under the worst transient: the prompt IS in the box but
+    EVERY AX read comes back not-ready, so the marker is NEVER positively read. The machinery
+    must NEVER press (a blind Enter could land on a sibling live session — owner's hard line)
+    and the re-read must be BOUNDED (no hang): with HANDOFF_SP_REREAD_TRIES=3 and 2 gate
+    attempts (retry_max=2) the focus is read exactly 6 times, then an HONEST rc=6 failed ack."""
+    task = "sp-all-transient"
+    repo = _seed_singlepane(home, tmp_path, task)
+    _transcript_dir(tmp_path, repo)
+    env = _env(
+        home,
+        tmp_path,
+        front_window=f"{_sp_title(task)} - x.py",
+        input_value=f"🆔{task} the pasted prompt",  # marker present but NEVER readably so
+        gate_transient_reads=99,  # every read stays not-ready
+        reread_tries=3,
+        retry_max=2,
+    )
+    assert _run(env, tmp_path).returncode == 0
+    assert not _ack(home, task, "submitted").exists()
+    failed = _ack(home, task, "failed")
+    assert failed.exists() and "ambiguous-after-first-enter" in failed.read_text()
+    assert _presses(tmp_path) == 1, (
+        "🔴 ONLY the title-gated first Enter — a markerless read must NEVER yield a press, "
+        "even though the prompt is physically present"
+    )
+    assert _gate_reads(tmp_path) == 6, "bounded: 2 gate attempts × 3 re-reads, then it STOPS"
+    assert "reread=3/3" in _log(home), "the re-read exhausted its bound (observable)"
+
+
+# ─── 11. a non-empty value WITHOUT the marker (wronginput) is terminal, NOT re-read ──
+
+
+def test_wronginput_is_terminal_not_rereadable(home, tmp_path):
+    """A non-empty focused value that does NOT carry 🆔<task> is provably-not-our-prompt (a
+    sibling window's text, a stray editor). It is NOT a render transient → the gate must return
+    it immediately and the machinery must NOT press (red line). The re-read must NOT 'wait it
+    out' (re-reading a wrong value could race into a sibling's content): exactly ONE read per
+    gate attempt — wronginput is terminal."""
+    task = "sp-wrong"
+    repo = _seed_singlepane(home, tmp_path, task)
+    _transcript_dir(tmp_path, repo)
+    env = _env(
+        home,
+        tmp_path,
+        front_window=f"{_sp_title(task)} - x.py",
+        input_value="some OTHER window's text, no marker here",  # non-empty, markerless
+        reread_tries=3,
+        retry_max=1,  # one gate attempt is enough to prove single-read
+    )
+    assert _run(env, tmp_path).returncode == 0
+    assert not _ack(home, task, "submitted").exists(), "a markerless value must never confirm"
+    assert _presses(tmp_path) == 1, "only the warm first Enter — wronginput is never pressed"
+    assert _gate_reads(tmp_path) == 1, "wronginput is TERMINAL — not re-read (no multiplied reads)"
+    assert "outcome=input-not-ready" in _log(home)

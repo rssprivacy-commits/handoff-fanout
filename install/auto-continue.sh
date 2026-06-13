@@ -697,9 +697,15 @@ cold_submit_with_retry() {
 #               empties the input — a second Enter there is the double-submit hazard), keep
 #               polling the jsonl; front window without the nonce → nonce-first
 #               raise_task_window, then retry;
+#   re-read   = a cold heavy-render burst can flash a transient not-ready focus read
+#               (noelem/notinput/emptyinput) while OUR 🆔 prompt is still physically in the box;
+#               singlepane_retry_gate_settled re-reads HANDOFF_SP_REREAD_TRIES (default 3) times
+#               with a HANDOFF_SP_REREAD_BACKOFF (default 0.4s) settle before conceding the
+#               attempt — the press red line is untouched (only a positive marker read presses);
 #   bounded   = retries ≤ HANDOFF_SP_RETRY_MAX (default 2) after the first Enter; confirm
 #               poll window HANDOFF_SP_POLL_SECS × HANDOFF_SP_POLL_TRIES (default 2s×3) per
-#               attempt. Exhausted → an HONEST failed ack saying which step fell empty.
+#               attempt; per-attempt re-read ≤ HANDOFF_SP_REREAD_TRIES. Exhausted → an HONEST
+#               failed ack saying which step fell empty.
 # Scope: SINGLEPANE_WINDOW=1 AND the URI `open` succeeded. The focus-contended defer/give-up
 # paths happen BEFORE the URI dispatch and never reach this machinery; a visible-park window
 # never receives an Enter.
@@ -799,6 +805,50 @@ singlepane_retry_gate() {
     end run' "$token" "$marker" 2>>"$LOG"
 }
 
+# Bounded focus RE-READ around singlepane_retry_gate (sw-sp-rc6-precision / cold-render precision).
+# THE FALSE NEGATIVE (xunyin 2/2): during a cold heavy-render burst a SINGLE AXFocusedUIElement read
+# can come back noelem/notinput/emptyinput even though the 🆔 prompt is physically sitting in the
+# Claude input — the AX tree has not settled yet / focus has not landed on the freshly-rendered webview
+# input (the owner's manual bare Return seconds later submits, proving the prompt was there all along).
+# A single read judged that transient as "not ready" and, after a swallowed first Enter, gave up at
+# rc=6. FIX: on a TRANSIENT not-ready read (noelem|notinput|emptyinput) re-read the focused value up to
+# HANDOFF_SP_REREAD_TRIES times with a short HANDOFF_SP_REREAD_BACKOFF settle; ANY read that sees
+# role=AXTextArea ∧ "Message input" ∧ value⊇marker presses INSIDE that same osascript process. THE PRESS
+# RED LINE IS UNCHANGED — keystroke only ever fires after a positive marker read, and that read+press is
+# singlepane_retry_gate's own atomic single process (re-reading just grants more chances to READ
+# positive, NEVER a blind press). wronginput (a non-empty value WITHOUT our marker — provably not our
+# prompt, possibly a sibling window's text) is NOT a render transient → returned immediately, never
+# re-read into a press. nofront/nowin/mismatch are returned immediately too (the caller's nonce-first
+# raise owns that recovery). Echoes the final gate outcome; a non-zero exit (osascript hard error /
+# accessibility revoked) is propagated unchanged so the orchestrator's `|| return 2` still fires.
+singlepane_retry_gate_settled() {
+    local token="$1" marker="$2" tries backoff k out rc
+    tries="${HANDOFF_SP_REREAD_TRIES:-3}"; case "$tries" in ''|*[!0-9]*) tries=3 ;; esac; [ "$tries" -lt 1 ] && tries=1
+    backoff="${HANDOFF_SP_REREAD_BACKOFF:-0.4}"; case "$backoff" in ''|*[!0-9.]*|*.*.*) backoff=0.4 ;; esac
+    k=0
+    while [ "$k" -lt "$tries" ]; do
+        k=$((k + 1))
+        out=$(singlepane_retry_gate "$token" "$marker"); rc=$?
+        [ "$rc" = "0" ] || return "$rc"   # osascript hard error → propagate (orchestrator returns 2)
+        case "$out" in
+            noelem|notinput|emptyinput)
+                # transient cold-render not-ready — observe, settle, re-read (unless this was the last try)
+                log "SP-SUBMIT: reread=$k/$tries gate=$out (AX not settled — re-reading focused value)"
+                if [ "$k" -lt "$tries" ]; then
+                    case "$backoff" in 0|0.0|0.00) : ;; *) sleep "$backoff" ;; esac
+                fi
+                ;;
+            *)
+                # sent | wronginput | nofront | nowin | mismatch → terminal (no re-read into a press)
+                printf '%s\n' "$out"
+                return 0
+                ;;
+        esac
+    done
+    printf '%s\n' "$out"
+    return 0
+}
+
 # Orchestrator. Return codes (HONEST per-state acks, mirroring cold):
 #   0 = our Enter + a NEW 🆔-marked jsonl (script-verified submit)
 #   3 = a NEW 🆔-marked jsonl appeared WITHOUT our machinery pressing (external/manual Enter,
@@ -835,7 +885,7 @@ singlepane_submit_with_retry() {
             if [ "$rc" = "2" ]; then return 2; fi
             if [ "$rc" = "0" ]; then out="sent"; else out="mismatch"; fi
         else
-            out=$(singlepane_retry_gate "$token" "$marker") || return 2
+            out=$(singlepane_retry_gate_settled "$token" "$marker") || return 2
         fi
         case "$out" in
             sent)
