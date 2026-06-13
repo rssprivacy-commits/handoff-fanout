@@ -138,6 +138,17 @@ def _forge_predecessor_sidecar(home: Path, nonce: str = PRED_NONCE) -> Path:
     return sidecar
 
 
+def _forge_predecessor_workspace(home: Path) -> Path:
+    """djs-jump-return: the OUT-OF-TREE singlepane ``.handoff.code-workspace`` the engine wrote
+    when the CLOSING coordinator's window was spawned (``maybe_write_singlepane_sidecar``:
+    ``ws_file = <home>/<proj>/singlepane/<task>.handoff.code-workspace``). Its existence is what
+    ``derive_singlepane_focus`` keys on to self-report the predecessor's desktop."""
+    ws_file = home / PROJECT / "singlepane" / f"{SELF_TASK}.handoff.code-workspace"
+    ws_file.parent.mkdir(parents=True, exist_ok=True)
+    ws_file.write_text("{}")
+    return ws_file
+
+
 def _tokens(home: Path) -> list[Path]:
     d = home / PROJECT / "authority"
     return sorted(d.glob("succession-*.token")) if d.is_dir() else []
@@ -318,6 +329,50 @@ def test_succession_route_e2e(tmp_path, monkeypatch, notify_calls, capsys):
     assert "succession-spawned" in out.out
     assert "spawn artifacts suppressed" in out.out
     assert "legacy-relay" not in out.err
+
+
+def test_succession_self_report_writes_spawner_focus_to_uri(tmp_path, monkeypatch, notify_calls):
+    """djs-jump-return Part A: when the PREDECESSOR coordinator's singlepane workspace file
+    exists, the succession spawn writes ``SPAWNER_FOCUS=<predecessor workspace>`` into the
+    successor .uri — DERIVED from ``--self-task`` (no env channel). The watchdog/code-router
+    focus-jumps the new coordinator window to the PREDECESSOR's desktop (not project-mapped)."""
+    home = _home(tmp_path, monkeypatch)
+    ws = _git_repo(tmp_path)
+    _forge_predecessor_sidecar(home)
+    pred_ws = _forge_predecessor_workspace(home)
+
+    rc = codex_audit.main_audit_close(_close_argv(ws))
+
+    assert rc == 0
+    uri_text = (home / PROJECT / "queue" / f"{TASK}.uri").read_text()
+    # the SPAWNER_FOCUS line points at the predecessor's OWN workspace (realpath-normalized
+    # by the shared validate_spawner_focus gate the produce site re-runs)
+    import os as _os
+
+    assert f"SPAWNER_FOCUS={_os.path.realpath(str(pred_ws))}\n" in uri_text
+    # still the SUCCESSOR's real-repo workspace + succession sidecar (no regression)
+    assert f"WORKSPACE={ws}" in uri_text
+    sidecar = json.loads((home / PROJECT / "queue" / f"{TASK}.singlepane").read_text())
+    assert sidecar["role"] == "supervisor_succession"
+
+
+def test_succession_no_predecessor_workspace_omits_spawner_focus_byte_compat(
+    tmp_path, monkeypatch, notify_calls
+):
+    """字节级向后兼容红线: a succession whose predecessor has NO singlepane workspace file
+    (bootstrap leg / file gone) derives None → the .uri carries NO SPAWNER_FOCUS line, exactly
+    like before this feature. Fail-open to today's per-project goto, zero regression."""
+    home = _home(tmp_path, monkeypatch)
+    ws = _git_repo(tmp_path)
+    _forge_predecessor_sidecar(home)
+    # NOTE: deliberately do NOT forge the predecessor workspace file
+
+    rc = codex_audit.main_audit_close(_close_argv(ws))
+
+    assert rc == 0
+    uri_text = (home / PROJECT / "queue" / f"{TASK}.uri").read_text()
+    assert "SPAWNER_FOCUS=" not in uri_text, "no workspace → no jump line (byte-compat)"
+    assert f"WORKSPACE={ws}" in uri_text
 
 
 def test_succession_route_worktree_mode_on_never_creates_worktree(

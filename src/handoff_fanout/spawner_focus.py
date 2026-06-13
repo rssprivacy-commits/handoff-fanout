@@ -58,3 +58,27 @@ def validate_spawner_focus(raw_path: str | None, *, cfg: _config.Config) -> str 
     ):
         return rp
     return None
+
+
+def derive_singlepane_focus(home: str | os.PathLike[str], project: str, task: str) -> str | None:
+    """SELF-REPORT (djs-jump-return 2026-06-14): derive a singlepane coordinator's OWN
+    ``.handoff.code-workspace`` path from the task IT self-reports — NOT from the env channel.
+
+    p19 proved ``$HANDOFF_WINDOW_FOCUS_PATH`` (injected via ``terminal.integrated.env.osx``) does
+    NOT reach the agent shell of an extension-panel auto-spawned singlepane coordinator, so the
+    env-based ``_spawner_focus_line`` / ``--spawner-focus-path`` produce ``""`` from such a window
+    and the worker never jumps to the coordinator's desktop. The agent, however, KNOWS its own task
+    (passed as ``--self-task`` on the succession close) — so reconstruct the path the engine itself
+    wrote when this coordinator was spawned: ``<home>/<project>/singlepane/<task>.handoff.code-workspace``
+    (see ``dump.maybe_write_singlepane_sidecar`` — ``ws_file = sp_dir / f"{task}.handoff.code-workspace"``).
+
+    Returns the path string only when it EXISTS as a regular file (so a bootstrap leg whose window
+    was opened by dx-spawn out-of-tree — no engine singlepane file — yields ``None`` and the caller
+    fail-opens to the existing per-project goto, no spurious "dropped" warning). The returned string
+    is still re-validated by :func:`validate_spawner_focus` at the produce site (single security
+    boundary — derivation does not bypass the gate). NEVER raises — a missing/odd value is ``None``.
+    """
+    if not project or not task:
+        return None
+    p = os.path.join(str(home), project, "singlepane", f"{task}.handoff.code-workspace")
+    return p if os.path.isfile(p) else None

@@ -75,3 +75,30 @@ def test_outside_allowed_roots_dropped(isolated_handoff_home):
         )
         is None
     )
+
+
+# ─── derive_singlepane_focus (djs-jump-return: SELF-REPORT from self-task, no env) ──────
+
+
+def test_derive_returns_path_when_singlepane_workspace_exists(isolated_handoff_home):
+    """The engine wrote ``<home>/<proj>/singlepane/<task>.handoff.code-workspace`` when this
+    coordinator spawned — derive reconstructs it from the self-reported task (no env channel)."""
+    home = isolated_handoff_home
+    ws = home / "demo-proj" / "singlepane" / "coord-leg-7.handoff.code-workspace"
+    ws.parent.mkdir(parents=True)
+    ws.write_text("{}")
+    got = spawner_focus.derive_singlepane_focus(home, "demo-proj", "coord-leg-7")
+    assert got == str(ws)
+    # and the derived path round-trips through the SAME security gate (single boundary)
+    assert spawner_focus.validate_spawner_focus(got, cfg=_config.load()) == os.path.realpath(str(ws))
+
+
+def test_derive_returns_none_when_workspace_missing(isolated_handoff_home):
+    """Bootstrap leg (dx-spawn-launched coordinator, no engine singlepane file) → None →
+    caller fail-opens to today's per-project goto, no spurious 'dropped' warning."""
+    assert spawner_focus.derive_singlepane_focus(isolated_handoff_home, "demo-proj", "nope") is None
+
+
+@pytest.mark.parametrize(("project", "task"), [("", "t"), ("p", ""), ("", "")])
+def test_derive_returns_none_on_empty_identity(isolated_handoff_home, project, task):
+    assert spawner_focus.derive_singlepane_focus(isolated_handoff_home, project, task) is None
