@@ -1277,6 +1277,68 @@ trap '_on_terminate 129' HUP
 trap '_on_terminate 130' INT
 trap '_on_terminate 143' TERM
 
+# ── djs-jump-return (2026-06-14): return-to-origin after spawn (MP-style locate-act-return) ──
+# A coordinator on desktop A spawns a worker while the owner works on desktop B. The worker is
+# born on A (code-router's SPAWNER_FOCUS focus-jump), then — AFTER the whole prompt-inject + Enter
+# sequence finishes on A — the view snaps back to B (owner barely notices, never gets dragged).
+# The return MUST run AFTER URI+Enter: the inject needs the worker window frontmost on A. Part B
+# ran it INSIDE code-router (BEFORE inject) → the prompt landed in the wrong window on B / AXRaise
+# cancelled the return (the placement bug this closes — p19, both external brains missed it). The
+# whole orchestration lives HERE now (watchdog-exclusive, so a human's hand-typed `code` is never
+# affected). Every step is fail-open: any failure/timeout never blocks the spawn, never tears the
+# desktop, never cascades — it degrades to "stay on the current desktop" (worker on A, no return =
+# an acceptable downgrade, far better than a prompt in the wrong window). Default ON; disable via
+# env HANDOFF_RETURN_AFTER_SPAWN∈{0,false,no,off} or the file ~/.vscode-spaces/return-after-spawn.off.
+_return_enabled() {
+    case "${HANDOFF_RETURN_AFTER_SPAWN:-}" in 0|false|no|FALSE|NO|off|OFF) return 1 ;; esac
+    [ -f "$HOME/.vscode-spaces/return-after-spawn.off" ] && return 1
+    return 0
+}
+
+# vscode-spaces.py (the return primitives) sits beside the router. Resolvable ONLY when
+# HANDOFF_CODE_BIN points at the router — the one case an outbound focus-jump happens. Any other
+# CODE_BIN (a plain `code`) has no sibling .py → return 1 → caller fail-opens (no return leg).
+_return_spaces_py() {
+    [ -n "$HANDOFF_CODE_BIN" ] || return 1
+    local _p
+    _p="$(dirname "$HANDOFF_CODE_BIN")/vscode-spaces.py"
+    [ -f "$_p" ] || return 1
+    printf '%s' "$_p"
+}
+
+# precapture — call BEFORE the outbound jump (`$CODE_BIN -n`). Snapshots the owner's desktop
+# (origin = B) + the window set, so the post-inject return can anchor the worker window on A and
+# goto back to B. Arms ONLY for a SPAWNER_FOCUS spawn (the direct-jump-spawn scenario this targets)
+# with the feature on + the router resolvable; a no-op (stays disarmed) otherwise → byte-for-byte
+# legacy behavior. Sets globals _RETURN_ARMED / _RETURN_ORIGIN / _RETURN_BEFORE / _RETURN_PY.
+_return_precapture() {
+    _RETURN_ARMED=0; _RETURN_ORIGIN=""; _RETURN_BEFORE=""; _RETURN_PY=""
+    [ -n "$HANDOFF_SPAWNER_FOCUS" ] || return 0
+    _return_enabled || return 0
+    _RETURN_PY="$(_return_spaces_py)" || { _RETURN_PY=""; return 0; }
+    local _pre
+    _pre=$(/usr/bin/python3 "$_RETURN_PY" spawn-precapture 2>>"$LOG") || return 0
+    _RETURN_ORIGIN=$(printf '%s\n' "$_pre" | /usr/bin/sed -n 's/^ORIGIN=//p')
+    _RETURN_BEFORE=$(printf '%s\n' "$_pre" | /usr/bin/sed -n 's/^BEFORE=//p')
+    _RETURN_ARMED=1
+}
+
+# return jump — call AFTER URI+Enter dispatch SUCCEEDS (and NOT on the screen-relock defer branch).
+# Anchors the just-born worker window on the current desktop (A) then goto-s back to origin (B).
+# SYNCHRONOUS by design: the frontmost/AXRaise/inject contention is already over here, so there is
+# no desktop race; a background `&` would instead race the NEXT iteration's precapture (re-creating
+# a desktop race — the same failure class as the bug). --max-wait bounds the worst-case sync block
+# in a degraded sensing state (the happy path resolves in ~0.2s: the worker window is provably
+# present post-inject). spawn-return always exits 0 (fail-open); `|| true` is belt-and-suspenders.
+_return_jump_back() {
+    [ "$_RETURN_ARMED" = "1" ] || return 0
+    [ -n "$_RETURN_PY" ] || return 0
+    /usr/bin/python3 "$_RETURN_PY" spawn-return \
+        --origin="${_RETURN_ORIGIN:--1}" --before="$_RETURN_BEFORE" \
+        --max-wait="${HANDOFF_RETURN_MAX_WAIT:-2.0}" >>"$LOG" 2>&1 || true
+    _RETURN_ARMED=0
+}
+
 # 遍历所有项目子目录 — main spawn loop (gated by HANDOFF_SKIP_SPAWN).
 if [ "$HANDOFF_SKIP_SPAWN" = "1" ]; then
     log "SKIP-SPAWN: HANDOFF_SKIP_SPAWN=1 — skipping main spawn loop (test mode)"
@@ -1342,6 +1404,11 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
         # Empty / unset → code-router falls back to its existing per-project goto (零行为变化).
         SPAWNER_FOCUS=$(grep -m1 '^SPAWNER_FOCUS=' "$URI_FILE" 2>/dev/null | cut -d= -f2-)
         export HANDOFF_SPAWNER_FOCUS="$SPAWNER_FOCUS"
+        # djs-jump-return: reset the return-leg state for THIS task. Unconditional (the warm and
+        # _skip_code_n=1 paths never call _return_precapture, so a previous task's arming must not
+        # leak into _return_jump_back below). _RETURN_DEFERRED=1 marks the screen-relock defer
+        # branch so the return jump is skipped there (no successfully-dispatched window to return from).
+        _RETURN_ARMED=0; _RETURN_DEFERRED=0
 
         if [ -z "$URI" ]; then
             log "WARN: empty URI in $URI_FILE (project=$PROJECT task=$TASK), skipping"
@@ -1571,6 +1638,11 @@ EOF
                     fi
                 fi
                 if [ "$_skip_code_n" != "1" ]; then
+                    # djs-jump-return: capture origin (owner's desktop B) + window snapshot BEFORE the
+                    # outbound focus-jump, which happens INSIDE `$CODE_BIN`(=code-router) when this is a
+                    # SPAWNER_FOCUS spawn. Must precede `$CODE_BIN -n`. No-op unless armed (feature on +
+                    # router resolvable + SPAWNER_FOCUS set) → legacy byte-for-byte when disarmed.
+                    _return_precapture
                     # `-n` forces a NEW dedicated window opening OPEN_TARGET (worktree's, or the singlepane
                     # generated .handoff.code-workspace) — never reuses/clobbers the owner's window.
                     "$CODE_BIN" -n "$OPEN_TARGET" 2>>"$LOG" || log "WARN: code -n $OPEN_TARGET failed (continue with open)"
@@ -1751,6 +1823,7 @@ EOF
                 # and mark deferred. The already-open tab stays for audit.
                 mv "$LAUNCHED_FILE" "$URI_FILE" 2>/dev/null
                 defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "re-locked-before-submit"
+                _RETURN_DEFERRED=1   # djs-jump-return: deferred for retry → do NOT return-jump (no dispatched window)
             elif ! _perf_call "$TASK" "accessibility-trusted" accessibility_trusted; then
                 # Skip the doomed keystroke entirely — it would just log a WARN
                 # and leave the tab un-submitted. Surface it loudly instead.
@@ -1896,6 +1969,11 @@ EOF
                 log "ABORT-SUBMIT: frontmost is '$front_app' (not Code) — Enter 未按, 主人需手动按一次 Enter"
                 write_ack "$PROJ_DIR" "$TASK" "failed" "frontmost was '$front_app' not Code, abort osascript Enter"
             fi
+            # djs-jump-return: the URI dispatched (window opened on A + prompt injected) and the whole
+            # submit sequence is done — NOW snap the owner's view back to origin (B). Skipped when this
+            # path deferred (screen re-locked: .uri restored for retry, nothing truly dispatched). Armed
+            # only for a SPAWNER_FOCUS cold/singlepane spawn; a no-op otherwise. Synchronous + fail-open.
+            [ "$_RETURN_DEFERRED" = "1" ] || _return_jump_back
             sleep 0.5  # 防同次 launchd run 内连续 spawn 让主人晕
         else
             log "FAIL: open URI failed for project=$PROJECT task=$TASK, restoring"
