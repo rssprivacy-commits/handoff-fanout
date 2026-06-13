@@ -50,8 +50,10 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import re
 import sys
+import tempfile
 import urllib.parse
 from pathlib import Path
 
@@ -106,10 +108,21 @@ def _build_uri(cfg: _config.Config, prompt_text: str) -> str:
     return cfg.uri_template.format(prompt=urllib.parse.quote(prompt_text, safe=""))
 
 
-def _write_uri(queue_dir: Path, task: str, *, workspace: Path, uri: str) -> None:
+def _write_uri(
+    queue_dir: Path, task: str, *, workspace: Path, uri: str, spawner_focus: str | None = None
+) -> None:
     """Publish the launchd trigger LAST. ``WORKSPACE`` drives the watchdog's COLD vs SINGLEPANE
-    routing (a worktree dir under ``*/worktrees/*`` ⇒ COLD; the real repo ⇒ SINGLEPANE)."""
-    atomic.atomic_replace(queue_dir / f"{task}.uri", f"WORKSPACE={workspace}\nURI={uri}\n")
+    routing (a worktree dir under ``*/worktrees/*`` ⇒ COLD; the real repo ⇒ SINGLEPANE).
+
+    ``spawner_focus`` (direct-jump-spawn 2026-06-13): the validated absolute .handoff.code-workspace
+    path of the SPAWNING window (the active coordinator). Written as an additive ``SPAWNER_FOCUS=``
+    line the watchdog reads → exports → ``code-router.sh`` natively jumps to the spawner's desktop
+    before opening this worker (so the worker is born on the spawner's Space). Omitted when absent →
+    the .uri stays byte-identical to the pre-feature form (向后兼容)."""
+    body = f"WORKSPACE={workspace}\nURI={uri}\n"
+    if spawner_focus:
+        body += f"SPAWNER_FOCUS={spawner_focus}\n"
+    atomic.atomic_replace(queue_dir / f"{task}.uri", body)
 
 
 # ─── sidecar / workspace-file writers (watchdog contract) ──────────────────────
@@ -149,7 +162,9 @@ def _write_sidecar(
     )
 
 
-def _singlepane_workspace_json(*, src: Path, project: str, task: str, role: str, nonce: str) -> str:
+def _singlepane_workspace_json(
+    *, src: Path, project: str, task: str, role: str, nonce: str, focus_path: str
+) -> str:
     """The OUT-OF-TREE ``.handoff.code-workspace`` content for a singlepane spawn (``folders``→the
     real repo). THIN settings — ``window.title`` (binding project·task·role·nonce via
     ``title_for``) + the 3 single-pane UX keys ONLY, never the coordinator's own settings/inject
@@ -180,7 +195,11 @@ def _singlepane_workspace_json(*, src: Path, project: str, task: str, role: str,
         settings["workbench.colorCustomizations"] = dict(_worktree._COORDINATOR_RED_TITLEBAR)
     # Step2 B 轨二: session-identity env signal — LAST key (byte-precise golden diff).
     # ``role`` here IS the session role (worker / supervisor_succession), no override.
-    settings[_worktree.SESSION_ENV_SETTINGS_KEY] = _worktree.session_env_osx(role=role, task=task)
+    # direct-jump-spawn: also carry this window's own focus path (the out-of-tree
+    # .handoff.code-workspace realpath) so a session here can self-report when it spawns.
+    settings[_worktree.SESSION_ENV_SETTINGS_KEY] = _worktree.session_env_osx(
+        role=role, task=task, window_focus_path=focus_path
+    )
     return json.dumps(
         {
             "folders": [{"path": str(src)}],
@@ -258,7 +277,7 @@ def _active_singlepane_worker(
 
 def _spawn_singlepane(
     *, cfg, project, task, role, src, nonce, close_policy, predecessor_nonce, prompt_text,
-    queue_dir, wave_id=None,
+    queue_dir, wave_id=None, spawner_focus=None,
 ) -> int:
     """Gate + produce. MUST 3 (p6a-fix1 / design §5.4): ``handoff spawn`` is a PUBLIC entry
     that bypasses ``dump``'s Task5.1 singlepane guard, so it must carry its own hard REJECT:
@@ -299,6 +318,7 @@ def _spawn_singlepane(
                 prompt_text=prompt_text,
                 queue_dir=queue_dir,
                 wave_id=wave_id,
+                spawner_focus=spawner_focus,
             )
     except LockHeld as e:
         _err(
@@ -310,15 +330,20 @@ def _spawn_singlepane(
 
 def _produce_singlepane(
     *, cfg, project, task, role, src, nonce, close_policy, predecessor_nonce, prompt_text,
-    queue_dir, wave_id=None,
+    queue_dir, wave_id=None, spawner_focus=None,
 ) -> int:
     sp_dir = cfg.home / project / "singlepane"
     ws_file = sp_dir / f"{task}.handoff.code-workspace"
+    # direct-jump-spawn: this singlepane window's own focus path (realpath = VS Code's stored
+    # configURIPath after norm) → injected into its terminal env so it can self-report when spawning.
+    own_focus = os.path.realpath(str(ws_file))
     uri = _build_uri(cfg, prompt_text)
     try:
         atomic.atomic_replace(
             ws_file,
-            _singlepane_workspace_json(src=src, project=project, task=task, role=role, nonce=nonce),
+            _singlepane_workspace_json(
+                src=src, project=project, task=task, role=role, nonce=nonce, focus_path=own_focus
+            ),
         )
         _write_sidecar(
             queue_dir,
@@ -331,7 +356,8 @@ def _produce_singlepane(
             predecessor_nonce=predecessor_nonce,
             wave_id=wave_id,
         )
-        _write_uri(queue_dir, task, workspace=src, uri=uri)  # WORKSPACE=real repo ⇒ SINGLEPANE path
+        # WORKSPACE=real repo ⇒ SINGLEPANE path; spawner_focus drives the watchdog direct-jump.
+        _write_uri(queue_dir, task, workspace=src, uri=uri, spawner_focus=spawner_focus)
     except Exception as e:
         _err(f"singlepane spawn failed ({e}); rolling back partial intent")
         _rollback(queue_dir, task, ws_file=ws_file)
@@ -352,7 +378,7 @@ _WORKTREE_LOCK_WAIT = 120.0
 
 def _spawn_worktree(
     *, cfg, project, task, role, src, nonce, close_policy, predecessor_nonce, prompt_text,
-    queue_dir, wave_id=None,
+    queue_dir, wave_id=None, spawner_focus=None,
 ) -> int:
     """Serialize create+publish under the project spawn lock (one critical section).
 
@@ -375,6 +401,7 @@ def _spawn_worktree(
                 prompt_text=prompt_text,
                 queue_dir=queue_dir,
                 wave_id=wave_id,
+                spawner_focus=spawner_focus,
             )
     except LockHeld as e:
         _err(
@@ -387,7 +414,7 @@ def _spawn_worktree(
 
 def _produce_worktree(
     *, cfg, project, task, role, src, nonce, close_policy, predecessor_nonce, prompt_text,
-    queue_dir, wave_id=None,
+    queue_dir, wave_id=None, spawner_focus=None,
 ) -> int:
     result = _worktree.create_worktree(
         source_workspace=src,
@@ -444,7 +471,8 @@ def _produce_worktree(
             predecessor_nonce=predecessor_nonce,
             wave_id=wave_id,
         )
-        _write_uri(queue_dir, task, workspace=wt, uri=uri)  # WORKSPACE=worktree dir ⇒ COLD path
+        # WORKSPACE=worktree dir ⇒ COLD path; spawner_focus drives the watchdog direct-jump.
+        _write_uri(queue_dir, task, workspace=wt, uri=uri, spawner_focus=spawner_focus)
     except Exception as e:
         _err(f"worktree publish failed ({e}); rolling back partial intent")
         _rollback(queue_dir, task)
@@ -475,6 +503,7 @@ def run_spawn(
     predecessor_nonce: str | None = None,
     succession_token: str | None = None,
     wave_id: str | None = None,
+    spawner_focus_path: str | None = None,
 ) -> int:
     """Orchestrate one fresh spawn. Returns ``0`` on success, ``2`` fail-closed (never raises for a
     semantic error; never returns the retro RETRY code 4).
@@ -586,6 +615,38 @@ def run_spawn(
     prompt_text = _build_prompt(task, brief=brief, prompt=prompt)
     queue_dir = cfg.queue_dir(project)
 
+    # direct-jump-spawn (2026-06-13): validate the optional spawner focus path — the ACTIVE
+    # coordinator's own .handoff.code-workspace (passed by dx-spawn from its $HANDOFF_WINDOW_FOCUS_PATH
+    # env). FAIL-OPEN: an invalid/foreign value is DROPPED (worker still spawns, just no desktop jump) —
+    # never fail a spawn over a UX hint. Gate: realpath + absolute + the engine-namespaced
+    # `.handoff.code-workspace` suffix (so a forged .uri can't make the router `code <arbitrary file>`)
+    # + existing + under an allowed root (the handoff home, ~/.claude-handoff, or a temp dir where
+    # `dx-spawn --coordinator` writes its WS_FILE).
+    spawner_focus = None
+    if spawner_focus_path:
+        rp = os.path.realpath(os.path.expanduser(spawner_focus_path))
+        _allowed = {
+            os.path.realpath(str(cfg.home)),
+            os.path.realpath(os.path.expanduser("~/.claude-handoff")),
+            os.path.realpath(tempfile.gettempdir()),
+            os.path.realpath(os.environ.get("TMPDIR") or "/tmp"),
+            "/tmp",
+            "/private/tmp",
+        }
+        if (
+            os.path.isabs(rp)
+            and rp.endswith(".handoff.code-workspace")
+            and os.path.isfile(rp)
+            and any(rp == a or rp.startswith(a + os.sep) for a in _allowed)
+        ):
+            spawner_focus = rp
+        else:
+            _err(
+                "--spawner-focus-path dropped (not an existing in-tree/.tmp "
+                f".handoff.code-workspace): {spawner_focus_path!r} — worker spawns "
+                "without the desktop jump (fail-open)"
+            )
+
     common = dict(
         cfg=cfg,
         project=project,
@@ -598,6 +659,7 @@ def run_spawn(
         prompt_text=prompt_text,
         queue_dir=queue_dir,
         wave_id=wave_id,
+        spawner_focus=spawner_focus,
     )
     if isolation == ISOLATION_WORKTREE:
         rc = _spawn_worktree(**common)
@@ -648,6 +710,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "the membership manifest afterwards via `handoff worktree wave-freeze`)",
     )
     p.add_argument(
+        "--spawner-focus-path",
+        default=None,
+        dest="spawner_focus_path",
+        help="direct-jump-spawn: the SPAWNING window's own .handoff.code-workspace abs path "
+        "(the active coordinator's $HANDOFF_WINDOW_FOCUS_PATH). Written to the .uri so the "
+        "watchdog/code-router natively jumps to the spawner's desktop before opening the worker. "
+        "Validated + fail-open (an invalid value is dropped; the worker still spawns).",
+    )
+    p.add_argument(
         "--succession-token",
         default=None,
         dest="succession_token",
@@ -672,6 +743,7 @@ def main(argv: list[str] | None = None) -> int:
         predecessor_nonce=args.predecessor_nonce,
         succession_token=args.succession_token,
         wave_id=args.wave_id,
+        spawner_focus_path=args.spawner_focus_path,
     )
 
 

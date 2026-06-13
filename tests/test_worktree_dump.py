@@ -9,6 +9,7 @@ gc`` reclaims a terminal task's worktree.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -235,6 +236,10 @@ def test_dump_worktree_relay_env_role_is_solo(tmp_path, monkeypatch):
     assert s["terminal.integrated.env.osx"] == {
         "HANDOFF_SESSION_ROLE": "solo",
         "HANDOFF_SESSION_TASK": TASK,
+        # direct-jump-spawn: the worktree window's own focus path (realpath of its .code-workspace).
+        "HANDOFF_WINDOW_FOCUS_PATH": os.path.realpath(
+            str(home / PROJECT / "worktrees" / TASK / wt.WORKTREE_VSCODE_FILE)
+        ),
     }
     assert s["window.title"] == f"{PROJECT} · {TASK} [worktree]${{separator}}${{activeEditorShort}}"
 

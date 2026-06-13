@@ -20,6 +20,7 @@ worktree state; a worktree created then a later step failing is rolled back (no 
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import urllib.parse
 from pathlib import Path
@@ -116,6 +117,7 @@ def _argv(
     close_policy: str | None = None,
     predecessor_nonce: str | None = None,
     succession_token: str | None = None,
+    spawner_focus_path: str | None = None,
 ) -> list[str]:
     a = [
         "--project",
@@ -139,6 +141,8 @@ def _argv(
         a += ["--predecessor-nonce", predecessor_nonce]
     if succession_token is not None:
         a += ["--succession-token", succession_token]
+    if spawner_focus_path is not None:
+        a += ["--spawner-focus-path", spawner_focus_path]
     return a
 
 
@@ -201,12 +205,57 @@ def test_singlepane_produces_workspace_sidecar_uri(tmp_path, monkeypatch):
     assert spec["settings"]["terminal.integrated.env.osx"] == {
         "HANDOFF_SESSION_ROLE": "worker",
         "HANDOFF_SESSION_TASK": TASK,
+        # direct-jump-spawn: the window's own focus path (realpath of this .code-workspace).
+        "HANDOFF_WINDOW_FOCUS_PATH": os.path.realpath(str(ws_file)),
     }
 
     # (4) .uri — WORKSPACE = the real repo (NOT under /worktrees/ ⇒ singlepane consumer path)
     uri = _uri_lines(home)
     assert uri["WORKSPACE"] == str(repo)
     assert uri["URI"].startswith("vscode://anthropic.claude-code/open?prompt=")
+    # direct-jump-spawn: no --spawner-focus-path passed ⇒ NO SPAWNER_FOCUS line (向后兼容).
+    assert "SPAWNER_FOCUS" not in uri
+
+
+def test_spawner_focus_path_valid_written_to_uri(tmp_path, monkeypatch):
+    """direct-jump-spawn: a valid --spawner-focus-path (an existing .handoff.code-workspace under an
+    allowed root) is realpath-normalized and written as the SPAWNER_FOCUS line the watchdog reads."""
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    # a plausible spawner identity: an existing .handoff.code-workspace under HANDOFF_HOME (an
+    # allowed root). The trailing-slash / symlink norm is what the router matches against storage.json.
+    spawner = home / "some-proj" / "singlepane" / "coord-x.handoff.code-workspace"
+    spawner.parent.mkdir(parents=True)
+    spawner.write_text("{}")
+    rc = spawn.main(_argv(isolation="singlepane", workspace=repo, spawner_focus_path=str(spawner)))
+    assert rc == 0
+    uri = _uri_lines(home)
+    assert uri["SPAWNER_FOCUS"] == os.path.realpath(str(spawner))
+
+
+def test_spawner_focus_path_invalid_dropped_fail_open(tmp_path, monkeypatch):
+    """Fail-open: an invalid --spawner-focus-path (wrong suffix / non-existent) is DROPPED — the
+    worker still spawns (rc=0) and just gets NO SPAWNER_FOCUS line (no desktop jump), never a failure."""
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    # wrong suffix (not a .handoff.code-workspace) — would let the router `code <arbitrary file>`.
+    bogus = home / "not-a-workspace.txt"
+    bogus.write_text("x")
+    rc = spawn.main(_argv(isolation="singlepane", workspace=repo, spawner_focus_path=str(bogus)))
+    assert rc == 0  # fail-open: never fail a spawn over the UX hint
+    assert "SPAWNER_FOCUS" not in _uri_lines(home)
+    # non-existent path → also dropped (a SEPARATE project to avoid the one-worker-per-project guard).
+    rc = spawn.main(
+        _argv(
+            project="focus-proj2",
+            task="wh-focus2",
+            isolation="singlepane",
+            workspace=repo,
+            spawner_focus_path=str(home / "ghost.handoff.code-workspace"),
+        )
+    )
+    assert rc == 0
+    assert "SPAWNER_FOCUS" not in _uri_lines(home, project="focus-proj2", task="wh-focus2")
 
 
 def test_prompt_has_id_prefix(tmp_path, monkeypatch):
@@ -316,9 +365,9 @@ def test_singlepane_succession_publish_holds_project_spawn_lock(tmp_path, monkey
     seen: dict[str, bool] = {}
     real_write_uri = spawn._write_uri
 
-    def probe(queue_dir: Path, task: str, *, workspace: Path, uri: str) -> None:
+    def probe(queue_dir: Path, task: str, *, workspace: Path, uri: str, spawner_focus=None) -> None:
         seen["lock_held"] = (home / PROJECT / ".spawn.lock").is_dir()
-        real_write_uri(queue_dir, task, workspace=workspace, uri=uri)
+        real_write_uri(queue_dir, task, workspace=workspace, uri=uri, spawner_focus=spawner_focus)
 
     monkeypatch.setattr(spawn, "_write_uri", probe)
     rc = spawn.main(
@@ -464,7 +513,8 @@ def test_succession_singlepane_workspace_is_redtopped(tmp_path, monkeypatch):
         )
     )
     assert rc == 0
-    ws = json.loads(Path(_sidecar(home)["workspace"]).read_text())
+    _ws_path = _sidecar(home)["workspace"]
+    ws = json.loads(Path(_ws_path).read_text())
     title = ws["settings"]["window.title"]
     assert title.startswith("🧭中枢·")
     assert NONCE in title  # nonce substring gate intact under the prefix
@@ -475,6 +525,8 @@ def test_succession_singlepane_workspace_is_redtopped(tmp_path, monkeypatch):
     assert ws["settings"]["terminal.integrated.env.osx"] == {
         "HANDOFF_SESSION_ROLE": "supervisor_succession",
         "HANDOFF_SESSION_TASK": TASK,
+        # direct-jump-spawn: the coordinator window's own focus path (realpath of its .code-workspace).
+        "HANDOFF_WINDOW_FOCUS_PATH": os.path.realpath(_ws_path),
     }
 
 

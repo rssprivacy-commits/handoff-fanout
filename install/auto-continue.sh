@@ -1332,9 +1332,16 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
         [ -f "$QUEUE/$TASK.done" ] && continue
         [ -f "$QUEUE/$TASK.BLOCKED.md" ] && continue
 
-        # Parse URI file: 第一行 WORKSPACE= / 第二行 URI=
+        # Parse URI file: 第一行 WORKSPACE= / 第二行 URI= / (可选)第三行 SPAWNER_FOCUS=
         WORKSPACE=$(grep -m1 '^WORKSPACE=' "$URI_FILE" 2>/dev/null | cut -d= -f2-)
         URI=$(grep -m1 '^URI=' "$URI_FILE" 2>/dev/null | cut -d= -f2-)
+        # direct-jump-spawn (2026-06-13): the SPAWNING window's own .handoff.code-workspace abs path,
+        # written by `handoff spawn --spawner-focus-path` (validated). EXPORT it (reset every iteration,
+        # empty when absent) so the `$CODE_BIN`(=code-router.sh) that opens this worker can natively
+        # JUMP to the spawner's desktop first → the worker is born on the active coordinator's Space.
+        # Empty / unset → code-router falls back to its existing per-project goto (零行为变化).
+        SPAWNER_FOCUS=$(grep -m1 '^SPAWNER_FOCUS=' "$URI_FILE" 2>/dev/null | cut -d= -f2-)
+        export HANDOFF_SPAWNER_FOCUS="$SPAWNER_FOCUS"
 
         if [ -z "$URI" ]; then
             log "WARN: empty URI in $URI_FILE (project=$PROJECT task=$TASK), skipping"

@@ -264,9 +264,9 @@ def test_worktree_publish_holds_project_spawn_lock(
     seen: dict[str, bool] = {}
     real_write_uri = spawn._write_uri
 
-    def probe(queue_dir: Path, task: str, *, workspace: Path, uri: str) -> None:
+    def probe(queue_dir: Path, task: str, *, workspace: Path, uri: str, spawner_focus=None) -> None:
         seen["lock_held"] = (home / project / ".spawn.lock").is_dir()
-        real_write_uri(queue_dir, task, workspace=workspace, uri=uri)
+        real_write_uri(queue_dir, task, workspace=workspace, uri=uri, spawner_focus=spawner_focus)
 
     monkeypatch.setattr(spawn, "_write_uri", probe)
     rc = cli.main(
@@ -707,6 +707,10 @@ def test_worktree_workspace_settings_are_thin(
     assert spec["settings"]["terminal.integrated.env.osx"] == {
         "HANDOFF_SESSION_ROLE": "worker",
         "HANDOFF_SESSION_TASK": "thin-task",
+        # direct-jump-spawn: the worktree window's own focus path (realpath of its .code-workspace).
+        "HANDOFF_WINDOW_FOCUS_PATH": os.path.realpath(
+            str(home / project / "worktrees" / "thin-task" / ".handoff.code-workspace")
+        ),
     }
     # the coordinator-only red-top block must never ride along
     assert "workbench.colorCustomizations" not in spec["settings"]

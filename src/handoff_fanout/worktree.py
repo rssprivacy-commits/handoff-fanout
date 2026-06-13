@@ -525,20 +525,37 @@ _COORDINATOR_RED_TITLEBAR = {
 SESSION_ENV_SETTINGS_KEY = "terminal.integrated.env.osx"
 SESSION_ENV_ROLE = "HANDOFF_SESSION_ROLE"
 SESSION_ENV_TASK = "HANDOFF_SESSION_TASK"
+# direct-jump-spawn (2026-06-13): the window's OWN .handoff.code-workspace absolute path.
+# A session running in this window reads it from os.environ to self-report its exact
+# re-activation identity when IT spawns a child → the child's launcher `code <this path>`
+# (from a no-IPC-hook context) natively jumps to THIS window's Space, so the child is born
+# on the spawner's desktop. Purely additive UX env (nothing breaks if unread); value is the
+# realpath so it matches VS Code's stored configURIPath after the router's normalization.
+SESSION_ENV_WINDOW_FOCUS = "HANDOFF_WINDOW_FOCUS_PATH"
 _ROLE_SUCCESSION = "supervisor_succession"  # mirrors spawn.ROLE_SUCCESSION (spawn imports us)
 
 
-def session_env_osx(*, role: str, task: str, is_coordinator: bool = False) -> dict[str, str]:
+def session_env_osx(
+    *, role: str, task: str, is_coordinator: bool = False, window_focus_path: str | None = None
+) -> dict[str, str]:
     """The Step2 env-signal payload. ``is_coordinator`` overrides the role to
     ``supervisor_succession``: a ``dump --coordinator`` relay carries role="worker" in
     its watchdog sidecar (that contract is untouched), but the SESSION role — what the
     memory-guard matrix fences on — is the coordinator one (env=supervisor_succession →
     放行 per the B.3 判定矩阵; tagging a 中枢 window "worker" would fence the very
-    session that MUST sediment memory)."""
-    return {
+    session that MUST sediment memory).
+
+    ``window_focus_path`` (direct-jump-spawn 2026-06-13): when given, append the window's
+    own .code-workspace absolute path as ``HANDOFF_WINDOW_FOCUS_PATH`` (LAST key, so the
+    pre-existing two-key callers stay byte-identical when None). The caller — which knows the
+    workspace file path it is writing — passes ``os.path.realpath(ws_file)``."""
+    env = {
         SESSION_ENV_ROLE: _ROLE_SUCCESSION if is_coordinator else role,
         SESSION_ENV_TASK: task,
     }
+    if window_focus_path:
+        env[SESSION_ENV_WINDOW_FOCUS] = window_focus_path
+    return env
 
 
 def _ensure_session_env(ws_file: Path, *, role: str, task: str, is_coordinator: bool) -> None:
@@ -562,7 +579,11 @@ def _ensure_session_env(ws_file: Path, *, role: str, task: str, is_coordinator: 
         env = {}
         settings[SESSION_ENV_SETTINGS_KEY] = env
     changed = False
-    for k, v in session_env_osx(role=role, task=task, is_coordinator=is_coordinator).items():
+    # direct-jump-spawn: include this window's focus path on the reuse path too (idempotent merge).
+    for k, v in session_env_osx(
+        role=role, task=task, is_coordinator=is_coordinator,
+        window_focus_path=os.path.realpath(ws_file),
+    ).items():
         if env.get(k) != v:
             env[k] = v
             changed = True
@@ -768,8 +789,11 @@ def inject_vscode_workspace(
             settings["workbench.colorCustomizations"] = dict(_COORDINATOR_RED_TITLEBAR)
         # Step2 B 轨二: session-identity env signal — appended LAST so the byte-precise
         # "the only diff vs the pre-Step2 artifact is this one key" assertions hold.
+        # direct-jump-spawn: also carry this window's own focus path (realpath of the file we
+        # are about to write) so a session here can self-report its identity when it spawns.
         settings[SESSION_ENV_SETTINGS_KEY] = session_env_osx(
-            role=role, task=task, is_coordinator=is_coordinator
+            role=role, task=task, is_coordinator=is_coordinator,
+            window_focus_path=os.path.realpath(ws_file),
         )
         try:
             ws_file.write_text(

@@ -8,6 +8,7 @@ fail-safe removal path. Mode resolution is pure (env/sentinel/config).
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -323,7 +324,10 @@ _GOLDEN_NON_COORD = (
     '    "claudeCode.preferredLocation": "panel",\n'
     '    "terminal.integrated.env.osx": {\n'
     '      "HANDOFF_SESSION_ROLE": "worker",\n'
-    '      "HANDOFF_SESSION_TASK": "stage1-10c"\n    }\n  }\n}'
+    '      "HANDOFF_SESSION_TASK": "stage1-10c",\n'
+    # direct-jump-spawn: the window's own focus path (realpath of the .code-workspace file) is a
+    # per-tmp-run absolute path → the test substitutes __FOCUS__ with the actual realpath.
+    '      "HANDOFF_WINDOW_FOCUS_PATH": "__FOCUS__"\n    }\n  }\n}'
 )
 
 
@@ -364,10 +368,16 @@ def test_inject_vscode_workspace_default_byte_identical_baseline(tmp_path):
     p_false = wt.inject_vscode_workspace(
         src, wt_false, "erp-system", "stage1-10c", is_coordinator=False
     )
+    assert p_default is not None and p_false is not None  # inject returns the workspace path here
     b_default = Path(p_default).read_text()
     b_false = Path(p_false).read_text()
-    assert b_default == _GOLDEN_NON_COORD  # byte-identical to the locked golden
-    assert b_default == b_false  # default arg == explicit False
+    # direct-jump-spawn: HANDOFF_WINDOW_FOCUS_PATH is the per-worktree realpath (differs by tmp dir),
+    # so normalize each window's own focus path to __FOCUS__ before the byte-golden + default==false
+    # comparisons — everything else must stay byte-identical to the locked golden.
+    norm_default = b_default.replace(os.path.realpath(p_default), "__FOCUS__")
+    norm_false = b_false.replace(os.path.realpath(p_false), "__FOCUS__")
+    assert norm_default == _GOLDEN_NON_COORD  # byte-identical (modulo per-run focus path)
+    assert norm_default == norm_false  # default arg == explicit False
     s = json.loads(b_default)["settings"]
     assert "workbench.colorCustomizations" not in s
     assert "🧭" not in s["window.title"]
@@ -375,7 +385,11 @@ def test_inject_vscode_workspace_default_byte_identical_baseline(tmp_path):
     # re-serializes to EXACTLY the pre-Step2 golden — no other byte drift rode along.
     spec = json.loads(b_default)
     env = spec["settings"].pop("terminal.integrated.env.osx")
-    assert env == {"HANDOFF_SESSION_ROLE": "worker", "HANDOFF_SESSION_TASK": "stage1-10c"}
+    assert env == {
+        "HANDOFF_SESSION_ROLE": "worker",
+        "HANDOFF_SESSION_TASK": "stage1-10c",
+        "HANDOFF_WINDOW_FOCUS_PATH": os.path.realpath(p_default),
+    }
     assert json.dumps(spec, indent=2) == _PRE_STEP2_GOLDEN_NON_COORD
 
 
@@ -401,6 +415,7 @@ def test_inject_reuse_patches_env_signal_into_pre_step2_file(tmp_path):
         "USER_KEY": "keep-me",  # merge, never replace (user content survives)
         "HANDOFF_SESSION_ROLE": "worker",
         "HANDOFF_SESSION_TASK": "stage1-10c",
+        "HANDOFF_WINDOW_FOCUS_PATH": os.path.realpath(str(p)),  # direct-jump-spawn: own focus path
     }
     # idempotent: same identity again → byte-identical no-op.
     before = p.read_text()
