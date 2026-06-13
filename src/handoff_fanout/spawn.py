@@ -53,7 +53,6 @@ import json
 import os
 import re
 import sys
-import tempfile
 import urllib.parse
 from pathlib import Path
 
@@ -61,6 +60,7 @@ from handoff_fanout import atomic
 from handoff_fanout import config as _config
 from handoff_fanout import memory_baseline as _memory_baseline
 from handoff_fanout import spawn_nonce as _spawn_nonce
+from handoff_fanout import spawner_focus as _spawner_focus
 from handoff_fanout import succession_authority as _authority
 from handoff_fanout import worktree as _worktree
 from handoff_fanout.spawn_lock import LockHeld, project_spawn_lock
@@ -617,35 +617,17 @@ def run_spawn(
 
     # direct-jump-spawn (2026-06-13): validate the optional spawner focus path — the ACTIVE
     # coordinator's own .handoff.code-workspace (passed by dx-spawn from its $HANDOFF_WINDOW_FOCUS_PATH
-    # env). FAIL-OPEN: an invalid/foreign value is DROPPED (worker still spawns, just no desktop jump) —
-    # never fail a spawn over a UX hint. Gate: realpath + absolute + the engine-namespaced
-    # `.handoff.code-workspace` suffix (so a forged .uri can't make the router `code <arbitrary file>`)
-    # + existing + under an allowed root (the handoff home, ~/.claude-handoff, or a temp dir where
-    # `dx-spawn --coordinator` writes its WS_FILE).
-    spawner_focus = None
-    if spawner_focus_path:
-        rp = os.path.realpath(os.path.expanduser(spawner_focus_path))
-        _allowed = {
-            os.path.realpath(str(cfg.home)),
-            os.path.realpath(os.path.expanduser("~/.claude-handoff")),
-            os.path.realpath(tempfile.gettempdir()),
-            os.path.realpath(os.environ.get("TMPDIR") or "/tmp"),
-            "/tmp",
-            "/private/tmp",
-        }
-        if (
-            os.path.isabs(rp)
-            and rp.endswith(".handoff.code-workspace")
-            and os.path.isfile(rp)
-            and any(rp == a or rp.startswith(a + os.sep) for a in _allowed)
-        ):
-            spawner_focus = rp
-        else:
-            _err(
-                "--spawner-focus-path dropped (not an existing in-tree/.tmp "
-                f".handoff.code-workspace): {spawner_focus_path!r} — worker spawns "
-                "without the desktop jump (fail-open)"
-            )
+    # env). The strict realpath/suffix/allowed-root gate lives in the shared ``spawner_focus`` module
+    # (single security-boundary source — ``dump`` calls the SAME helper for its env path). FAIL-OPEN:
+    # an invalid/foreign value returns None and is DROPPED (worker still spawns, just no desktop jump)
+    # — never fail a spawn over a UX hint.
+    spawner_focus = _spawner_focus.validate_spawner_focus(spawner_focus_path, cfg=cfg)
+    if spawner_focus_path and spawner_focus is None:
+        _err(
+            "--spawner-focus-path dropped (not an existing in-tree/.tmp "
+            f".handoff.code-workspace): {spawner_focus_path!r} — worker spawns "
+            "without the desktop jump (fail-open)"
+        )
 
     common = dict(
         cfg=cfg,

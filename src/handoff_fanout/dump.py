@@ -36,6 +36,7 @@ from handoff_fanout import atomic, retro_gate, templates
 from handoff_fanout import config as _config
 from handoff_fanout import memory_baseline as _memory_baseline
 from handoff_fanout import spawn_nonce as _spawn_nonce
+from handoff_fanout import spawner_focus as _spawner_focus
 from handoff_fanout import worktree as _worktree
 from handoff_fanout.git_guard import git_guard_dir
 from handoff_fanout.handoff_precheck import (
@@ -769,6 +770,17 @@ def build_uri(cfg: _config.Config, project: str, task: str) -> str:
     return cfg.uri_template.format(prompt=encoded)
 
 
+def _spawner_focus_line(cfg: _config.Config) -> str:
+    """direct-jump-spawn (2026-06-13): when this dump runs in a coordinator terminal whose
+    ``$HANDOFF_WINDOW_FOCUS_PATH`` points at its OWN ``.handoff.code-workspace``, emit the additive
+    ``SPAWNER_FOCUS=`` line so the watchdog/code-router jumps the new window to the coordinator's
+    desktop (symmetric with ``spawn``'s ``--spawner-focus-path``; the SAME ``spawner_focus`` security
+    gate validates it). FAIL-OPEN: a missing/invalid env value yields ``""`` so the ``.uri`` stays
+    byte-identical to the pre-feature form (向后兼容). Never raises — a UX hint must not block dump."""
+    rp = _spawner_focus.validate_spawner_focus(os.environ.get("HANDOFF_WINDOW_FOCUS_PATH"), cfg=cfg)
+    return f"SPAWNER_FOCUS={rp}\n" if rp else ""
+
+
 # ─── single-task dump (default mode) ────────────────────────────────────────
 
 
@@ -994,8 +1006,11 @@ def write_active_dump(
         return 0
 
     # ── PUBLISH: write the .uri trigger LAST (all sidecars now exist) ────────────
-    # §3.7 — atomic .uri write (see the .md note above).
-    atomic.atomic_replace(uri_path, f"WORKSPACE={workspace}\nURI={uri}\n")
+    # §3.7 — atomic .uri write (see the .md note above). direct-jump-spawn: append the
+    # SPAWNER_FOCUS line when this dump runs in a coordinator terminal (fail-open → "").
+    atomic.atomic_replace(
+        uri_path, f"WORKSPACE={workspace}\nURI={uri}\n{_spawner_focus_line(cfg)}"
+    )
     print(f"[dump] wrote {uri_path}")
 
     _notify(next_brief, f"自动接续 / {project}", task)
@@ -1269,10 +1284,11 @@ def handle_open_batch(
             spawn_nonce=_spawn_nonce.new_nonce(),
         )
         uri = build_uri(cfg, project, sub_id)
-        # Launcher-visible trigger — atomic_replace (see the .md note above).
+        # Launcher-visible trigger — atomic_replace (see the .md note above). direct-jump-spawn:
+        # append the SPAWNER_FOCUS line when dumped from a coordinator terminal (fail-open → "").
         atomic.atomic_replace(
             queue_dir / f"{sub_id}.uri",
-            f"WORKSPACE={workspace}\nURI={uri}\n",
+            f"WORKSPACE={workspace}\nURI={uri}\n{_spawner_focus_line(cfg)}",
         )
         print(f"[open-batch]   sub-task {sub_id} (#{idx + 1}/{len(sub_tasks)}) written")
 
@@ -1354,9 +1370,11 @@ def trigger_fan_in_if_ready(
         spawn_nonce=_spawn_nonce.new_nonce(),
     )
     uri = build_uri(cfg, project, fan_in_task)
+    # direct-jump-spawn: append the SPAWNER_FOCUS line when dumped from a coordinator
+    # terminal (fail-open → ""; the fan-in tab lands on the spawner's desktop too).
     atomic.atomic_replace(
         queue_dir / f"{fan_in_task}.uri",
-        f"WORKSPACE={workspace}\nURI={uri}\n",
+        f"WORKSPACE={workspace}\nURI={uri}\n{_spawner_focus_line(cfg)}",
     )
     print(f"[trigger-fan-in] wrote queue/{fan_in_task}.{{md,uri}} + fan-in.env")
 
