@@ -778,14 +778,31 @@ def build_uri(cfg: _config.Config, project: str, task: str) -> str:
     return cfg.uri_template.format(prompt=encoded)
 
 
-def _spawner_focus_line(cfg: _config.Config) -> str:
-    """direct-jump-spawn (2026-06-13): when this dump runs in a coordinator terminal whose
-    ``$HANDOFF_WINDOW_FOCUS_PATH`` points at its OWN ``.handoff.code-workspace``, emit the additive
-    ``SPAWNER_FOCUS=`` line so the watchdog/code-router jumps the new window to the coordinator's
-    desktop (symmetric with ``spawn``'s ``--spawner-focus-path``; the SAME ``spawner_focus`` security
-    gate validates it). FAIL-OPEN: a missing/invalid env value yields ``""`` so the ``.uri`` stays
-    byte-identical to the pre-feature form (向后兼容). Never raises — a UX hint must not block dump."""
+def _spawner_focus_line(cfg: _config.Config, project: str, self_task: str | None = None) -> str:
+    """Emit the additive ``SPAWNER_FOCUS=<path>`` line — the SPAWNING coordinator's OWN
+    ``.handoff.code-workspace`` — so the watchdog/code-router runs the EXISTING ``focus-jump``
+    (``code <workspace>`` → macOS slides to its Space in ONE native step) and the worker is born on the
+    coordinator's desktop. Two sources, in order:
+
+      1. direct-jump-spawn (2026-06-13): ``$HANDOFF_WINDOW_FOCUS_PATH`` (a coordinator terminal that
+         got the env). The env channel is empty in an extension-auto-spawned agent shell (p19/p21).
+      2. mp-locate-return (2026-06-14 / sw-coord-p22 §1): env-independent SELF-IDENTIFICATION —
+         :func:`spawner_focus.resolve_spawner_focus_path` derives the coordinator's own workspace from
+         ``os.getcwd()`` (worktree Tier-1) or ``derive_singlepane_focus(home, project, self_task)``
+         (singlepane Tier-2, from the spawner's self-reported ``--self-task``).
+
+    Both go through the SAME ``validate_spawner_focus`` security gate (single boundary). FAIL-OPEN: no
+    valid focus from either → ``""`` so the ``.uri`` stays byte-identical to the pre-feature form
+    (向后兼容). Never raises — a UX hint must not block dump."""
     rp = _spawner_focus.validate_spawner_focus(os.environ.get("HANDOFF_WINDOW_FOCUS_PATH"), cfg=cfg)
+    if not rp:
+        rp = _spawner_focus.resolve_spawner_focus_path(
+            os.getcwd(),
+            cfg=cfg,
+            home=cfg.home,
+            project=project,
+            self_task=self_task,
+        )
     return f"SPAWNER_FOCUS={rp}\n" if rp else ""
 
 
@@ -810,6 +827,7 @@ def write_active_dump(
     worktree_info: dict | None = None,
     is_coordinator: bool = False,
     suppress_spawn_artifacts: bool = False,
+    self_task: str | None = None,
 ) -> int:
     # warmgap-C §1a: ``suppress_spawn_artifacts=True`` (Python-keyword-only, NEVER a CLI
     # flag — a public flag would be a legal bypass of the spawn-side G4 contract) keeps
@@ -1017,7 +1035,7 @@ def write_active_dump(
     # §3.7 — atomic .uri write (see the .md note above). direct-jump-spawn: append the
     # SPAWNER_FOCUS line when this dump runs in a coordinator terminal (fail-open → "").
     atomic.atomic_replace(
-        uri_path, f"WORKSPACE={workspace}\nURI={uri}\n{_spawner_focus_line(cfg)}"
+        uri_path, f"WORKSPACE={workspace}\nURI={uri}\n{_spawner_focus_line(cfg, project, self_task)}"
     )
     print(f"[dump] wrote {uri_path}")
 
@@ -1239,6 +1257,9 @@ def handle_open_batch(
 
     baseline = detect_baseline(workspace, cfg=cfg, project=project)
     roadmap_excerpt = get_roadmap_excerpt(cfg, project)
+    # mp-locate-return: resolve the coordinator's own focus PATH ONCE and reuse for every sub-task .uri
+    # (it's the same coordinator window for all sub-tasks).
+    _focus_line = _spawner_focus_line(cfg, project, getattr(args, "self_task", None))
 
     for idx, st in enumerate(sub_tasks):
         sub_id = st["id"]
@@ -1296,7 +1317,7 @@ def handle_open_batch(
         # append the SPAWNER_FOCUS line when dumped from a coordinator terminal (fail-open → "").
         atomic.atomic_replace(
             queue_dir / f"{sub_id}.uri",
-            f"WORKSPACE={workspace}\nURI={uri}\n{_spawner_focus_line(cfg)}",
+            f"WORKSPACE={workspace}\nURI={uri}\n{_focus_line}",
         )
         print(f"[open-batch]   sub-task {sub_id} (#{idx + 1}/{len(sub_tasks)}) written")
 
@@ -1315,6 +1336,7 @@ def trigger_fan_in_if_ready(
     batch_id: str,
     queue_dir: Path,
     cfg: _config.Config | None = None,
+    self_task: str | None = None,
 ) -> bool:
     """If all sub-tasks have ``.done``/``.blocked``, atomic-create the trigger and dump fan-in."""
     if cfg is None:
@@ -1382,7 +1404,7 @@ def trigger_fan_in_if_ready(
     # terminal (fail-open → ""; the fan-in tab lands on the spawner's desktop too).
     atomic.atomic_replace(
         queue_dir / f"{fan_in_task}.uri",
-        f"WORKSPACE={workspace}\nURI={uri}\n{_spawner_focus_line(cfg)}",
+        f"WORKSPACE={workspace}\nURI={uri}\n{_spawner_focus_line(cfg, project, self_task)}",
     )
     print(f"[trigger-fan-in] wrote queue/{fan_in_task}.{{md,uri}} + fan-in.env")
 
@@ -1426,7 +1448,8 @@ def handle_batch_done(
     # Terminal state: drop the sub-task heartbeat so the watchdog's mode-4/6
     # stale sweep doesn't mis-flag a completed sub-task.
     (batch_dir / f"{sub_task_id}.heartbeat").unlink(missing_ok=True)
-    trigger_fan_in_if_ready(project, workspace, args.batch_id, queue_dir, cfg=cfg)
+    trigger_fan_in_if_ready(project, workspace, args.batch_id, queue_dir, cfg=cfg,
+                            self_task=getattr(args, "self_task", None))
     return 0
 
 
@@ -1464,7 +1487,8 @@ def handle_batch_blocked(
     print(f"[batch-blocked] {blocked_path} written")
     # Terminal state — same heartbeat cleanup as the batch-done path.
     (batch_dir / f"{sub_task_id}.heartbeat").unlink(missing_ok=True)
-    trigger_fan_in_if_ready(project, workspace, args.batch_id, queue_dir, cfg=cfg)
+    trigger_fan_in_if_ready(project, workspace, args.batch_id, queue_dir, cfg=cfg,
+                            self_task=getattr(args, "self_task", None))
     return 0
 
 
@@ -1759,6 +1783,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--workspace", default=None, help="absolute path to project root; defaults to cwd"
     )
     ap.add_argument("--status", default="active", choices=["active", "done", "blocked"])
+    ap.add_argument(
+        "--self-task", dest="self_task", default=None,
+        help="mp-locate-return §1: the SPAWNING coordinator's OWN task id (self-reported, "
+             "env-independent) → singlepane Tier-2 derives its workspace via derive_singlepane_focus "
+             "so the worker focus-jumps to the coordinator's desktop. Omit for worktree coordinators "
+             "(Tier-1 uses cwd) or when no self-identification is wanted (fail-open).",
+    )
     ap.add_argument("--blocked-reason", default="")
     ap.add_argument("--tests", default="")
     ap.add_argument("--dry-run", action="store_true")
@@ -2022,6 +2053,7 @@ def main(argv: list[str] | None = None, *, suppress_spawn_artifacts: bool = Fals
                 # args lack --coordinator) working unchanged.
                 is_coordinator=getattr(args, "coordinator", False),
                 suppress_spawn_artifacts=suppress_spawn_artifacts,
+                self_task=getattr(args, "self_task", None),
             )
     except SinglepaneBusy as e:
         print(

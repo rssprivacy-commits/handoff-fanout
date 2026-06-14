@@ -82,3 +82,54 @@ def derive_singlepane_focus(home: str | os.PathLike[str], project: str, task: st
         return None
     p = os.path.join(str(home), project, "singlepane", f"{task}.handoff.code-workspace")
     return p if os.path.isfile(p) else None
+
+
+# ── mp-locate-return Part A / 去程 (2026-06-14 / sw-coord-p22 AUDITED-SPEC §1): self-report the
+# spawner's OWN workspace PATH (NOT a desktop number) and emit it as ``SPAWNER_FOCUS=<PATH>`` so the
+# watchdog code-router runs the EXISTING one-step ``focus-jump`` (``code <workspace>`` reactivates the
+# already-open window → macOS slides to its Space in ONE native step). p22 reversal: the
+# ``SPAWNER_DESKTOP=N`` → ``goto N`` route was ``Ctrl+arrow`` PER-STEP (逐格), violating the north
+# star「一步原生、非逐格」. Two env-independent tiers, BOTH derived from data the engine already wrote:
+#   * Tier 1 WORKTREE — ``<cwd>/.handoff.code-workspace`` (the worktree coordinator's own workspace).
+#   * Tier 2 SINGLEPANE — :func:`derive_singlepane_focus` from the spawner's self-reported task
+#     (``--self-task``) → the REAL ``<home>/<proj>/singlepane/<task>.handoff.code-workspace`` sidecar
+#     (the marker-hook route is DROPPED: that marker base never existed → was always ``None``).
+# Every candidate goes through the SAME :func:`validate_spawner_focus` security gate (single boundary).
+# Strictly ADDITIVE + FAIL-OPEN: any miss → ``None`` → caller omits ``SPAWNER_FOCUS`` and the existing
+# per-project goto is unchanged (字节级向后兼容).
+
+
+def resolve_spawner_focus_path(
+    cwd: str | os.PathLike[str],
+    *,
+    cfg: _config.Config,
+    home: str | os.PathLike[str] | None = None,
+    project: str | None = None,
+    self_task: str | None = None,
+) -> str | None:
+    """Return the SPAWNING coordinator's OWN ``.handoff.code-workspace`` realpath (validated through
+    :func:`validate_spawner_focus`, the single security boundary), or ``None``. Two env-independent
+    tiers; NEVER raises (fail-open → caller omits ``SPAWNER_FOCUS`` and the existing goto stands):
+
+      * Tier 1 — WORKTREE: ``<cwd>/.handoff.code-workspace`` (a worktree coordinator always carries one;
+        the engine creates worktrees under ``cfg.home/<project>/worktrees`` = an allowed root).
+      * Tier 2 — SINGLEPANE: :func:`derive_singlepane_focus(home, project, self_task)` → the REAL engine
+        sidecar ``<home>/<proj>/singlepane/<self_task>.handoff.code-workspace`` (the identity a singlepane
+        window can't read from cwd — its cwd is the shared repo root). Requires ``home``/``project``/
+        ``self_task`` (the spawner's OWN task, self-reported via ``--self-task``).
+
+    Each candidate is re-validated by ``validate_spawner_focus`` (realpath + ``.handoff.code-workspace``
+    suffix + allowed-root) before return, so a path outside the trusted roots is dropped (``None``),
+    never written verbatim into the worker ``.uri``."""
+    cand = os.path.join(str(cwd), ".handoff.code-workspace")
+    if os.path.isfile(cand):
+        rp = validate_spawner_focus(cand, cfg=cfg)
+        if rp:
+            return rp
+    if home and project and self_task:
+        sidecar_ws = derive_singlepane_focus(home, project, self_task)
+        if sidecar_ws:
+            rp = validate_spawner_focus(sidecar_ws, cfg=cfg)
+            if rp:
+                return rp
+    return None

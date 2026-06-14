@@ -56,6 +56,26 @@ def neutralize_ambient_audit_mandate(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("HANDOFF_AUDIT_MANDATE", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def neutralize_spawner_self_report(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the mp-locate-return SPAWNER_FOCUS self-identification OFF by default so the suite is
+    hermetic.
+
+    ``spawn``/``dump`` fall back to ``spawner_focus.resolve_spawner_focus_path(os.getcwd(), ...)`` when
+    the CLI/env focus path is absent. Running the suite from INSIDE a worktree, ``os.getcwd()`` carries
+    a real ``.handoff.code-workspace`` UNDER ``~/.claude-handoff`` (an allowed root that
+    ``validate_spawner_focus`` honors regardless of the test's tmp HANDOFF_HOME) — so the resolver would
+    emit a machine-dependent ``SPAWNER_FOCUS=`` line, breaking determinism / byte-compat assertions.
+    Monkeypatching the function to ``None`` makes dump/spawn behave as if no self-identified focus
+    exists. Tests that exercise the resolver ITSELF call the real implementation captured before this
+    autouse runs (see ``test_spawner_focus._REAL_RESOLVE``); tests that want dump/spawn to see a focus
+    re-``monkeypatch.setattr`` it, which wins (runs after).
+    """
+    from handoff_fanout import spawner_focus as _sf
+
+    monkeypatch.setattr(_sf, "resolve_spawner_focus_path", lambda *a, **k: None)
+
+
 @pytest.fixture
 def git_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """Initialise a throwaway git repo in ``tmp_path`` and chdir into it.

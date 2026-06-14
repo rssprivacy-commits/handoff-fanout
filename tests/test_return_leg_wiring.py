@@ -108,6 +108,9 @@ def _build_stubs(tmp_path: Path, *, router: bool, lock_seq: str = "unlocked") ->
             "if cmd == 'spawn-precapture':\n"
             "    print('ORIGIN=' + os.environ.get('_PRE_ORIGIN', '8'))\n"
             "    print('BEFORE=' + os.environ.get('_PRE_BEFORE', '111,222'))\n"
+            "    _aws = os.environ.get('_PRE_ANCHOR_WS', '')\n"
+            "    if _aws:\n"
+            "        print('RETURN_ANCHOR_WS=' + _aws)\n"
             "sys.exit(0)\n",
             encoding="utf-8",
         )
@@ -178,7 +181,6 @@ def _env(home: Path, tmp_path: Path, *, front_window: str, grow_transcript: Path
         "HANDOFF_TRANSCRIPT_ROOT": str(tmp_path / "transcripts"),
         "HANDOFF_COLD_VERIFY_SECS": "1",
         "HANDOFF_COLD_READY_SECS": "2",
-        "HANDOFF_RETURN_MAX_WAIT": "0.2",   # keep the (already-immediate) return poll snappy in tests
         "_EVENTS": str(events),
         "_FRONT_WIN": front_window,
         "_CODE_WINS": "",
@@ -239,20 +241,25 @@ def test_code_n_flag_still_present(home, tmp_path):
     assert " -n " in f" {code_log} ", "cold spawn must still force a NEW window (-n)"
 
 
-def test_spawn_return_carries_precaptured_origin_and_before(home, tmp_path):
-    """spawn-return's argv threads the precapture ORIGIN/BEFORE (so the primitive can goto the owner)."""
+def test_spawn_return_carries_precaptured_origin_before_and_anchor(home, tmp_path):
+    """spawn-return's argv threads precapture ORIGIN/BEFORE + the §2.1 RETURN_ANCHOR_WS (so the
+    primitive can one-step re-activate the owner's anchor) + the identity --anchor-token."""
     task = "ret-args"
     ws = _cold_ws(tmp_path, task)
     _seed(home, ws, task, spawner_focus=str(tmp_path / "c.handoff.code-workspace"))
     tr = _cold_transcript(tmp_path, ws)
     env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py", grow_transcript=tr,
-               extra={"_PRE_ORIGIN": "8", "_PRE_BEFORE": "111,222"})
+               extra={"_PRE_ORIGIN": "8", "_PRE_BEFORE": "111,222",
+                      "_PRE_ANCHOR_WS": "/o/owner.code-workspace"})
     assert _run(env).returncode == 0
     line = next((e for e in _events(tmp_path) if e.startswith("SPAWN-RETURN")), "")
     assert "--origin=8" in line, line
     assert "--before=111,222" in line, line
-    assert "--max-wait=" in line, line
-    # mp-locate-return P2-live-2: the cold submit token is the task id → threaded as the identity anchor
+    # mp-locate-return §2: the precaptured anchor is threaded; --max-wait is GONE (no poll)
+    assert "--anchor-ws=/o/owner.code-workspace" in line, line
+    assert "--anchor-app=" in line, line
+    assert "--max-wait=" not in line, line
+    # the cold submit token is the task id → threaded as the focus-steal identity guard token
     assert f"--anchor-token={task}" in line, line
 
 

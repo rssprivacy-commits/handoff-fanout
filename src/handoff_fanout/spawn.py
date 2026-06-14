@@ -114,11 +114,13 @@ def _write_uri(
     """Publish the launchd trigger LAST. ``WORKSPACE`` drives the watchdog's COLD vs SINGLEPANE
     routing (a worktree dir under ``*/worktrees/*`` ⇒ COLD; the real repo ⇒ SINGLEPANE).
 
-    ``spawner_focus`` (direct-jump-spawn 2026-06-13): the validated absolute .handoff.code-workspace
-    path of the SPAWNING window (the active coordinator). Written as an additive ``SPAWNER_FOCUS=``
-    line the watchdog reads → exports → ``code-router.sh`` natively jumps to the spawner's desktop
-    before opening this worker (so the worker is born on the spawner's Space). Omitted when absent →
-    the .uri stays byte-identical to the pre-feature form (向后兼容)."""
+    ``spawner_focus`` (direct-jump-spawn 2026-06-13 / mp-locate-return 2026-06-14): the validated
+    absolute .handoff.code-workspace path of the SPAWNING window (the active coordinator) — from the
+    CLI/env OR env-independent self-identification (cwd worktree / singlepane focus marker). Written as
+    an additive ``SPAWNER_FOCUS=`` line the watchdog reads → exports → ``code-router.sh`` runs the
+    one-step ``focus-jump`` to the spawner's desktop before opening this worker (so the worker is born
+    on the spawner's Space). Omitted when absent → the .uri stays byte-identical to the pre-feature
+    form (向后兼容)."""
     body = f"WORKSPACE={workspace}\nURI={uri}\n"
     if spawner_focus:
         body += f"SPAWNER_FOCUS={spawner_focus}\n"
@@ -356,7 +358,7 @@ def _produce_singlepane(
             predecessor_nonce=predecessor_nonce,
             wave_id=wave_id,
         )
-        # WORKSPACE=real repo ⇒ SINGLEPANE path; spawner_focus drives the watchdog direct-jump.
+        # WORKSPACE=real repo ⇒ SINGLEPANE path; spawner_focus drives the watchdog one-step focus-jump.
         _write_uri(queue_dir, task, workspace=src, uri=uri, spawner_focus=spawner_focus)
     except Exception as e:
         _err(f"singlepane spawn failed ({e}); rolling back partial intent")
@@ -471,7 +473,7 @@ def _produce_worktree(
             predecessor_nonce=predecessor_nonce,
             wave_id=wave_id,
         )
-        # WORKSPACE=worktree dir ⇒ COLD path; spawner_focus drives the watchdog direct-jump.
+        # WORKSPACE=worktree dir ⇒ COLD path; spawner_focus drives the watchdog one-step focus-jump.
         _write_uri(queue_dir, task, workspace=wt, uri=uri, spawner_focus=spawner_focus)
     except Exception as e:
         _err(f"worktree publish failed ({e}); rolling back partial intent")
@@ -504,6 +506,7 @@ def run_spawn(
     succession_token: str | None = None,
     wave_id: str | None = None,
     spawner_focus_path: str | None = None,
+    self_task: str | None = None,
 ) -> int:
     """Orchestrate one fresh spawn. Returns ``0`` on success, ``2`` fail-closed (never raises for a
     semantic error; never returns the retro RETRY code 4).
@@ -629,6 +632,21 @@ def run_spawn(
             "without the desktop jump (fail-open)"
         )
 
+    # mp-locate-return (2026-06-14 / sw-coord-p22): when the CLI/env didn't supply a valid focus path,
+    # SELF-IDENTIFY the SPAWNING coordinator's own .handoff.code-workspace (env-independent) and emit it
+    # as SPAWNER_FOCUS so the watchdog runs the EXISTING one-step focus-jump — Tier 1 worktree (cwd at
+    # `handoff spawn` time is the coordinator's worktree) + Tier 2 singlepane (the session-keyed focus
+    # marker, Stage 3 — the singlepane succession path spawns from the shared repo cwd). Validated through
+    # the SAME gate. FAIL-OPEN: None when unresolvable → SPAWNER_FOCUS omitted, existing goto stands.
+    if spawner_focus is None:
+        spawner_focus = _spawner_focus.resolve_spawner_focus_path(
+            os.getcwd(),
+            cfg=cfg,
+            home=cfg.home,
+            project=project,
+            self_task=self_task,
+        )
+
     common = dict(
         cfg=cfg,
         project=project,
@@ -708,6 +726,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--status active` (required for --role supervisor_succession; G4 收口 — a bare "
         "manual succession spawn is rejected)",
     )
+    p.add_argument(
+        "--self-task",
+        default=None,
+        dest="self_task",
+        help="mp-locate-return §1: the SPAWNING coordinator's OWN task id (self-reported, "
+        "env-independent). When --spawner-focus-path is absent, singlepane Tier-2 derives the "
+        "coordinator's workspace via derive_singlepane_focus(home, project, self_task) so the worker "
+        "focus-jumps to its desktop. Worktree coordinators use cwd (Tier-1, no --self-task). Fail-open.",
+    )
     return p
 
 
@@ -726,6 +753,7 @@ def main(argv: list[str] | None = None) -> int:
         succession_token=args.succession_token,
         wave_id=args.wave_id,
         spawner_focus_path=args.spawner_focus_path,
+        self_task=args.self_task,
     )
 
 

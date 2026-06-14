@@ -1310,13 +1310,15 @@ _return_spaces_py() {
     printf '%s' "$_p"
 }
 
-# precapture — call BEFORE the outbound jump (`$CODE_BIN -n`). Snapshots the owner's desktop
-# (origin = B) + the window set, so the post-inject return can anchor the worker window on A and
-# goto back to B. Arms ONLY for a SPAWNER_FOCUS spawn (the direct-jump-spawn scenario this targets)
-# with the feature on + the router resolvable; a no-op (stays disarmed) otherwise → byte-for-byte
-# legacy behavior. Sets globals _RETURN_ARMED / _RETURN_ORIGIN / _RETURN_BEFORE / _RETURN_PY.
+# precapture — call BEFORE the outbound jump (`$CODE_BIN -n`), while the owner is still on B and the
+# frontmost window is NOT yet polluted by the child window. Snapshots origin (B) + the window set
+# (P2-live-2 identity baseline) + the owner's RE-ACTIVATABLE anchor (§2.1: RETURN_ANCHOR_WS/APP), so the
+# post-inject return can re-activate that anchor in ONE step. Arms ONLY for a SPAWNER_FOCUS spawn (the
+# direct-jump-spawn / mp-locate-return focus-jump scenario) with the feature on + the router resolvable;
+# a no-op (stays disarmed) otherwise → byte-for-byte legacy behavior. Sets globals _RETURN_ARMED /
+# _RETURN_ORIGIN / _RETURN_BEFORE / _RETURN_ANCHOR_WS / _RETURN_ANCHOR_APP / _RETURN_PY.
 _return_precapture() {
-    _RETURN_ARMED=0; _RETURN_ORIGIN=""; _RETURN_BEFORE=""; _RETURN_PY=""
+    _RETURN_ARMED=0; _RETURN_ORIGIN=""; _RETURN_BEFORE=""; _RETURN_ANCHOR_WS=""; _RETURN_ANCHOR_APP=""; _RETURN_PY=""
     [ -n "$HANDOFF_SPAWNER_FOCUS" ] || return 0
     _return_enabled || return 0
     _RETURN_PY="$(_return_spaces_py)" || { _RETURN_PY=""; return 0; }
@@ -1324,33 +1326,32 @@ _return_precapture() {
     _pre=$(/usr/bin/python3 "$_RETURN_PY" spawn-precapture 2>>"$LOG") || return 0
     _RETURN_ORIGIN=$(printf '%s\n' "$_pre" | /usr/bin/sed -n 's/^ORIGIN=//p')
     _RETURN_BEFORE=$(printf '%s\n' "$_pre" | /usr/bin/sed -n 's/^BEFORE=//p')
+    # §2.1 anchor lines are emitted ONLY when capturable ("捕不准就不输出") → empty here = spawn-return
+    # fail-opens to goto. (Owner workspace paths/App names have no '=', so cut on the first '=' is safe.)
+    _RETURN_ANCHOR_WS=$(printf '%s\n' "$_pre" | /usr/bin/sed -n 's/^RETURN_ANCHOR_WS=//p')
+    _RETURN_ANCHOR_APP=$(printf '%s\n' "$_pre" | /usr/bin/sed -n 's/^RETURN_ANCHOR_APP=//p')
     _RETURN_ARMED=1
 }
 
 # return jump — call AFTER URI+Enter dispatch SUCCEEDS (and NOT on the screen-relock defer branch).
-# Anchors the just-born worker window on the current desktop (A) then goto-s back to origin (B).
-# SYNCHRONOUS by design: the frontmost/AXRaise/inject contention is already over here, so there is
-# no desktop race; a background `&` would instead race the NEXT iteration's precapture (re-creating
-# a desktop race — the same failure class as the bug). NOTE: --max-wait bounds ONLY the anchor-poll
-# loop inside spawn-return; the subsequent goto_desktop is NOT bounded by it (its internal retries
-# are bounded, but its osascript subprocess has no timeout — the SAME pre-existing hang exposure the
-# outbound focus-jump/goto already carries, NOT newly introduced here). Happy path resolves ~0.2s
-# (worker window provably present post-inject). Whether to wrap this call in run_with_timeout for
-# consistency with the other slow calls in this file is deferred to codex 6-15 (the timing auditor).
-# spawn-return always exits 0 (fail-open); `|| true` is belt-and-suspenders.
+# mp-locate-return §2: ONE-STEP re-activation of the owner's pre-captured anchor (RETURN_ANCHOR_WS via
+# `code <ws>` / RETURN_ANCHOR_APP via `activate`) → owner back to B in one native step; no anchor /
+# re-activation fails → fail-open per-step goto_desktop(origin). SYNCHRONOUS by design: the
+# frontmost/AXRaise/inject contention is over here, so there is no desktop race; a background `&` would
+# instead race the NEXT iteration's precapture. No poll/timeout: spawn-return does a single winlist read
+# (the worker is provably rendered on A post-inject) then re-activates. spawn-return always exits 0
+# (fail-open); `|| true` is belt-and-suspenders.
 _return_jump_back() {
     [ "$_RETURN_ARMED" = "1" ] || return 0
     [ -n "$_RETURN_PY" ] || return 0
-    # mp-locate-return P2-live-2: pass the identity token ($1 = the same _submit_token the submit guard
-    # asserted in the front window's title) so spawn-return anchors on OUR worker (title carries the
-    # token), not merely "a new window on A" — kills the presence-not-identity / empty-before misfire.
+    # $1 = the identity token (the same _submit_token the submit guard asserted in the worker's title) →
+    # spawn-return's focus-steal guard confirms OUR worker is on the current desktop (= owner didn't
+    # drift) before re-activating; --anchor-ws/--anchor-app are the owner's re-activatable anchor.
     local _anchor="${1:-}"
-    # --max-wait default raised 2.0 → 8.0 (design refinement #2): MP full-chain cold-start title load can
-    # exceed 2s; over-waiting only forgoes the "return to B" nicety (worker safe on A), tearing is worse.
     /usr/bin/python3 "$_RETURN_PY" spawn-return \
-        --origin="${_RETURN_ORIGIN:--1}" --before="$_RETURN_BEFORE" \
-        --anchor-token="$_anchor" \
-        --max-wait="${HANDOFF_RETURN_MAX_WAIT:-8.0}" >>"$LOG" 2>&1 || true
+        --origin="${_RETURN_ORIGIN:--1}" --before="${_RETURN_BEFORE:-}" \
+        --anchor-ws="${_RETURN_ANCHOR_WS:-}" --anchor-app="${_RETURN_ANCHOR_APP:-}" \
+        --anchor-token="$_anchor" >>"$LOG" 2>&1 || true
     _RETURN_ARMED=0
 }
 
@@ -1412,10 +1413,11 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
         # Parse URI file: 第一行 WORKSPACE= / 第二行 URI= / (可选)第三行 SPAWNER_FOCUS=
         WORKSPACE=$(grep -m1 '^WORKSPACE=' "$URI_FILE" 2>/dev/null | cut -d= -f2-)
         URI=$(grep -m1 '^URI=' "$URI_FILE" 2>/dev/null | cut -d= -f2-)
-        # direct-jump-spawn (2026-06-13): the SPAWNING window's own .handoff.code-workspace abs path,
-        # written by `handoff spawn --spawner-focus-path` (validated). EXPORT it (reset every iteration,
-        # empty when absent) so the `$CODE_BIN`(=code-router.sh) that opens this worker can natively
-        # JUMP to the spawner's desktop first → the worker is born on the active coordinator's Space.
+        # direct-jump-spawn (2026-06-13) / mp-locate-return (2026-06-14): the SPAWNING window's own
+        # .handoff.code-workspace abs path — from `handoff spawn --spawner-focus-path` OR engine
+        # self-identification (validated). EXPORT it (reset every iteration, empty when absent) so the
+        # `$CODE_BIN`(=code-router.sh) that opens this worker runs the one-step `focus-jump` to the
+        # spawner's desktop first → the worker is born on the active coordinator's Space.
         # Empty / unset → code-router falls back to its existing per-project goto (零行为变化).
         SPAWNER_FOCUS=$(grep -m1 '^SPAWNER_FOCUS=' "$URI_FILE" 2>/dev/null | cut -d= -f2-)
         export HANDOFF_SPAWNER_FOCUS="$SPAWNER_FOCUS"
@@ -1426,7 +1428,7 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
         # `submitted`), so every NOT-truly-dispatched path (screen re-lock, accessibility missing,
         # Enter withheld / no transcript growth, frontmost-not-Code) correctly suppresses the return —
         # the owner is NEVER snapped back to B while a worker tab sits unsubmitted on A.
-        _RETURN_ARMED=0; _RETURN_DISPATCHED=0
+        _RETURN_ARMED=0; _RETURN_DISPATCHED=0; _RETURN_ANCHOR_WS=""; _RETURN_ANCHOR_APP=""
 
         if [ -z "$URI" ]; then
             log "WARN: empty URI in $URI_FILE (project=$PROJECT task=$TASK), skipping"

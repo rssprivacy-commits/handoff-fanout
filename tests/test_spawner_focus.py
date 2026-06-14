@@ -102,3 +102,80 @@ def test_derive_returns_none_when_workspace_missing(isolated_handoff_home):
 @pytest.mark.parametrize(("project", "task"), [("", "t"), ("p", ""), ("", "")])
 def test_derive_returns_none_on_empty_identity(isolated_handoff_home, project, task):
     assert spawner_focus.derive_singlepane_focus(isolated_handoff_home, project, task) is None
+
+
+# ─── resolve_spawner_focus_path (mp-locate-return / sw-coord-p22: self-report the workspace PATH) ────
+# The corrected Part A: env-independently identify the spawner's OWN .handoff.code-workspace (worktree
+# from cwd; singlepane from the focus marker), validate through the SAME gate, and emit it as
+# SPAWNER_FOCUS so the watchdog runs the EXISTING one-step focus-jump (no SPAWNER_DESKTOP/goto-N, no
+# winlist here). Captured BEFORE the conftest autouse neutralizes the public name, so these tests hit
+# the real implementation (dump/spawn see the neutralized None — suite hermeticity).
+_REAL_RESOLVE = spawner_focus.resolve_spawner_focus_path
+
+
+def _worktree_cwd(home: Path, project: str = "erp-system", task: str = "erp-dev-coord-33") -> Path:
+    """A worktree coordinator cwd UNDER the handoff home (= an allowed root) carrying its workspace —
+    mirrors the engine layout ``<home>/<project>/worktrees/<task>/.handoff.code-workspace``."""
+    cwd = home / project / "worktrees" / task
+    cwd.mkdir(parents=True)
+    (cwd / ".handoff.code-workspace").write_text("{}")
+    return cwd
+
+
+def test_resolve_focus_worktree_returns_validated_path(isolated_handoff_home):
+    cwd = _worktree_cwd(isolated_handoff_home)
+    got = _REAL_RESOLVE(cwd, cfg=_config.load())
+    assert got == os.path.realpath(str(cwd / ".handoff.code-workspace"))
+
+
+def test_resolve_focus_none_when_no_workspace_and_no_marker(isolated_handoff_home, tmp_path):
+    """A plain cwd (no .handoff.code-workspace) with no marker → None (singlepane / non-worktree)."""
+    plain = tmp_path / "plain-repo"
+    plain.mkdir()
+    assert _REAL_RESOLVE(plain, cfg=_config.load()) is None
+
+
+# (validation gate — path outside allowed roots / wrong suffix → None — is covered by the
+# validate_spawner_focus tests above; resolve_spawner_focus_path delegates to the SAME gate.)
+
+
+# ─── §1 Tier-2 SINGLEPANE: derive_singlepane_focus from the self-reported task (NO marker hook) ─────
+# The corrected Tier-2: a singlepane coordinator (cwd = shared repo root) self-reports its OWN task via
+# --self-task; resolve reads the REAL engine sidecar <home>/<proj>/singlepane/<task>.handoff.code-workspace
+# (derive_singlepane_focus) → validate → SPAWNER_FOCUS. The earlier marker-hook route is DROPPED.
+
+
+def _singlepane_ws(home: Path, project: str, task: str) -> Path:
+    """The engine's real singlepane workspace sidecar under the home (so derive + validate accept it)."""
+    ws = home / project / "singlepane" / f"{task}.handoff.code-workspace"
+    ws.parent.mkdir(parents=True, exist_ok=True)
+    ws.write_text("{}")
+    return ws
+
+
+def test_resolve_focus_tier2_singlepane_via_self_task(isolated_handoff_home):
+    """cwd is NOT a worktree → Tier-2: derive_singlepane_focus(home, project, self_task) → validated PATH."""
+    home = isolated_handoff_home
+    ws = _singlepane_ws(home, "sdgf-runner", "sdgf-sup-13")
+    plain = home / "sdgf-runner"  # singlepane cwd = shared repo root (no in-tree .handoff.code-workspace)
+    plain.mkdir(parents=True, exist_ok=True)
+    got = _REAL_RESOLVE(plain, cfg=_config.load(), home=home, project="sdgf-runner",
+                        self_task="sdgf-sup-13")
+    assert got == os.path.realpath(str(ws))
+
+
+def test_resolve_focus_tier2_none_when_no_sidecar(isolated_handoff_home):
+    """self_task given but the engine sidecar doesn't exist (bootstrap leg) → None (fail-open)."""
+    home = isolated_handoff_home
+    plain = home / "sdgf-runner"
+    plain.mkdir(parents=True, exist_ok=True)
+    assert _REAL_RESOLVE(plain, cfg=_config.load(), home=home, project="sdgf-runner",
+                         self_task="nope-task") is None
+
+
+def test_resolve_focus_tier2_skipped_without_self_task(isolated_handoff_home):
+    """No self_task (worker / non-self-reporting caller) → Tier-2 never consulted → None."""
+    home = isolated_handoff_home
+    _singlepane_ws(home, "p", "co")  # sidecar exists, but no self_task to point at it
+    plain = home / "p"
+    assert _REAL_RESOLVE(plain, cfg=_config.load(), home=home, project="p") is None

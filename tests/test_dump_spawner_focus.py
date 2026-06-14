@@ -107,6 +107,26 @@ def test_active_dump_no_focus_line_when_env_absent(tmp_path, monkeypatch):
     assert text == f"WORKSPACE={ws}\nURI={dump.build_uri(_config.load(), PROJECT, TASK)}\n"
 
 
+def test_active_dump_writes_spawner_focus_from_self_id(tmp_path, monkeypatch):
+    """mp-locate-return (sw-coord-p22): env absent, but env-independent self-identification resolves the
+    coordinator's OWN workspace → the additive ``SPAWNER_FOCUS=<path>`` line (the worktree/singlepane
+    fix where the env channel is empty). The conftest autouse neutralizes the resolver by default; here
+    we override it to a validated path, which wins (runs after the fixture)."""
+    from handoff_fanout import spawner_focus as _sf
+    home = tmp_path / "handoff"
+    home.mkdir()
+    (home / "config.json").write_text("{}")
+    ws = _bare_and_clone(tmp_path)
+    monkeypatch.delenv("HANDOFF_WINDOW_FOCUS_PATH", raising=False)  # env empty → exercise self-id
+    focus = os.path.realpath(str(_valid_focus(home)))
+    monkeypatch.setattr(_sf, "resolve_spawner_focus_path", lambda *a, **k: focus)
+
+    assert _active_dump(home, ws, monkeypatch) == 0
+    text = _uri_text(home / PROJECT / "queue", TASK)
+    assert f"SPAWNER_FOCUS={focus}\n" in text
+    assert text.splitlines()[2] == f"SPAWNER_FOCUS={focus}"  # additive third line
+
+
 # ─── points 2 & 3: open-batch fan-out + fan-in ───────────────────────────────
 
 
