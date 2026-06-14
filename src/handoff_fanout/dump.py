@@ -79,6 +79,14 @@ SUB_TASK_N_MAX = 3
 STAGGER_SPAWN_SECONDS = 30
 GLOBAL_ACTIVE_LIMIT = 5
 
+# Bounded wait for the project spawn lock on the dump WORKTREE-create path (sw-coord-p21
+# symmetry fix). Kept equal to spawn.py's ``_WORKTREE_LOCK_WAIT`` (120.0): parallel
+# worktree workers are LEGITIMATE (design §2.2), so a concurrent same-project dump QUEUES
+# on the shared source repo's ``.spawn.lock`` instead of rejecting — see
+# ``resolve_spawn_workspace``. A duplicated literal (not an import of spawn.py's private
+# constant) keeps dump→spawn decoupled while documenting the intended parity.
+_WORKTREE_LOCK_WAIT = 120.0
+
 TASK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$")
 
 
@@ -1656,22 +1664,54 @@ def resolve_spawn_workspace(
         return source_workspace, None, None
 
     is_coordinator = getattr(args, "coordinator", False)
-    result = _worktree.create_worktree(
-        source_workspace=source_workspace,
-        project=project,
-        task=args.task,
-        cfg=cfg,
-        mode=mode,
-        # E3 role taxonomy: the dump single-task active relay is the SOLO chain on this
-        # path too — its workspace env signal (HANDOFF_SESSION_ROLE) must say "solo", not
-        # "worker". Title is unaffected (dump passes no spawn_nonce → legacy title). A
-        # coordinator's env is overridden to supervisor_succession inside session_env_osx
-        # regardless of this value (kept "worker" for symmetry with the sidecar contract).
-        role=("worker" if is_coordinator else ROLE_SOLO),
-        # §五·2 (2026-06-09 owner立法): a 中枢 dump red-tops its worktree window. getattr keeps
-        # batch / fan-in / legacy callers (whose args lack --coordinator) working unchanged.
-        is_coordinator=is_coordinator,
-    )
+    # sw-coord-p21 symmetry fix: serialize create_worktree under the project spawn lock,
+    # exactly as the SPAWN path does (spawn.py:391). Concurrent same-project dumps each run
+    # ``git worktree add -b``, which writes branch upstream config into the SHARED source
+    # repo's ``.git/config``; git's own lock turns that race into spurious "could not lock
+    # config file" fail-closes. An N=8 reproduction created only 5/8 worktrees UNLOCKED (3
+    # spurious degrades, no corruption) vs 8/8 LOCKED — the lock is the fix. Parallel
+    # worktree workers are LEGITIMATE (design §2.2), so this WAITS (queues) rather than
+    # rejecting, mirroring spawn.py's ``_WORKTREE_LOCK_WAIT``. The lock is held ONLY across
+    # create_worktree (the sole ``.git/config`` writer here — the later sidecar/.uri publish
+    # touches only the queue dir) and released before main() reaches singlepane_worker_guard,
+    # which acquires the SAME non-reentrant lock but only on the singlepane path. The two are
+    # SEQUENTIAL in main(), never nested — so this is deadlock-safe even for a project
+    # mis-configured as both worktree-ON and singlepane (the MODE_OFF early-return above
+    # already keeps every non-worktree dump path out of the lock = byte-identical).
+    try:
+        with project_spawn_lock(project, root=cfg.home, wait=_WORKTREE_LOCK_WAIT):
+            result = _worktree.create_worktree(
+                source_workspace=source_workspace,
+                project=project,
+                task=args.task,
+                cfg=cfg,
+                mode=mode,
+                # E3 role taxonomy: the dump single-task active relay is the SOLO chain on this
+                # path too — its workspace env signal (HANDOFF_SESSION_ROLE) must say "solo", not
+                # "worker". Title is unaffected (dump passes no spawn_nonce → legacy title). A
+                # coordinator's env is overridden to supervisor_succession inside session_env_osx
+                # regardless of this value (kept "worker" for symmetry with the sidecar contract).
+                role=("worker" if is_coordinator else ROLE_SOLO),
+                # §五·2 (2026-06-09 owner立法): a 中枢 dump red-tops its worktree window. getattr keeps
+                # batch / fan-in / legacy callers (whose args lack --coordinator) working unchanged.
+                is_coordinator=is_coordinator,
+            )
+    except LockHeld as e:
+        # Held past the bounded wait → fail closed (禁止静默降级: never silently fall back to a
+        # shared-tree spawn). Mirror spawn.py:406-412 with the dump-side owner-readable
+        # artifact: a BLOCKED.md (so the closing session sees why) + drop the .uri (so the
+        # launcher never spawns a successor on this contended state).
+        head = _worktree.head_sha(source_workspace) or "(unknown)"
+        _write_worktree_block(
+            queue_dir,
+            project,
+            args.task,
+            head,
+            f"project spawn lock held past {_WORKTREE_LOCK_WAIT:.0f}s ({e}); refusing to "
+            "create the worktree concurrently — retry after the other spawn/dump settles",
+        )
+        return source_workspace, None, 2  # EXIT_FAIL_CLOSED (spawn.py parity)
+
     if result.is_blocked:
         head = _worktree.head_sha(source_workspace) or "(unknown)"
         _write_worktree_block(queue_dir, project, args.task, head, result.reason or "unsafe")
