@@ -165,8 +165,28 @@ def find_gc_candidates(
             age_days = 0.0
         if not (has_done or age_days >= retention_days):
             continue  # young + not explicitly done → keep (conservative buffer)
+        # P1-2 (codex focusjump-fix re-audit): only the CANONICAL workspace path is bundled for
+        # quarantine. A stale / corrupted / polluted sidecar could point ``workspace`` at an
+        # arbitrary existing file; ``_quarantine`` would then basename-fallback + ``shutil.move`` it
+        # out of place (破坏面过大, 可逆≠可接受). Anything off the canonical
+        # ``<home>/<project>/singlepane/<task>.handoff.code-workspace`` → WARN (no silent downgrade)
+        # + quarantine the sidecar ONLY, never the foreign file.
         ws_raw = data.get("workspace") or ""
-        ws_path = Path(ws_raw) if ws_raw and Path(ws_raw).is_file() else None
+        expected_ws = queue_dir.parent / "singlepane" / f"{task}.handoff.code-workspace"
+        ws_path = None
+        if ws_raw:
+            cand = Path(ws_raw)
+            if cand == expected_ws and cand.is_file():
+                ws_path = cand
+            elif cand != expected_ws:
+                # any off-canonical path (existing OR not) → WARN (codex re-audit polish: fully
+                # honour 禁静默降级; a canonical-but-already-deleted ws stays quiet = normal cleanup).
+                print(
+                    f"[gc-singlepane] ⚠️ WARN {proj_name}/{task}: sidecar 'workspace' ({ws_raw}) is "
+                    f"outside the canonical singlepane path ({expected_ws}); quarantining the "
+                    "sidecar ONLY, NOT the foreign file.",
+                    file=sys.stderr,
+                )
         out.append(
             {
                 "project": proj_name,

@@ -166,3 +166,77 @@ def test_main_execute_aborts_when_liveness_unknown(tmp_path, monkeypatch, capsys
     assert rc == 1, "execute must abort when liveness can't be proven"
     assert sp.exists(), "nothing moved on fail-safe abort"
     assert "ABORTED" in capsys.readouterr().err
+
+
+# ─── P1-2 (codex re-audit): a foreign 'workspace' path must never be quarantined ────
+
+
+def _make_polluted_sidecar(home: Path, project: str, task: str, ws_target: Path,
+                           *, age_days=5.0) -> Path:
+    """A stale supervisor sidecar whose ``workspace`` points OUTSIDE the canonical
+    ``<home>/<project>/singlepane/<task>.handoff.code-workspace`` location."""
+    queue = home / project / "queue"
+    queue.mkdir(parents=True, exist_ok=True)
+    sp = queue / f"{task}.singlepane"
+    sp.write_text(json.dumps({"workspace": str(ws_target), "role": "supervisor_succession"}))
+    import os
+    old = time.time() - age_days * 86400.0
+    os.utime(sp, (old, old))
+    return sp
+
+
+def test_foreign_workspace_path_not_bundled(tmp_path, capsys):
+    """A corrupted/polluted sidecar pointing ``workspace`` at an arbitrary existing file must NOT
+    bundle that foreign file for quarantine — only the sidecar itself is eligible."""
+    foreign = tmp_path / "victim.txt"
+    foreign.write_text("do not move me")
+    _make_polluted_sidecar(tmp_path, "proj", "coord-12", foreign, age_days=5.0)
+
+    recs = gc.find_gc_candidates(tmp_path, live_titles=[], retention_days=1.0)
+
+    assert _tasks(recs) == ["coord-12"], "the sidecar itself is still eligible"
+    assert recs[0]["workspace"] is None, "foreign workspace path must NOT be bundled for quarantine"
+    assert foreign.exists(), "find_gc_candidates is read-only — foreign file untouched"
+    assert "outside the canonical" in capsys.readouterr().err, "out-of-range path must WARN (no silent downgrade)"
+
+
+def test_main_execute_never_moves_foreign_workspace(tmp_path, monkeypatch):
+    """End-to-end: ``--execute`` quarantines the sidecar but NEVER the foreign file it points at."""
+    monkeypatch.setenv("HANDOFF_HOME", str(tmp_path))
+    foreign = tmp_path / "victim.txt"
+    foreign.write_text("do not move me")
+    sp = _make_polluted_sidecar(tmp_path, "proj", "coord-12", foreign, age_days=5.0)
+    monkeypatch.setattr(gc, "_live_code_window_titles", lambda: [])
+
+    rc = gc.main(["--project", "proj", "--execute"])
+
+    assert rc == 0
+    assert not sp.exists(), "the sidecar is quarantined"
+    assert foreign.exists(), "the foreign file is NEVER moved (GC blast radius bounded to canonical path)"
+
+
+def test_canonical_workspace_still_bundled(tmp_path):
+    """Regression guard: a legitimate canonical workspace path is still bundled (fix didn't over-reject)."""
+    _make_sidecar(tmp_path, "proj", "coord-12", age_days=5.0, with_ws=True)
+    recs = gc.find_gc_candidates(tmp_path, live_titles=[], retention_days=1.0)
+    assert recs[0]["workspace"] is not None, "the canonical workspace file is still eligible for quarantine"
+
+
+def test_off_canonical_nonexistent_workspace_warns(tmp_path, capsys):
+    """codex re-audit polish: an off-canonical workspace path that does NOT exist must still WARN
+    (禁静默降级), while a canonical-but-already-deleted ws stays quiet (normal cleanup)."""
+    ghost = tmp_path / "elsewhere" / "ghost.code-workspace"  # off-canonical, never created
+    _make_polluted_sidecar(tmp_path, "proj", "coord-12", ghost, age_days=5.0)
+    recs = gc.find_gc_candidates(tmp_path, live_titles=[], retention_days=1.0)
+    assert recs[0]["workspace"] is None
+    assert "outside the canonical" in capsys.readouterr().err
+
+
+def test_canonical_deleted_workspace_silent(tmp_path, capsys):
+    """A canonical workspace whose file was already deleted is normal cleanup → no WARN noise."""
+    _make_sidecar(tmp_path, "proj", "coord-12", age_days=5.0, with_ws=True)
+    # delete just the workspace file, keep the sidecar pointing at the canonical (now-missing) path
+    (tmp_path / "proj" / "singlepane" / "coord-12.handoff.code-workspace").unlink()
+    recs = gc.find_gc_candidates(tmp_path, live_titles=[], retention_days=1.0)
+    assert recs[0]["workspace"] is None
+    assert "outside the canonical" not in capsys.readouterr().err, "canonical-but-deleted must NOT warn"
