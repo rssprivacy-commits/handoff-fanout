@@ -1341,9 +1341,16 @@ _return_precapture() {
 _return_jump_back() {
     [ "$_RETURN_ARMED" = "1" ] || return 0
     [ -n "$_RETURN_PY" ] || return 0
+    # mp-locate-return P2-live-2: pass the identity token ($1 = the same _submit_token the submit guard
+    # asserted in the front window's title) so spawn-return anchors on OUR worker (title carries the
+    # token), not merely "a new window on A" — kills the presence-not-identity / empty-before misfire.
+    local _anchor="${1:-}"
+    # --max-wait default raised 2.0 → 8.0 (design refinement #2): MP full-chain cold-start title load can
+    # exceed 2s; over-waiting only forgoes the "return to B" nicety (worker safe on A), tearing is worse.
     /usr/bin/python3 "$_RETURN_PY" spawn-return \
         --origin="${_RETURN_ORIGIN:--1}" --before="$_RETURN_BEFORE" \
-        --max-wait="${HANDOFF_RETURN_MAX_WAIT:-2.0}" >>"$LOG" 2>&1 || true
+        --anchor-token="$_anchor" \
+        --max-wait="${HANDOFF_RETURN_MAX_WAIT:-8.0}" >>"$LOG" 2>&1 || true
     _RETURN_ARMED=0
 }
 
@@ -1414,9 +1421,12 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
         export HANDOFF_SPAWNER_FOCUS="$SPAWNER_FOCUS"
         # djs-jump-return: reset the return-leg state for THIS task. Unconditional (the warm and
         # _skip_code_n=1 paths never call _return_precapture, so a previous task's arming must not
-        # leak into _return_jump_back below). _RETURN_DEFERRED=1 marks the screen-relock defer
-        # branch so the return jump is skipped there (no successfully-dispatched window to return from).
-        _RETURN_ARMED=0; _RETURN_DEFERRED=0
+        # leak into _return_jump_back below). _RETURN_DISPATCHED gates the return jump POSITIVELY
+        # (mp-locate-return P2-live-1): it is set ONLY where a submit actually SUCCEEDS (ack
+        # `submitted`), so every NOT-truly-dispatched path (screen re-lock, accessibility missing,
+        # Enter withheld / no transcript growth, frontmost-not-Code) correctly suppresses the return —
+        # the owner is NEVER snapped back to B while a worker tab sits unsubmitted on A.
+        _RETURN_ARMED=0; _RETURN_DISPATCHED=0
 
         if [ -z "$URI" ]; then
             log "WARN: empty URI in $URI_FILE (project=$PROJECT task=$TASK), skipping"
@@ -1831,7 +1841,8 @@ EOF
                 # and mark deferred. The already-open tab stays for audit.
                 mv "$LAUNCHED_FILE" "$URI_FILE" 2>/dev/null
                 defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "re-locked-before-submit"
-                _RETURN_DEFERRED=1   # djs-jump-return: deferred for retry → do NOT return-jump (no dispatched window)
+                # mp-locate-return P2-live-1: no _RETURN_DISPATCHED set here → the return jump is
+                # suppressed by the positive gate below (nothing truly dispatched; .uri restored for retry).
             elif ! _perf_call "$TASK" "accessibility-trusted" accessibility_trusted; then
                 # Skip the doomed keystroke entirely — it would just log a WARN
                 # and leave the tab un-submitted. Surface it loudly instead.
@@ -1879,12 +1890,14 @@ EOF
                         0)
                             log "AUTO-SUBMIT: Enter + worktree-transcript verified (cold window, auto) for project=$PROJECT task=$TASK"
                             write_ack "$PROJ_DIR" "$TASK" "submitted" "Enter + worktree transcript growth verified (cold window, auto)"
+                            _RETURN_DISPATCHED=1   # mp-locate-return P2-live-1: real submit → return jump armed
                             ;;
                         3)
                             # already-grew: an external/manual Enter started the session before ours. It IS running →
                             # mark submitted (do NOT re-trigger a duplicate window) but HONEST it was not our auto-Enter.
                             log "AUTO-SUBMIT: cold session already running via external/manual Enter (NOT script-verified) for project=$PROJECT task=$TASK"
                             write_ack "$PROJ_DIR" "$TASK" "submitted" "external/manual Enter started the session before auto-submit — running, NOT script-verified (cold)"
+                            _RETURN_DISPATCHED=1   # mp-locate-return P2-live-1: session running (external Enter) → return jump armed
                             ;;
                         2)
                             warn_accessibility_once
@@ -1919,11 +1932,13 @@ EOF
                         0)
                             log "AUTO-SUBMIT: Enter + new 🆔-marked transcript jsonl verified (singlepane, auto) for project=$PROJECT task=$TASK"
                             write_ack "$PROJ_DIR" "$TASK" "submitted" "Enter + new 🆔-marked transcript jsonl verified (singlepane, auto)"
+                            _RETURN_DISPATCHED=1   # mp-locate-return P2-live-1: real submit → return jump armed
                             ;;
                         3)
                             # confirm arrived without our machinery pressing — running, but HONEST
                             log "AUTO-SUBMIT: singlepane session already running via external/manual Enter (NOT script-verified) for project=$PROJECT task=$TASK"
                             write_ack "$PROJ_DIR" "$TASK" "submitted" "external/manual Enter started the session before auto-submit — running, NOT script-verified (singlepane)"
+                            _RETURN_DISPATCHED=1   # mp-locate-return P2-live-1: session running (external Enter) → return jump armed
                             ;;
                         2)
                             warn_accessibility_once
@@ -1948,6 +1963,7 @@ EOF
                     if "$HANDOFF_OSASCRIPT_CMD" -e 'tell application "System Events" to tell process "Code" to keystroke return' 2>>"$LOG"; then
                         log "AUTO-SUBMIT: pressed Enter (warm, app-level escape hatch) for project=$PROJECT task=$TASK"
                         write_ack "$PROJ_DIR" "$TASK" "submitted" "Enter sent (warm app-level / window guard off)"
+                        _RETURN_DISPATCHED=1   # mp-locate-return P2-live-1: real submit → return jump armed
                     else
                         warn_accessibility_once
                         log "WARN: osascript keystroke failed despite accessibility preflight OK (transient / 权限 mid-run 撤销?) project=$PROJECT task=$TASK"
@@ -1960,6 +1976,7 @@ EOF
                         0)
                             log "AUTO-SUBMIT: pressed Enter (warm, window-guarded '$_submit_token') for project=$PROJECT task=$TASK"
                             write_ack "$PROJ_DIR" "$TASK" "submitted" "Enter sent to matched window ($_submit_token)"
+                            _RETURN_DISPATCHED=1   # mp-locate-return P2-live-1: real submit → return jump armed
                             ;;
                         2)
                             warn_accessibility_once
@@ -1978,10 +1995,13 @@ EOF
                 write_ack "$PROJ_DIR" "$TASK" "failed" "frontmost was '$front_app' not Code, abort osascript Enter"
             fi
             # djs-jump-return: the URI dispatched (window opened on A + prompt injected) and the whole
-            # submit sequence is done — NOW snap the owner's view back to origin (B). Skipped when this
-            # path deferred (screen re-locked: .uri restored for retry, nothing truly dispatched). Armed
-            # only for a SPAWNER_FOCUS cold/singlepane spawn; a no-op otherwise. Synchronous + fail-open.
-            [ "$_RETURN_DEFERRED" = "1" ] || _return_jump_back
+            # submit sequence is done — NOW snap the owner's view back to origin (B). mp-locate-return
+            # P2-live-1: gated POSITIVELY on _RETURN_DISPATCHED (set ONLY where a submit actually
+            # SUCCEEDED, ack `submitted`) — so EVERY un-confirmed-Enter path (screen re-lock, accessibility
+            # missing, Enter withheld / no transcript growth, frontmost-not-Code) suppresses the return
+            # and the owner is NEVER snapped back while the worker tab sits unsubmitted on A. Armed only
+            # for a SPAWNER_FOCUS cold/singlepane spawn; a no-op otherwise. Synchronous + fail-open.
+            [ "$_RETURN_DISPATCHED" = "1" ] && _return_jump_back "${_submit_token:-}"
             sleep 0.5  # 防同次 launchd run 内连续 spawn 让主人晕
         else
             log "FAIL: open URI failed for project=$PROJECT task=$TASK, restoring"

@@ -126,7 +126,7 @@ def _build_stubs(tmp_path: Path, *, router: bool, lock_seq: str = "unlocked") ->
        '      tok="${@: -1}"\n'
        '      if [ -n "$_CODE_WINS" ] && printf "%s\\n" "$_CODE_WINS" | grep -Fq -- "$tok"; then echo hit; else echo nohit; fi ;;\n'
        '  *"handoff-window-raise"*) echo raised ;;\n'
-       '  *"UI elements enabled"*) echo true ;;\n'
+       '  *"UI elements enabled"*) echo "${_ACCESSIBILITY:-true}" ;;\n'
        '  *"AXFocusedUIElement"*)\n'
        '      tok="${@: -1}"\n'
        '      case "$_FRONT_WIN" in\n'
@@ -252,6 +252,8 @@ def test_spawn_return_carries_precaptured_origin_and_before(home, tmp_path):
     assert "--origin=8" in line, line
     assert "--before=111,222" in line, line
     assert "--max-wait=" in line, line
+    # mp-locate-return P2-live-2: the cold submit token is the task id → threaded as the identity anchor
+    assert f"--anchor-token={task}" in line, line
 
 
 # ─── disarmed paths (byte-for-byte legacy: no precapture, no return) ─────────────────────────────
@@ -334,3 +336,51 @@ def test_screen_relock_defer_suppresses_return(home, tmp_path):
     assert "PRECAPTURE" in tags, "precapture still arms before code -n"
     assert "OPEN" in tags, "open URI happened before the relock check"
     assert "SPAWN-RETURN" not in tags, f"defer branch must suppress the return jump: {tags}"
+
+
+# ─── P2-live-1: return arms ONLY on a SUCCESSFUL dispatch (ack `submitted`) ───────────────────────
+# The gate is `_RETURN_DISPATCHED` (set only where a submit succeeds), NOT `!_RETURN_DEFERRED`. Any
+# path that opens the worker tab on A but does NOT confirm the Enter (accessibility missing, Enter
+# withheld / no transcript growth, frontmost-not-Code, …) must SUPPRESS the return — else the owner
+# is snapped back to B, HIDING a worker that still needs a manual Enter (the LIVE P2 this closes).
+
+
+def test_accessibility_missing_suppresses_return(home, tmp_path):
+    """Accessibility not trusted → Enter never pressed (tab open, unsubmitted) → return SUPPRESSED."""
+    task = "ret-noax"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task, spawner_focus=str(tmp_path / "c.handoff.code-workspace"))
+    tr = _cold_transcript(tmp_path, ws)
+    env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py", grow_transcript=tr,
+               extra={"_ACCESSIBILITY": "false"})
+    assert _run(env).returncode == 0
+    tags = _tags(_events(tmp_path))
+    assert "PRECAPTURE" in tags, "precapture still arms before code -n"
+    assert "OPEN" in tags, "the tab still opened (worker born on A, just unsubmitted)"
+    assert "SPAWN-RETURN" not in tags, f"unsubmitted (no accessibility) must NOT return: {tags}"
+
+
+def test_cold_no_transcript_growth_suppresses_return(home, tmp_path):
+    """Cold submit: Enter sent on the verified input but the transcript NEVER grows (the session did
+    not actually start) → ack `failed`, not `submitted` → return SUPPRESSED (worker needs manual Enter)."""
+    task = "ret-nogrow"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task, spawner_focus=str(tmp_path / "c.handoff.code-workspace"))
+    # grow_transcript=None ⇒ the cold-submit stub presses Enter but the transcript file never grows
+    env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py", grow_transcript=None)
+    assert _run(env).returncode == 0
+    tags = _tags(_events(tmp_path))
+    assert "PRECAPTURE" in tags and "OPEN" in tags, tags
+    assert "SPAWN-RETURN" not in tags, f"failed submit (no growth) must NOT return: {tags}"
+
+
+def test_successful_cold_dispatch_still_returns(home, tmp_path):
+    """Positive regression for the dispatch gate: a genuinely submitted cold spawn STILL returns."""
+    task = "ret-ok"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task, spawner_focus=str(tmp_path / "c.handoff.code-workspace"))
+    tr = _cold_transcript(tmp_path, ws)
+    env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py", grow_transcript=tr)
+    assert _run(env).returncode == 0
+    tags = _tags(_events(tmp_path))
+    assert "SPAWN-RETURN" in tags, f"a verified submit must still snap the owner back: {tags}"
