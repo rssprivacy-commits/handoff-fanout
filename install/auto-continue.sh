@@ -1299,7 +1299,11 @@ _return_enabled() {
 # HANDOFF_CODE_BIN points at the router — the one case an outbound focus-jump happens. Any other
 # CODE_BIN (a plain `code`) has no sibling .py → return 1 → caller fail-opens (no return leg).
 _return_spaces_py() {
-    [ -n "$HANDOFF_CODE_BIN" ] || return 1
+    # ${VAR:-} default: HANDOFF_CODE_BIN may be UNSET (manual/debug invocation, a future test
+    # harness, a plist regression) — under `set -u` (line 24) a bare $HANDOFF_CODE_BIN would abort
+    # the WHOLE watchdog run on "unbound variable", violating the fail-open red line. The :- makes
+    # an unset value cleanly disarm the return leg (return 1) instead. Mirrors line 80's pattern.
+    [ -n "${HANDOFF_CODE_BIN:-}" ] || return 1
     local _p
     _p="$(dirname "$HANDOFF_CODE_BIN")/vscode-spaces.py"
     [ -f "$_p" ] || return 1
@@ -1327,9 +1331,13 @@ _return_precapture() {
 # Anchors the just-born worker window on the current desktop (A) then goto-s back to origin (B).
 # SYNCHRONOUS by design: the frontmost/AXRaise/inject contention is already over here, so there is
 # no desktop race; a background `&` would instead race the NEXT iteration's precapture (re-creating
-# a desktop race — the same failure class as the bug). --max-wait bounds the worst-case sync block
-# in a degraded sensing state (the happy path resolves in ~0.2s: the worker window is provably
-# present post-inject). spawn-return always exits 0 (fail-open); `|| true` is belt-and-suspenders.
+# a desktop race — the same failure class as the bug). NOTE: --max-wait bounds ONLY the anchor-poll
+# loop inside spawn-return; the subsequent goto_desktop is NOT bounded by it (its internal retries
+# are bounded, but its osascript subprocess has no timeout — the SAME pre-existing hang exposure the
+# outbound focus-jump/goto already carries, NOT newly introduced here). Happy path resolves ~0.2s
+# (worker window provably present post-inject). Whether to wrap this call in run_with_timeout for
+# consistency with the other slow calls in this file is deferred to codex 6-15 (the timing auditor).
+# spawn-return always exits 0 (fail-open); `|| true` is belt-and-suspenders.
 _return_jump_back() {
     [ "$_RETURN_ARMED" = "1" ] || return 0
     [ -n "$_RETURN_PY" ] || return 0
