@@ -2264,6 +2264,40 @@ def _succession_relay(
             )
         return 1
 
+    # focusjump-fix S2 (2026-06-15 / codex 收窄安全边界): the spawn SUCCEEDED → the predecessor
+    # coordinator window this succession closes is now superseded. Mark its task terminal by writing
+    # queue/<predecessor_task>.done so the SHARED identity resolver
+    # (dx_session_role._scan_singlepane_supervisor) skips its now-stale .singlepane sidecar. Without
+    # this, succession never cleaned predecessors → sidecars accumulate (p10–p26) → the resolver
+    # turns ambiguous (the L2 root cause this fix removes). 🔴 ONLY the explicit DIRECT predecessor
+    # (the self-reported --self-task carried here as ``predecessor_task``) — NEVER a cwd batch scan
+    # (codex: a batch scan would risk marking a LIVE coordinator done). The workspace file is NOT
+    # deleted here (codex: deletion moved OFF the correctness path → independent GC, S4
+    # ``handoff gc-singlepane``). fail-open: a .done write failure NEVER fails the succession.
+    if predecessor_task:
+        done_path = home / project / "queue" / f"{predecessor_task}.done"
+        try:
+            done_path.write_text(
+                json.dumps(
+                    {
+                        "done_by": "succession_relay",
+                        "successor_task": successor_task,
+                        "ts": datetime.now(UTC).isoformat(timespec="seconds"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            sys.stdout.write(
+                f"OK succession-predecessor-done: marked {predecessor_task}.done — the "
+                "stale singlepane sidecar is now skipped by the shared identity resolver\n"
+            )
+        except OSError as e:
+            sys.stderr.write(
+                f"WARN succession-predecessor-done-failed: {e} — could not mark "
+                f"{predecessor_task}.done; the stale sidecar lingers (resolver may stay ambiguous "
+                "until GC). Succession itself proceeds (fail-open)\n"
+            )
+
     # The ONE relay notification (the suppressed dump sent none — codex MUST#3).
     from handoff_fanout import dump as _dump
 

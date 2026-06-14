@@ -331,6 +331,58 @@ def test_succession_route_e2e(tmp_path, monkeypatch, notify_calls, capsys):
     assert "legacy-relay" not in out.err
 
 
+def test_succession_marks_predecessor_done(tmp_path, monkeypatch, notify_calls, capsys):
+    """focusjump-fix S2: a successful succession spawn marks the DIRECT predecessor
+    (``--self-task``) terminal by writing ``queue/<predecessor>.done`` so the SHARED identity
+    resolver skips its now-stale ``.singlepane`` sidecar (the L2 ambiguity root cause). The
+    marker carries diagnostic JSON; it is the predecessor's task, NOT the successor's."""
+    home = _home(tmp_path, monkeypatch)
+    ws = _git_repo(tmp_path)
+    _forge_predecessor_sidecar(home)
+
+    rc = codex_audit.main_audit_close(_close_argv(ws))
+
+    assert rc == 0
+    queue = home / PROJECT / "queue"
+    done = queue / f"{SELF_TASK}.done"  # the PREDECESSOR (closing coordinator), not TASK
+    assert done.exists(), "the direct predecessor must be marked .done after a succession spawn"
+    payload = json.loads(done.read_text())
+    assert payload["done_by"] == "succession_relay"
+    assert payload["successor_task"] == TASK
+    # the predecessor's stale sidecar still exists (S2 only writes .done; workspace GC is S4) but
+    # the resolver now skips it because of the .done marker — prove the co-located skip key exists.
+    assert (queue / f"{SELF_TASK}.singlepane").exists(), "S2 does not delete the sidecar (that is S4 GC)"
+    assert "succession-predecessor-done" in capsys.readouterr().out
+
+
+def test_succession_predecessor_done_write_failure_is_fail_open(
+    tmp_path, monkeypatch, notify_calls, capsys
+):
+    """focusjump-fix S2 fail-open red line: a ``.done`` write failure NEVER fails the
+    succession —去程/清理是 best-effort hygiene, the relay still spawns the successor (rc=0)
+    and emits a loud WARN (禁止静默降级)."""
+    home = _home(tmp_path, monkeypatch)
+    ws = _git_repo(tmp_path)
+    _forge_predecessor_sidecar(home)
+
+    real_write_text = Path.write_text
+
+    def _boom_on_predecessor_done(self, *args, **kwargs):
+        if self.name == f"{SELF_TASK}.done":
+            raise OSError("disk full")
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", _boom_on_predecessor_done)
+    rc = codex_audit.main_audit_close(_close_argv(ws))
+
+    assert rc == 0, "a .done write failure must NOT fail the succession (fail-open)"
+    # the successor window intent still published (the relay ran to completion)
+    assert (home / PROJECT / "queue" / f"{TASK}.singlepane").exists()
+    assert len(notify_calls) == 1
+    err = capsys.readouterr().err
+    assert "WARN succession-predecessor-done-failed" in err, "禁止静默降级: must warn visibly"
+
+
 def test_succession_self_report_writes_spawner_focus_to_uri(tmp_path, monkeypatch, notify_calls):
     """djs-jump-return Part A: when the PREDECESSOR coordinator's singlepane workspace file
     exists, the succession spawn writes ``SPAWNER_FOCUS=<predecessor workspace>`` into the

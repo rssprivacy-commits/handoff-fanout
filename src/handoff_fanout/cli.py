@@ -53,6 +53,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Remove leftover heartbeat/529/uri sidecars for terminal tasks (dry-run by default)",
     )
     sub.add_parser(
+        "gc-singlepane",
+        help="Quarantine STALE singlepane coordinator sidecars + workspace files so the shared "
+        "identity resolver resolves uniquely again (liveness-gated, dry-run by default, reversible)",
+    )
+    sub.add_parser(
         "audit-run",
         help="Register one codex audit run (findings artifact + sidecar manifest)",
     )
@@ -140,6 +145,11 @@ def main(argv: list[str] | None = None) -> int:
         from handoff_fanout import handoff_precheck
 
         return handoff_precheck.main(rest)
+    if args.subcommand == "gc-singlepane":
+        from handoff_fanout import gc_singlepane
+
+        return gc_singlepane.main(rest)
+
     if args.subcommand == "prune":
         from handoff_fanout import prune
 
