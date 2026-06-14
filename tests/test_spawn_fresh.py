@@ -29,11 +29,17 @@ import pytest
 
 from handoff_fanout import spawn
 from handoff_fanout import spawn_nonce as _spawn_nonce
+from handoff_fanout import spawner_focus as _spawner_focus
 from handoff_fanout import succession_authority as _authority
 
 PROJECT = "wilde-hexe"
 TASK = "wh-frobnicate"
 NONCE = "deadbeefcafef00d"  # fixed via monkeypatch so assertions can pin the title
+
+# The REAL resolver, captured at import (BEFORE the conftest autouse ``neutralize_spawner_self_report``
+# pins it to None per-test). The dispatch end-to-end tests below re-set this to UN-neutralize and hit
+# the real Tier-2 path (mirrors test_spawner_focus._REAL_RESOLVE).
+_REAL_RESOLVE = _spawner_focus.resolve_spawner_focus_path
 
 
 # ─── fixtures / helpers ───────────────────────────────────────────────────────
@@ -256,6 +262,64 @@ def test_spawner_focus_path_invalid_dropped_fail_open(tmp_path, monkeypatch):
     )
     assert rc == 0
     assert "SPAWNER_FOCUS" not in _uri_lines(home, project="focus-proj2", task="wh-focus2")
+
+
+# ─── singlepane DISPATCH end-to-end: --self-task drives the Tier-2 SPAWNER_FOCUS ────────────────
+# The conftest autouse ``neutralize_spawner_self_report`` pins ``resolve_spawner_focus_path`` to None
+# for every dump/spawn integration test (suite hermeticity) — so NO existing test proved the REAL
+# dispatch path (``handoff spawn --self-task`` → Tier-2 ``derive_singlepane_focus`` → the additive
+# SPAWNER_FOCUS line) actually fires end-to-end. That blind spot is exactly why dx-spawn's missing
+# ``--self-task`` (the singlepane去程 bug) was invisible to tests. These two RESTORE the real resolver
+# (captured pre-neutralize) and exercise it through ``spawn.main`` with a REAL on-disk sidecar — no stub.
+
+
+def _coord_singlepane_sidecar(home: Path, task: str, project: str = PROJECT) -> Path:
+    """The engine wrote ``<home>/<proj>/singlepane/<task>.handoff.code-workspace`` when this singlepane
+    coordinator was itself spawned — exactly what ``derive_singlepane_focus(--self-task)`` reconstructs."""
+    ws = home / project / "singlepane" / f"{task}.handoff.code-workspace"
+    ws.parent.mkdir(parents=True, exist_ok=True)
+    ws.write_text("{}")
+    return ws
+
+
+def test_singlepane_dispatch_self_task_emits_spawner_focus(tmp_path, monkeypatch):
+    """End-to-end: a singlepane coordinator self-reporting its task (``--self-task``) — its terminal env
+    never reaching the agent shell (p19) so ``--spawner-focus-path`` is absent — resolves its OWN sidecar
+    workspace via Tier-2 → the additive SPAWNER_FOCUS line the watchdog reads for the one-step focus-jump.
+    Restores the real resolver (un-neutralizes the conftest autouse) so this hits the resolver for real."""
+    monkeypatch.setattr(_spawner_focus, "resolve_spawner_focus_path", _REAL_RESOLVE)
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    coord_ws = _coord_singlepane_sidecar(home, "wh-coord-23")
+    # A singlepane coordinator's cwd is the SHARED repo root (NO in-tree .handoff.code-workspace), so
+    # Tier-1 (cwd workspace) misses and Tier-2 (self_task → sidecar) is the ONLY way SPAWNER_FOCUS appears.
+    plain_cwd = tmp_path / "shared-repo-root"
+    plain_cwd.mkdir()
+    monkeypatch.chdir(plain_cwd)
+    monkeypatch.delenv("HANDOFF_WINDOW_FOCUS_PATH", raising=False)  # env empty → exercise the self-report
+
+    rc = spawn.main(_argv(isolation="singlepane", workspace=repo) + ["--self-task", "wh-coord-23"])
+    assert rc == 0
+    assert _uri_lines(home)["SPAWNER_FOCUS"] == os.path.realpath(str(coord_ws))
+
+
+def test_singlepane_dispatch_no_self_task_omits_spawner_focus(tmp_path, monkeypatch):
+    """Byte-compat / fail-open: WITHOUT ``--self-task`` the dispatch path emits NO SPAWNER_FOCUS line even
+    though the sidecar EXISTS on disk — Tier-2 is gated on the self-reported task, so the .uri stays
+    identical to today. Real resolver restored, so the omission proves the gate (self_task None), not the
+    neutralize stub. This is the negative the missing-flag fail-open contract rests on."""
+    monkeypatch.setattr(_spawner_focus, "resolve_spawner_focus_path", _REAL_RESOLVE)
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    _coord_singlepane_sidecar(home, "wh-coord-23")  # sidecar present, but no --self-task points at it
+    plain_cwd = tmp_path / "shared-repo-root"
+    plain_cwd.mkdir()
+    monkeypatch.chdir(plain_cwd)
+    monkeypatch.delenv("HANDOFF_WINDOW_FOCUS_PATH", raising=False)
+
+    rc = spawn.main(_argv(isolation="singlepane", workspace=repo))  # no --self-task
+    assert rc == 0
+    assert "SPAWNER_FOCUS" not in _uri_lines(home)
 
 
 def test_prompt_has_id_prefix(tmp_path, monkeypatch):
