@@ -6,9 +6,10 @@
 #   2. $HANDOFF_HOME/config.json (from install/examples/config.json, if missing)
 #   3. git pre-commit hook in the current repo (if any), symlinked to install/git-hooks/pre-commit
 #   4. macOS launchd agent for the watchdog (if --no-launchd not given and uname=Darwin)
-#   5. migration: removes the obsolete handoff-helper VS Code extension (the
-#      autoclose feature was dropped — owner ruling 2026-05-31; tabs are the
-#      human-audit record). --no-extension skips this migration.
+#   5. installs/refreshes the handoff-helper VS Code extension from the current
+#      vsix build (drives single-pane fold, §6c worktree reclaim, and succession
+#      window-close — required for the spawn/coordinator UX). --no-extension
+#      skips this step.
 #
 # Pre-req: `pip install handoff-fanout` (provides the `handoff` console script).
 #
@@ -22,7 +23,7 @@
 #   --no-hooks        skip git pre-commit hook installation
 #   --no-launchd      skip launchd plist installation (macOS only step regardless)
 #   --no-config       don't write $HANDOFF_HOME/config.json
-#   --no-extension    skip the handoff-helper extension removal migration
+#   --no-extension    skip installing/refreshing the handoff-helper extension
 #   --uninstall       reverse everything this script installs
 #   --sync-launcher   push canonical auto-continue.sh → ~/.local/bin + record sha
 #                     (keeps the com.dharmaxis.auto-continue runtime copy canonical)
@@ -249,20 +250,29 @@ elif [[ $INSTALL_LAUNCHD -eq 1 ]]; then
     echo "⊘ launchd skipped (not macOS)"
 fi
 
-# ─── 5. handoff-helper VS Code extension — REMOVED (autoclose feature dropped) ──
-# The autoclose tab-closing feature was removed (owner ruling 2026-05-31: VS Code
-# tabs are the human-audit record and must NOT auto-close). The handoff-helper
-# extension existed ONLY to drive autoclose, so it is no longer installed. As a
-# migration, uninstall any previously-installed copy so it doesn't linger dormant.
-# (--no-extension skips this migration.)
+# ─── 5. handoff-helper VS Code extension — install/refresh the current build ──
+# The handoff-helper extension is REQUIRED, not obsolete: the live 0.6.0 build
+# drives single-pane fold + §6c worktree reclaim + succession window-close (the
+# old "autoclose-only" worldview that motivated removing it is long gone). Install
+# the current vsix build if present; NEVER uninstall here (that would strip a live
+# extension from anyone running the installer). The vsix is a build artifact
+# (gitignored) produced by `npm run package` in extension/, so a fresh curl-piped
+# clone won't have it — in that case we warn with the build command and no-op
+# rather than fail. (--no-extension skips this step; --uninstall removes it.)
 if [[ $INSTALL_EXTENSION -eq 1 ]]; then
     CODE_BIN="$(command -v code || true)"
-    if [[ -n "$CODE_BIN" ]] && "$CODE_BIN" --list-extensions 2>/dev/null | grep -qx "dharmaxis.handoff-helper"; then
-        if "$CODE_BIN" --uninstall-extension dharmaxis.handoff-helper >/dev/null 2>&1; then
-            echo "✓ removed obsolete handoff-helper extension (autoclose feature dropped)"
+    EXT_VSIX="$(cd "$ASSET_DIR/.." && pwd)/extension/handoff-helper.vsix"
+    if [[ -z "$CODE_BIN" ]]; then
+        echo "⊘ extension skipped — 'code' CLI not found (enable VS Code's 'code' command in PATH)"
+    elif [[ -f "$EXT_VSIX" ]]; then
+        if "$CODE_BIN" --install-extension "$EXT_VSIX" --force >/dev/null 2>&1; then
+            echo "✓ installed/refreshed handoff-helper extension from $EXT_VSIX"
         else
-            echo "  ⚠ failed to remove handoff-helper extension — remove manually via 'code --uninstall-extension dharmaxis.handoff-helper'"
+            echo "  ⚠ failed to install handoff-helper extension — install manually via 'code --install-extension \"$EXT_VSIX\"'"
         fi
+    else
+        echo "⊘ extension vsix not found at $EXT_VSIX"
+        echo "  build it: (cd \"$(dirname "$EXT_VSIX")\" && npm install && npm run package), then re-run the installer"
     fi
 fi
 
