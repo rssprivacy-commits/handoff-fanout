@@ -36,9 +36,13 @@ HANDOFF_SHA256_CMD="${HANDOFF_SHA256_CMD:-/usr/bin/shasum}"
 HANDOFF_SKIP_SPAWN="${HANDOFF_SKIP_SPAWN:-0}"
 # v4 path-D autoclose (role-gated supervisor succession; spawn-window-unify Task 4.1).
 # Default OFF — opt in via this env or an autoclose.enabled sentinel (global/per-project,
-# 改进 #6). Safe to flip ON globally today: only a `supervisor_succession` spawn ever closes
-# a window, and every current dump writes role="worker" → a no-op until a succession producer
-# lands (dormant-but-ready). HANDOFF_SPAWN_LOCK_TTL mirrors handoff_fanout.spawn_lock.ttl=120.
+# 改进 #6). NOT a no-op when enabled: the succession producer HAS landed — `spawn --role
+# supervisor_succession` writes a role=supervisor_succession + predecessor_nonce sidecar
+# (coordinator successions p12+, real sidecars on disk), which passes try_autoclose's role
+# gate (a role="worker" sidecar skips). So with the opt-in ON a coordinator succession could
+# close its predecessor window — a path not yet E2E-exercised; flip ON only behind the v4
+# path-D rollout gate (real triggers + 0 failed; global CLAUDE.md), not "safe today as a
+# no-op". HANDOFF_SPAWN_LOCK_TTL mirrors handoff_fanout.spawn_lock.ttl=120.
 HANDOFF_AUTOCLOSE_ENABLED="${HANDOFF_AUTOCLOSE_ENABLED:-0}"
 HANDOFF_SPAWN_LOCK_TTL="${HANDOFF_SPAWN_LOCK_TTL:-120}"
 # tests set HANDOFF_VSCODE_CHECK=0 to skip the `pgrep "Visual Studio Code"`
