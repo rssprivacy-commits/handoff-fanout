@@ -97,8 +97,14 @@ def _build_stubs(tmp_path: Path, *, router: bool, lock_seq: str = "unlocked") ->
     # EVENTS; precapture prints ORIGIN=/BEFORE= so the wiring threads them into spawn-return's argv.
     if router:
         (stub / "vscode-spaces.py").write_text(
-            "import os, sys\n"
+            "import os, sys, time\n"
             "cmd = sys.argv[1] if len(sys.argv) > 1 else ''\n"
+            # gap C1 timeout tests: optionally HANG this subcommand (mimics a swiftc/winlist
+            # stall) so run_with_timeout's wall-clock ceiling can be exercised. Sleep BEFORE any
+            # event write so a kill leaves no trace (precapture → empty stdout → rc=124).
+            "_slp = os.environ.get('_SPACES_SLEEP_' + cmd.replace('-', '_').upper(), '')\n"
+            "if _slp:\n"
+            "    time.sleep(float(_slp))\n"
             f"ev = {str(events)!r}\n"
             "with open(ev, 'a') as f:\n"
             "    if cmd == 'spawn-precapture':\n"
@@ -391,3 +397,43 @@ def test_successful_cold_dispatch_still_returns(home, tmp_path):
     assert _run(env).returncode == 0
     tags = _tags(_events(tmp_path))
     assert "SPAWN-RETURN" in tags, f"a verified submit must still snap the owner back: {tags}"
+
+
+# ─── gap C1 (sw-coord-p28): return helpers have a wall-clock timeout (no watchdog freeze) ──────────
+# vscode-spaces.py has no internal ceiling; its ensure_winlist() can hang in a first-run swiftc compile.
+# Both return helpers sit on the SYNCHRONOUS dispatch path, so a hang would freeze the whole watchdog
+# iteration (per-task lock never released, caffeinate never stopped). run_with_timeout bounds them.
+
+
+def test_precapture_timeout_disarms_but_spawn_proceeds(home, tmp_path):
+    """A HUNG spawn-precapture is reaped by run_with_timeout: the return leg disarms (no SPAWN-RETURN)
+    but the spawn ITSELF still completes (OPEN happens) — a missed return is cosmetic, a frozen
+    watchdog is not. Without the fix the helper would block for the full stub sleep."""
+    task = "ret-hang-pre"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task, spawner_focus=str(tmp_path / "c.handoff.code-workspace"))
+    tr = _cold_transcript(tmp_path, ws)
+    env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py", grow_transcript=tr,
+               extra={"HANDOFF_RETURN_TIMEOUT": "1", "_SPACES_SLEEP_SPAWN_PRECAPTURE": "8"})
+    cp = _run(env)  # _run's subprocess timeout=40 → a true freeze would raise here
+    assert cp.returncode == 0
+    tags = _tags(_events(tmp_path))
+    assert "OPEN" in tags, f"spawn must still proceed after a precapture timeout: {tags}"
+    assert "SPAWN-RETURN" not in tags, f"a precapture timeout must disarm the return leg: {tags}"
+    log = (home / "auto-continue.log").read_text(encoding="utf-8")
+    assert "RETURN-PRECAPTURE-TIMEOUT" in log, log
+
+
+def test_spawn_return_timeout_does_not_freeze_watchdog(home, tmp_path):
+    """A HUNG spawn-return is reaped by run_with_timeout: the watchdog logs the timeout and finishes
+    (fail-open) instead of freezing. Without the fix the helper would block for the full stub sleep."""
+    task = "ret-hang-ret"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task, spawner_focus=str(tmp_path / "c.handoff.code-workspace"))
+    tr = _cold_transcript(tmp_path, ws)
+    env = _env(home, tmp_path, front_window=f"demo · {task} [worktree] — x.py", grow_transcript=tr,
+               extra={"HANDOFF_RETURN_TIMEOUT": "1", "_SPACES_SLEEP_SPAWN_RETURN": "8"})
+    cp = _run(env)
+    assert cp.returncode == 0
+    log = (home / "auto-continue.log").read_text(encoding="utf-8")
+    assert "RETURN-JUMPBACK-TIMEOUT" in log, log

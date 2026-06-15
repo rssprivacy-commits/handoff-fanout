@@ -1322,8 +1322,21 @@ _return_precapture() {
     [ -n "$HANDOFF_SPAWNER_FOCUS" ] || return 0
     _return_enabled || return 0
     _RETURN_PY="$(_return_spaces_py)" || { _RETURN_PY=""; return 0; }
-    local _pre
-    _pre=$(/usr/bin/python3 "$_RETURN_PY" spawn-precapture 2>>"$LOG") || return 0
+    local _pre _rc
+    # C2-sibling hardening (sw-coord-p28 / gap C1): bound the helper with a wall-clock
+    # timeout. vscode-spaces.py has no internal ceiling — its ensure_winlist() can hang
+    # in a first-run/recompile `swiftc` — and this call sits on the SYNCHRONOUS dispatch
+    # path, so a hang would freeze the whole watchdog iteration (per-task lock never
+    # released, caffeinate never stopped). run_with_timeout reaps the python AND its
+    # swiftc grandchild on rc=124; any nonzero (incl. timeout) disarms the return leg
+    # (fail-open, _RETURN_ARMED stays 0) — a missed return jump is cosmetic, a frozen
+    # watchdog is not.
+    _pre=$(run_with_timeout "${HANDOFF_RETURN_TIMEOUT:-20}" /usr/bin/python3 "$_RETURN_PY" spawn-precapture 2>>"$LOG")
+    _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+        [ "$_rc" -eq 124 ] && log "RETURN-PRECAPTURE-TIMEOUT: spawn-precapture exceeded ${HANDOFF_RETURN_TIMEOUT:-20}s — return leg disarmed (fail-open)"
+        return 0
+    fi
     _RETURN_ORIGIN=$(printf '%s\n' "$_pre" | /usr/bin/sed -n 's/^ORIGIN=//p')
     _RETURN_BEFORE=$(printf '%s\n' "$_pre" | /usr/bin/sed -n 's/^BEFORE=//p')
     # §2.1 anchor lines are emitted ONLY when capturable ("捕不准就不输出") → empty here = spawn-return
@@ -1338,20 +1351,29 @@ _return_precapture() {
 # `code <ws>` / RETURN_ANCHOR_APP via `activate`) → owner back to B in one native step; no anchor /
 # re-activation fails → fail-open per-step goto_desktop(origin). SYNCHRONOUS by design: the
 # frontmost/AXRaise/inject contention is over here, so there is no desktop race; a background `&` would
-# instead race the NEXT iteration's precapture. No poll/timeout: spawn-return does a single winlist read
-# (the worker is provably rendered on A post-inject) then re-activates. spawn-return always exits 0
-# (fail-open); `|| true` is belt-and-suspenders.
+# instead race the NEXT iteration's precapture. No POLL (spawn-return does a single winlist read — the
+# worker is provably rendered on A post-inject — then re-activates), but a wall-clock timeout DOES wrap it
+# (gap C1): vscode-spaces.py has no internal ceiling. spawn-return is fail-open (normally exits 0); on a
+# rc=124 timeout we WARN and continue rather than freeze the watchdog.
 _return_jump_back() {
     [ "$_RETURN_ARMED" = "1" ] || return 0
     [ -n "$_RETURN_PY" ] || return 0
     # $1 = the identity token (the same _submit_token the submit guard asserted in the worker's title) →
     # spawn-return's focus-steal guard confirms OUR worker is on the current desktop (= owner didn't
     # drift) before re-activating; --anchor-ws/--anchor-app are the owner's re-activatable anchor.
-    local _anchor="${1:-}"
-    /usr/bin/python3 "$_RETURN_PY" spawn-return \
+    local _anchor="${1:-}" _rc
+    # gap C1 (sw-coord-p28): wall-clock timeout — spawn-return does a single winlist
+    # read then re-activates, but vscode-spaces.py's ensure_winlist() can hang in a
+    # first-run `swiftc` compile with no internal ceiling; on this synchronous path that
+    # would freeze the watchdog iteration. run_with_timeout reaps python + swiftc on
+    # rc=124. spawn-return is fail-open by design (always exits 0 normally), so on
+    # timeout we just WARN and continue — the owner simply isn't auto-returned to origin.
+    run_with_timeout "${HANDOFF_RETURN_TIMEOUT:-20}" /usr/bin/python3 "$_RETURN_PY" spawn-return \
         --origin="${_RETURN_ORIGIN:--1}" --before="${_RETURN_BEFORE:-}" \
         --anchor-ws="${_RETURN_ANCHOR_WS:-}" --anchor-app="${_RETURN_ANCHOR_APP:-}" \
-        --anchor-token="$_anchor" >>"$LOG" 2>&1 || true
+        --anchor-token="$_anchor" >>"$LOG" 2>&1
+    _rc=$?
+    [ "$_rc" -eq 124 ] && log "RETURN-JUMPBACK-TIMEOUT: spawn-return exceeded ${HANDOFF_RETURN_TIMEOUT:-20}s — owner not auto-returned to origin desktop (fail-open)"
     _RETURN_ARMED=0
 }
 
