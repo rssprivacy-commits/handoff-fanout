@@ -2,11 +2,14 @@
 findings artifacts (sidecar manifest), and the ``audit-run`` / ``audit-disposition``
 / ``audit-close`` CLI surface.
 
-This module is the *evidence capability* layer of the audit-before-handoff gate
-(design / spec v0.2). It does NOT add any G0-G9 gating to ``retro_gate`` — that
-is Phase B. With the audit mandate OFF (the only state Phase A ships in), a
-5.5.0 evidence carrying a ``codex_audit`` block passes the retro gate exactly
-like one without it; the block is recorded, not yet enforced.
+This module is the *evidence capability* layer of the audit-before-handoff gate.
+The G0-G9 gating itself lives in ``retro_gate`` (Phase B); this module produces
+and validates the machine artifacts those gates consume. The audit mandate is
+now **ON** (Phase D, flipped 2026-05-30): with ``HANDOFF_AUDIT_MANDATE=1`` set, a
+dump that changed code but carries no passing ``codex_audit`` block is BLOCKED by
+the gate — the block is recorded *and* enforced ("缺陷不下传"). (History: Phase A
+shipped with the mandate OFF, recording the block without enforcing it. Do NOT
+read this as "enforcement is off" — it is on. See ``templates.py`` §-1.5 / §0.)
 
 Authority principle (R1/R2): the *machine artifact* is the source of truth.
 codex emits a structured ``codex-findings.json``; its hash lives in a **sidecar

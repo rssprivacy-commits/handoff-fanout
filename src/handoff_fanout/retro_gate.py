@@ -668,8 +668,12 @@ def _check_follow_up_overdue(project: str, cfg: dict) -> GateResult | None:
     # (*.retro_overdue.txt) and the Phase C codex-audit bypass overdue
     # (*.audit_overdue.txt). The shell overdue scanner writes both via the same
     # machinery (auto-continue.sh scan_overdue_kind); the gate must read both or
-    # the codex-audit marker would be write-only (R1 P1). The audit kind stays
-    # dormant until the bypass-override producer lands (deferred, spec §7.3).
+    # the codex-audit marker would be write-only (R1 P1). The bypass-override
+    # producer IS wired (codex_audit.write_bypass_override → ack/<task>.audit.
+    # override.json); this path activates when an audit-close uses
+    # codex_unavailable_bypass mode. Currently no such markers exist on disk —
+    # the open codex re-audit debts use the separate PUSH gate
+    # (audits/bypasses/*.json), which this scanner does not read.
     for pattern in ("*.retro_overdue.txt", "*.audit_overdue.txt"):
         for marker in ack.glob(pattern):
             kind = "codex-audit" if marker.name.endswith(".audit_overdue.txt") else "retro"
