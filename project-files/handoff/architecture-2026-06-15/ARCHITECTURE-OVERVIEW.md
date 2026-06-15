@@ -1,5 +1,8 @@
 # handoff-fanout 系统架构总览
 
+> ⚠️ **快照时效声明（务必先读）**：本文是 **2026-06-15 晨的架构快照**，勘察锚点 git HEAD `5e8d7b2`（p27 baseline），但实际随 commit `5527ce1` 入库——其间 **p28/p29 已闭多个本文标为「缺口/未修」的项**：GAP §F **#1**（install.sh 反向卸载 live 扩展 → `6f8c2c8`）、**#3**（C1 回程 helper 无 wall-clock timeout → `c641b28`）、**#4**（C2 spawn_lock stale-break 竞态 → `0aad8f4`）、**#2**（24GB 零应用级备份 → `359e650`），并订正了 `codex_audit.py`/`retro_gate.py` 的 mandate-OFF/dormant 注释（`5b4eb20`）。
+> **据此读本文**：凡标「🔴 P1 未修 / CONFIRMED REAL / No heartbeat exists / 提议修法」且涉及 **C1/C2/install-A3/备份** 的，**均为快照态、现已修复**；行号 / LOC / 日志计数 / exit-code 等具体值为快照时刻、可能已漂移。**当前权威状态以 [GAP-ANALYSIS.md](GAP-ANALYSIS.md) §F（状态列已更新）+ 现行代码为准**。逐图 refresh-to-HEAD 待后续 doc 包（外审 punch-list：`~/.claude-handoff/handoff-fanout/audits/p29-submap-audit-workflow-findings.json`）。
+
 ## 1. 系统定位与运行时拓扑
 
 handoff-fanout 是一套**单用户、单台 Mac、内网运行的 macOS CLI / 自动化系统**。它服务于一个 owner——这个 owner 同时驱动多个 AI 编码会话（一个监管中枢窗 + 若干 worker 窗），分布在 macOS 的多个桌面（Space）上。系统解决的问题是：把"一个会话干完一段活、交棒给下一个会话"这件事从手工开窗、手工贴 prompt、手工切桌面，变成无人值守的自动接续——并在交棒过程中强制复盘、强制审计、自动把 owner 的视图带到 worker 所在桌面再一步带回原桌面、最后回收死掉的窗口与 git worktree。它不是商业 Web 产品：没有网络监听端口、没有资金流、不托管任何第三方 PII。

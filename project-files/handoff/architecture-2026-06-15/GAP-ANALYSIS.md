@@ -1,5 +1,8 @@
 # handoff-fanout 架构缺口与半实现陷阱分析
 
+> ⚠️ **快照时效声明（务必先读）**：本文是 **2026-06-15 晨的架构快照**，勘察锚点 git HEAD `5e8d7b2`（p27 baseline），但实际随 commit `5527ce1` 入库——其间 **p28/p29 已闭多个本文标为「缺口/未修」的项**：GAP §F **#1**（install.sh 反向卸载 live 扩展 → `6f8c2c8`）、**#3**（C1 回程 helper 无 wall-clock timeout → `c641b28`）、**#4**（C2 spawn_lock stale-break 竞态 → `0aad8f4`）、**#2**（24GB 零应用级备份 → `359e650`），并订正了 `codex_audit.py`/`retro_gate.py` 的 mandate-OFF/dormant 注释（`5b4eb20`）。
+> **据此读本文**：凡标「🔴 P1 未修 / CONFIRMED REAL / No heartbeat exists / 提议修法」且涉及 **C1/C2/install-A3/备份** 的，**均为快照态、现已修复**；行号 / LOC / 日志计数 / exit-code 等具体值为快照时刻、可能已漂移。**当前权威状态以 [GAP-ANALYSIS.md](GAP-ANALYSIS.md) §F（状态列已更新）+ 现行代码为准**。逐图 refresh-to-HEAD 待后续 doc 包（外审 punch-list：`~/.claude-handoff/handoff-fanout/audits/p29-submap-audit-workflow-findings.json`）。
+
 > 配套 `ARCHITECTURE-OVERVIEW.md`。本篇专列「功能架构完整 ≠ 可安全运营」的缺口：看着完成实则休眠/空转的半实现陷阱、运维 NFR 缺口、未修的工程加固债、文档漂移。承重论断带 `file:line`，已实地 read-back 坐实（含一次 grep 假阴自纠：`focus-jump ✅`(空格) 漏匹配真实格式 `focus-jump: ✅`(冒号)，实际 70 条命中非 0）。
 
 ## 摘要 — 一句话健康判断
@@ -116,13 +119,13 @@
 
 | # | 缺口 | 严重度 | 爆炸半径 | 现状 |
 |---|------|--------|----------|------|
-| 1 | install.sh 反向卸载 live 0.6.0 扩展（A3） | 🔴 高 | 一跑 install 就拆掉单栏/§6c/关窗 | 待改 install.sh 第 5 步 |
-| 2 | 24GB 运行时状态零应用级备份（B1） | 🔴 高 | 丢目录=在飞棒/审计证据/token 不可恢复 | 待加 export 或纳入备份 |
-| 3 | 回程 helper 无 timeout（C1） | 🔴 中-高 | 一 hang 冻死看门狗迭代、阻塞后续 spawn | P1 待修（run_with_timeout 包裹） |
-| 4 | spawn_lock stale-break 竞态（C2） | 🔴 中 | 慢 fs 下并发同仓 git 改动 | P1 待修（flock/heartbeat） |
-| 5 | 去程自动派生未激活 + GC 无排程（A1/A2） | 🟡 中 | 中枢忘传 --self-task 则 worker 不去程（owner 主诉） | 待 GC --execute + E2E（owner 在环） |
-| 6 | 文档覆盖 ⅓、陈旧注释/悬空 SOT（D） | 🟡 中 | 非技术读者/新会话误判系统边界 | 待重写 ARCHITECTURE/PROTOCOL + 修注释 |
-| 7 | §6c 从未 E2E 验证（A4） | 🟡 低-中 | 声称 LIVE 实为 ready-idle | 待一次真 E2E 留证 |
-| 8 | 哨兵无界累积（B2）/ diag log 自盲（B4）/ owner_ack 非加密（A6）/ 名不副实小陷阱（A7） | 🟡 低 | 渐进/局部 | 待清理/排程/文档化 |
+| 1 | install.sh 反向卸载 live 0.6.0 扩展（A3） | 🔴 高 | 一跑 install 就拆掉单栏/§6c/关窗 | ✅ **已闭 p28（`6f8c2c8`）**：第5步改装当前 vsix `--install-extension --force`·永不卸载·删陈旧 0.4.0 vsix |
+| 2 | 24GB 运行时状态零应用级备份（B1） | 🔴 高 | 丢目录=在飞棒/审计证据/token 不可恢复 | ✅ **已闭 p29（`359e650`）**：`install/backup-handoff-state.sh`（排 bulk·26GB→72MB）+ `docs/runbook-backup-and-recovery.md` |
+| 3 | 回程 helper 无 timeout（C1） | 🔴 中-高 | 一 hang 冻死看门狗迭代、阻塞后续 spawn | ✅ **已闭 p28（`c641b28`）**：`run_with_timeout ${HANDOFF_RETURN_TIMEOUT:-20}` 包 precapture/jump_back |
+| 4 | spawn_lock stale-break 竞态（C2） | 🔴 中 | 慢 fs 下并发同仓 git 改动 | ✅ **已闭 p28（`0aad8f4`）**：`os.utime` 心跳保活空 lockdir·daemon interval=ttl/4 |
+| 5 | 去程自动派生未激活 + GC 无排程（A1/A2） | 🟡 中 | 中枢忘传 --self-task 则 worker 不去程（owner 主诉） | ⏳ 待 GC --execute + E2E（owner 在环） |
+| 6 | 文档覆盖 ⅓、陈旧注释/悬空 SOT（D）+ 本快照逐图 refresh | 🟡 中 | 非技术读者/新会话误判系统边界 | 🟡 **部分 p29（`5b4eb20` 修 codex_audit/retro_gate 注释）**；ARCHITECTURE/PROTOCOL 重写 + 建项目 CLAUDE.md + auto-continue.sh 注释 + 悬空 SOT + 本快照逐图 refresh-to-HEAD → p30 |
+| 7 | §6c 从未 E2E 验证（A4） | 🟡 低-中 | 声称 LIVE 实为 ready-idle（实测 host_pid 写侧跑过 21×、回收 E2E 0 成功） | ⏳ 待一次真 E2E 留证（owner 在环） |
+| 8 | 哨兵无界累积（B2）/ diag log 自盲（B4）/ owner_ack 非加密（A6）/ 名不副实小陷阱（A7） | 🟡 低 | 渐进/局部 | 待清理/排程/文档化 → p30/backlog |
 
-**底线判断**：功能主干 live 且经测试/日志/磁盘证据支撑，可继续日常运营；但「长期可安全自托管」需先补 #1（install 自毁）、#2（备份）两块高爆炸半径，再清 #3/#4 两个 P1 加固债。其余为渐进改善，不阻断当前运营。
+**底线判断（更新至 HEAD `5527ce1`）**：4 块高爆炸半径缺口 **#1（install 自毁）、#2（备份）、#3（C1 timeout）、#4（C2 spawn_lock）已全部闭环**（p28/p29·机器闸 GREEN·已部署）。功能主干 live 且经测试/日志/磁盘证据支撑、可继续日常运营。**剩余**：🟡#6 文档（ARCHITECTURE/PROTOCOL 重写 + 项目 CLAUDE.md + 本快照逐图 refresh）+ owner-在环 2 步（#5 GC --execute / #7 §6c 真 E2E）+ #8 渐进清理。**距「可安全长期自托管」**：高爆炸半径项已清，余为文档化 + owner-在环验证。

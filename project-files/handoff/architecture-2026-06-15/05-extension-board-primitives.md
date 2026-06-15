@@ -1,5 +1,8 @@
 # handoff-fanout 架构图 · Shard 05 — VS Code 扩展 + 状态板 + 原语 + 安装器
 
+> ⚠️ **快照时效声明（务必先读）**：本文是 **2026-06-15 晨的架构快照**，勘察锚点 git HEAD `5e8d7b2`（p27 baseline），但实际随 commit `5527ce1` 入库——其间 **p28/p29 已闭多个本文标为「缺口/未修」的项**：GAP §F **#1**（install.sh 反向卸载 live 扩展 → `6f8c2c8`）、**#3**（C1 回程 helper 无 wall-clock timeout → `c641b28`）、**#4**（C2 spawn_lock stale-break 竞态 → `0aad8f4`）、**#2**（24GB 零应用级备份 → `359e650`），并订正了 `codex_audit.py`/`retro_gate.py` 的 mandate-OFF/dormant 注释（`5b4eb20`）。
+> **据此读本文**：凡标「🔴 P1 未修 / CONFIRMED REAL / No heartbeat exists / 提议修法」且涉及 **C1/C2/install-A3/备份** 的，**均为快照态、现已修复**；行号 / LOC / 日志计数 / exit-code 等具体值为快照时刻、可能已漂移。**当前权威状态以 [GAP-ANALYSIS.md](GAP-ANALYSIS.md) §F（状态列已更新）+ 现行代码为准**。逐图 refresh-to-HEAD 待后续 doc 包（外审 punch-list：`~/.claude-handoff/handoff-fanout/audits/p29-submap-audit-workflow-findings.json`）。
+
 > 只读架构勘察 · git HEAD `5e8d7b2`（extension/ 最新三笔 §6c 提交 `325bcea`/`92437d2`/`da9b266`）· 2026-06-15
 > 范围：`extension/` 的 handoff-helper 扩展、`status_board.py` 会话/状态板、`atomic.py`/`safe_commit.py`/`prune.py`/`memory_baseline.py` 原语、`install/install.sh` 安装器。
 
