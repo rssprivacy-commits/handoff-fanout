@@ -98,7 +98,9 @@
 
 ## D. 文档与代码漂移（非技术读者据此易误判系统）
 
-- 🔴 `docs/PROTOCOL.md`（289 行，schema 2）**零** retro/precheck/evidence/mandate/exit-code/old_ready/locks/worktree/singlepane/coordinator 内容——只剩 fan-out/Gate-A/原子性 base 层还对应代码。据它建「conforming 实现」会漏掉整个 v5.4 闸层。
+> **✅ p30 更新（务必先读）**：本节多数条目**已闭**——`docs/PROTOCOL.md` 已补 Part II §11-18（retro/precheck/evidence/mandate/exit-code/locks/worktree/singlepane/succession 全覆盖）、`docs/ARCHITECTURE.md` 已补 Part II（post-v1.0 层）、`codex_audit.py` docstring 已订正 mandate-**ON**（p29 `5b4eb20`）、悬空 SOT ref（`codex-audit-gate-spec-draft.md` 等 3 不存在文件）已全清改指 PROTOCOL Part II、项目级 `CLAUDE.md` 已建。下列原始条目**保留作快照历史**；当前权威状态见 §F#6。
+
+- 🔴〔p30 已闭〕`docs/PROTOCOL.md`（289 行，schema 2）**零** retro/precheck/evidence/mandate/exit-code/old_ready/locks/worktree/singlepane/coordinator 内容——只剩 fan-out/Gate-A/原子性 base 层还对应代码。据它建「conforming 实现」会漏掉整个 v5.4 闸层。
 - 🔴 `docs/ARCHITECTURE.md` 只描述原始 5 层防御，**零提** unlock-pivot / 审计闸 / coordinator-succession / singlepane / worktree-isolation / winlist——现只覆盖约 ⅓ 的系统。
 - 🟡 多处陈旧注释把**已上线**说成休眠：`retro_gate.py:670-672` + `auto-continue.sh:2113-2116` 写 audit-overdue producer「deferred / dormant-but-ready」，但 producer 已 wired（`codex_audit.py:2568`）、扫描器已跑、闸已读。读注释者会误判 codex bypass 是免费午餐。
 - 🟡 `codex_audit.py:7-9` docstring 写「mandate OFF（Phase A 唯一状态）」，与 `templates.py` 的「mandate ON（flipped）」**同仓自相矛盾**（实际代码按 mandate-ON 跑）。
@@ -124,8 +126,8 @@
 | 3 | 回程 helper 无 timeout（C1） | 🔴 中-高 | 一 hang 冻死看门狗迭代、阻塞后续 spawn | ✅ **已闭 p28（`c641b28`）**：`run_with_timeout ${HANDOFF_RETURN_TIMEOUT:-20}` 包 precapture/jump_back |
 | 4 | spawn_lock stale-break 竞态（C2） | 🔴 中 | 慢 fs 下并发同仓 git 改动 | ✅ **已闭 p28（`0aad8f4`）**：`os.utime` 心跳保活空 lockdir·daemon interval=ttl/4 |
 | 5 | 去程自动派生未激活 + GC 无排程（A1/A2） | 🟡 中 | 中枢忘传 --self-task 则 worker 不去程（owner 主诉） | ⏳ 待 GC --execute + E2E（owner 在环） |
-| 6 | 文档覆盖 ⅓、陈旧注释/悬空 SOT（D）+ 本快照逐图 refresh | 🟡 中 | 非技术读者/新会话误判系统边界 | 🟡 **部分 p29（`5b4eb20` 修 codex_audit/retro_gate 注释）**；ARCHITECTURE/PROTOCOL 重写 + 建项目 CLAUDE.md + auto-continue.sh 注释 + 悬空 SOT + 本快照逐图 refresh-to-HEAD → p30 |
+| 6 | 文档覆盖 ⅓、陈旧注释/悬空 SOT（D）+ 本快照逐图 refresh | 🟡 中 | 非技术读者/新会话误判系统边界 | 🟢 **主体 p30 闭**：`docs/PROTOCOL.md` 扩 Part II §11-18（v5.4/audit/lock/worktree/succession=新 SOT）+ `docs/ARCHITECTURE.md` 扩 Part II（post-v1.0 层 + 指向本快照）+ 建项目级 `CLAUDE.md`；6 处源码 + 4 处 test docstring 悬空 SOT ref（`codex-audit-gate-spec-draft.md`/`v5.4-retro-mandate-draft.md`/`owner-ack-token-design.md` 三不存在文件）全改指 `docs/PROTOCOL.md`；map 01/05 的 3 处 **forward overclaim**（banner 不覆盖此类）就地订正。**剩余（banner 已兜底·低价值·可延后）**：`auto-continue.sh:2132-2138` dormant 注释（deploy-trap）+ 6 子图 **inverse**-overclaim 逐行 refresh-to-HEAD（banner 已显式覆盖此类）+ 行号/LOC nits（re-drift） |
 | 7 | §6c 从未 E2E 验证（A4） | 🟡 低-中 | 声称 LIVE 实为 ready-idle（实测 host_pid 写侧跑过 21×、回收 E2E 0 成功） | ⏳ 待一次真 E2E 留证（owner 在环） |
 | 8 | 哨兵无界累积（B2）/ diag log 自盲（B4）/ owner_ack 非加密（A6）/ 名不副实小陷阱（A7） | 🟡 低 | 渐进/局部 | 待清理/排程/文档化 → p30/backlog |
 
-**底线判断（更新至 HEAD `5527ce1`）**：4 块高爆炸半径缺口 **#1（install 自毁）、#2（备份）、#3（C1 timeout）、#4（C2 spawn_lock）已全部闭环**（p28/p29·机器闸 GREEN·已部署）。功能主干 live 且经测试/日志/磁盘证据支撑、可继续日常运营。**剩余**：🟡#6 文档（ARCHITECTURE/PROTOCOL 重写 + 项目 CLAUDE.md + 本快照逐图 refresh）+ owner-在环 2 步（#5 GC --execute / #7 §6c 真 E2E）+ #8 渐进清理。**距「可安全长期自托管」**：高爆炸半径项已清，余为文档化 + owner-在环验证。
+**底线判断（更新至 HEAD `56ca5fb` + p30 doc 包）**：4 块高爆炸半径缺口 **#1（install 自毁）、#2（备份）、#3（C1 timeout）、#4（C2 spawn_lock）已全部闭环**（p28/p29·机器闸 GREEN·已部署）；**#6 文档主体 p30 闭**（PROTOCOL/ARCHITECTURE 扩全 + 项目 CLAUDE.md + 悬空 SOT ref 全清 + forward overclaim 订正）。功能主干 live 且经测试/日志/磁盘证据支撑、可继续日常运营。**剩余**：#6 尾巴（auto-continue.sh dormant 注释[deploy-trap] + 子图 inverse-overclaim 逐行 refresh，均 banner 已兜底·低价值）+ owner-在环 2 步（#5 GC --execute / #7 §6c 真 E2E）+ #8 渐进清理。**距「可安全长期自托管」**：高爆炸半径项 + 文档主体已清，余为 banner-兜底的文档尾巴 + owner-在环验证。

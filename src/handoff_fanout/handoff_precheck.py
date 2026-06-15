@@ -7,7 +7,7 @@ This module has two surfaces:
   * A CLI (`handoff-precheck`) that the AI invokes after closing a task to
     emit a `precheck/<task>.retro.evidence.json` file.
 
-Spec source of truth: ``v5.4-retro-mandate-draft.md §7.5 / §7.6 / §7.8``.
+Spec source of truth: ``docs/PROTOCOL.md`` Part II §13 (the v5.4 retro-evidence gate).
 
 The Phase 0 / Phase 1 schemas are intentionally lightweight skeletons —
 the precheck CLI captures what the workspace can prove (git HEAD, last

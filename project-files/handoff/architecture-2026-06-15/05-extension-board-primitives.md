@@ -94,7 +94,7 @@
 
 **§6c reclaim 文件流**（全在 `~/.claude-handoff/<project>/ack/`）：
 - producer 写 `<task>.reclaim_pending.json`（授权信号，携带 role/reason/nonce/run_id/issued_at/ack_timeout）。
-- 窗口 activate 写 `<task>.host_pid.json`（pid+nonce+project+task+ts；PID dead-man token）。**实查：磁盘上有多个真实 host_pid.json**（fateforge/dharmaxis/handoff-fanout 等），证明 reclaim/PID 机制 live 且被实跑过。
+- 窗口 activate 写 `<task>.host_pid.json`（pid+nonce+project+task+ts；PID dead-man token）。**实查：磁盘上有 21 个真实 host_pid.json**（fateforge/dharmaxis/handoff-fanout 等），证明 **PID-token 落盘路径**被实跑过（worker-worktree 窗口 activate 时**无条件**写）；但 **reclaim 关窗回收路径盘上无成功证据**（0 `reclaim_ack.json` / 0 `close_issued`；唯一落盘是 3 笔 2026-06-11 旧 push-model `ack-timeout` 失败）——host_pid.json 证明窗口 activate，**非** reclaim 完成。〔订正 p30：原文「证明 reclaim/PID 机制被实跑过」=forward overclaim。〕
 - 窗口决策后写 `<task>.reclaim_ack.json`（`relPath=<project>/ack/<task>.reclaim_ack.json`，result=close_issued|failed + reason；`ackIntent`，`handoffReclaim.ts:121-137`）。
 - producer 读 close_issued ack + `os.kill(host_pid,0)` ESRCH 才删 worktree（终态 done 由 producer 拥有）。
 
@@ -110,7 +110,7 @@
 
 ## 5. 现状三态
 
-- ✅ **§6c reclaim + PID dead-man（方案 D）live**：扩展 0.6.0 已装=源码一致；磁盘有真实 host_pid.json；A-poll pull 模型在 extension.ts/handoffReclaim.ts 接线完整。
+- 🟡 **§6c reclaim + PID dead-man（方案 D）接线完整、未 E2E**：扩展 0.6.0 已装=源码一致；A-poll pull 模型在 extension.ts/handoffReclaim.ts 接线完整；磁盘 21 个 host_pid.json 仅证明 **worker-worktree 窗口 activate** 时写了 PID token，**reclaim 关窗回收从未端到端完成**（0 `reclaim_ack.json` / 0 `close_issued`；详 GAP §F#7）。〔订正 p30：原文 ✅「live」=forward overclaim。〕
 - ✅ **单栏折叠 live**：onStartupFinished + /singlepane URI 双路，`.handoff.code-workspace` 守卫；config `singlepane_projects` 开关。
 - ✅ **nonce 自定位（窗口本地）live**：但是**子串校验**而非 per-window 内容比对（见下）。
 - ✅ **atomic/flock/safe-commit 原语 live**：flock 锁、atomic_replace、防劫持 commit 全在运行路径。

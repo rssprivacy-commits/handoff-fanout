@@ -290,3 +290,37 @@ Temporal is the gold standard for durable workflow execution across distributed 
 | Heartbeat & metrics | `src/handoff_fanout/heartbeat.py` |
 | PATH-injected git | `src/handoff_fanout/git_guard/git` |
 | Wire format | [`docs/PROTOCOL.md`](PROTOCOL.md) |
+
+---
+
+## Part II — governance & runtime layers (post-v1.0)
+
+The five layers above solve the **v1.0 fan-out/fan-in correctness problem** (orphan tabs, git-index hijack, stale baselines, missing primitives). After v1.0 the system grew a second concern: **letting an owner run an AI org across many desktops and many sessions, unattended, safely.** That added a governance stack (gates a baton must pass before spawning the next) and a runtime stack (worktree isolation + cross-desktop focus + window reclaim). Each is specified normatively in [`PROTOCOL.md` Part II](PROTOCOL.md#part-ii--governance-gate-layer-post-v10); each has a full prose walkthrough with `file:line` evidence in [`project-files/handoff/architecture-2026-06-15/`](../project-files/handoff/architecture-2026-06-15/) (the comprehensive architecture snapshot). This section is the map between the two.
+
+| Subsystem | Code | Failure it addresses | Detail |
+|---|---|---|---|
+| **Worktree isolation** | `worktree.py` | two sessions racing the same git index (the v1.0 Layer-2/3 problem; **opt-in, default OFF** — `worktree_mode`/`worktree_projects`; when on, each session gets its own checkout) | PROTOCOL §11 · map `03-spawn-worktree-focus` |
+| **Spawn lock** | `spawn_lock.py` | concurrent `create_worktree` on the shared source repo; a crashed holder deadlocking the project | PROTOCOL §12 · map `03` |
+| **v5.4 retro-evidence gate** | `handoff_precheck.py` + `retro_gate.check_retro_gate` | a session dumping the next baton without closing the loop on its own work ("已复盘" as a slogan, not an invariant) | PROTOCOL §13 · map `01-dispatch-handoff` |
+| **codex audit gate** | `codex_audit.py` + `retro_gate.evaluate_audit_gate` (G0–G9) | code shipping downstream with un-triaged P0/P1 findings ("缺陷不下传") | PROTOCOL §14 · map `02-audit-gate-succession` |
+| **Coordinator succession** | `dump.py` / `worktree.py` `--coordinator` + one-shot nonce | a supervisor window mis-closed or its role silently lost on hand-off | PROTOCOL §15 · map `02` |
+| **Pre-push delivery-audit gate** | `.git/hooks/pre-push` → `handoff audit-check` | a push to `main` (incl. docs-only) landing without a GREEN dual-brain delivery audit | PROTOCOL §16 · map `02` |
+| **Return-leg + §6c reclaim** | `auto-continue.sh` + `reclaim.py` + VS Code extension | a worker window left on the coordinator's desktop / an orphan worktree window never reclaimed | PROTOCOL §17 · maps `04-runtime-watchdog-reclaim`, `05-extension-board-primitives` |
+| **NFR / operational posture** | (cross-cutting) | backup, observability, unlock/credential surface, failure modes for self-hosted operation | map `06-nfr-operational` · [`GAP-ANALYSIS.md`](../project-files/handoff/architecture-2026-06-15/GAP-ANALYSIS.md) |
+
+### Design note: the same composition principle, extended
+
+The v1.0 thesis — *multiple independent layers of different kinds must fail simultaneously for a bad outcome to land* — carries into Part II, **but which layers are armed depends on scoping** (PROTOCOL §13.3). For a `mandate_projects`-listed project, work reaching `main` despite un-closed loops requires the dump-time retro/audit gates **and** the pre-push hook to all miss. For an unlisted project like handoff-fanout itself the dump-time gates take the legacy path, so the load-bearing guards are the **pre-push hook** (gates *publishing* to `main`) + the new-session **§0 self-audit** + explicit `--retro-evidence`. On the runtime side, a worker window leaking onto the wrong desktop requires the focus return-leg, the watchdog, **and** the reclaim poller to all miss. The redundancy is deliberate because the operator (the owner) is often asleep when these fire.
+
+### Source-of-truth pointers (Part II)
+
+| Concern | File |
+|---|---|
+| Retro-evidence builder + CLI | `src/handoff_fanout/handoff_precheck.py` |
+| Dump-time gate (retro + audit G0–G9) | `src/handoff_fanout/retro_gate.py` |
+| Codex audit artifacts | `src/handoff_fanout/codex_audit.py` |
+| Project spawn mutex | `src/handoff_fanout/spawn_lock.py` |
+| Worktree isolation + red-top | `src/handoff_fanout/worktree.py` |
+| §6c reclaim state machine | `src/handoff_fanout/reclaim.py` |
+| Runtime watchdog (return-leg + reclaim tick) | `install/auto-continue.sh` |
+| Comprehensive architecture snapshot | [`project-files/handoff/architecture-2026-06-15/`](../project-files/handoff/architecture-2026-06-15/) |

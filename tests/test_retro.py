@@ -1,7 +1,7 @@
 """v5.4 retro-evidence gate test matrix.
 
-Implements the cases in ``v5.4-retro-mandate-draft.md §7.11`` whose
-ownership lives in ``test_handoff_retro.py``:
+Implements the retro-gate case matrix specified in ``docs/PROTOCOL.md`` Part II §13
+(the v5.4 retro-evidence gate) whose ownership lives in ``test_handoff_retro.py``:
 
   * **R-01 .. R-14** — single-axis behaviours (full pass, missing phase,
     bypass, HEAD freshness, forensic mode, attempt counter, lock

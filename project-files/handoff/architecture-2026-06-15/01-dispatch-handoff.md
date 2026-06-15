@@ -2,6 +2,7 @@
 
 > ⚠️ **快照时效声明（务必先读）**：本文是 **2026-06-15 晨的架构快照**，勘察锚点 git HEAD `5e8d7b2`（p27 baseline），但实际随 commit `5527ce1` 入库——其间 **p28/p29 已闭多个本文标为「缺口/未修」的项**：GAP §F **#1**（install.sh 反向卸载 live 扩展 → `6f8c2c8`）、**#3**（C1 回程 helper 无 wall-clock timeout → `c641b28`）、**#4**（C2 spawn_lock stale-break 竞态 → `0aad8f4`）、**#2**（24GB 零应用级备份 → `359e650`），并订正了 `codex_audit.py`/`retro_gate.py` 的 mandate-OFF/dormant 注释（`5b4eb20`）。
 > **据此读本文**：凡标「🔴 P1 未修 / CONFIRMED REAL / No heartbeat exists / 提议修法」且涉及 **C1/C2/install-A3/备份** 的，**均为快照态、现已修复**；行号 / LOC / 日志计数 / exit-code 等具体值为快照时刻、可能已漂移。**当前权威状态以 [GAP-ANALYSIS.md](GAP-ANALYSIS.md) §F（状态列已更新）+ 现行代码为准**。逐图 refresh-to-HEAD 待后续 doc 包（外审 punch-list：`~/.claude-handoff/handoff-fanout/audits/p29-submap-audit-workflow-findings.json`）。
+> **🔴 forward-overclaim 警示（mandate scoping / p30 补）**：本图凡述 `HANDOFF_RETRO_MANDATE` / `HANDOFF_AUDIT_MANDATE` 的「强制 G0-G9 / 无 evidence→exit 4 / dump RETRY→BLOCKED / 门禁真实强制 ✅」均为**通用表述、省略 `mandate_projects` scoping**——实际仅对 `mandate_projects` 列内项目（当前 `["erp-system"]`）的裸 no-evidence dump 在 **dump-时**强制；**未列入项目（handoff-fanout 自身）走 legacy**（`dump.py:293` 在闸前返回 None），dump-时强制改由 pre-push 闸 + 显式 `--retro-evidence`/`audit-close` + §0 承担。权威 scoping = [`docs/PROTOCOL.md`](../../../docs/PROTOCOL.md) §13.3。
 
 > 范围：`handoff-fanout` 的「派会话 dump + 复盘证据闸 + precheck」子系统。
 > Git HEAD `5e8d7b2`（read-only 勘察，未改任何源码 / 未跑测试 / 未派子 agent）。
@@ -155,7 +156,7 @@
 ## 6. 🔴 半实现陷阱
 
 ### 陷阱 1 — `retro_gate.py:670-672` 过时注释把已上线的 audit-overdue 链说成「dormant/deferred」
-- **现象**：`_check_follow_up_overdue` 注释写「The audit kind stays dormant until the bypass-override producer lands (deferred, spec §7.3)」（`retro_gate.py:672`）。但实查：产出器 `codex_audit.write_bypass_override` 已在 audit-close（codex_audit.py:2568）live 调用，扫描器 auto-continue.sh:2245-2246 每周期已扫 `audit.override.json`/写 `audit_overdue.txt`，闸 `retro_gate.py:673` 已读 `*.audit_overdue.txt`。整条链已闭环。
+- **现象**：`_check_follow_up_overdue` 注释写「The audit kind stays dormant until the bypass-override producer lands (deferred, spec §7.3)」（`retro_gate.py:672`）。但实查：产出器 `codex_audit.write_bypass_override` 已在 audit-close（codex_audit.py:2568）live 调用，扫描器 auto-continue.sh:2245-2246 每周期已扫 `audit.override.json`/写 `audit_overdue.txt`，闸 `retro_gate.py:673` 已读 `*.audit_overdue.txt`——整条链**结构上已接线，但从未端到端触发**（盘上 0 个 `audit.override.json` / 0 个 `audit_overdue.txt`；当前 6 笔真实 codex re-audit 债走的是**另一套** PUSH 闸 `audits/bypasses/*.json`，本扫描器不读它）。〔订正 p30：原文「整条链已闭环」=forward overclaim，banner 不覆盖此类，故就地改。〕
 - **后果**：注释误导未来维护者以为 audit-overdue 是死代码可删/不必测。**代码行为正确**（闸真会因 audit overdue 返回 exit 6），只是文字落后于实现 = 反向半实现（代码已活、注释说没活）。
 - **正解**：把 `retro_gate.py:670-672` 注释更新为「producer 已 land（codex_audit.write_bypass_override，audit-close 自动写），两 kind 均 live」。
 

@@ -7,7 +7,8 @@ token; these tests verify the token defends against silent REUSE (finding_hash
 binding), indefinite validity (7d expiry) and trace-less approval, not against
 a malicious forger.
 
-Source of truth: erp-system ``project-files/handoff/owner-ack-token-design.md``.
+Source of truth: ``docs/PROTOCOL.md`` Part II §14.4 (owner-override: owner_ack_token
+binding — tamper-evident + friction, not cryptographic).
 """
 
 from __future__ import annotations

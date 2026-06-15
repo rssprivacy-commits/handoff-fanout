@@ -7,9 +7,14 @@ The G0-G9 gating itself lives in ``retro_gate`` (Phase B); this module produces
 and validates the machine artifacts those gates consume. The audit mandate is
 now **ON** (Phase D, flipped 2026-05-30): with ``HANDOFF_AUDIT_MANDATE=1`` set, a
 dump that changed code but carries no passing ``codex_audit`` block is BLOCKED by
-the gate — the block is recorded *and* enforced ("缺陷不下传"). (History: Phase A
-shipped with the mandate OFF, recording the block without enforcing it. Do NOT
-read this as "enforcement is off" — it is on. See ``templates.py`` §-1.5 / §0.)
+the gate — the block is recorded *and* enforced ("缺陷不下传"). **Scoped like the
+retro gate** (``docs/PROTOCOL.md`` §13.3): dump-time enforcement applies to a
+``mandate_projects``-listed project, or to any dump using explicit
+``--retro-evidence`` / ``audit-close``; an *unlisted* project's bare no-evidence
+dump still takes the legacy path (``dump.py`` returns before the gate runs), with
+enforcement carried by the pre-push hook + §0. (History: Phase A shipped with the
+mandate OFF, recording the block without enforcing it. Do NOT read this as
+"enforcement is off" — it is on. See ``templates.py`` §-1.5 / §0.)
 
 Authority principle (R1/R2): the *machine artifact* is the source of truth.
 codex emits a structured ``codex-findings.json``; its hash lives in a **sidecar
@@ -21,8 +26,9 @@ are written via the shared atomic + fsync primitives. Evidence references them
 by canonical *relative* path (relative to ``$HANDOFF_HOME/<project>/``), never an
 absolute path (spec §3.4).
 
-Spec source of truth: ``project-files/handoff/codex-audit-gate-spec-draft.md``
-v0.2 and ``codex-audit-gate-design.md`` v0.2.
+Spec source of truth: ``docs/PROTOCOL.md`` Part II §14 (the codex audit gate). The
+inline ``(spec §N)`` markers below are from the original (uncommitted) design draft,
+now consolidated into that document.
 """
 
 from __future__ import annotations

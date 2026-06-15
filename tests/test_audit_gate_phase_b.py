@@ -12,7 +12,7 @@ close: empty-diff-跳审, 旧 HEAD pass, run1-P1/run2-pass disposition drop,
 fabricated owner override (no ack token), fabricated independent refute (same
 session), bypass without failure proof — plus each G-check's own subcode.
 
-Spec: ``project-files/handoff/codex-audit-gate-spec-draft.md`` v0.2 §1/§2/§5.
+Spec: ``docs/PROTOCOL.md`` Part II §14 (the codex audit gate, G0-G9).
 """
 
 from __future__ import annotations

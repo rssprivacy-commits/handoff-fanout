@@ -13,7 +13,7 @@ Phase A is the *evidence capability* layer ONLY (mandate OFF). It must:
   * NOT add any G0-G9 gating to retro_gate (that is Phase B). With mandate off,
     a 5.5.0 evidence without a codex_audit block must pass exactly like 5.4.1.
 
-Spec: ``project-files/handoff/codex-audit-gate-spec-draft.md`` v0.2.
+Spec: ``docs/PROTOCOL.md`` Part II §14 (the codex audit gate).
 """
 
 from __future__ import annotations

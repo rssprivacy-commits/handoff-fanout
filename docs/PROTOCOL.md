@@ -1,9 +1,12 @@
 # Handoff Protocol Specification
 
-> Version: **schema_version 2** (matches `handoff_fanout.dump.SCHEMA_VERSION`)
-> Status: stable for v1.0.0
+> Version: **schema_version 2** (manifest/handoff layout, matches `handoff_fanout.dump.SCHEMA_VERSION`); **retro-evidence schema 5.5.0** (matches `handoff_precheck.EVIDENCE_SCHEMA_VERSION`).
+> Status: stable.
+> Scope: **Part I (§1–§10)** is the original v1.0.0 base — root layout, single-task + fan-out queue, atomicity, watchdog, ACK. **Part II (§11–§18)** is the post-v1.0 governance gate layer (worktree isolation, spawn lock, the v5.4 retro-evidence gate, the codex audit gate, coordinator succession, the pre-push delivery-audit gate, the runtime return/reclaim loop, and Part II reference implementations). Part II is the source-of-truth the in-code docstrings point to.
 
 This document specifies the on-disk layout, file formats, and state machine that the `handoff-fanout` tool reads and writes. Any tool conforming to this spec can be used as a producer (e.g. a custom `handoff dump` replacement) or a consumer (e.g. an IDE auto-spawn helper).
+
+> **Live home vs. default.** `$HANDOFF_HOME` defaults to `~/.handoff` (`config.DEFAULT_HOME`); the deployed install overrides it to `~/.claude-handoff` via the env var, so all on-disk paths below resolve under `~/.claude-handoff/<project>/` in practice.
 
 ## 1. Root directory
 
@@ -287,3 +290,151 @@ Forward-incompatible changes will bump `SCHEMA_VERSION`. Forward-compatible addi
 * `handoff_fanout.safe_commit` — cross-process commit wrapper (Layer 3).
 * `handoff_fanout.git_guard` — PATH-injected `git` shell wrapper (Layer 1).
 * `tests/test_handoff_orphan.py` + `tests/test_handoff_hijack.py` — black-box conformance tests; any alternative implementation should pass these.
+
+---
+
+## Part II — governance gate layer (post-v1.0)
+
+Part I describes how a baton is produced, spawned, and watched. Part II describes the **gates that govern whether a session may close out and a baton may advance**, plus the runtime machinery that isolates and reclaims worktree workers. **Where each gate actually bites depends on scoping** (§13.3): for a project listed in `mandate_projects` the retro/audit gates fire at *dump* time; for an unlisted project (e.g. handoff-fanout itself) a no-evidence dump takes the legacy path and the always-on enforcement is instead the **pre-push** hook (§16, gates *publishing*) + the new-session §0 self-audit + an explicit `--retro-evidence`. These layers were added after v1.0.0 and are what the in-code docstrings in `codex_audit.py`, `templates.py`, and `handoff_precheck.py` reference as their source of truth. Full prose walkthroughs with `file:line` evidence live in `project-files/handoff/architecture-2026-06-15/` (the comprehensive architecture snapshot); this Part is the normative summary.
+
+## 11. Per-session git-worktree isolation
+
+Worktree isolation is **opt-in (default OFF)**: `config.worktree_mode` is `"off"` by default and flips to `"on"` only via env `HANDOFF_WORKTREE_ISOLATION`, a sentinel, or the per-project `config.worktree_projects` allow-list (`worktree.resolve_mode`; `"report"` logs what would happen and mutates nothing). When **on**, `handoff dump` / `spawn` does **not** spawn the next tab in the shared checkout — it creates an out-of-tree git worktree so each session gets its own working copy of the source repo, eliminating cross-session git-index races.
+
+* **Location:** `worktrees_root` (default `$HANDOFF_HOME/<project>/worktrees/<task>/`).
+* **Workspace file:** the dump writes a `.handoff.code-workspace` (VS Code multi-root) pointing the new window at the worktree, and the spawn URI opens that workspace.
+* **Coordinator marker:** a `--coordinator` dump injects `workbench.colorCustomizations` (red title bar `#8B0000`/`#5A0000`) + a `🧭中枢·` window-title prefix into the workspace JSON, so a supervisor window is visually unmistakable (`worktree.inject_vscode_workspace`). Non-coordinator dumps are byte-identical to the un-marked form.
+* **Reclaim:** when a worktree task terminates, the worktree directory becomes *eligible* for reclaim GC (`handoff worktree` subcommands + §17). The reclaim **close/GC path is wired but has not completed end-to-end** (see §17 + `GAP-ANALYSIS §F#7`); in practice stale worktrees are pruned manually / owner-in-loop.
+
+## 12. Project spawn lock (`<project>/.spawn.lock`)
+
+`spawn_lock.project_spawn_lock` is a project-scoped mutex covering the spawn-intent decision and the worktree-create critical section. macOS lacks `flock` on all filesystems, so the lock is an **atomic `mkdir`** of `$HANDOFF_HOME/<project>/.spawn.lock`.
+
+* **TTL break:** a crashed holder must not deadlock the project. A waiter computes `age = now − mtime(lockdir)`; once `age ≥ ttl` (default 120 s) it breaks the stale lock and re-acquires. Breaking is a **bounded** retry loop (`max_stale_breaks`, default 5) — when two waiters race to break the same stale lock exactly one wins the re-`mkdir`; the loser's `FileExistsError` is a normal race outcome, never a crash.
+* **Held-lock heartbeat (gap C2):** while held, a daemon thread refreshes the lockdir mtime via `os.utime(lockdir, None)` every `ttl/4`. This stops a *live* holder in a long critical section (a slow-fs / slow-remote `create_worktree` whose `git fetch` + `git worktree add` exceed `ttl`) from being mis-judged stale and broken out from under itself.
+* **🔴 Empty-dir invariant:** three independent actors (`spawn_lock`, `reclaim`, the bash `try_autoclose`) all `rmdir` this lock as an **empty** directory. No file may ever be written *inside* `.spawn.lock` — fencing data goes in sibling files. The heartbeat refreshes mtime only; it writes nothing inside.
+* **`wait` budget:** default `wait=0.0` (non-blocking, immediate `LockHeld`) for the singlepane reject path + watchdog skip-on-contention. Parallel worktree workers pass a positive `wait` so legitimate concurrency *queues* on the shared source repo rather than rejecting.
+
+## 13. The v5.4 retro-evidence gate
+
+> Source-of-truth for the in-code refs `handoff_precheck.py` / `templates.py` §0 (formerly cited as `v5.4-retro-mandate-draft.md`).
+
+A session must prove it closed the loop on its own work before it is allowed to dump the next baton. The proof is a JSON evidence artifact; the dump gate verifies it.
+
+### 13.1 The artifact — `precheck/<task>.retro.evidence.json`
+
+Written by `handoff precheck` (`handoff_precheck` CLI) after a task closes:
+
+```jsonc
+{
+  "schema_version": "5.5.0",          // EVIDENCE_SCHEMA_VERSION; gate also accepts "v5.4.1" (migration window)
+  "evidence_kind": "retro",            // EVIDENCE_KIND_RETRO ("fan_in_aggregate" for batch fan-in)
+  "task_id": "<task>",
+  "project": "<project>",
+  "workspace": "<absolute-workspace>",
+  "mode": "normal",                    // or "forensic_retro"
+  "head_at_precheck": "<git-sha>",     // bound at precheck; gate checks freshness vs live HEAD
+  "head_at_precheck_timestamp": "<iso>",
+  "session_commits": ["<sha>", ...],   // commits this session owns (for HEAD re-align proof)
+  "session_id": "<id>", "session_id_kind": "claude-uuid",
+  "phase0": { "memory": {"status": "✅"}, "tests": {...}, "audit": {...},
+              "commit": {...}, "code_review": {...} },
+  "phase1": { "codex": {...}, "claude_md": {...}, "l2_memory": {...},
+              "tests": {...}, "prs": {...} },
+  "evidence_hash": "<canonical-sha256>" // optional: "nonce", "codex_audit" (added by audit-close)
+}
+```
+
+> Exact field names matter — a producer that emits `kind`/`task`/`head` instead of `evidence_kind`/`task_id`/`head_at_precheck` is rejected. Authority: `handoff_precheck.build_*` (the builder) + `retro_gate` (the reader).
+
+* **Phase 0 keys** (5): `memory`, `tests`, `audit`, `commit`, `code_review`.
+* **Phase 1 keys** (5): `codex`, `claude_md`, `l2_memory`, `tests`, `prs`.
+* **status enum:** `✅` (this task actually changed it) / `⚠️` (warning, non-blocking) / `❌` (omitted → gate rejects) / `skip` (explicit, requires a `reason`). All 10 items must carry a known status.
+
+### 13.2 The gate — `retro_gate.check_retro_gate` (invoked by `dump`)
+
+Activation triggers (`dump.py`): an explicit `--retro-evidence FILE`, `HANDOFF_RETRO_BYPASS=1`, `HANDOFF_RETRO_MANDATE=1`, or `HANDOFF_AUDIT_MANDATE=1` (the latter drives the codex audit gate, §14). Two exemptions skip the gate *before* triggers/scoping are evaluated at all: fan-out/fan-in **batch** dumps (`dump.py:261`) and a **terminal `done`/`blocked` dump with no explicit evidence** (`dump.py:276` — no successor to gate). Past those: the `mandate_projects` scoping (§13.3) applies **only to the bare env-mandate path** — an *active* dump with *no* explicit `--retro-evidence` **and** no `HANDOFF_RETRO_BYPASS`, where an unlisted project takes the legacy (no-gate) path. An explicit `--retro-evidence` always validates (it defeats both the terminal-status skip and the project-scope skip); `HANDOFF_RETRO_BYPASS=1` runs the gate for an active successor dump regardless of project listing (`dump.py:276-292`). On activation it verifies evidence presence + canonical-hash match + `head_at_precheck` freshness vs live HEAD, with a per-task attempt counter (hard-reject after 2) and a three-tier lock.
+
+**Exit codes** (stderr carries the matching prefix; AI dispatches on the subcode):
+
+| exit | prefix | meaning | response |
+|---|---|---|---|
+| 0 | `OK:` | gate passed | wait for the IDE to spawn the next tab |
+| 1 | `ERR-FATAL:` | tamper / unrecoverable (retry can't help) | stop |
+| 2 | `ERR-BLOCKED:` | attempt #2 hard-reject / head-stale-fatal | stop retrying → BLOCKED flow |
+| 3 | `ERR-LOCKED:` | precheck/dump/attempt lock contention | yield + exit (a parallel tab is dumping) |
+| 4 | `ERR-RETRY:` | evidence missing / hash mismatch / schema unknown | fix + re-dump once (attempt < 2) |
+| 6 | `ERR-BYPASS:` | bypass field missing / follow-up overdue | add the trail fields + re-dump |
+
+> Exit 5 is intentionally unassigned (§7.1). Schema-version: an evidence file whose `schema_version` is not in `SUPPORTED_EVIDENCE_SCHEMA_VERSIONS` is a fatal-class `ERR-RETRY`.
+
+### 13.3 `mandate_projects` scoping (🔴 repo-specific behaviour)
+
+`config.json:mandate_projects` whitelists which projects the **dump-time** env mandate applies to. It is currently `["erp-system"]` — **handoff-fanout is not listed**. So for handoff-fanout a no-evidence, no-bypass `dump` takes the **legacy path** (`dump.py` returns before `check_retro_gate` runs → exit 0); the env mandate alone does **not** cause exit 4 for this repo. Dump-time enforcement for handoff-fanout therefore requires an **explicit `--retro-evidence`** (which coordinator `audit-close` always passes), and the always-on enforcement is the **pre-push hook** (§16) + the new-session §0 self-audit.
+
+### 13.4 Emergency bypass
+
+`HANDOFF_RETRO_BYPASS=1` requires an `ack/<task>.retro.override.json` carrying a `follow_up_retro_task_id` + ISO-8601 `follow_up_deadline`, else `ERR-BYPASS` (exit 6). Bypass is *deferred* retro, not *skipped* retro: an overdue follow-up is caught at the next dump.
+
+## 14. The codex audit gate
+
+> Source-of-truth for the in-code refs `codex_audit.py` / `templates.py` §-1.5 (formerly cited as `codex-audit-gate-spec-draft.md` / `codex-audit-gate-design.md`).
+
+A task that **changed code** must carry a passing codex-audit block before it can dump — **with the same scoping as §13.3**: dump-time G0–G9 enforcement applies to a `mandate_projects`-listed project, or to any dump that uses explicit `--retro-evidence` / `audit-close`; an unlisted project's bare no-evidence dump takes the legacy path (`dump.py:293`), with enforcement carried instead by the pre-push hook (§16) + §0. The audit→fix→re-audit loop produces machine artifacts; `retro_gate.evaluate_audit_gate` (gates G0–G9) verifies them in the same locked process as the dump (so HEAD can't drift between audit and dump).
+
+### 14.1 Authority + artifacts
+
+* The **machine artifact is the source of truth** — codex emits a structured `codex-findings.json`; its hash lives in a **sidecar manifest** (a JSON can't contain its own hash). Evidence stores only per-finding *dispositions*, each bound to an original finding id + hash.
+* Runtime artifacts: `$HANDOFF_HOME/<project>/audit/<task>/<run>/`, referenced by canonical relative path (never absolute).
+* CLI: `handoff audit-run` (records a run's findings + sidecar) → `handoff audit-disposition` (one per P0/P1) → `handoff audit-close` (folds the audit block into retro evidence + dumps, atomically).
+
+### 14.2 The four audit modes
+
+| mode | when |
+|---|---|
+| `full_codex_audit` | code changed |
+| `empty_diff_attestation` | diff is empty (e.g. a coordinator hand-off with no code delta) |
+| `docs_only_light_audit` | docs only (prompts / CLAUDE.md / schema / SQL do **not** count as docs) |
+| `codex_unavailable_bypass` | codex genuinely unavailable |
+
+### 14.3 The G0–G9 gates (`evaluate_audit_gate`)
+
+G9 round-cap → G2 artifact integrity (missing = RETRY / tampered = FATAL) → G0 the last (clean) re-audit ran against the current HEAD → docs-only content-diff legitimacy → G3 every P0/P1 (union across all rounds, deduped by identity hash) has a disposition → G4 a P0/P1 may never be merely *deferred* → G5 a `fixed` disposition needs a real `fix_commit` AND the finding must be gone from the last run → G6 an `independent_reviewer_refuted` must come from a *different* session and be anti-forgery-bound → G7 owner-override binding → G8 disposition shape. `empty_diff_attestation` reduces to G0 (attested HEAD == live HEAD) + a machine re-compute.
+
+### 14.4 Bypass = debt; owner-override = friction-bound, not crypto
+
+* **Bypass** (`codex_unavailable_bypass`) needs a bypass file with `codex_failure_attempts` (≥3 machine-proven failures) + a `follow_up_audit_task_id`. The next dump's `--task` **must** equal that follow-up id (written into `old_ready.next_session_forced_task`; the new session's §0 verifies it). `audit-close` bypass auto-writes `ack/<task>.audit.override.json` (deadline = now + 1 day); an overdue debt is caught by the Phase C overdue scanner at the next dump.
+* **owner-override** (exempting a finding the AI argues should not be fixed) needs an on-disk `ack/<task>.owner_ack.<finding_hash_short>.json` whose `owner_ack_token = sha256(task | finding_hash | nonce | approved_at)` recomputes (G7). **Honest bound:** this token is a *tamper-evident + friction* binding, **not** cryptographic — it stops one approval being silently replayed onto a different finding / used past expiry, but does **not** stop a process running *as the owner* from forging a self-consistent token (single-user-machine assumption; a private-key HMAC is the deferred multi-user upgrade).
+
+> **Two distinct overdue mechanisms** (do not conflate): the open codex re-audit debts currently live in the **PUSH gate** `audits/bypasses/*.json` (one-shot, already-used), which the dump-time overdue scanner does **not** read. The scanner reads `ack/*.audit.override.json` / `*.audit_overdue.txt`. Both producers are wired LIVE, but the dump-time audit-overdue chain has never fired end-to-end for handoff-fanout (0 such markers on disk).
+
+## 15. Coordinator succession, red-top, singlepane
+
+A supervisor/coordinator window hands its role to a fresh window (coordinator→coordinator) rather than to a worker.
+
+* **Red-top + singlepane:** a coordinator window is a single-pane VS Code window with a red title bar + `🧭中枢·<chain>·<coord-id>` prefix (§11). Defence-in-depth against accidental close: the visual marker lowers mis-close probability, and a mis-closed coordinator is recoverable from the durable hand-off brief + `/resume`.
+* **One-shot succession token:** when the predecessor's sidecar carries a 16-hex `predecessor_nonce`, `audit-close` routes through a *suppressed* dump + an in-process succession spawn that opens the heir window; the token transitions ISSUED → CONSUMED so it can't be replayed. With no nonce it falls back to a legacy dump with a loud WARN.
+* **autoclose (old window):** opt-in only (`HANDOFF_AUTOCLOSE_ENABLED` env / global sentinel / per-project sentinel), all currently un-armed — so by default the old coordinator window stays open and the owner closes it. This is a deliberate safety posture (mis-close losing context > the minor friction of a manual close).
+
+## 16. Pre-push delivery-audit machine gate
+
+The always-on enforcement point for handoff-fanout (given §13.3). Three hooks call `handoff audit-check` with different teeth: **`pre-push` blocks** pushing new commits to `main` unless a matching GREEN delivery-audit evidence file (keyed by head SHA, or by `git patch-id` + changed-file set) exists under `~/.claude-handoff/handoff-fanout/audits/`; **`post-merge` warns only**; **`post-commit` gates only the auto-deploy** of the two deploy-copy assets (§16 note below), not the commit itself. The pushed-commit requirement: The evidence is produced by the dual-brain runner (`--evidence-repo <repo> --evidence-range <base>..<head> --out audits/…`); a RED verdict can only be released by the owner via an interactive-tty `handoff audit-override`. **Docs-only commits are not exempt** — every push of a new commit to `main` needs GREEN evidence.
+
+> **Launcher = deployment COPY.** `install/auto-continue.sh` and `install/dump-handoff.py` are copied to the live launcher by a post-commit hook. Editing them requires `export HANDOFF_INSTALL_SH=/nonexistent` before commit (to skip the auto-deploy), verifying the launcher SHA is unchanged, then a manual `install.sh --sync-launcher` after the gate passes. `install.sh` itself and `backup-handoff-state.sh` are **not** on the deploy manifest — editing them is safe.
+
+## 17. Runtime return-leg + §6c worker-window reclaim
+
+The always-on watchdog (`auto-continue.sh`, launchd/cron tick) drives two runtime loops beyond Part I's batch watchdog:
+
+* **Focus return-leg:** when a spawn is armed with `HANDOFF_SPAWNER_FOCUS`, after the worker window opens on the coordinator's desktop the watchdog jumps the *view* back to the owner's origin desktop (`spawn-precapture` / `spawn-return` via the cross-repo `vscode-spaces.py`). Both helpers are wrapped in `run_with_timeout ${HANDOFF_RETURN_TIMEOUT:-20}` (gap C1) — an `rc=124` timeout disarms + WARNs rather than freezing the watchdog iteration.
+* **§6c reclaim (PID dead-man):** a worker-worktree window writes `<task>.host_pid.json` (pid + nonce + project + task + ts) on activate. Reclaim is **A-poll pull**, not push: a coordinator's `<request>.reclaim_requested` sentinel is consumed by the watchdog/reclaim producer, which writes a `<task>.reclaim_pending.json` (post-gate authorization); the worker window's extension polls **its own** `<task>.reclaim_pending.json`, self-closes, and writes `<task>.reclaim_ack.json`; the producer then verifies the host PID is gone (`os.kill(pid, 0)` → ESRCH) and GC's the worktree. (Pull beats push because `open vscode://…` only reaches the *focused* window — a worker on another desktop never received a pushed reclaim; an extension reading its own pending file makes window-targeting intrinsic.) **Status:** wired and code-live, but the reclaim *close* path has never completed end-to-end (host_pid.json proves window activation, not reclaim completion); enabling it for real needs one `reclaim_requested → reclaim_pending → reclaim_ack → PID-ESRCH → GC` trace as evidence.
+
+## 18. Reference implementations (Part II)
+
+* `handoff_fanout.handoff_precheck` — retro-evidence builder + CLI (§13).
+* `handoff_fanout.retro_gate` — the dump-time gate: `check_retro_gate` (§13) + `evaluate_audit_gate` G0–G9 (§14).
+* `handoff_fanout.codex_audit` — audit run/disposition/close builders + sidecar manifest (§14).
+* `handoff_fanout.spawn_lock` — project spawn mutex (§12).
+* `handoff_fanout.worktree` — worktree isolation + coordinator red-top injection (§11).
+* `handoff_fanout.reclaim` — §6c PID dead-man reclaim state machine (§17).
+* `install/auto-continue.sh` — the launchd watchdog: return-leg + reclaim tick + overdue scanner (§16/§17).

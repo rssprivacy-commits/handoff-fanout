@@ -2,6 +2,7 @@
 
 > ⚠️ **快照时效声明（务必先读）**：本文是 **2026-06-15 晨的架构快照**，勘察锚点 git HEAD `5e8d7b2`（p27 baseline），但实际随 commit `5527ce1` 入库——其间 **p28/p29 已闭多个本文标为「缺口/未修」的项**：GAP §F **#1**（install.sh 反向卸载 live 扩展 → `6f8c2c8`）、**#3**（C1 回程 helper 无 wall-clock timeout → `c641b28`）、**#4**（C2 spawn_lock stale-break 竞态 → `0aad8f4`）、**#2**（24GB 零应用级备份 → `359e650`），并订正了 `codex_audit.py`/`retro_gate.py` 的 mandate-OFF/dormant 注释（`5b4eb20`）。
 > **据此读本文**：凡标「🔴 P1 未修 / CONFIRMED REAL / No heartbeat exists / 提议修法」且涉及 **C1/C2/install-A3/备份** 的，**均为快照态、现已修复**；行号 / LOC / 日志计数 / exit-code 等具体值为快照时刻、可能已漂移。**当前权威状态以 [GAP-ANALYSIS.md](GAP-ANALYSIS.md) §F（状态列已更新）+ 现行代码为准**。逐图 refresh-to-HEAD 待后续 doc 包（外审 punch-list：`~/.claude-handoff/handoff-fanout/audits/p29-submap-audit-workflow-findings.json`）。
+> **🔴 forward-overclaim 警示（mandate scoping / p30 补）**：本图凡述 `HANDOFF_RETRO_MANDATE` / `HANDOFF_AUDIT_MANDATE` 的「任何 dump 前强制 G0-G9 / dump 被 RETRY→BLOCKED / 门禁真实强制 ✅」均为**通用表述、省略 `mandate_projects` scoping**——实际仅对 `mandate_projects` 列内项目（当前 `["erp-system"]`）的裸 no-evidence dump 在 **dump-时**强制；**未列入项目（handoff-fanout 自身）走 legacy**（`dump.py:293` 在闸前返回 None），dump-时强制改由 pre-push 闸 + 显式 `--retro-evidence`/`audit-close` + §0 承担。权威 scoping = [`docs/PROTOCOL.md`](../../../docs/PROTOCOL.md) §13.3。
 
 **子系统**：codex audit gate · delivery-audit machine gate · supervisor succession relay
 **仓库**：`/Users/chenmingzhong/Projects/handoff-fanout` · git HEAD `5e8d7b2`（read-only 勘察）
