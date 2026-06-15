@@ -2131,11 +2131,15 @@ json_get() {
 # Phase C (codex audit gate, spec §6 / §4 module table): the SAME machinery is
 # reused for the codex-audit bypass debt — ack/<task>.audit.override.json with
 # a follow_up_audit_task_id. scan_overdue_kind is the parameterized core; the
-# two kinds differ only in glob suffix / follow-key / marker names. NOTE: the
-# codex-audit override *producer* (the bypass sidecar artifact carrying
-# follow_up_audit_task_id + follow_up_deadline) is an owner-decision item
-# deferred to before Phase D (spec §7.3); until it lands no *.audit.override.json
-# files exist, so the codex kind is dormant-but-ready and a strict no-op.
+# two kinds differ only in glob suffix / follow-key / marker names. The codex-
+# audit override *producer* IS wired: `handoff audit-close` auto-emits
+# ack/<task>.audit.override.json via codex_audit.write_bypass_override when it
+# runs in codex_unavailable_bypass mode (audit-close Component B — no owner
+# click, codex-down is a machine fact). Currently no such markers exist on disk:
+# the open codex re-audit debts use the SEPARATE push gate (audits/bypasses/
+# *.json), which this scanner does not read — so the codex kind is a no-op until
+# the first audit-close bypass lands, NOT because the producer is deferred.
+# (Matches the codex_audit/retro_gate docstrings corrected in p29 `5b4eb20`.)
 
 # Is the follow-up debt actually satisfied by the follow-up evidence file?
 #   $1 evidence file (already confirmed to exist)
