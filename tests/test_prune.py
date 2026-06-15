@@ -22,8 +22,9 @@ def _queue(home: Path, project: str = PROJECT) -> Path:
     return q
 
 
-def _make_task(queue: Path, task: str, *, terminal: str | None, sidecars=()) -> None:
-    """terminal: None=active, 'done', or 'blocked'. sidecars: ext names to create."""
+def _make_task(queue: Path, task: str, *, terminal: str | None, sidecars=(), ack_sidecars=()) -> None:
+    """terminal: None=active, 'done', or 'blocked'. sidecars: queue ext names.
+    ack_sidecars: ext names to create under the sibling ``ack/`` dir."""
     (queue / f"{task}.md").write_text("# task")
     if terminal == "done":
         (queue / f"{task}.done").touch()
@@ -31,6 +32,11 @@ def _make_task(queue: Path, task: str, *, terminal: str | None, sidecars=()) -> 
         (queue / f"{task}.BLOCKED.md").write_text("blocked")
     for ext in sidecars:
         (queue / f"{task}.{ext}").write_text("")
+    if ack_sidecars:
+        ack = queue.parent / "ack"
+        ack.mkdir(parents=True, exist_ok=True)
+        for ext in ack_sidecars:
+            (ack / f"{task}.{ext}").write_text("")
 
 
 def test_find_prunable_lists_only_terminal_with_sidecars(isolated_handoff_home):
@@ -124,6 +130,61 @@ def test_skips_special_dirs(isolated_handoff_home):
 def test_empty_home_is_noop(isolated_handoff_home):
     assert prune.main([]) == 0
     assert prune.main(["--execute"]) == 0
+
+
+def test_find_prunable_includes_terminal_ack_worker_reported(isolated_handoff_home):
+    queue = _queue(isolated_handoff_home)
+    _make_task(queue, "done-wr", terminal="done", ack_sidecars=["worker_reported"])
+    _make_task(queue, "active-wr", terminal=None, ack_sidecars=["worker_reported"])  # skip
+
+    records = prune.find_prunable(isolated_handoff_home)
+    tasks = {r["task"] for r in records}
+    assert tasks == {"done-wr"}
+    ack = isolated_handoff_home / PROJECT / "ack"
+    files = [f for r in records for f in r["files"]]
+    assert (ack / "done-wr.worker_reported") in files
+
+
+def test_execute_prunes_terminal_ack_worker_reported(isolated_handoff_home):
+    queue = _queue(isolated_handoff_home)
+    _make_task(queue, "t", terminal="done", ack_sidecars=["worker_reported"])
+    ack = isolated_handoff_home / PROJECT / "ack"
+
+    prune.main(["--execute"])
+
+    assert not (ack / "t.worker_reported").exists()
+
+
+def test_execute_never_touches_gate_reclaim_or_spawn_ack_sidecars(isolated_handoff_home):
+    """The safety invariant: only worker_reported is prunable from ack/. Every
+    file the watchdog/autoclose/gate/reclaim machinery reads must survive, even
+    for a terminal task — pruning one would break a live mechanism."""
+    queue = _queue(isolated_handoff_home)
+    protected = [
+        "spawned", "submitted", "queued", "failed",  # autoclose / watchdog
+        "old_ready",                                   # §0 successor audit trail
+        "host_pid.json", "reclaim_pending.json", "head.json",  # §6c reclaim
+        "audit.override.json", "audit_overdue.txt", "owner_ack.abc123.json",  # gate
+        "retro.warnings.txt", "mandate_drift.json",    # retro gate
+    ]
+    _make_task(queue, "t", terminal="done", ack_sidecars=["worker_reported", *protected])
+    ack = isolated_handoff_home / PROJECT / "ack"
+
+    prune.main(["--execute"])
+
+    assert not (ack / "t.worker_reported").exists()  # the one prunable ext
+    for ext in protected:
+        assert (ack / f"t.{ext}").exists(), f"ack/{ext} must survive prune"
+
+
+def test_active_task_ack_worker_reported_survives(isolated_handoff_home):
+    queue = _queue(isolated_handoff_home)
+    _make_task(queue, "active", terminal=None, ack_sidecars=["worker_reported"])
+    ack = isolated_handoff_home / PROJECT / "ack"
+
+    prune.main(["--execute"])
+
+    assert (ack / "active.worker_reported").exists()
 
 
 def test_cli_dispatch_routes_to_prune(isolated_handoff_home):
