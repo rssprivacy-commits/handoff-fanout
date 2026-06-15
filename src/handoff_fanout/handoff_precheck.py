@@ -42,9 +42,10 @@ EVIDENCE_KIND_RETRO = "retro"
 EVIDENCE_KIND_AGGREGATE = "fan_in_aggregate"
 
 # ─── codex audit gate constants (spec §3.5 / §4.4 / §1.7) ───────────────────
-# Phase A introduces the *evidence capability* only (mandate OFF): these
-# constants pin the four audit modes, the convergence bounds, and the
-# disposition vocabulary that the Phase B retro_gate (G0-G9) will enforce.
+# These constants pin the four audit modes, the convergence bounds, and the
+# disposition vocabulary that the retro_gate G0-G9 path enforces (mandate ON
+# since Phase D, 2026-05-30). (History: Phase A shipped the evidence capability
+# with the mandate OFF, recording the block without enforcing it.)
 
 AUDIT_MODE_FULL = "full_codex_audit"
 AUDIT_MODE_EMPTY_DIFF = "empty_diff_attestation"

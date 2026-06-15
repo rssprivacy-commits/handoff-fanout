@@ -2323,9 +2323,13 @@ def main_audit_close(argv: list[str] | None = None) -> int:
     dispositions, fold it into retro evidence, then invoke ``dump`` — all under
     one held dump lock so HEAD can't drift between audit and handoff (R2-P0-6).
 
-    Phase A note (mandate OFF): the dump gate does not yet enforce G0-G9, so a
-    close here only *records* the audit block. The lock + single-process
-    sequencing is the Phase-B-ready scaffold.
+    Mandate ON (Phase D, flipped 2026-05-30): because this path always folds an
+    explicit retro-evidence block into the inner ``dump``, the gate runs G0-G9
+    and *enforces* the codex_audit block here ("缺陷不下传") — it does not merely
+    record it. (An *unlisted* project's bare no-evidence ``dump`` still takes the
+    legacy path; this evidence-bearing close does not — see the module docstring
+    + ``docs/PROTOCOL.md`` §13.3.) The held dump lock keeps HEAD from drifting
+    between audit and handoff (R2-P0-6).
 
     Step1 A-收口 (coordinator relay / 中枢交棒): ``--coordinator --status active`` is THE
     retro-gated coordinator relay path — batch/fan-in dump paths and the bare
