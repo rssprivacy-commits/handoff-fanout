@@ -298,6 +298,36 @@ def _run_retro_gate(
     ):
         return None
 
+    # A listed project is configured to expect the env mandate ON. Used both for the
+    # §F#9 total-drift guard below and threaded to the gate for the partial-drift guard.
+    audit_mandate_expected = bool(
+        getattr(cfg, "mandate_projects_configured", False)
+        and project in getattr(cfg, "mandate_projects", [])
+    )
+
+    # §F#9 silent-downgrade guard — TOTAL drift (policy B, owner-ruled): a listed
+    # project expects the mandate ON, but BOTH env mandates are missing on a
+    # no-evidence/no-bypass dump → it would silently take the legacy (no-gate) path
+    # below. WARN + durable sentinel, then continue legacy (NON-fatal — a fail-closed
+    # reject would break the config.py:564 "unset env to disable" escape hatch and could
+    # brick the listed project). Fires only for listed projects (audit_mandate_expected).
+    if (
+        evidence_path is None
+        and not bypass
+        and not mandate
+        and not audit_mandate
+        and audit_mandate_expected
+    ):
+        retro_gate.write_mandate_drift_sentinel(
+            project,
+            args.task,
+            workspace=workspace,
+            classification="total_missing",
+            retro_mandate=mandate,
+            audit_mandate=audit_mandate,
+            mandate_projects=getattr(cfg, "mandate_projects", []),
+        )
+
     if evidence_path is None and not bypass and not mandate and not audit_mandate:
         # legacy path: no gate, preserve pre-v5.4 ERP shim behaviour
         return None
@@ -311,6 +341,7 @@ def _run_retro_gate(
         bypass_enabled=bypass,
         mandate_enabled=mandate,
         audit_mandate_enabled=audit_mandate,
+        audit_mandate_expected=audit_mandate_expected,
         nonce=args.nonce,
         session_id=sid,
     )

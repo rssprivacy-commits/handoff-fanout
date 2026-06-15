@@ -268,6 +268,66 @@ def _audit_append(project: str, task: str, record: dict) -> None:
         fh.write(line)
 
 
+def write_mandate_drift_sentinel(
+    project: str,
+    task: str,
+    *,
+    workspace: Path | str,
+    classification: str,
+    retro_mandate: bool,
+    audit_mandate: bool,
+    mandate_projects: list[str] | None = None,
+) -> None:
+    """§F#9 silent-downgrade guard (owner ruling: policy B — WARN, never fail-closed).
+
+    A project listed in ``config.json:mandate_projects`` is configured to expect the
+    GLOBAL env mandate ON, but the env that activates it is missing — so the governance
+    gate would silently fall to the legacy / no-G0-G9 path for a high-blast-radius
+    project. ``classification`` is ``"total_missing"`` (BOTH mandates gone on a
+    no-evidence dump → silent legacy, detected in ``dump._run_retro_gate``) or
+    ``"partial_missing"`` (the AUDIT mandate dropped while the RETRO mandate persisted
+    → an evidence-bearing close silently skips the G0-G9 audit, detected at the audit
+    gate below).
+
+    Policy B is deliberately NON-fatal (a fail-closed reject would break the
+    ``config.py`` documented "unset env mandate to disable enforcement" escape hatch and
+    could brick the listed project). We WARN loudly to stderr + leave a durable,
+    SELF-OVERWRITING per-task sentinel (no unbounded accumulation), then let the existing
+    flow continue. A sentinel write failure must NEVER block the dump (a drift guard must
+    not become a new failure mode) — but it emits its own stderr WARN so a missing
+    sentinel is itself visible.
+    """
+    projects = list(mandate_projects) if mandate_projects else []
+    where = f" (mandate_projects={projects})" if projects else ""
+    print(
+        f"⚠️  MANDATE-DRIFT [{classification}]: project={project!r} expects the env "
+        f"mandate ON{where} but it is missing "
+        f"(HANDOFF_RETRO_MANDATE={retro_mandate}, HANDOFF_AUDIT_MANDATE={audit_mandate}) "
+        f"— the governance gate is silently degraded for this project. Restore the env "
+        f"mandate (.zshenv / launchctl setenv / auto-continue.plist) or, to intentionally "
+        f"disable enforcement, clear mandate_projects in config.json.",
+        file=sys.stderr,
+    )
+    try:
+        ack = _ack_dir(project)
+        ack.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": "1",
+            "kind": "mandate_drift",
+            "classification": classification,
+            "project": project,
+            "task": task,
+            "workspace": str(workspace),
+            "retro_mandate": retro_mandate,
+            "audit_mandate": audit_mandate,
+            "mandate_projects": projects,
+            "detected_at": _iso_now(),
+        }
+        atomic.atomic_replace(ack / f"{task}.mandate_drift.json", json.dumps(payload, indent=2))
+    except OSError as e:  # never block the dump on a guard's own write failure
+        print(f"⚠️  MANDATE-DRIFT sentinel write failed for {project}/{task}: {e}", file=sys.stderr)
+
+
 def _read_counter(p: Path) -> tuple[int | None, str]:
     """Return ``(value, raw)`` for an attempt-counter file at ``p``.
 
@@ -1236,6 +1296,7 @@ def check_retro_gate(
     bypass_enabled: bool,
     mandate_enabled: bool,
     audit_mandate_enabled: bool = False,
+    audit_mandate_expected: bool = False,
     nonce: str | None = None,
     config: dict | None = None,
     session_id: str = "",
@@ -1484,6 +1545,19 @@ def check_retro_gate(
                         head=_git(["rev-parse", "HEAD"], workspace),
                     )
                 _clear_audit_attempt_on_success(project, task)
+            elif audit_mandate_expected:
+                # §F#9 silent-downgrade guard — PARTIAL drift: we reached the audit gate
+                # with validated evidence, but the AUDIT mandate env dropped while this
+                # listed project still expects it → G0-G9 is silently skipped. WARN +
+                # durable sentinel, then continue (policy B — non-fatal).
+                write_mandate_drift_sentinel(
+                    project,
+                    task,
+                    workspace=workspace,
+                    classification="partial_missing",
+                    retro_mandate=mandate_enabled,
+                    audit_mandate=audit_mandate_enabled,
+                )
 
             if not forensic:
                 _clear_attempt_on_success(project, task, payload.get("evidence_hash", ""), sid)

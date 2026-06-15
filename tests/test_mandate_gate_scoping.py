@@ -197,3 +197,89 @@ def test_config_all_invalid_entries_is_unconfigured(tmp_path):
     cfg = _config.load(_home(tmp_path, mandate_projects=["", None, 123]))
     assert cfg.mandate_projects == []
     assert cfg.mandate_projects_configured is False
+
+
+# ── §F#9 mandate-drift silent-downgrade guard (policy B: WARN + sentinel, non-fatal) ──
+def _drift_sentinel(home: Path, *, project: str = PROJECT, task: str = TASK) -> Path:
+    return home / project / "ack" / f"{task}.mandate_drift.json"
+
+
+def test_total_drift_listed_project_warns_sentinel_and_continues(tmp_path, monkeypatch, capsys):
+    # TOTAL drift: listed project + BOTH env mandates missing + no evidence → it would
+    # silently take the legacy (no-gate) path. Policy B = NON-fatal: legacy still runs
+    # (rc 0) but a loud WARN + a durable sentinel make the downgrade visible.
+    ws, home = _git_ws(tmp_path), _home(tmp_path, mandate_projects=[PROJECT])
+    rc = _run(home, ws, monkeypatch, status="active", project=PROJECT, mandate=False)
+    assert rc == 0   # policy B: drift is non-fatal, legacy continues
+    sentinel = _drift_sentinel(home)
+    assert sentinel.exists()
+    data = json.loads(sentinel.read_text(encoding="utf-8"))
+    assert data["classification"] == "total_missing"
+    assert data["project"] == PROJECT
+    assert data["retro_mandate"] is False and data["audit_mandate"] is False
+    assert "MANDATE-DRIFT" in capsys.readouterr().err
+
+
+def test_total_drift_not_fired_for_unlisted_project(tmp_path, monkeypatch):
+    # An UNLISTED project legacy-skips at the scoping return BEFORE the drift guard — it
+    # was never expected to be gated, so its env-off is not drift (no false positive).
+    ws, home = _git_ws(tmp_path), _home(tmp_path, mandate_projects=["erp-system"])
+    rc = _run(home, ws, monkeypatch, status="active", project="ptest", mandate=False)
+    assert rc == 0
+    assert not _drift_sentinel(home, project="ptest").exists()
+
+
+def test_total_drift_not_fired_when_mandate_on(tmp_path, monkeypatch):
+    # Listed project + mandate ON + no evidence → the gate ENFORCES (blocks); this is
+    # normal operation, not drift → no sentinel (no false positive).
+    ws, home = _git_ws(tmp_path), _home(tmp_path, mandate_projects=[PROJECT])
+    rc = _run(home, ws, monkeypatch, status="active", project=PROJECT, mandate=True)
+    assert rc != 0   # gate enforced (no evidence under mandate)
+    assert not _drift_sentinel(home).exists()
+
+
+def test_partial_drift_audit_missing_warns_but_gate_passes(tmp_path, monkeypatch, capsys):
+    # PARTIAL drift: RETRO mandate present, AUDIT mandate dropped, listed project, WITH
+    # valid evidence → reaches the audit gate where G0-G9 is silently skipped. Policy B =
+    # NON-fatal: the gate still PASSES (rc 0) but a partial_missing sentinel records it.
+    from handoff_fanout import handoff_precheck
+    ws, home = _git_ws(tmp_path), _home(tmp_path, mandate_projects=[PROJECT])
+    monkeypatch.setenv("HANDOFF_HOME", str(home))
+    monkeypatch.setenv("HANDOFF_RETRO_MANDATE", "1")
+    monkeypatch.delenv("HANDOFF_AUDIT_MANDATE", raising=False)
+    monkeypatch.delenv("HANDOFF_RETRO_BYPASS", raising=False)
+    p0 = {k: {"status": "✅"} for k in handoff_precheck.PHASE0_KEYS}
+    p1 = {k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS}
+    payload = handoff_precheck.build_evidence(
+        task_id=TASK, project=PROJECT, workspace=ws, phase0=p0, phase1=p1
+    )
+    ev = home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json"
+    handoff_precheck.write_evidence(payload, ev)
+    argv = ["--task", TASK, "--next", "n", "--project", PROJECT,
+            "--workspace", str(ws), "--status", "active", "--dry-run",
+            "--retro-evidence", str(ev)]
+    rc = dump.main(argv)
+    assert rc == 0, "policy B: partial drift is non-fatal (gate still passes)"
+    sentinel = _drift_sentinel(home)
+    assert sentinel.exists()
+    assert json.loads(sentinel.read_text(encoding="utf-8"))["classification"] == "partial_missing"
+    assert "MANDATE-DRIFT" in capsys.readouterr().err
+
+
+def test_drift_sentinel_overwrites_itself_no_unbounded_accumulation(tmp_path):
+    # The sentinel is a stable per-task file (overwrites itself) so a project that dumps
+    # repeatedly during a drift window leaves ONE file, not an unbounded pile.
+    from handoff_fanout import retro_gate
+    home = _home(tmp_path, mandate_projects=[PROJECT])
+    import os as _os
+    _os.environ["HANDOFF_HOME"] = str(home)
+    try:
+        for _ in range(3):
+            retro_gate.write_mandate_drift_sentinel(
+                PROJECT, TASK, workspace=tmp_path, classification="total_missing",
+                retro_mandate=False, audit_mandate=False, mandate_projects=[PROJECT],
+            )
+        files = list((home / PROJECT / "ack").glob(f"{TASK}.mandate_drift*.json"))
+        assert len(files) == 1
+    finally:
+        _os.environ.pop("HANDOFF_HOME", None)
