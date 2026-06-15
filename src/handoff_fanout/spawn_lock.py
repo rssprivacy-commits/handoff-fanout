@@ -13,6 +13,8 @@ Anti-concurrency IS this primitive's entire job, so it must stay crash-free unde
 from __future__ import annotations
 
 import contextlib
+import os
+import threading
 import time
 from pathlib import Path
 
@@ -78,8 +80,32 @@ def project_spawn_lock(
             with contextlib.suppress(OSError):
                 lockdir.rmdir()
             # loop → next mkdir
+    # Heartbeat (sw-coord-p28 / gap C2): keep the EMPTY lockdir's mtime fresh while
+    # we hold it. Every actor on this shared lock — a waiting spawn, reclaim, and the
+    # bash try_autoclose — detects "stale" purely by age-of-mtime, so a LIVE holder in
+    # a long critical section (a slow-fs / slow-remote ``create_worktree`` whose git
+    # fetch + worktree add exceed ``ttl``) would otherwise be mis-judged stale and have
+    # its lock broken out from under it → two concurrent same-repo git mutations. The
+    # renew mirrors ``reclaim._renew_lock``'s ``os.utime``. It MUST NOT write any file
+    # INSIDE the lockdir: every actor ``rmdir``s it as an empty dir (reclaim.py:230), so
+    # a non-empty dir would wedge the project. ``Event.wait`` returns the instant we
+    # ``set()`` on release, so the thread exits promptly (no ``ttl``-long lingering).
+    stop = threading.Event()
+
+    def _heartbeat() -> None:
+        interval = max(0.05, ttl / 4.0)
+        while not stop.wait(interval):
+            with contextlib.suppress(OSError):
+                os.utime(lockdir, None)
+
+    hb = threading.Thread(
+        target=_heartbeat, name=f"spawnlock-hb-{project}", daemon=True
+    )
+    hb.start()
     try:
         yield
     finally:
+        stop.set()
+        hb.join(timeout=2.0)
         with contextlib.suppress(OSError):
             lockdir.rmdir()  # ALWAYS release

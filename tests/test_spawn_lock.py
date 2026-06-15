@@ -112,6 +112,72 @@ def test_wait_bounded_gives_up_with_lockheld(tmp_path):
         assert 0.25 <= time.monotonic() - t0 < 5.0
 
 
+def test_live_holder_heartbeat_keeps_lock_fresh(tmp_path):
+    # sw-coord-p28 / gap C2: a holder that LEGITIMATELY holds longer than ttl
+    # (e.g. a slow-fs create_worktree whose git fetch + worktree add exceed ttl)
+    # must NOT be stale-broken — the heartbeat keeps the empty lockdir's mtime
+    # fresh while the holder is alive. WITHOUT the heartbeat, after ttl the lock
+    # would look stale and a concurrent acquire would break it (this test would
+    # then NOT raise LockHeld → it pins the fix).
+    import threading
+
+    holding = threading.Event()
+    release = threading.Event()
+    ttl = 0.5
+
+    def holder() -> None:
+        with project_spawn_lock("erp", root=tmp_path, ttl=ttl):
+            holding.set()
+            release.wait(10)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    try:
+        assert holding.wait(5)
+        time.sleep(ttl * 2.5)  # outlive ttl — heartbeat must keep mtime fresh
+        # non-blocking acquire must STILL see the lock as held (not broken)
+        with (
+            pytest.raises(LockHeld),
+            project_spawn_lock("erp", root=tmp_path, ttl=ttl),
+        ):
+            pass
+    finally:
+        release.set()
+        t.join(10)
+    # released cleanly + heartbeat stopped → lock is re-acquirable
+    with project_spawn_lock("erp", root=tmp_path, ttl=ttl):
+        pass
+
+
+def test_heartbeat_does_not_write_files_inside_lockdir(tmp_path):
+    # The heartbeat MUST keep the lockdir EMPTY (every actor — reclaim, bash
+    # try_autoclose, a waiting spawn — rmdir's it as an empty dir; a stray file
+    # inside would wedge the project, reclaim.py:230). Hold across >1 heartbeat
+    # interval and assert nothing was created inside.
+    import threading
+
+    holding = threading.Event()
+    release = threading.Event()
+    ttl = 0.4
+    lockdir = tmp_path / "erp" / ".spawn.lock"
+
+    def holder() -> None:
+        with project_spawn_lock("erp", root=tmp_path, ttl=ttl):
+            holding.set()
+            release.wait(10)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    try:
+        assert holding.wait(5)
+        time.sleep(ttl)  # let several heartbeats fire (interval = ttl/4)
+        assert lockdir.is_dir()
+        assert list(lockdir.iterdir()) == []  # still empty — rmdir-able by any actor
+    finally:
+        release.set()
+        t.join(10)
+
+
 def test_stale_break_bounded_no_livelock(tmp_path, monkeypatch):
     # A pathological rival that re-creates a STALE lock after EVERY break would spin
     # the retry loop forever without a bound. max_stale_breaks caps it: after N break
