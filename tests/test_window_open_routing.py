@@ -111,12 +111,20 @@ def _env(home: Path, tmp_path: Path, *, front_window: str,
         '  *"UI elements enabled"*) echo true ;;\n'
         # singlepane retry gate (sw-sp-enter-retry; carries AXFocusedUIElement + on run argv too, so it
         # MUST route before those generic cases): token = second-to-last argv (last is the 🆔 marker).
-        # Minimal model for this harness: matching front title → emptyinput (no input model here —
-        # the dedicated input/jsonl scenarios live in test_singlepane_submit_retry.py), else mismatch.
+        # sw-coord-p34: the singlepane FIRST press now routes through THIS gate (the wall-clock
+        # readiness poll), not the title-gated `on run argv` path — so for THIS routing harness the
+        # gate models a READY input when the front title carries the token: press + record `k` +
+        # grow the transcript on/after $_GROW_ON_ATTEMPT (mirrors the `on run argv` model below), else
+        # mismatch. The marker-value / cold-render-transient nuances live in
+        # test_singlepane_submit_retry.py; here we only need the press to fire on the right window.
         '  *"handoff-sp-retry-gate"*)\n'
         '      tok="${@: -2:1}"\n'
         '      case "$_FRONT_WIN" in\n'
-        '        *"$tok"*) echo emptyinput ;;\n'
+        '        *"$tok"*)\n'
+        '          printf k >> "$_KEY_SINK"\n'
+        '          n=$(cat "$_SUBMIT_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$_SUBMIT_COUNT"\n'
+        '          if [ -n "$_GROW_ON_ATTEMPT" ] && [ "$n" -ge "$_GROW_ON_ATTEMPT" ]; then echo "${_GROW_CONTENT:-x}" >> "$_GROW_TRANSCRIPT"; fi\n'
+        '          echo sent ;;\n'
         '        *) echo mismatch ;;\n'
         "      esac ;;\n"
         # readiness-gated cold submit (`on run argv` … `AXFocusedUIElement` … `Message input`): simulate the
@@ -184,6 +192,10 @@ def _env(home: Path, tmp_path: Path, *, front_window: str,
             # singlepane bounded-retry knobs (sw-sp-enter-retry) — fast confirm polls in tests
             "HANDOFF_SP_POLL_SECS": "1",
             "HANDOFF_SP_POLL_TRIES": "1",
+            # sw-coord-p34: the singlepane FIRST press is now a wall-clock readiness poll. Keep its
+            # budget small + a tiny settle so routing tests stay fast (prod defaults 10s/0.5s).
+            "HANDOFF_SP_FIRST_READY_SECS": "1",
+            "HANDOFF_SP_FIRST_SETTLE": "0.05",
             "_GROW_CONTENT": grow_content or "",
             "_FRONT_WIN": front_window,
             "_CODE_WINS": "\n".join(code_wins) if code_wins else "",

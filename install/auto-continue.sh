@@ -826,12 +826,20 @@ singlepane_retry_gate() {
 # raise owns that recovery). Echoes the final gate outcome; a non-zero exit (osascript hard error /
 # accessibility revoked) is propagated unchanged so the orchestrator's `|| return 2` still fires.
 singlepane_retry_gate_settled() {
-    local token="$1" marker="$2" tries backoff k out rc
+    local token="$1" marker="$2" ws="$3" task="$4" base="$5" tries backoff k out rc
     tries="${HANDOFF_SP_REREAD_TRIES:-3}"; case "$tries" in ''|*[!0-9]*) tries=3 ;; esac; [ "$tries" -lt 1 ] && tries=1
     backoff="${HANDOFF_SP_REREAD_BACKOFF:-0.4}"; case "$backoff" in ''|*[!0-9.]*|*.*.*) backoff=0.4 ;; esac
     k=0
     while [ "$k" -lt "$tries" ]; do
         k=$((k + 1))
+        # RE-PROBE before EACH inner read too (codex bind P1 — the residual double-submit race): a NEW
+        # 🆔-marked jsonl appearing between inner re-reads = an external/manual Enter already started the
+        # session → withhold + signal "confirmed" up (caller maps to rc=0 if WE had pressed, else rc=3).
+        # Same guard the first-press loop applies before every press-capable read. ws-gated: callers that
+        # don't pass the probe context (ws empty) keep the old behavior (no probe).
+        if [ -n "$ws" ] && singlepane_probe_confirm "$ws" "$task" "$base"; then
+            printf 'confirmed\n'; return 0
+        fi
         out=$(singlepane_retry_gate "$token" "$marker"); rc=$?
         [ "$rc" = "0" ] || return "$rc"   # osascript hard error → propagate (orchestrator returns 2)
         case "$out" in
@@ -853,6 +861,90 @@ singlepane_retry_gate_settled() {
     return 0
 }
 
+# Wall-clock READINESS-GATED first press for SINGLEPANE (sw-coord-p34 / 2026-06-17, dual-brain GREEN).
+# THE BUG IT KILLS (production rc=6, owner: "xunyin enter 很慢·有时失效"): the singlepane FIRST press
+# used submit_enter_if_front_window_contains — a TITLE-gated bare Enter that fires the instant the front
+# window title matches the nonce, WITHOUT verifying the Claude "Message input" is focused or carries our
+# 🆔<task>. On a cold-rendering NEW window the URI paste has not landed / focus has not reached the
+# freshly-rendered webview input → that Enter is SWALLOWED (nothing submitted), yet the keystroke
+# succeeds so enter_pressed=1. The marker-gated retries (attempts 2+) then correctly REFUSE to press an
+# empty/markerless input (double-submit red line) → if the render outlasts the bounded retry budget the
+# run ends rc=6 ambiguous and the owner presses Enter by hand. The worktree (COLD) path never had this:
+# cold_submit_with_retry gates its single press behind a CONTINUOUS wall-clock readiness poll (≤10s).
+# THE FIX: give the singlepane first press the SAME wall-clock readiness gate. Poll the EXISTING
+# marker-gated atomic SINGLE-read gate (singlepane_retry_gate — READ-ONLY until it reads READY; the
+# *_settled re-read wrapper is deliberately NOT used here so the outer loop owns every read+probe cycle,
+# see the round-3 race fix below) up to ~HANDOFF_SP_FIRST_READY_SECS, pressing ONLY when it reads Claude
+# "Message input" ∧ value⊇🆔<task>.
+# The press still happens INSIDE the gate's one osascript process (the double-submit red line is
+# byte-identical to attempts 2+ — re-reading just grants more chances to READ positive, NEVER a blind
+# press). front-mismatch (a concurrent window stole front) → nonce-first raise_task_window, keep polling.
+# Deadline with no READY read → echo the last not-ready state; the caller's input-not-ready arm polls the
+# jsonl and (enter_pressed stays 0) yields an HONEST rc=5 withhold — NOT a blind-press rc=6.
+# BOUNDEDNESS: the wall-clock deadline is checked BETWEEN gate calls, so the loop is bounded provided
+# each osascript gate call RETURNS (codex finding 1). This is the SAME guarantee the proven, in-production
+# cold_submit_with_retry provides — it too polls osascript in a wall-clock loop with no per-call timeout —
+# and a genuinely hung osascript on either path is backstopped at the system level by watchdog mode 6
+# (heartbeat stall → kill). A per-call run_with_timeout was tried and REJECTED: its shallow `pkill -P`
+# cannot reliably kill the osascript, which runs as a GRANDCHILD (via the gate's own `$(...)` subshell),
+# so a killed-then-completing osascript could fire a LATE blind `keystroke return` AFTER the loop moved
+# on — a double-submit hazard strictly worse than the rare hang it guards (proven by a unit test that
+# observed the late press). So boundedness here is "between-calls + watchdog backstop", matching cold.
+# Echoes: sent | <last not-ready/mismatch state>. Non-zero exit = osascript HARD error (accessibility
+# revoked) — propagated unchanged so the caller's `|| return 2` still fires (same rc=2 contract as the
+# removed blind press). RE-PROBE the jsonl before EACH gate call (cold_submit_with_retry parity): the
+# enlarged ~ready_secs wait widens the window for an external/manual Enter to start the session mid-wait;
+# without an in-loop re-probe the gate could re-press if AX still exposed the marker before the input
+# cleared = a double-submit. On a mid-wait confirm the helper withholds and echoes "confirmed" → caller
+# maps it to rc=3 (NOT script-verified). [This supersedes the round-1 "no per-tick probe" call: the wider
+# window made the in-loop probe necessary — codex bind-audit P1.]
+singlepane_first_press_gated() {
+    local token="$1" marker="$2" task="$3" ws="$4" base="$5" start deadline ready_secs out="" settle
+    ready_secs="${HANDOFF_SP_FIRST_READY_SECS:-10}"; case "$ready_secs" in ''|*[!0-9]*) ready_secs=10 ;; esac; [ "$ready_secs" -lt 1 ] && ready_secs=1
+    # settle paces the wall-clock loop. Default 0.5; junk / multi-dot → default. Then a NUMERIC floor
+    # (awk handles EVERY zero-form a string `case` misses — 0, 00, 0.0, 0.0000, '.') clamps any near-zero
+    # value up to 0.05, so a misconfigured HANDOFF_SP_FIRST_SETTLE can never hot-spin the poll (codex
+    # finding 2; the gate's own HANDOFF_SP_REREAD_BACKOFF also paces non-terminal reads in prod). Tests
+    # pass 0.05 (== the floor) to stay fast-but-paced.
+    settle="${HANDOFF_SP_FIRST_SETTLE:-0.5}"; case "$settle" in ''|*[!0-9.]*|*.*.*) settle=0.5 ;; esac
+    awk -v s="$settle" 'BEGIN{exit !(s+0 < 0.05)}' && settle=0.05
+    start=$(/bin/date +%s); deadline=$((start + ready_secs))
+    log "SP-FIRST-PRESS-START: token=$token task=$task ready≈${ready_secs}s settle=${settle}s (readiness-gated first press / mirrors COLD)"
+    while [ "$(/bin/date +%s)" -lt "$deadline" ]; do
+        # RE-PROBE immediately before EVERY press-capable gate read (cold_submit_with_retry parity —
+        # codex bind/round-3 P1): a NEW 🆔-marked jsonl appearing mid-wait = an external/manual Enter
+        # already started the session → withhold (never a second press onto a running session). We call
+        # the SINGLE-read gate singlepane_retry_gate here (NOT the *_settled re-read wrapper): the outer
+        # wall-clock loop owns the re-read cadence, so the probe sits right before EACH actual read and
+        # there is no inner re-read that could press between probes (the residual race round-3 caught).
+        # singlepane_probe_confirm is READ-ONLY (greps the jsonl set), echoes nothing → safe in this
+        # $(...)-captured helper.
+        if singlepane_probe_confirm "$ws" "$task" "$base"; then
+            log "SP-FIRST-PRESS: NEW 🆔 jsonl appeared during readiness wait (external/manual Enter) — withholding (no press)"
+            out="confirmed"; break
+        fi
+        out=$(singlepane_retry_gate "$token" "$marker") || return 2
+        case "$out" in
+            sent) break ;;
+            nofront|nowin|mismatch)
+                # front not ours → nonce-first raise it back (raise PRESERVES the editor input focus —
+                # proven live in cold_submit_with_retry), then keep polling for readiness. stdout MUST
+                # be muted: this helper's stdout IS its return value ($(...)-captured by the caller),
+                # and raise_task_window's uncaptured raise-osascript echoes to stdout — leaking it would
+                # corrupt `out` into "raised\n<state>" and mis-route the outcome (cold's raise is safe
+                # only because cold_submit_with_retry returns via exit code, not stdout capture).
+                log "SP-FIRST-PRESS: gate=$out — nonce-first raise + keep polling"
+                raise_task_window "$token" "$task" >/dev/null
+                ;;
+            *) : ;;   # noelem|notinput|emptyinput|wronginput → wait out the cold render
+        esac
+        sleep "$settle"
+    done
+    [ "$out" = "sent" ] || log "SP-FIRST-PRESS: readiness never arrived within ≈${ready_secs}s (last=$out) — Enter WITHHELD on the first press"
+    printf '%s\n' "$out"
+    return 0
+}
+
 # Orchestrator. Return codes (HONEST per-state acks, mirroring cold):
 #   0 = our Enter + a NEW 🆔-marked jsonl (script-verified submit)
 #   3 = a NEW 🆔-marked jsonl appeared WITHOUT our machinery pressing (external/manual Enter,
@@ -870,7 +962,7 @@ singlepane_submit_with_retry() {
     retry_max="${HANDOFF_SP_RETRY_MAX:-2}"; case "$retry_max" in ''|*[!0-9]*) retry_max=2 ;; esac
     poll_secs="${HANDOFF_SP_POLL_SECS:-2}"; case "$poll_secs" in ''|*[!0-9]*) poll_secs=2 ;; esac; [ "$poll_secs" -lt 1 ] && poll_secs=1
     poll_tries="${HANDOFF_SP_POLL_TRIES:-3}"; case "$poll_tries" in ''|*[!0-9]*) poll_tries=3 ;; esac; [ "$poll_tries" -lt 1 ] && poll_tries=1
-    local attempt=0 max_attempts=$((1 + retry_max)) enter_pressed=0 out rc i base_n
+    local attempt=0 max_attempts=$((1 + retry_max)) enter_pressed=0 out i base_n
     base_n=$(printf '%s' "$base" | /usr/bin/grep -c . || true)
     SP_LAST_OUTCOME=""
     log "SP-SUBMIT-START: token=$token task=$task retries≤$retry_max poll=${poll_secs}sx${poll_tries} base_jsonls=$base_n (new-file-set + 🆔 confirm, bounded Enter retry)"
@@ -883,15 +975,26 @@ singlepane_submit_with_retry() {
             return 3
         fi
         if [ "$attempt" -eq 1 ]; then
-            # first press = the pre-existing warm atomic title(nonce)-gated bare Enter —
-            # status quo for the initial submit; the NEW machinery is everything after it.
-            submit_enter_if_front_window_contains "$token"; rc=$?
-            if [ "$rc" = "2" ]; then return 2; fi
-            if [ "$rc" = "0" ]; then out="sent"; else out="mismatch"; fi
+            # first press = a READINESS-GATED wall-clock poll (sw-coord-p34) — replaces the OLD blind
+            # title-gated bare Enter (submit_enter_if_front_window_contains) that fired onto a still-
+            # rendering cold input → swallowed → rc=6 ambiguous. It presses ONLY when the marker-gated
+            # gate reads our 🆔 prompt in the focused Claude input (same press red line as the retries
+            # below), waiting out the cold render up to ~HANDOFF_SP_FIRST_READY_SECS; never ready →
+            # withheld (enter_pressed stays 0 → honest rc=5, not rc=6).
+            out=$(singlepane_first_press_gated "$token" "$marker" "$task" "$ws" "$base") || return 2
         else
-            out=$(singlepane_retry_gate_settled "$token" "$marker") || return 2
+            out=$(singlepane_retry_gate_settled "$token" "$marker" "$ws" "$task" "$base") || return 2
         fi
         case "$out" in
+            confirmed)
+                # a gate helper (first-press wall-clock loop OR an attempts-2+ inner re-read) saw a NEW
+                # 🆔 jsonl appear DURING its readiness wait and WITHHELD (no press) — same handling as the
+                # pre-press probe above: if WE had already pressed earlier, this confirms OUR submit (rc=0,
+                # script-verified); otherwise an external/manual Enter started it (rc=3, NOT script-verified).
+                log "SP-SUBMIT: attempt=$attempt outcome=confirmed (NEW 🆔 jsonl during readiness wait — no press this attempt)"
+                [ "$enter_pressed" = "1" ] && return 0
+                return 3
+                ;;
             sent)
                 enter_pressed=1
                 i=0

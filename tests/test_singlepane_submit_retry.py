@@ -119,6 +119,7 @@ def _env(
     new_jsonl: Path | None = None,
     new_jsonl_text: str = "",
     jsonl_on_press: int | None = None,
+    jsonl_on_gate_read: int | None = None,
     jsonl_on_open: bool = False,
     raise_sets_front: str | None = None,
     enum_hit_only_after_open: bool = False,
@@ -186,6 +187,12 @@ def _env(
         # tree has not settled — even though the 🆔 prompt is physically in the box. Later reads
         # see the real input. A bare counter file ranks the reads across the whole run.
         '      gc=$(cat "$_SP_GATE_COUNT" 2>/dev/null || echo 0); gc=$((gc+1)); echo "$gc" > "$_SP_GATE_COUNT"\n'
+        # _SP_JSONL_ON_GATE_READ models an EXTERNAL/manual Enter starting the session MID-WAIT (codex
+        # bind-audit P1 double-submit race): once gc reaches the threshold a NEW 🆔-marked jsonl is born
+        # WITHOUT our gate pressing and WITHOUT emptying the input (the race = jsonl exists but AX still
+        # shows the marker). The first-press loop's next-iteration re-probe must catch it → withhold.
+        '      if [ -n "$_SP_JSONL_ON_GATE_READ" ] && [ "$gc" -ge "$_SP_JSONL_ON_GATE_READ" ] && [ -n "$_SP_NEW_JSONL" ] && [ ! -s "$_SP_NEW_JSONL" ]; then\n'
+        '        printf "%s\\n" "$_SP_NEW_JSONL_TEXT" > "$_SP_NEW_JSONL"; fi\n'
         '      if [ -n "$_SP_GATE_TRANSIENT_READS" ] && [ "$gc" -le "$_SP_GATE_TRANSIENT_READS" ]; then\n'
         '        echo "${_SP_GATE_TRANSIENT_STATE:-emptyinput}"; exit 0; fi\n'
         '      case "$(_front)" in\n'
@@ -252,6 +259,12 @@ def _env(
             # fast knobs for the machinery under test (1s×1 confirm poll)
             "HANDOFF_SP_POLL_SECS": "1",
             "HANDOFF_SP_POLL_TRIES": "1",
+            # sw-coord-p34: the readiness-gated first press is a wall-clock poll. Keep its budget
+            # SMALL + a tiny (nonzero) settle so the suite stays fast-but-paced — production defaults
+            # are 10s/0.5s. Individual tests override HANDOFF_SP_FIRST_READY_SECS when they probe the
+            # never-ready withhold path.
+            "HANDOFF_SP_FIRST_READY_SECS": "1",
+            "HANDOFF_SP_FIRST_SETTLE": "0.05",
             # re-read knobs: backoff 0 keeps the suite real-sleep-free (the recovery depends on
             # the read COUNT the stub models, not on wall-clock); tries default to production (3).
             "HANDOFF_SP_REREAD_BACKOFF": "0",
@@ -271,6 +284,7 @@ def _env(
             "_SP_NEW_JSONL": str(new_jsonl) if new_jsonl else "",
             "_SP_NEW_JSONL_TEXT": new_jsonl_text,
             "_SP_JSONL_ON_PRESS": str(jsonl_on_press) if jsonl_on_press else "",
+            "_SP_JSONL_ON_GATE_READ": str(jsonl_on_gate_read) if jsonl_on_gate_read else "",
             "_SP_JSONL_ON_OPEN": "1" if jsonl_on_open else "",
             "_RAISE_SETS_FRONT": raise_sets_front or "",
             "_ENUM_AFTER_OPEN": "1" if enum_hit_only_after_open else "",
@@ -365,7 +379,10 @@ def test_old_jsonl_with_same_marker_never_confirms(home, tmp_path):
     log = _log(home)
     assert "SP-SUBMIT-START" in log
     assert "outcome=no-new-jsonl" in log, "diagnostic enum must say which step fell empty"
-    assert _presses(tmp_path) >= 1, "the title-gated first Enter did fire (it just never confirmed)"
+    assert _presses(tmp_path) >= 1, (
+        "the marker-gated first Enter did fire (the input was ready — it just never confirmed; "
+        "sw-coord-p34: the first press is now readiness-gated, not blind title-gated)"
+    )
 
 
 # ─── 2. happy path: our Enter births the NEW marked jsonl → submitted (verified) ─────
@@ -480,24 +497,34 @@ def test_front_mismatch_raises_then_retry_confirms(home, tmp_path):
         raise_sets_front=title,  # the raise actually brings OUR window front
         enum_hit_only_after_open=True,  # pre-URI raise misses; submit-time raise hits
     )
+    # generous readiness budget so the integer-second deadline can't truncate the first-press loop
+    # before its mismatch→raise→retry iterations run (needs >=2; the press is early once raised).
+    env["HANDOFF_SP_FIRST_READY_SECS"] = "3"
     assert _run(env, tmp_path).returncode == 0
     sub = _ack(home, task, "submitted")
     assert sub.exists(), "raise + marker-gated retry must recover a front-mismatch"
     assert _presses(tmp_path) == 1, "no press ever lands on the wrong window"
     log = _log(home)
-    assert "outcome=front-mismatch" in log
+    # sw-coord-p34: front-mismatch on the FIRST press is now handled INSIDE the wall-clock
+    # readiness poll (singlepane_first_press_gated logs "SP-FIRST-PRESS: gate=mismatch …"), then it
+    # raises + keeps polling and presses on the next READY read → outcome=confirmed (rc=0). (Pre-p34
+    # the blind first press logged the orchestrator-level "outcome=front-mismatch".)
+    assert "SP-FIRST-PRESS: gate=mismatch" in log, "the first-press poll saw the mismatch + raised"
     assert "outcome=confirmed" in log
     assert "handoff-window-raise" in _read(tmp_path / "osa.log"), "the nonce-first raise fired"
 
 
-# ─── 6. empty input → retry NEVER presses → ambiguous-after-first-enter ──────────────
+# ─── 6. input never ready → first press WITHHELD → honest rc=5 (NOT a blind press) ────
 
 
-def test_empty_input_withholds_retry_press_ambiguous(home, tmp_path):
-    """After Enter #1 the input reads EMPTY but no marked jsonl ever appears (submitted with
-    a hung transcript? swallowed with the paste lost?). The retry gate must NOT press (an
-    empty input is the double-submit hazard) — polls run out → failed ack names
-    ambiguous-after-first-enter + the manual instruction."""
+def test_empty_input_first_press_withholds_rc5(home, tmp_path):
+    """sw-coord-p34: the input NEVER shows our prompt within the readiness budget. PRE-p34 the
+    blind title-gated FIRST Enter fired anyway (the swallow), enter_pressed went high, and the run
+    ended rc=6 ``ambiguous-after-first-enter`` — the owner's pain. NOW the first press is
+    readiness-gated: with no READY read it NEVER presses (``_presses==0``) → an HONEST rc=5
+    withhold ("submit withheld after bounded retries"), not the ambiguous rc=6. (rc=6 is still
+    reachable + still tested by test 3 — a marker-verified press whose jsonl never carries the
+    marker — this test asserts the blind-press-then-ambiguous path is GONE.)"""
     task = "sp-ambig"
     repo = _seed_singlepane(home, tmp_path, task)
     _transcript_dir(tmp_path, repo)
@@ -513,10 +540,12 @@ def test_empty_input_withholds_retry_press_ambiguous(home, tmp_path):
     failed = _ack(home, task, "failed")
     assert failed.exists()
     body = failed.read_text()
-    assert "ambiguous-after-first-enter" in body
+    assert "submit withheld after bounded retries" in body, "honest rc=5 withhold, not rc=6"
+    assert "ambiguous-after-first-enter" not in body, "the blind-press ambiguity is GONE"
     assert "手动" in body or "核实" in body, "the ack must carry actionable manual guidance"
-    assert _presses(tmp_path) == 1, "ONLY the title-gated first Enter — never a blind retry press"
+    assert _presses(tmp_path) == 0, "🔴 never a blind first press — withheld until READY (never was)"
     assert "outcome=input-not-ready" in _log(home)
+    assert "Enter WITHHELD on the first press" in _log(home), "the first-press poll honestly withheld"
 
 
 # ─── 7. pre-press confirm → rc 3 honesty + baseline-before-URI proof ─────────────────
@@ -577,17 +606,17 @@ def test_focus_giveup_never_invokes_submit_machinery(home, tmp_path):
     assert _presses(tmp_path) == 0, "a visible-park window never receives an Enter"
 
 
-# ─── 9. cold-render false negative: a transient not-ready read is RE-READ → recovers ──
+# ─── 9. cold-render false negative: the wall-clock first-press loop waits out a SHORT transient ──
 
 
 def test_cold_render_transient_reread_recovers(home, tmp_path):
-    """THE rc=6 false negative (xunyin 2/2): during a cold heavy-render burst the first focus
-    reads come back not-ready (emptyinput) even though the 🆔 prompt is physically in the box.
-    The PRE-FIX single read judged that transient as 'input-not-ready' and, after the first
-    Enter was swallowed, gave up at rc=6 (failed ack) — the owner pressed Enter by hand. THE FIX:
-    on a transient read, re-read the focused value up to HANDOFF_SP_REREAD_TRIES times; the
-    later read sees role=AXTextArea ∧ Message-input ∧ 🆔 → marker-gated press → the NEW marked
-    jsonl appears → submitted. The press still happens ONLY on a positive marker read."""
+    """A SHORT cold-render transient: the first focus reads come back not-ready (emptyinput) even
+    though the 🆔 prompt is physically in the box, then the input settles. sw-coord-p34 first press
+    is a wall-clock poll calling the SINGLE-read gate per iteration (round-3 fix — no inner re-read
+    loop), so each not-ready read just waits for the next iteration. Here reads 1,2 are not-ready and
+    read 3 sees the settled input → marker-gated press. The press still happens ONLY on a positive
+    marker read. (A LONGER transient is covered by test 12; the press red line under all-transient by
+    test 10.)"""
     task = "sp-cold-reread"
     repo = _seed_singlepane(home, tmp_path, task)
     tdir = _transcript_dir(tmp_path, repo)
@@ -598,18 +627,21 @@ def test_cold_render_transient_reread_recovers(home, tmp_path):
         input_value=f"🆔{task} the pasted prompt",  # prompt IS in the box the whole time
         new_jsonl=tdir / "new-sess.jsonl",
         new_jsonl_text=f'{{"text":"🆔{task} session started"}}',
-        jsonl_on_press=2,  # warm Enter #1 swallowed; the recovering retry press lands
+        jsonl_on_press=2,  # marker-gated press #1 swallowed; the recovering retry press lands
         gate_transient_reads=2,  # reads 1,2 read not-ready, read 3 sees the settled input
         reread_tries=3,
         retry_max=2,
     )
+    # generous readiness budget so the integer-second deadline can't truncate before the loop has run
+    # the few iterations this case needs (the per-press is early; it never burns the whole budget).
+    env["HANDOFF_SP_FIRST_READY_SECS"] = "3"
     assert _run(env, tmp_path).returncode == 0
     sub = _ack(home, task, "submitted")
-    assert sub.exists(), "the bounded re-read must recover the cold-render false negative"
+    assert sub.exists(), "the wall-clock first press must wait out the cold-render false negative"
     assert "verified" in sub.read_text()
-    assert _presses(tmp_path) == 2, "warm Enter + exactly ONE recovering marker-gated press"
+    assert _presses(tmp_path) == 2, "first marker-gated press (swallowed) + exactly ONE recovering press"
     log = _log(home)
-    assert "reread=" in log, "each re-read outcome must be observable (SP-SUBMIT: reread=N/M …)"
+    assert "SP-FIRST-PRESS-START" in log, "the readiness-gated first press ran"
     assert "outcome=confirmed" in log
     assert not _ack(home, task, "failed").exists(), "no rc=6 — the false negative is gone"
 
@@ -621,8 +653,12 @@ def test_all_reads_transient_red_line_and_bounded(home, tmp_path):
     """The 🔴 core safety red line under the worst transient: the prompt IS in the box but
     EVERY AX read comes back not-ready, so the marker is NEVER positively read. The machinery
     must NEVER press (a blind Enter could land on a sibling live session — owner's hard line)
-    and the re-read must be BOUNDED (no hang): with HANDOFF_SP_REREAD_TRIES=3 and 2 gate
-    attempts (retry_max=2) the focus is read exactly 6 times, then an HONEST rc=6 failed ack."""
+    and it must be BOUNDED (no hang). sw-coord-p34 STRENGTHENS the red line: pre-p34 the blind
+    title-gated first Enter still fired once (``_presses==1``) before the marker-gated retries
+    withheld → rc=6; now the readiness-gated first press ALSO withholds when no READY read ever
+    arrives → ``_presses==0`` and an HONEST rc=5 withhold. Boundedness is by the first-press
+    WALL-CLOCK deadline (HANDOFF_SP_FIRST_READY_SECS) + the bounded per-gate re-read — the run
+    terminates well within the subprocess timeout (a hang would raise TimeoutExpired in _run)."""
     task = "sp-all-transient"
     repo = _seed_singlepane(home, tmp_path, task)
     _transcript_dir(tmp_path, repo)
@@ -635,16 +671,19 @@ def test_all_reads_transient_red_line_and_bounded(home, tmp_path):
         reread_tries=3,
         retry_max=2,
     )
-    assert _run(env, tmp_path).returncode == 0
+    assert _run(env, tmp_path).returncode == 0  # completes (bounded — no hang)
     assert not _ack(home, task, "submitted").exists()
     failed = _ack(home, task, "failed")
-    assert failed.exists() and "ambiguous-after-first-enter" in failed.read_text()
-    assert _presses(tmp_path) == 1, (
-        "🔴 ONLY the title-gated first Enter — a markerless read must NEVER yield a press, "
-        "even though the prompt is physically present"
+    assert failed.exists() and "submit withheld after bounded retries" in failed.read_text(), (
+        "honest rc=5 withhold — NOT rc=6 (no blind first press to make it ambiguous)"
     )
-    assert _gate_reads(tmp_path) == 6, "bounded: 2 gate attempts × 3 re-reads, then it STOPS"
-    assert "reread=3/3" in _log(home), "the re-read exhausted its bound (observable)"
+    assert "ambiguous-after-first-enter" not in failed.read_text()
+    assert _presses(tmp_path) == 0, (
+        "🔴 a markerless read must NEVER yield a press — and there is no blind first press either "
+        "(sw-coord-p34): zero Enter even though the prompt is physically present"
+    )
+    assert 0 < _gate_reads(tmp_path) < 1000, "bounded reads (wall-clock + per-gate re-read), no spin"
+    assert "reread=3/3" in _log(home), "the per-gate re-read exhausted its bound (observable)"
 
 
 # ─── 11. a non-empty value WITHOUT the marker (wronginput) is terminal, NOT re-read ──
@@ -652,10 +691,13 @@ def test_all_reads_transient_red_line_and_bounded(home, tmp_path):
 
 def test_wronginput_is_terminal_not_rereadable(home, tmp_path):
     """A non-empty focused value that does NOT carry 🆔<task> is provably-not-our-prompt (a
-    sibling window's text, a stray editor). It is NOT a render transient → the gate must return
-    it immediately and the machinery must NOT press (red line). The re-read must NOT 'wait it
-    out' (re-reading a wrong value could race into a sibling's content): exactly ONE read per
-    gate attempt — wronginput is terminal."""
+    sibling window's text, a stray editor). It is NOT a render transient → each gate call must
+    return it IMMEDIATELY (never re-read 3× — re-reading a wrong value could race into a sibling's
+    content) and the machinery must NOT press (red line). sw-coord-p34: there is also NO blind
+    first press now → ``_presses==0`` (pre-p34 the title-gated first Enter fired once). The
+    first-press poll keeps re-checking (codex finding #3: 'terminal now' → 'terminal after budget'
+    — focus may return to our input), but every gate call short-circuits on wronginput WITHOUT
+    entering the re-read loop, so ``reread=`` NEVER appears. Never READY → honest rc=5 withhold."""
     task = "sp-wrong"
     repo = _seed_singlepane(home, tmp_path, task)
     _transcript_dir(tmp_path, repo)
@@ -665,10 +707,138 @@ def test_wronginput_is_terminal_not_rereadable(home, tmp_path):
         front_window=f"{_sp_title(task)} - x.py",
         input_value="some OTHER window's text, no marker here",  # non-empty, markerless
         reread_tries=3,
-        retry_max=1,  # one gate attempt is enough to prove single-read
+        retry_max=1,
     )
     assert _run(env, tmp_path).returncode == 0
     assert not _ack(home, task, "submitted").exists(), "a markerless value must never confirm"
-    assert _presses(tmp_path) == 1, "only the warm first Enter — wronginput is never pressed"
-    assert _gate_reads(tmp_path) == 1, "wronginput is TERMINAL — not re-read (no multiplied reads)"
+    assert _presses(tmp_path) == 0, "🔴 wronginput is never pressed — and there is no blind first press"
+    assert "reread=" not in _log(home), "wronginput is TERMINAL — short-circuits BEFORE the re-read loop"
+    assert "submit withheld after bounded retries" in _ack(home, task, "failed").read_text()
     assert "outcome=input-not-ready" in _log(home)
+
+
+# ─── 12. THE production rc=6 fix: a render slower than ONE gate's re-read budget is waited ─
+#         out by the wall-clock FIRST-PRESS poll → marker-gated press lands → submitted ──────
+
+
+def test_first_press_wallclock_waits_out_slow_render_then_submits(home, tmp_path):
+    """THE production rc=6 (xunyin-l1-q1-identity 6-13, sw-coord-p19 6-14, xunyin-web-design 6-16):
+    a cold render stays not-ready for MANY reads — pre-p34 longer than the whole bounded-retry budget.
+    PRE-p34 the singlepane FIRST press was a BLIND title-gated Enter that fired immediately onto the
+    unready input (swallowed), then the marker-gated retries (≤2) read only ~6 times total → never
+    READY → rc=6 ambiguous → the owner pressed Enter by hand. sw-coord-p34: the first press is a
+    WALL-CLOCK readiness poll — it re-probes + calls the SINGLE-read gate across MANY iterations
+    (HANDOFF_SP_FIRST_READY_SECS budget), waiting out the slow render, and presses the instant a READY
+    read arrives (here at read #8). ONE marker-gated press → the NEW 🆔-marked jsonl appears →
+    submitted (script-verified, rc=0). No blind Enter is ever sent."""
+    task = "sp-slow-render"
+    repo = _seed_singlepane(home, tmp_path, task)
+    tdir = _transcript_dir(tmp_path, repo)
+    env = _env(
+        home,
+        tmp_path,
+        front_window=f"{_sp_title(task)} - x.py",
+        input_value=f"🆔{task} the pasted prompt",  # prompt IS in the box the whole time
+        new_jsonl=tdir / "new-sess.jsonl",
+        new_jsonl_text=f'{{"text":"🆔{task} session started"}}',
+        jsonl_on_press=1,  # the FIRST (marker-gated) press lands — there is no blind swallow to absorb
+        gate_transient_reads=7,  # not-ready for 7 single-read iterations (> pre-p34's ~6 total)
+        retry_max=2,
+    )
+    # generous budget so the integer-second deadline never truncates before read #8 (this needs >=8
+    # single-read iterations; with the default 1s budget a late-in-the-second start could under-run).
+    env["HANDOFF_SP_FIRST_READY_SECS"] = "3"
+    assert _run(env, tmp_path).returncode == 0
+    sub = _ack(home, task, "submitted")
+    assert sub.exists(), "the wall-clock first-press poll must wait out a slow render and submit"
+    assert "verified" in sub.read_text(), "script-verified (our press born the marked jsonl)"
+    assert _presses(tmp_path) == 1, "exactly ONE marker-gated press — never a blind swallowed Enter"
+    log = _log(home)
+    assert "SP-FIRST-PRESS-START" in log, "the readiness-gated first press ran"
+    assert "outcome=confirmed" in log
+    assert not _ack(home, task, "failed").exists(), "no rc=6 / no withhold — the production failure is gone"
+
+
+# ─── 13. 🔴 double-submit race: an external Enter MID-WAIT → in-loop re-probe withholds → rc=3 ──
+
+
+def test_first_press_external_enter_midwait_withholds_rc3(home, tmp_path):
+    """codex bind-audit P1 (double-submit race): the wall-clock first-press wait enlarges the window
+    for an external/manual Enter to start the session WHILE we are still waiting for readiness. If a
+    NEW 🆔-marked jsonl appears mid-wait AND the input still shows the marker (the race: jsonl born
+    before the UI cleared), a naive loop would press → a SECOND submit onto a running session. THE FIX
+    (cold_submit_with_retry parity): re-probe the jsonl before EACH gate read; a mid-wait confirm →
+    WITHHOLD + echo 'confirmed' → caller maps to rc=3 (running via external Enter, NOT script-verified).
+    Here gate read 1 is not-ready and births the external jsonl (input still carries the marker); the
+    next iteration's re-probe catches it → ZERO presses, rc=3 (no double-submit)."""
+    task = "sp-midwait"
+    repo = _seed_singlepane(home, tmp_path, task)
+    tdir = _transcript_dir(tmp_path, repo)
+    env = _env(
+        home,
+        tmp_path,
+        front_window=f"{_sp_title(task)} - x.py",
+        input_value=f"🆔{task} the pasted prompt",  # input STILL shows the marker (the race window)
+        new_jsonl=tdir / "external-sess.jsonl",
+        new_jsonl_text=f'{{"text":"🆔{task} external manual start"}}',
+        jsonl_on_gate_read=1,  # gate read 1 births the external jsonl (no press, input not emptied)
+        # gate reads 1-2 are not-ready (SINGLE-read gate per iteration after round-3); read 1 births the
+        # external jsonl, and the NEXT iteration re-probes BEFORE its read → catches it → withhold. The
+        # first press-capable (non-transient) read would be #3, by which point the probe has had ≥2
+        # chances to catch the jsonl. WITHOUT the round-3 single-read fix, gate_settled's inner re-read
+        # would reach read #3 and press inside ONE gate call before any probe — the exact race the
+        # bind/round-3 RED flagged. (2 not 1 = robustness margin under load; codex suggested "1 or 2".)
+        gate_transient_reads=2,
+        retry_max=2,
+    )
+    # generous budget so the integer-second deadline can't truncate before the iter-2/3 re-probe runs.
+    env["HANDOFF_SP_FIRST_READY_SECS"] = "3"
+    assert _run(env, tmp_path).returncode == 0
+    sub = _ack(home, task, "submitted")
+    assert sub.exists(), "the session IS running (external Enter) → submitted, honestly attributed"
+    assert "NOT script-verified" in sub.read_text(), "external start → rc=3, not a script-verified press"
+    assert _presses(tmp_path) == 0, (
+        "🔴 the first-press loop re-probed mid-wait and WITHHELD — never a second press onto a "
+        "running session (no double-submit)"
+    )
+    assert "during readiness wait" in _log(home), "the mid-wait confirm path is observable"
+
+
+# ─── 14. 🔴 attempts-2+ residual race: a mid-INNER-read external Enter → gate_settled withholds → rc=3 ──
+
+
+def test_attempt2_inner_read_external_enter_withholds_rc3(home, tmp_path):
+    """codex bind P1 residual: after a never-ready first press, attempts 2+ use
+    singlepane_retry_gate_settled, whose INNER re-reads (no probe between them) could press if an
+    external/manual Enter births a marked jsonl between inner reads while AX still shows the marker —
+    the same double-submit race, on the retry path. THE FIX: gate_settled now re-probes the jsonl
+    before EACH inner read too (cold parity) → withhold + echo 'confirmed' → caller maps to rc=3.
+
+    Deterministic setup: HANDOFF_SP_FIRST_SETTLE=1 with a 1s budget makes the first press do exactly
+    ONE (not-ready) read then exit, so global gate read #2 is attempt-2's first inner read. The
+    external jsonl is born on read #2 (gate_transient_reads=2 keeps reads 1-2 from pressing); attempt
+    2's gate_settled re-probe (before its 2nd inner read) catches it → ZERO presses, rc=3. WITHOUT the
+    fix, gate_settled's inner read #3 (gc=3, non-transient, marker present) would press = double-submit."""
+    task = "sp-a2-race"
+    repo = _seed_singlepane(home, tmp_path, task)
+    tdir = _transcript_dir(tmp_path, repo)
+    env = _env(
+        home,
+        tmp_path,
+        front_window=f"{_sp_title(task)} - x.py",
+        input_value=f"🆔{task} the pasted prompt",  # marker present (would press but for the transient)
+        new_jsonl=tdir / "external-sess.jsonl",
+        new_jsonl_text=f'{{"text":"🆔{task} external manual start"}}',
+        jsonl_on_gate_read=2,  # global read #2 (= attempt-2's first inner read) births the external jsonl
+        gate_transient_reads=2,  # reads 1-2 not-ready (first-press read #1, attempt-2 inner read #2)
+        retry_max=2,
+    )
+    env["HANDOFF_SP_FIRST_READY_SECS"] = "1"
+    env["HANDOFF_SP_FIRST_SETTLE"] = "1"  # 1s settle + 1s budget → first press does exactly ONE read
+    assert _run(env, tmp_path).returncode == 0
+    sub = _ack(home, task, "submitted")
+    assert sub.exists(), "the session IS running (external Enter) → submitted, honestly attributed"
+    assert "NOT script-verified" in sub.read_text(), "external start → rc=3"
+    assert _presses(tmp_path) == 0, (
+        "🔴 gate_settled re-probed between inner reads and WITHHELD — no double-submit on the retry path"
+    )
