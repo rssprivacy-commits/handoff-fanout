@@ -1458,27 +1458,33 @@ _return_precapture() {
 # `code <ws>` / RETURN_ANCHOR_APP via `activate`) → owner back to B in one native step; no anchor /
 # re-activation fails → fail-open per-step goto_desktop(origin). SYNCHRONOUS by design: the
 # frontmost/AXRaise/inject contention is over here, so there is no desktop race; a background `&` would
-# instead race the NEXT iteration's precapture. No POLL (spawn-return does a single winlist read — the
-# worker is provably rendered on A post-inject — then re-activates), but a wall-clock timeout DOES wrap it
-# (gap C1): vscode-spaces.py has no internal ceiling. spawn-return is fail-open (normally exits 0); on a
-# rc=124 timeout we WARN and continue rather than freeze the watchdog.
+# instead race the NEXT iteration's precapture. §2.3.4.5 (2026-06-19): spawn-return does a BOUNDED winlist
+# poll (fresh scan each tick on the pinned spawn desktop, ≤ RETURN_SCAN_MAX_WAIT ~2.5s — singlepane Space/
+# title lags the inject, which a single read false-ABANDONs) then re-activates; a wall-clock timeout STILL
+# wraps it (gap C1): vscode-spaces.py has no internal ceiling on ensure_winlist()'s swiftc compile.
+# spawn-return is fail-open (normally exits 0); on a rc=124 timeout we WARN and continue rather than freeze.
 _return_jump_back() {
     [ "$_RETURN_ARMED" = "1" ] || return 0
     [ -n "$_RETURN_PY" ] || return 0
     # $1 = the identity token (the same _submit_token the submit guard asserted in the worker's title) →
-    # spawn-return's focus-steal guard confirms OUR worker is on the current desktop (= owner didn't
+    # spawn-return's focus-steal guard confirms OUR worker is on the spawn desktop (= owner didn't
     # drift) before re-activating; --anchor-ws/--anchor-app are the owner's re-activatable anchor.
-    local _anchor="${1:-}" _rc
-    # gap C1 (sw-coord-p28): wall-clock timeout — spawn-return does a single winlist
-    # read then re-activates, but vscode-spaces.py's ensure_winlist() can hang in a
-    # first-run `swiftc` compile with no internal ceiling; on this synchronous path that
+    # $2 = "1" when that token is a per-spawn-unique SPAWN NONCE (singlepane) → pass --anchor-token-unique
+    # so spawn-return's identity check is title-carries-nonce (immune to VS Code window-handle reuse on
+    # singlepane reloads, which otherwise false-ABANDONs the return). Worktree's stable $TASK passes "0"
+    # (keeps NEW∧token). §2.3.4.5 (2026-06-19 singlepane false-ABANDON fix).
+    local _anchor="${1:-}" _unique="${2:-0}" _rc _uflag=""
+    [ "$_unique" = "1" ] && _uflag="--anchor-token-unique"
+    # gap C1 (sw-coord-p28): wall-clock timeout — spawn-return does a BOUNDED winlist poll
+    # (§2.3.4.5 RETURN_SCAN_MAX_WAIT) then re-activates, but vscode-spaces.py's ensure_winlist() can hang
+    # in a first-run `swiftc` compile with no internal ceiling; on this synchronous path that
     # would freeze the watchdog iteration. run_with_timeout reaps python + swiftc on
     # rc=124. spawn-return is fail-open by design (always exits 0 normally), so on
     # timeout we just WARN and continue — the owner simply isn't auto-returned to origin.
     run_with_timeout "${HANDOFF_RETURN_TIMEOUT:-20}" /usr/bin/python3 "$_RETURN_PY" spawn-return \
         --origin="${_RETURN_ORIGIN:--1}" --before="${_RETURN_BEFORE:-}" \
         --anchor-ws="${_RETURN_ANCHOR_WS:-}" --anchor-app="${_RETURN_ANCHOR_APP:-}" \
-        --anchor-token="$_anchor" >>"$LOG" 2>&1
+        --anchor-token="$_anchor" $_uflag >>"$LOG" 2>&1
     _rc=$?
     [ "$_rc" -eq 124 ] && log "RETURN-JUMPBACK-TIMEOUT: spawn-return exceeded ${HANDOFF_RETURN_TIMEOUT:-20}s — owner not auto-returned to origin desktop (fail-open)"
     _RETURN_ARMED=0
@@ -2005,6 +2011,7 @@ EOF
                 # on stage1-10d); WARM submits once (window already rendered). Warm escape hatch
                 # HANDOFF_WARM_WINDOW_GUARD=0 → app-level Enter for a custom window.title without rootName.
                 _submit_token="$TASK"
+                _submit_token_unique=0   # §2.3.4.5: 1 only when the token is a per-spawn-unique SPAWN NONCE
                 if [ "$SINGLEPANE_WINDOW" = "1" ]; then
                     # singlepane: gate on the unguessable spawn_nonce from the JSON sidecar (R2 M1 TOCTOU)
                     # — the generated workspace title binds project·task·role·nonce, so an exact nonce match
@@ -2012,6 +2019,11 @@ EOF
                     # carries the task but not the nonce). Fall back to the task token (which the title also
                     # carries) only when the sidecar had no nonce (legacy/parse-fail) — never worse than before.
                     _submit_token="${SINGLEPANE_NONCE:-$TASK}"
+                    # §2.3.4.5 (2026-06-19): the nonce is per-spawn-unique → tell spawn-return it may relax the
+                    # ∉before "newness" check (immune to VS Code window-handle reuse on singlepane reloads,
+                    # which false-ABANDONs the return). Only on the real nonce path — the $TASK fallback is
+                    # NOT unique, so leave _submit_token_unique=0 (keeps NEW∧token, same as worktree).
+                    [ -n "${SINGLEPANE_NONCE:-}" ] && _submit_token_unique=1
                 elif [ "$COLD_WINDOW" != "1" ]; then
                     _submit_token=$(basename "$WORKSPACE")   # warm: window.title rootName = the folder basename
                 fi
@@ -2132,7 +2144,7 @@ EOF
             # missing, Enter withheld / no transcript growth, frontmost-not-Code) suppresses the return
             # and the owner is NEVER snapped back while the worker tab sits unsubmitted on A. Armed only
             # for a SPAWNER_FOCUS cold/singlepane spawn; a no-op otherwise. Synchronous + fail-open.
-            [ "$_RETURN_DISPATCHED" = "1" ] && _return_jump_back "${_submit_token:-}"
+            [ "$_RETURN_DISPATCHED" = "1" ] && _return_jump_back "${_submit_token:-}" "${_submit_token_unique:-0}"
             sleep 0.5  # 防同次 launchd run 内连续 spawn 让主人晕
         else
             log "FAIL: open URI failed for project=$PROJECT task=$TASK, restoring"
