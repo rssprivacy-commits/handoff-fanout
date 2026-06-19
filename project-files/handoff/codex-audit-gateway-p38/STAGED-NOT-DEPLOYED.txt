@@ -1,0 +1,3 @@
+final gateway SHA recorded: 16d1b4f61cb5f784
+STATUS: staged, dual-brain R4 GREEN/GREEN + workflow panel clean. NOT deployed (owner gate).
+deploy target (on owner approval): ~/.claude/scripts/claude-audit-gateway.py + ~/.claude/audit-pool/accounts.json

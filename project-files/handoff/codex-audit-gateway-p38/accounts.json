@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "_comment": "Claude external-audit pool. Claude-governed. Codex executes the gateway but never edits this file and never sees a token. Each account reads from the dedicated 'claude-audit-pool/<alias>' Keychain namespace ONLY — never the live 'Claude Code-credentials'. Populate via: owner `claude /login <account>` then `claude-audit-gateway store --alias <alias>`. cc-account (retired 2026-06-14) must NEVER be revived.",
+  "poolPolicy": {
+    "declaredTotalAccounts": 3,
+    "credentialNamespace": "claude-audit-pool/<alias>",
+    "neverReadLivePrimary": "Claude Code-credentials",
+    "populationStatus": "PENDING owner /login + store for all 3 (codex deleted accounts b/c creds during 2026-06-19 decontamination)",
+    "policyOnPoolDegradation": "If `check` shows fewer than 1 usable account, `run` exits non-zero and the caller must disclose the degraded ratio — do not silently proceed.",
+    "lastUpdated": "2026-06-19"
+  },
+  "accounts": [
+    {
+      "alias": "claude-max-a",
+      "keychainService": "claude-audit-pool/claude-max-a",
+      "keychainAccount": "claude-max-a",
+      "enabled": true,
+      "preferredModel": "opus",
+      "intendedLoginIdentity": "jascawow",
+      "note": "Populate with: owner `claude /login` jascawow, then `claude-audit-gateway store --alias claude-max-a`."
+    },
+    {
+      "alias": "claude-max-b",
+      "keychainService": "claude-audit-pool/claude-max-b",
+      "keychainAccount": "claude-max-b",
+      "enabled": true,
+      "preferredModel": "opus",
+      "intendedLoginIdentity": "rssprivacy",
+      "note": "Credential deleted in 2026-06-19 decontamination. Populate with: owner `claude /login` rssprivacy, then `store --alias claude-max-b`."
+    },
+    {
+      "alias": "claude-max-c",
+      "keychainService": "claude-audit-pool/claude-max-c",
+      "keychainAccount": "claude-max-c",
+      "enabled": true,
+      "preferredModel": "opus",
+      "intendedLoginIdentity": "sopranoquan",
+      "note": "Credential deleted in 2026-06-19 decontamination. Populate with: owner `claude /login` sopranoquan, then `store --alias claude-max-c`."
+    }
+  ]
+}
