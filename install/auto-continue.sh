@@ -2144,7 +2144,25 @@ EOF
             # missing, Enter withheld / no transcript growth, frontmost-not-Code) suppresses the return
             # and the owner is NEVER snapped back while the worker tab sits unsubmitted on A. Armed only
             # for a SPAWNER_FOCUS cold/singlepane spawn; a no-op otherwise. Synchronous + fail-open.
-            [ "$_RETURN_DISPATCHED" = "1" ] && _return_jump_back "${_submit_token:-}" "${_submit_token_unique:-0}"
+            #
+            # §2.3.4.6 singlepane-return-fix (sw-coord-p40 / 2026-06-19): the RETURN identity token differs
+            # from the SUBMIT token for a SINGLEPANE spawn. The submit token is the per-spawn NONCE, which
+            # lives ONLY in the late-applied custom window.title (the singlepane folder is the project ROOT,
+            # so it contributes no per-spawn identity to VS Code's native title). The return-leg scans
+            # winlist = kCGWindowName = the NATIVE title during its bounded poll, where the nonce is
+            # structurally absent → singlepane return false-ABANDONed 0/7 ("无 OUR 子窗") while worktree
+            # (whose task id is the folder basename → native title) returned 97/97. The TASK id is in the
+            # title at ALL times (workspace-file rootName natively + the custom title) and is per-spawn-
+            # unique for coordinator succession, so the return-leg focus-steal guard matches it reliably —
+            # the SAME token CLASS worktree uses. The SUBMIT keeps the nonce (the safety-critical Enter
+            # still targets the exact window); only the RETURN guard relaxes to the task id. Worktree is
+            # byte-behavior-identical: _submit_token IS the task id there and _submit_token_unique stays 0.
+            _return_token="${_submit_token:-}"; _return_unique="${_submit_token_unique:-0}"
+            if [ "$SINGLEPANE_WINDOW" = "1" ]; then
+                _return_token="$TASK"   # in title always (rootName + custom); nonce lands in kCGWindowName too late
+                _return_unique=1        # task id is per-spawn-unique → unique-mode title-substring (handle-reuse-immune)
+            fi
+            [ "$_RETURN_DISPATCHED" = "1" ] && _return_jump_back "${_return_token:-}" "${_return_unique:-0}"
             sleep 0.5  # 防同次 launchd run 内连续 spawn 让主人晕
         else
             log "FAIL: open URI failed for project=$PROJECT task=$TASK, restoring"

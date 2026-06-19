@@ -437,3 +437,49 @@ def test_spawn_return_timeout_does_not_freeze_watchdog(home, tmp_path):
     assert cp.returncode == 0
     log = (home / "auto-continue.log").read_text(encoding="utf-8")
     assert "RETURN-JUMPBACK-TIMEOUT" in log, log
+
+
+# ─── §2.3.4.6 sw-coord-p40: the SINGLEPANE return identity token is the TASK-ID, not the nonce ─────
+# Root cause of the 0/7 singlepane false-ABANDON: the submit token is the per-spawn NONCE, which lives
+# ONLY in the late-applied custom window.title (the singlepane folder is the project ROOT → no per-spawn
+# id in VS Code's native title). The return-leg scans winlist = kCGWindowName = the NATIVE title during
+# its bounded poll, where the nonce is structurally absent. The TASK-ID is in the title at ALL times
+# (workspace-file rootName + custom title) and is per-spawn-unique, so the return guard must match it.
+# These are STRUCTURAL guards (the singlepane submit machinery is exercised by test_singlepane_submit_retry;
+# the behavioral return E2E is owner-in-the-loop) that pin the token-selection wiring against regression.
+
+SRC_TEXT = SCRIPT.read_text(encoding="utf-8")
+
+
+def test_singlepane_return_token_is_task_id_not_nonce():
+    """The SINGLEPANE branch overrides the return identity token to $TASK with unique=1 (the nonce is
+    kept ONLY for the safety-critical submit). Worktree falls through to the submit token (byte-id)."""
+    # the call must thread the dedicated _return_token / _return_unique (not _submit_token directly)
+    assert '_return_jump_back "${_return_token:-}" "${_return_unique:-0}"' in SRC_TEXT, \
+        "the return jump must pass the dedicated _return_token / _return_unique"
+    # default (worktree / non-singlepane): _return_token IS the submit token, _return_unique IS its
+    # unique flag → byte-behavior-identical to the pre-fix `_return_jump_back $_submit_token $..unique`
+    assert '_return_token="${_submit_token:-}"; _return_unique="${_submit_token_unique:-0}"' in SRC_TEXT, \
+        "worktree/default must inherit the submit token (byte-identical 97/97 path)"
+    # singlepane override: the TASK-ID (always in the title) + unique-mode (per-spawn-unique succession).
+    # Anchor on the UNIQUE return-token default line (there are several `SINGLEPANE_WINDOW` blocks in the
+    # script; the fix region is the one right after this default assignment).
+    default_at = SRC_TEXT.index('_return_token="${_submit_token:-}"; _return_unique="${_submit_token_unique:-0}"')
+    region = SRC_TEXT[default_at:default_at + 600]   # the small token-selection block
+    assert 'if [ "$SINGLEPANE_WINDOW" = "1" ]; then' in region, "singlepane override guard must follow the default"
+    assert '_return_token="$TASK"' in region, "singlepane return must match the TASK-ID, not the nonce"
+    assert "_return_unique=1" in region, "singlepane return must use unique-mode (title-substring match)"
+
+
+def test_worktree_return_override_is_guarded_by_singlepane_flag():
+    """The TASK-ID override is GUARDED by `if [ "$SINGLEPANE_WINDOW" = "1" ]` → the worktree path
+    (flag=0) never enters it, so _return_token stays = _submit_token (= $TASK) and _return_unique stays
+    = _submit_token_unique (= 0): byte-behavior-identical to pre-fix. The live behavioral proof that the
+    worktree spawn-return still carries --anchor-token=<task> is
+    test_spawn_return_carries_precaptured_origin_before_and_anchor (a cold/worktree spawn)."""
+    # exactly one guarded override block, and the default assignment precedes it (worktree fall-through)
+    assert SRC_TEXT.count('_return_token="$TASK"') == 1, "the task-id override appears once (singlepane only)"
+    default_at = SRC_TEXT.index('_return_token="${_submit_token:-}"')
+    guard_at = SRC_TEXT.index('if [ "$SINGLEPANE_WINDOW" = "1" ]; then', default_at)
+    override_at = SRC_TEXT.index('_return_token="$TASK"', guard_at)
+    assert default_at < guard_at < override_at, "default (worktree) assignment must precede the singlepane guard"
