@@ -842,3 +842,41 @@ def test_attempt2_inner_read_external_enter_withholds_rc3(home, tmp_path):
     assert _presses(tmp_path) == 0, (
         "🔴 gate_settled re-probed between inner reads and WITHHELD — no double-submit on the retry path"
     )
+
+
+# ─── 15. 🔴 sw-coord-p41: the emoji-AX wronginput root cause — ASCII task-id gate now presses ──
+
+
+def test_ascii_taskid_value_without_emoji_confirms(home, tmp_path):
+    """sw-coord-p41 (owner ruling + codex+gemini dual-brain GREEN). THE production root cause: the
+    dominant singlepane withhold was ``gate=wronginput`` (live log 20/21 input-not-ready) — the
+    focused webview AXTextArea value read back NON-EMPTY but the 4-byte 🆔 emoji prefix did not
+    survive the macOS-AX read of the Electron webview, so the OLD gate's ``value contains "🆔<task>"``
+    failed WHILE the prompt was physically in the box → false withhold → the owner pressed Enter by
+    hand. THE FIX (Dir 2): the input gate now matches the PLAIN ASCII task id (it leads the pasted
+    prompt and survives the AX read); the jsonl CONFIRM still greps the full ``🆔<task>`` (file
+    content — reliable). Here the focused value carries the task id but NOT the emoji (the AX-strip
+    shape); press 1 is marker(=task-id)-gated → the NEW jsonl (with the emoji) confirms → submitted,
+    exactly ONE press. REGRESSION LOCK: on the PRE-fix code (marker=``🆔$task``) this value reads as
+    ``wronginput`` → withheld → ``sub.exists()`` would be False, so this test fails on the old bytes."""
+    task = "sp-ascii-noemoji"
+    repo = _seed_singlepane(home, tmp_path, task)
+    tdir = _transcript_dir(tmp_path, repo)
+    env = _env(
+        home,
+        tmp_path,
+        front_window=f"{_sp_title(task)} - x.py",
+        input_value=f"{task} the pasted prompt (emoji stripped by the AX read)",  # 🆔 absent in AX value
+        new_jsonl=tdir / "new-sess.jsonl",
+        new_jsonl_text=f'{{"text":"🆔{task} session started"}}',  # confirm STILL carries the emoji
+        jsonl_on_press=1,
+    )
+    assert _run(env, tmp_path).returncode == 0
+    sub = _ack(home, task, "submitted")
+    assert sub.exists(), "🔴 the ASCII task-id gate must press on an emoji-stripped AX value (the fix)"
+    assert "verified" in sub.read_text()
+    assert _presses(tmp_path) == 1, "exactly one marker-gated press — no manual Enter, no wronginput withhold"
+    log = _log(home)
+    assert "outcome=confirmed" in log
+    assert "gate=wronginput" not in log, "🔴 the emoji-AX wronginput false-withhold is gone"
+    assert not _ack(home, task, "failed").exists(), "no withhold — the production owner-pain is fixed"

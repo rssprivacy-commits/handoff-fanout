@@ -696,8 +696,9 @@ cold_submit_with_retry() {
 #   re-probe BEFORE every retry — already confirmed → ack submitted, NEVER press again;
 #   retry gate = ONE osascript asserting Code frontmost ∧ front window title contains the
 #               nonce token ∧ focused element is the Claude "Message input" ∧ its value still
-#               contains 🆔<task> (= OUR prompt sits UNSUBMITTED in OUR input) → only then
-#               keystroke return. Empty/markerless input → DO NOT press (a submitted prompt
+#               contains <task> (the ASCII task id — NOT the 🆔 emoji marker; see the emoji-AX
+#               note in singlepane_submit_with_retry) (= OUR prompt sits UNSUBMITTED in OUR
+#               input) → only then keystroke return. Empty/markerless input → DO NOT press (a submitted prompt
 #               empties the input — a second Enter there is the double-submit hazard), keep
 #               polling the jsonl; front window without the nonce → nonce-first
 #               raise_task_window, then retry;
@@ -875,7 +876,8 @@ singlepane_retry_gate_settled() {
 # marker-gated atomic SINGLE-read gate (singlepane_retry_gate — READ-ONLY until it reads READY; the
 # *_settled re-read wrapper is deliberately NOT used here so the outer loop owns every read+probe cycle,
 # see the round-3 race fix below) up to ~HANDOFF_SP_FIRST_READY_SECS, pressing ONLY when it reads Claude
-# "Message input" ∧ value⊇🆔<task>.
+# "Message input" ∧ value⊇<task> (the ASCII task id — sw-coord-p41 dropped the 🆔 emoji from the
+# AX value match; the emoji does not survive the webview AX read reliably; jsonl confirm keeps it).
 # The press still happens INSIDE the gate's one osascript process (the double-submit red line is
 # byte-identical to attempts 2+ — re-reading just grants more chances to READ positive, NEVER a blind
 # press). front-mismatch (a concurrent window stole front) → nonce-first raise_task_window, keep polling.
@@ -957,7 +959,22 @@ singlepane_first_press_gated() {
 SP_LAST_OUTCOME=""
 singlepane_submit_with_retry() {
     local token="$1" task="$2" ws="$3" base="$4"
-    local marker="🆔$task"
+    # sw-coord-p41 (2026-06-20 / owner ruling + codex+gemini dual-brain): the input-gate marker is
+    # the PLAIN ASCII task id, NOT "🆔$task". ROOT CAUSE (live log: the input-not-ready withholds
+    # were 20/21 gate=wronginput, NOT the noelem/emptyinput "webview returns nothing" class): the
+    # focused webview AXTextArea value reads back NON-EMPTY but the 4-byte emoji prefix 🆔 does not
+    # survive the macOS-AX read of the Electron webview reliably → `value contains "🆔$task"` fails
+    # while the prompt is physically in the box → false withhold → the owner pressed Enter by hand.
+    # The bare task id is plain ASCII and LEADS the pasted prompt (spawn.py embeds "🆔<task>" first),
+    # so it DOES survive the AX read. The COLD path already matched the ASCII token and never hit
+    # this, so the fix is singlepane-only (not symmetric). The jsonl CONFIRM still greps "🆔$task"
+    # (file content, not AX — reliable); only the AX value-gate match drops the emoji. Every other
+    # gate property is unchanged (front app=Code, front title⊇nonce, focused AXTextArea "Message
+    # input", value non-empty) → the wrong-window guard (wh-coord-10) and the post-submit-empty
+    # double-submit guard both survive; the press red line is untouched (still only on a positive
+    # marker read). Rejected Dir 1 (title-only press): dual-brain flagged Enter-on-empty can trigger
+    # the webview's Stop-Generation / newline-injection — not a safe no-op.
+    local marker="$task"
     local retry_max poll_secs poll_tries
     retry_max="${HANDOFF_SP_RETRY_MAX:-2}"; case "$retry_max" in ''|*[!0-9]*) retry_max=2 ;; esac
     poll_secs="${HANDOFF_SP_POLL_SECS:-2}"; case "$poll_secs" in ''|*[!0-9]*) poll_secs=2 ;; esac; [ "$poll_secs" -lt 1 ] && poll_secs=1
