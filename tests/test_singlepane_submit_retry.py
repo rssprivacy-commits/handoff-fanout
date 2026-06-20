@@ -16,7 +16,9 @@ THE FIX (dual-brain GREEN + coordinator arbitration, implemented in
      false-positive MAIN path, locked by test 1);
   2. re-probe BEFORE every retry — confirmed → ack submitted, never press again;
   3. retry Enter gate (ONE osascript): Code frontmost ∧ front title contains the nonce ∧
-     focused element is the Claude input ∧ focused value contains 🆔<task> → only then press.
+     focused element is the Claude input ∧ focused value contains <task> (the ASCII task id —
+     sw-coord-p41 dropped the 🆔 emoji from the AX value match: it does not survive the webview
+     AX read reliably; the jsonl confirm in step 1 KEEPS 🆔<task>) → only then press.
      Empty/markerless input → DO NOT press, keep polling; polls exhausted →
      ``ambiguous-after-first-enter``. Front without the nonce → nonce-first raise, retry;
   4. bounded: retries ≤ HANDOFF_SP_RETRY_MAX (default 2), confirm poll
