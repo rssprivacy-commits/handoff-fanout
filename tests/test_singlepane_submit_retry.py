@@ -413,6 +413,50 @@ def test_new_marked_jsonl_confirms_submitted(home, tmp_path):
     assert "outcome=confirmed" in _log(home)
 
 
+def test_singlepane_skips_post_paste_lock_recheck(home, tmp_path):
+    """sw-coord-p43 regression guard (change C): the SINGLEPANE path SKIPS the POST-paste
+    screen-is-locked RE-check (the 1.1-4.9s Quartz `--status` subprocess) — it sat squarely on
+    the paste→Enter hot path. Keystroke-into-a-locked-screen safety is instead held by the
+    front=Code atomic read inside singlepane_retry_gate (a locked screen makes a non-Code process
+    frontmost → "nofront" → no press). Proven two independent ways:
+      (a) NO `PERF[...]: screen-is-locked` line — that mark wraps ONLY the post-paste recheck;
+      (b) the lock probe is invoked exactly ONCE (the unconditional pre-paste unlock-pivot check),
+          not twice.
+    Reverting change C (restoring the SP post-paste recheck) re-adds the PERF line AND a 2nd probe
+    call → this test FAILS (disable-fix → FAIL). The submit must still succeed (skipping the
+    recheck did not break submission)."""
+    task = "sp-lockskip"
+    repo = _seed_singlepane(home, tmp_path, task)
+    tdir = _transcript_dir(tmp_path, repo)
+    env = _env(
+        home,
+        tmp_path,
+        front_window=f"{_sp_title(task)} - x.py",
+        input_value=f"🆔{task} the pasted prompt",
+        new_jsonl=tdir / "new-sess.jsonl",
+        new_jsonl_text=f'{{"text":"🆔{task} session started"}}',
+        jsonl_on_press=1,
+    )
+    # COUNT every lock-probe invocation (pre-paste + any post-paste recheck). Not PATH-shadowed,
+    # so the _assert_shadow_then_clean tripwire never touches this sink — its count is pure.
+    lock_sink = tmp_path / "lock_calls.txt"
+    lock_probe = Path(env["HANDOFF_LOCK_CHECK_CMD"])
+    lock_probe.write_text(f'#!/bin/bash\nprintf x >> "{lock_sink}"\necho unlocked\n', encoding="utf-8")
+    lock_probe.chmod(0o755)
+
+    assert _run(env, tmp_path).returncode == 0
+    assert _ack(home, task, "submitted").exists(), "skipping the recheck must NOT break the submit"
+    assert "screen-is-locked" not in _log(home), (
+        "SP must skip the POST-paste lock recheck (no PERF[...]: screen-is-locked line); "
+        "the line reappearing = change C was reverted"
+    )
+    lock_calls = len(_read(lock_sink))
+    assert lock_calls == 1, (
+        f"SP lock probe must run ONCE (pre-paste unlock-pivot only), got {lock_calls} "
+        "(2 = the post-paste recheck was NOT skipped → change C reverted)"
+    )
+
+
 # ─── 3. sibling guard: a NEW jsonl WITHOUT the marker is not a confirm ───────────────
 
 

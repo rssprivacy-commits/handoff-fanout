@@ -901,7 +901,7 @@ singlepane_retry_gate_settled() {
 # maps it to rc=3 (NOT script-verified). [This supersedes the round-1 "no per-tick probe" call: the wider
 # window made the in-loop probe necessary — codex bind-audit P1.]
 singlepane_first_press_gated() {
-    local token="$1" marker="$2" task="$3" ws="$4" base="$5" start deadline ready_secs out="" settle
+    local token="$1" marker="$2" task="$3" ws="$4" base="$5" start deadline ready_secs out="" settle _dbg_last=""
     ready_secs="${HANDOFF_SP_FIRST_READY_SECS:-10}"; case "$ready_secs" in ''|*[!0-9]*) ready_secs=10 ;; esac; [ "$ready_secs" -lt 1 ] && ready_secs=1
     # settle paces the wall-clock loop. Default 0.5; junk / multi-dot → default. Then a NUMERIC floor
     # (awk handles EVERY zero-form a string `case` misses — 0, 00, 0.0, 0.0000, '.') clamps any near-zero
@@ -938,7 +938,18 @@ singlepane_first_press_gated() {
                 log "SP-FIRST-PRESS: gate=$out — nonce-first raise + keep polling"
                 raise_task_window "$token" "$task" >/dev/null
                 ;;
-            *) : ;;   # noelem|notinput|emptyinput|wronginput → wait out the cold render
+            *)
+                # sw-coord-p43 diagnostic (LOG-ONLY / behavior-preserving — log() writes only to
+                # $LOG, never stdout [verified line 91], so the $(...) capture stays sent|<state>):
+                # surface the SILENT not-ready states the first-press poll waits in, logged on
+                # state-change to avoid spam. This is the evidence that decides whether owner's
+                # "fast press on front+title" (drop the value⊇marker wait) would submit earlier
+                # (a ready input) or just be swallowed (noelem/notinput/emptyinput = input genuinely
+                # not rendered/focused). Keystroke red line untouched (only a positive marker read
+                # presses). REMOVE once the wait-state distribution is collected.
+                [ "$out" != "$_dbg_last" ] && log "SP-FIRST-PRESS: gate=$out (input not ready — waiting out render)"
+                _dbg_last="$out"
+                ;;   # noelem|notinput|emptyinput|wronginput → wait out the cold render
         esac
         sleep "$settle"
     done
@@ -1972,6 +1983,15 @@ EOF
             # 快速重试 + 「mismatch 则 AXRaise 抬回前台」兜底（AXRaise 不破坏输入框焦点，实测坐实）。
             if [ "$COLD_WINDOW" = "1" ]; then
                 sleep "${HANDOFF_COLD_RENDER_SECS:-0.5}"   # 主人立法 2026-06-06: 粘完 0.5s 直接 Enter, 之间无任何搅焦动作
+            elif [ "$SINGLEPANE_WINDOW" = "1" ]; then
+                # sw-coord-p43: trim the fixed 1.5s singlepane pre-pad to a short tunable. The
+                # readiness-gated first press (singlepane_first_press_gated) already waits out the cold
+                # render via its wall-clock poll + the value⊇marker gate, so a long fixed pad only adds
+                # dead time to the paste→Enter window. Junk env → 0.5s default; a too-short value just
+                # yields an extra harmless poll iteration (the gate never presses an empty/markerless
+                # input), never a bad Enter (R1 dual-brain codex+gemini GREEN).
+                _sp_settle="${HANDOFF_SP_SETTLE:-0.5}"; case "$_sp_settle" in ''|*[!0-9.]*|*.*.*) _sp_settle=0.5 ;; esac
+                sleep "$_sp_settle"
             else
                 sleep 1.5
             fi
@@ -1983,7 +2003,25 @@ EOF
             # _perf_call times each preflight probe while preserving its exit code + short-circuit:
             # accessibility_trusted runs only when the screen is unlocked, is_frontmost_code only when
             # accessibility is trusted — exactly as the bare elif chain did (the 2026-06-07 +20s suspects).
-            _perf_call "$TASK" "screen-is-locked" screen_is_locked; _SRC=$?
+            # sw-coord-p43: SINGLEPANE skips the post-paste lock RE-check (the 1.1–4.9s Quartz
+            # `--status` subprocess) — it sits squarely ON the paste→Enter hot path. Keystroke-into-a-
+            # locked-screen is still prevented for SP by the ATOMIC front-window read inside
+            # singlepane_retry_gate: a locked screen makes loginwindow / ScreenSaverEngine /
+            # SecurityAgent frontmost (NOT "Code"), so the gate returns "nofront" and NEVER presses
+            # (R1 dual-brain codex+gemini GREEN: ANY lock-state process ≠ Code). The pre-paste lock
+            # check (line ~1595) already gated unlock/defer for THIS tick; caffeinate is held ONLY
+            # when we had to auto-unlock (line ~1622), so in the common already-unlocked case the
+            # front=Code gate — not caffeinate — is the universal lock net.
+            # TRADE-OFF (R1 codex P2, ACCEPTED + surfaced, NOT silent): if the screen re-locks inside
+            # the now-~1s window (rare: needs a manual lock at exactly the wrong moment), SP yields an
+            # honest `failed` ack via the front=Code gate WITHOUT the .uri-restore+defer the COLD/WARM
+            # re-locked branch performs (an operational retry downgrade — NO bad-Enter path; owner
+            # re-presses manually). COLD/WARM keep the recheck unchanged (zero regression).
+            if [ "$SINGLEPANE_WINDOW" = "1" ]; then
+                _SRC=1
+            else
+                _perf_call "$TASK" "screen-is-locked" screen_is_locked; _SRC=$?
+            fi
             if [ "$_SRC" != "1" ]; then
                 # P1-6: screen re-locked (or lock state unconfirmable) during the
                 # unlock→submit window. Abort the submit; the tab is open but
