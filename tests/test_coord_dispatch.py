@@ -718,6 +718,60 @@ def test_any_directory_segment_metachar_is_indeterminate(tmp_path: Path, pattern
     assert any("directory-segment" in n for n in prof.file_notes)
 
 
+# ─── #0c: metachar-NAMED symlink segment — realpath erasure → indeterminate ───
+
+
+def test_glob_metachar_named_symlink_segment_realpath_erasure_is_must_serial(
+    tmp_path: Path,
+) -> None:
+    """#0c P0 (codex R4 counter-example): the #0b directory-segment-wildcard guard
+    must key on the RAW DECLARED string, NOT on the realpath-anchored path. A symlink
+    whose own NAME contains a metachar — a literal dir ``l*`` → ``src`` — is resolved
+    AWAY by ``_anchor``'s realpath, ERASING the ``*`` from the anchored path: an
+    anchored-keyed guard then sees a clean ``src/*.py`` (whose final-only wildcard is
+    precise) and stays silent → false SAFE-PARALLEL. Yet at runtime A's ``l*/*.py``
+    glob-expands ``l*`` onto B's brand-new ``lib/`` and clobbers ``lib/brand_new.py``.
+    Keying on the raw ``l*/*.py`` (whose ``l*`` segment the filesystem can't rewrite)
+    fails closed → MUST-SERIAL — and immunizes the whole symlink/alias class."""
+    pa = _mkproject(tmp_path, "proj-a", files=["src/existing.py"])
+    (pa / "l*").symlink_to("src")  # literal symlink NAMED 'l*' → src; realpath erases the '*'
+    tasks = [
+        cd._parse_identity(_task(pa, "t-star", predicted_files=["l*/*.py"]), 0),
+        cd._parse_identity(_task(pa, "t-newlib", predicted_files=["lib/brand_new.py"]), 1),
+    ]
+    analysis = cd.analyze_batch(tasks)
+    assert _verdict_for(analysis, "t-star", "t-newlib") == cd.MUST_SERIAL
+    prof = cd.build_conflict_profile(
+        cd._parse_identity(_task(pa, "t-star", predicted_files=["l*/*.py"]), 0)
+    )
+    assert prof.files_indeterminate
+    assert any("directory-segment" in n for n in prof.file_notes)
+
+
+@pytest.mark.parametrize("linkname,pattern", [
+    ("?x", "?x/*.py"),    # ``?`` in the symlink-named directory segment
+    ("[a]", "[a]/*.py"),  # ``[`` char-class symlink-named directory segment
+])
+def test_metachar_named_symlink_segment_closes_whole_class(
+    tmp_path: Path, linkname: str, pattern: str
+) -> None:
+    """#0c generalization lock: ANY glob metachar (``*`` covered above; here ``?`` /
+    ``[``) in a directory segment that is ALSO a literal symlink with that exact name
+    (``?x`` / ``[a]`` → ``src``) is dissolved by realpath under anchored-keying — the
+    whole metachar-named-symlink class would slip through. Raw-string keying flags
+    every one → fail-closed indeterminate, regardless of the metachar or the symlink's
+    target. (A genuine regression: ``glob`` matches ``src/existing.py`` so the
+    0-match path can't accidentally cover this; only the raw directory-segment rule
+    can fire.)"""
+    pa = _mkproject(tmp_path, "proj-a", files=["src/existing.py"])
+    (pa / linkname).symlink_to("src")  # literal symlink whose NAME holds the metachar
+    prof = cd.build_conflict_profile(
+        cd._parse_identity(_task(pa, "t-seg", predicted_files=[pattern]), 0)
+    )
+    assert prof.files_indeterminate
+    assert any("directory-segment" in n for n in prof.file_notes)
+
+
 # ─── #1: case-insensitive filesystem path comparison ─────────────────────────
 
 

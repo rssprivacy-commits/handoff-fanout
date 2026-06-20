@@ -355,15 +355,25 @@ def build_conflict_profile(task: Task) -> ConflictProfile:
             if _has_glob(entry):
                 prof.glob_patterns.add(anchored)
                 # A wildcard in a NON-FINAL (directory) segment makes the glob's
-                # future expansion unbounded. _anchor has already realpath-resolved
-                # the STATIC prefix — so a static symlink (``link/…``) collapses to
-                # its real dir and is NOT a wildcard segment — leaving only a genuine
-                # directory-position metachar (``l*/…``, ``**/…``). Such a segment can
-                # match a symlink dir or a not-yet-created subdir at runtime that no
-                # static expansion (nor the leaf-realpath check below, which sees only
-                # TODAY's matches) can predict — the codex case ``l*`` matching a plain
-                # dir today but a symlink dir tomorrow. Fail closed → indeterminate.
-                if any(_has_glob(seg) for seg in anchored.split(os.sep)[:-1]):
+                # future expansion unbounded — it can match a symlink dir or a
+                # not-yet-created subdir at runtime that no static expansion (nor the
+                # leaf-realpath check below, which sees only TODAY's matches) can
+                # predict (the codex case ``l*`` matching a plain dir today but a
+                # symlink dir tomorrow). Fail closed → indeterminate.
+                #
+                # Key this check on the RAW DECLARED string, NOT on ``anchored``:
+                # ``_anchor``'s realpath can dissolve a symlink whose own NAME contains
+                # a metachar — a literal dir named ``l*`` → ``src`` collapses to ``src``,
+                # ERASING the ``*`` that should have tripped this guard → false
+                # SAFE-PARALLEL (two workers then clobber a runtime-shared file). The
+                # raw string is a pure-syntactic anchor the filesystem can't rewrite,
+                # so it's immune to every symlink/alias trick. Precision is unchanged:
+                # a guarded directory segment (``src``, static-symlink ``link``) carries
+                # no metachar in raw OR anchored form, so keying on raw adds zero false
+                # serialization — it only plugs the metachar-named-symlink hole.
+                # Declarations use ``/`` (POSIX); normalize ``\`` too before splitting.
+                raw_segs = entry.replace("\\", "/").split("/")
+                if any(_has_glob(seg) for seg in raw_segs[:-1]):
                     prof.files_indeterminate = True
                     prof.file_notes.append(
                         f"glob has a directory-segment wildcard — future expansion "
