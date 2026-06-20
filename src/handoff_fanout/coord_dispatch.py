@@ -162,6 +162,7 @@ class ConflictProfile:
 
     task_id: str
     project_root: str  # realpath of the task's project dir (anchors file paths)
+    case_insensitive: bool = False  # project FS folds case (macOS APFS) → fold path keys
     files_concrete: set[str] = field(default_factory=set)  # abs paths (literals + expanded globs)
     glob_patterns: set[str] = field(default_factory=set)  # abs glob patterns (for fnmatch vs literals)
     files_indeterminate: bool = False
@@ -196,6 +197,44 @@ def _anchor(project_root: str, entry: str) -> str:
     return os.path.realpath(raw)
 
 
+def _fs_case_insensitive(path: str) -> bool:
+    """Best-effort probe: does the filesystem holding ``path`` treat names
+    case-INSENSITIVELY (macOS APFS/HFS+ default, Windows) vs case-sensitively
+    (typical Linux/ext4 CI)? This drives whether file-path comparison case-folds —
+    on a case-insensitive FS ``src/Foo.py`` and ``src/foo.py`` are the SAME on-disk
+    file, so distinct spellings must NOT read as file-disjoint (a false
+    ``SAFE-PARALLEL``). ``os.path.realpath`` does NOT fold case — and for a
+    predicted *new* file (not yet on disk) it returns the declared case verbatim —
+    so the gate cannot lean on realpath here and must probe the FS itself.
+
+    Probes by toggling the case of an existing path component and checking whether
+    the toggled name still resolves to the SAME inode. Fails closed to ``True``
+    (treat as insensitive → fold → may over-serialize, but never misses a real
+    same-file collision) whenever the probe is inconclusive."""
+    probe = path
+    # climb to the nearest existing ancestor (a predicted new file won't exist)
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            return True  # no existing ancestor to probe → fail closed
+        probe = parent
+    cur = probe
+    while True:
+        head, tail = os.path.split(cur)
+        swapped = tail.swapcase()
+        if swapped != tail:  # this component has alphabetic case to toggle
+            cand = os.path.join(head, swapped)
+            try:
+                if os.path.lexists(cand) and os.path.samefile(cand, cur):
+                    return True   # toggled-case name = same file → case-insensitive
+                return False      # toggled-case absent / different inode → sensitive
+            except OSError:
+                return True       # stat error → fail closed
+        if head == cur:           # reached the root with nothing to toggle
+            return True           # can't probe → fail closed
+        cur = head
+
+
 def _parse_shared_dim(raw: dict, key: str) -> set[str] | None:
     """A list-or-"none" declared field → a set of tokens, or ``None`` when the
     field is missing / "unknown" / malformed (fail-closed: caller treats None as a
@@ -225,30 +264,58 @@ def _parse_bool_field(raw: dict, key: str) -> bool | None:
     return None  # "unknown", strings, numbers → can't trust → fail-closed
 
 
-# git ref-prefix spellings of a *local* branch — all denote the same branch.
-_BRANCH_REF_PREFIXES = ("refs/heads/", "heads/")
+def _strip_branch_ref_prefixes(branch: str) -> str:
+    """Reduce a branch ref spelling to its bare local-branch name.
+
+    Handles the local-branch namespace (``refs/heads/`` / ``heads/``) and the
+    remote-tracking namespace (``refs/remotes/<remote>/`` / ``remotes/<remote>/``):
+    the namespace prefix AND the remote-name component are dropped, while a slashed
+    branch *under* that remote is kept whole (``refs/remotes/origin/feature/x`` →
+    ``feature/x``). A bare ``<remote>/<branch>`` with NO namespace prefix (e.g.
+    ``origin/main``) is deliberately NOT stripped — it is indistinguishable from a
+    legitimately-slashed local branch (``feature/main``), and blindly collapsing it
+    would falsely merge distinct branches; it stays a documented boundary like the
+    symbolic refs ``HEAD`` / ``@`` (left verbatim, never guessed).
+
+    Returns the bare branch — possibly ``""`` when the spelling carries no branch
+    at all (``refs/heads/`` / ``refs/remotes/origin``); the caller fails closed on
+    an empty branch (an untrustworthy declaration)."""
+    branch = branch.strip()
+    for prefix in ("refs/remotes/", "remotes/"):
+        if branch.startswith(prefix):
+            # drop the namespace prefix AND the leading remote-name component
+            _, _, after = branch[len(prefix):].partition("/")
+            return after.strip()
+    for prefix in ("refs/heads/", "heads/"):
+        if branch.startswith(prefix):
+            return branch[len(prefix):].strip()
+    return branch
 
 
-def _normalize_repo_branch(rb: str) -> str:
-    """Canonicalize a self-reported ``repo_branch`` so ref-prefix aliases of the
-    *same* branch compare equal — e.g. ``proj@main`` ≡ ``proj@refs/heads/main`` ≡
-    ``proj@heads/main``. Without this, an aliased spelling slips past the
+def _normalize_repo_branch(rb: str) -> tuple[str, str]:
+    """Canonicalize a self-reported ``repo_branch`` and expose its branch part.
+
+    Returns ``(canonical, branch)`` where *canonical* is the comparable
+    ``<repo>@<branch>`` (or bare ``<branch>``) string and *branch* is the bare
+    branch component. Ref-prefix and remote-tracking aliases of the *same* branch
+    map to one canonical — e.g. ``proj@main`` ≡ ``proj@refs/heads/main`` ≡
+    ``proj@heads/main`` ≡ ``proj@refs/remotes/origin/main`` ≡
+    ``proj@remotes/origin/main`` — so an aliased spelling can't slip past the
     same-repo+branch-push rule (string mismatch → false ``SAFE-PARALLEL`` → two
-    pushes racing the same branch).
+    pushes racing the same branch). An empty *branch* signals a malformed
+    declaration (``repo@`` / ``refs/heads/`` / ``@``) the caller must fail-closed on.
 
     The convention is ``<repo>@<branch>``; we split on the LAST ``@`` (a repo
-    identifier such as ``git@host:org/repo`` may itself contain ``@``, but a
-    branch ref does not), normalize only the branch component's ref prefix, and
-    rejoin. A bare value with no ``@`` is treated as the branch."""
+    identifier such as ``git@host:org/repo`` may itself contain ``@``, but a branch
+    ref does not), normalize only the branch component, and rejoin. Git refs are
+    case-SENSITIVE, so the branch is never case-folded."""
     rb = rb.strip()
     repo, sep, branch = rb.rpartition("@")
     if not sep:  # no "@": the whole value is the branch
         repo, branch = "", rb
-    for prefix in _BRANCH_REF_PREFIXES:
-        if branch.startswith(prefix):
-            branch = branch[len(prefix):]
-            break
-    return f"{repo}@{branch}" if sep else branch
+    branch = _strip_branch_ref_prefixes(branch)
+    canonical = f"{repo}@{branch}" if sep else branch
+    return canonical, branch
 
 
 def build_conflict_profile(task: Task) -> ConflictProfile:
@@ -256,6 +323,7 @@ def build_conflict_profile(task: Task) -> ConflictProfile:
     no mutation) except read-only filesystem glob expansion against the project."""
     project_root = os.path.realpath(task.project)
     prof = ConflictProfile(task_id=task.task_id, project_root=project_root)
+    prof.case_insensitive = _fs_case_insensitive(project_root)
 
     if not os.path.isdir(project_root):
         prof.field_issues.append(f"project dir does not exist: {task.project}")
@@ -269,6 +337,14 @@ def build_conflict_profile(task: Task) -> ConflictProfile:
     else:
         for entry in pf:
             entry = entry.strip()
+            if entry.lower() == UNKNOWN_TOKEN:
+                # A literal "unknown" sentinel means the worker can't name its
+                # files — that is an indeterminate file set (fail-closed →
+                # MUST-SERIAL), NOT a concrete file literally named "unknown"
+                # (which would wrongly read as disjoint from real files).
+                prof.files_indeterminate = True
+                prof.file_notes.append('predicted_files entry "unknown" → file set unknown')
+                continue
             # A trailing separator declares a *directory* — capture it before
             # _anchor (realpath strips it).
             declared_dir = entry.endswith("/") or entry.endswith(os.sep)
@@ -284,6 +360,20 @@ def build_conflict_profile(task: Task) -> ConflictProfile:
                     # yields them unresolved, so two globs reaching one real file
                     # would otherwise look disjoint.
                     prof.files_concrete.update(os.path.realpath(m) for m in matches)
+                    # A glob whose SYMLINK lives in a glob *segment* (``l*/*.py``,
+                    # not a static prefix) can't be statically resolved by _anchor,
+                    # so the stored pattern keeps the unresolved ``l*`` — a future
+                    # file created under the symlinked real dir WOULD collide at
+                    # runtime but the unresolved pattern won't ``fnmatch`` it
+                    # (false SAFE). Detect it: a match whose realpath differs from
+                    # its literal (normpath) form crossed a symlink the pattern
+                    # can't predict → fail-closed indeterminate.
+                    if any(os.path.realpath(m) != os.path.normpath(m) for m in matches):
+                        prof.files_indeterminate = True
+                        prof.file_notes.append(
+                            f"glob expands through a symlink — future matches "
+                            f"unpredictable: {entry}"
+                        )
                 else:
                     # "无法展开的 glob 不得当空集" — a glob that matches nothing on disk
                     # (incl. one whose prefix dir is missing / an unresolvable symlink)
@@ -311,7 +401,15 @@ def build_conflict_profile(task: Task) -> ConflictProfile:
     if not isinstance(rb, str) or not rb.strip() or rb.strip().lower() == UNKNOWN_TOKEN:
         prof.field_issues.append("repo_branch missing / unknown")
     else:
-        prof.repo_branch = _normalize_repo_branch(rb)
+        canonical, branch = _normalize_repo_branch(rb)
+        if not branch:
+            # A spelling that normalizes to an EMPTY branch (``repo@`` /
+            # ``refs/heads/`` / ``@``) is an untrustworthy declaration → taint.
+            prof.field_issues.append(
+                f"repo_branch malformed (empty branch after normalize): {rb!r}"
+            )
+        else:
+            prof.repo_branch = canonical
 
     prof.will_push = _parse_bool_field(task.raw, "will_push")
     if prof.will_push is None:
@@ -334,12 +432,25 @@ def build_conflict_profile(task: Task) -> ConflictProfile:
 # ─── pairwise conflict analysis ────────────────────────────────────────────────
 
 
+def _case_key(path: str, fold: bool) -> str:
+    """Case-canonical comparison key for a path: casefolded on a case-insensitive
+    filesystem (so ``src/Foo.py`` and ``src/foo.py`` — the SAME file on APFS —
+    compare equal), verbatim on a case-sensitive one (where they are distinct
+    files and folding would over-serialize)."""
+    return path.casefold() if fold else path
+
+
 def _files_overlap(a: ConflictProfile, b: ConflictProfile) -> tuple[bool, list[str]]:
     """Return (overlap, reasons). Overlap is conservative/fail-closed: an
     indeterminate file set on EITHER side counts as overlap (cannot prove
     disjoint). Otherwise concrete∩concrete, plus a glob pattern on one side that
     ``fnmatch``-matches a concrete path on the other (catches "my glob will match
-    your new file")."""
+    your new file").
+
+    Path comparison is case-folded when EITHER side lives on a case-insensitive
+    filesystem (fail-closed: a case-only spelling difference there reaches the same
+    on-disk file — ``realpath`` doesn't fold case, and a predicted new file keeps
+    its declared case, so two casings would otherwise read as file-disjoint)."""
     reasons: list[str] = []
     if a.files_indeterminate or b.files_indeterminate:
         notes = a.file_notes + b.file_notes
@@ -349,16 +460,24 @@ def _files_overlap(a: ConflictProfile, b: ConflictProfile) -> tuple[bool, list[s
         )
         return True, reasons
 
-    inter = a.files_concrete & b.files_concrete
-    if inter:
-        reasons.append(f"predicted_files overlap: {sorted(inter)}")
+    fold = a.case_insensitive or b.case_insensitive
+    # case-canonical key → an original spelling (keeps the reasons human-readable)
+    a_concrete = {_case_key(p, fold): p for p in a.files_concrete}
+    b_concrete = {_case_key(p, fold): p for p in b.files_concrete}
+
+    common = a_concrete.keys() & b_concrete.keys()
+    if common:
+        label = "predicted_files overlap" + (" (case-insensitive FS)" if fold else "")
+        reasons.append(f"{label}: {sorted(a_concrete[k] for k in common)}")
 
     for patt in a.glob_patterns:
-        hits = sorted(p for p in b.files_concrete if fnmatch.fnmatch(p, patt))
+        pk = _case_key(patt, fold)
+        hits = sorted(orig for k, orig in b_concrete.items() if fnmatch.fnmatch(k, pk))
         if hits:
             reasons.append(f"{a.task_id} glob {patt!r} matches {b.task_id} files {hits}")
     for patt in b.glob_patterns:
-        hits = sorted(p for p in a.files_concrete if fnmatch.fnmatch(p, patt))
+        pk = _case_key(patt, fold)
+        hits = sorted(orig for k, orig in a_concrete.items() if fnmatch.fnmatch(k, pk))
         if hits:
             reasons.append(f"{b.task_id} glob {patt!r} matches {a.task_id} files {hits}")
 

@@ -596,6 +596,165 @@ def test_cli_routing(tmp_path: Path) -> None:
     assert rc == 0
 
 
+# ─── #0: glob pattern traversing a symlink SEGMENT → indeterminate ────────────
+
+
+def test_glob_through_symlink_segment_is_indeterminate_must_serial(tmp_path: Path) -> None:
+    """#0 P0: when the symlink lives in a glob SEGMENT (``l*/*.py``) — not a static
+    prefix (``link/*.py``) — _anchor can't statically resolve it, so the stored
+    pattern keeps the unresolved ``l*``. Task A's glob has an existing match
+    through ``link``→``src``; task B declares a brand-new file under the real
+    ``src``. Without flagging the symlink-traversing glob indeterminate, ``fnmatch``
+    on the unresolved ``l*/*.py`` misses ``src/brand_new.py`` → false SAFE-PARALLEL,
+    yet at runtime A's glob would expand through ``link``→``src`` and clobber B's
+    new file. The fix marks A's file set indeterminate → MUST-SERIAL."""
+    pa = _mkproject(tmp_path, "proj-a", files=["src/existing.py"])
+    (pa / "link").symlink_to("src")  # link/ → src/, but lives behind the l* glob
+    tasks = [
+        cd._parse_identity(_task(pa, "t-globlink", predicted_files=["l*/*.py"]), 0),
+        cd._parse_identity(_task(pa, "t-newreal", predicted_files=["src/brand_new.py"]), 1),
+    ]
+    analysis = cd.analyze_batch(tasks)
+    assert _verdict_for(analysis, "t-globlink", "t-newreal") == cd.MUST_SERIAL
+    assert any("symlink" in r for p in analysis.pairs for r in p.reasons)
+
+
+def test_glob_no_symlink_segment_stays_precise(tmp_path: Path) -> None:
+    """Precision guard for #0: a plain glob with NO symlink in its expansion must
+    NOT be marked indeterminate — it still resolves to a fixed concrete set and a
+    disjoint task stays SAFE-PARALLEL (proves the fix keys on symlink traversal,
+    not 'a glob is present')."""
+    pa = _mkproject(tmp_path, "proj-a", files=["src/existing.py"])
+    pb = _mkproject(tmp_path, "proj-b", files=["lib/other.py"])
+    tasks = [
+        cd._parse_identity(_task(pa, "t-glob", predicted_files=["src/*.py"], repo_branch="a@main"), 0),
+        cd._parse_identity(_task(pb, "t-ok", predicted_files=["lib/other.py"], repo_branch="b@main"), 1),
+    ]
+    assert cd.analyze_batch(tasks).parallel_safe
+
+
+# ─── #1: case-insensitive filesystem path comparison ─────────────────────────
+
+
+def _fs_is_case_insensitive(base: Path) -> bool:
+    """Independent ground truth (separate from the production probe ``cd.
+    _fs_case_insensitive``): create a mixed-case file and check whether its
+    lowercased name resolves to the same entry."""
+    marker = base / "CaseGroundTruthZ.tmp"
+    marker.write_text("x", encoding="utf-8")
+    try:
+        return (base / "casegroundtruthz.tmp").exists()
+    finally:
+        marker.unlink()
+
+
+def test_fs_case_insensitive_probe_matches_reality(tmp_path: Path) -> None:
+    """#1 unit: the gate's FS-sensitivity probe agrees with on-disk reality (so it
+    folds case on macOS APFS and stays exact on a case-sensitive Linux CI)."""
+    assert cd._fs_case_insensitive(str(tmp_path)) == _fs_is_case_insensitive(tmp_path)
+
+
+def test_predicted_files_case_only_difference_follows_fs(tmp_path: Path) -> None:
+    """#1: ``src/Foo.py`` and ``src/foo.py`` are NEW (not on disk), so realpath
+    can't fold their case. On a case-INSENSITIVE FS (macOS APFS) they are the SAME
+    file → MUST-SERIAL; on a case-SENSITIVE FS they are genuinely distinct →
+    SAFE-PARALLEL. The verdict must track the filesystem (no blanket casefold that
+    would over-serialize distinct files on Linux)."""
+    pa = _mkproject(tmp_path, "proj-a")
+    tasks = [
+        cd._parse_identity(_task(pa, "t-upper", predicted_files=["src/Foo.py"]), 0),
+        cd._parse_identity(_task(pa, "t-lower", predicted_files=["src/foo.py"]), 1),
+    ]
+    verdict = _verdict_for(cd.analyze_batch(tasks), "t-upper", "t-lower")
+    if _fs_is_case_insensitive(pa):
+        assert verdict == cd.MUST_SERIAL
+    else:
+        assert verdict == cd.SAFE_PARALLEL
+
+
+def test_distinct_name_files_stay_parallel_regardless_of_fs(tmp_path: Path) -> None:
+    """Precision guard for #1: genuinely different filenames (no case-only twist)
+    must stay SAFE-PARALLEL on either FS — casefolding equal-cased distinct names
+    must not collide them."""
+    pa = _mkproject(tmp_path, "proj-a")
+    tasks = [
+        cd._parse_identity(_task(pa, "t-a", predicted_files=["src/alpha.py"]), 0),
+        cd._parse_identity(_task(pa, "t-b", predicted_files=["src/beta.py"]), 1),
+    ]
+    assert cd.analyze_batch(tasks).parallel_safe
+
+
+# ─── #2: repo_branch remote-tracking aliases + malformed fail-closed ──────────
+
+
+def test_normalize_repo_branch_strips_remote_tracking_prefixes() -> None:
+    """#2 unit: ``refs/remotes/<remote>/`` and ``remotes/<remote>/`` spellings
+    normalize to the same bare local branch; a bare slashed LOCAL branch is not a
+    remote alias and must stay distinct."""
+    norm = cd._normalize_repo_branch
+    assert norm("main") == norm("refs/remotes/origin/main")
+    assert norm("main") == norm("remotes/origin/main")
+    assert norm("proj@main") == norm("proj@refs/remotes/origin/main")
+    # a slashed branch UNDER a remote keeps its slashes (only the remote name drops)
+    assert norm("refs/remotes/origin/feature/x")[1] == "feature/x"
+    # a bare local slashed branch is NOT a remote alias → must stay distinct
+    assert norm("feature/main") != norm("main")
+
+
+def test_repo_branch_remote_tracking_alias_judged_same_branch_must_serial(tmp_path: Path) -> None:
+    """#2 e2e: a ``refs/remotes/origin/main`` spelling must normalize to the same
+    branch as ``main`` so the same-repo+branch-push rule fires → MUST-SERIAL
+    (without the alias-strip the string mismatch falsely clears the pair)."""
+    pa = _mkproject(tmp_path, "proj-a")
+    tasks = [
+        cd._parse_identity(
+            _task(pa, "t-one", predicted_files=["src/one.py"], repo_branch="proj-a@main",
+                  will_push=True, worktree_isolation=False), 0),
+        cd._parse_identity(
+            _task(pa, "t-two", predicted_files=["src/two.py"],
+                  repo_branch="proj-a@refs/remotes/origin/main",
+                  will_push=True, worktree_isolation=False), 1),
+    ]
+    analysis = cd.analyze_batch(tasks)
+    assert _verdict_for(analysis, "t-one", "t-two") == cd.MUST_SERIAL
+    assert any("same repo+branch push" in r for r in analysis.pairs[0].reasons)
+
+
+@pytest.mark.parametrize("malformed", ["proj-a@", "refs/heads/", "refs/remotes/origin", "@", "proj-a@heads/"])
+def test_malformed_repo_branch_empty_branch_is_fail_closed(tmp_path: Path, malformed: str) -> None:
+    """#2: a declaration that normalizes to an EMPTY branch (``repo@`` /
+    ``refs/heads/`` / ``refs/remotes/origin`` / ``@``) is untrustworthy → taint →
+    MUST-SERIAL (previously the non-empty raw value slipped through as valid)."""
+    pa = _mkproject(tmp_path, "proj-a")
+    pb = _mkproject(tmp_path, "proj-b")
+    bad = _task(pb, "t-bad", repo_branch=malformed)
+    tasks = [
+        cd._parse_identity(_task(pa, "t-ok", repo_branch="a@main"), 0),
+        cd._parse_identity(bad, 1),
+    ]
+    assert _verdict_for(cd.analyze_batch(tasks), "t-ok", "t-bad") == cd.MUST_SERIAL
+
+
+# ─── #3: predicted_files "unknown" sentinel → indeterminate ───────────────────
+
+
+@pytest.mark.parametrize("tok", ["unknown", "UNKNOWN", "Unknown"])
+def test_predicted_files_unknown_token_is_indeterminate_must_serial(tmp_path: Path, tok: str) -> None:
+    """#3: ``predicted_files=["unknown"]`` (any case) means 'I don't know which
+    files' → indeterminate file set (fail-closed MUST-SERIAL), NOT a concrete file
+    literally named ``unknown`` (which would read as disjoint from real files →
+    false SAFE-PARALLEL)."""
+    pa = _mkproject(tmp_path, "proj-a")
+    pb = _mkproject(tmp_path, "proj-b", files=["src/b.py"])
+    tasks = [
+        cd._parse_identity(_task(pa, "t-unknown", predicted_files=[tok], repo_branch="a@main"), 0),
+        cd._parse_identity(_task(pb, "t-ok", predicted_files=["src/b.py"], repo_branch="b@main"), 1),
+    ]
+    analysis = cd.analyze_batch(tasks)
+    assert _verdict_for(analysis, "t-unknown", "t-ok") == cd.MUST_SERIAL
+    assert any("indeterminate" in r or "unknown" in r for p in analysis.pairs for r in p.reasons)
+
+
 # ─── shared test fixtures ────────────────────────────────────────────────────
 
 
