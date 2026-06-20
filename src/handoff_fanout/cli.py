@@ -53,6 +53,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Remove leftover heartbeat/529/uri sidecars for terminal tasks (dry-run by default)",
     )
     sub.add_parser(
+        "coord-dispatch",
+        help="Low-friction coordinator fan-out: draft worker briefs from a tasks-json and run "
+        "the HARD machine-judged concurrency-conflict gate (dry-run by default; --execute fans "
+        "out via dx-spawn-session.sh only when the batch is SAFE-PARALLEL)",
+    )
+    sub.add_parser(
         "gc-singlepane",
         help="Quarantine STALE singlepane coordinator sidecars + workspace files so the shared "
         "identity resolver resolves uniquely again (liveness-gated, dry-run by default, reversible)",
@@ -154,6 +160,10 @@ def main(argv: list[str] | None = None) -> int:
         from handoff_fanout import prune
 
         return prune.main(rest)
+    if args.subcommand == "coord-dispatch":
+        from handoff_fanout import coord_dispatch
+
+        return coord_dispatch.main(rest)
     if args.subcommand == "audit-run":
         from handoff_fanout import codex_audit
 
