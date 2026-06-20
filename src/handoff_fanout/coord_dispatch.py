@@ -354,6 +354,22 @@ def build_conflict_profile(task: Task) -> ConflictProfile:
             anchored = _anchor(project_root, entry)
             if _has_glob(entry):
                 prof.glob_patterns.add(anchored)
+                # A wildcard in a NON-FINAL (directory) segment makes the glob's
+                # future expansion unbounded. _anchor has already realpath-resolved
+                # the STATIC prefix — so a static symlink (``link/…``) collapses to
+                # its real dir and is NOT a wildcard segment — leaving only a genuine
+                # directory-position metachar (``l*/…``, ``**/…``). Such a segment can
+                # match a symlink dir or a not-yet-created subdir at runtime that no
+                # static expansion (nor the leaf-realpath check below, which sees only
+                # TODAY's matches) can predict — the codex case ``l*`` matching a plain
+                # dir today but a symlink dir tomorrow. Fail closed → indeterminate.
+                if any(_has_glob(seg) for seg in anchored.split(os.sep)[:-1]):
+                    prof.files_indeterminate = True
+                    prof.file_notes.append(
+                        f"glob has a directory-segment wildcard — future expansion "
+                        f"unbounded (may cross symlinks / new subdirs): {entry}"
+                    )
+                    continue
                 matches = glob.glob(anchored, recursive=True)
                 if matches:
                     # canonicalize each match too: glob traverses INTO symlinks and

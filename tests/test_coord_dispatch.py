@@ -633,6 +633,91 @@ def test_glob_no_symlink_segment_stays_precise(tmp_path: Path) -> None:
     assert cd.analyze_batch(tasks).parallel_safe
 
 
+# ─── #0b: glob with a DIRECTORY-SEGMENT wildcard → indeterminate (generalized) ─
+
+
+def test_glob_directory_segment_wildcard_is_indeterminate_must_serial(tmp_path: Path) -> None:
+    """#0b P0 (codex counter-example generalizing #0): a wildcard in a glob's
+    DIRECTORY (non-final) segment makes its future expansion unbounded, and #0's
+    leaf-realpath check alone misses it. ``l*`` matches a plain dir ``logs`` (a
+    NON-symlink leaf → #0's check stays silent) AND a symlink dir ``link``→``src``.
+    Task A globs ``l*/*.py`` while ``src`` has no ``.py`` today, so the glob expands
+    only to ``logs/existing.py`` (no symlink leaf); task B declares a brand-new
+    ``src/brand_new.py``. The unresolved ``l*/*.py`` fnmatch-misses ``src/brand_new.py``
+    → would falsely read SAFE-PARALLEL, yet at runtime once B creates the file A's
+    glob expands through ``link``→``src`` onto the SAME real file → clobber. The fix
+    fails closed on ANY non-final wildcard segment, regardless of what it expands to
+    today → MUST-SERIAL."""
+    pa = _mkproject(tmp_path, "proj-a", files=["logs/existing.py"])  # plain dir, l* match
+    (pa / "src").mkdir()                  # real src dir, currently EMPTY of .py
+    (pa / "link").symlink_to("src")       # l* ALSO matches link→src (symlink dir)
+    tasks = [
+        cd._parse_identity(_task(pa, "t-dirglob", predicted_files=["l*/*.py"]), 0),
+        cd._parse_identity(_task(pa, "t-newsrc", predicted_files=["src/brand_new.py"]), 1),
+    ]
+    analysis = cd.analyze_batch(tasks)
+    assert _verdict_for(analysis, "t-dirglob", "t-newsrc") == cd.MUST_SERIAL
+    assert any("indeterminate" in r for p in analysis.pairs for r in p.reasons)
+
+
+def test_glob_recursive_doublestar_segment_is_indeterminate_must_serial(tmp_path: Path) -> None:
+    """#0b: a recursive ``**`` is a non-final (directory) segment whose expansion
+    spans arbitrarily-deep subtrees — including dirs/symlinks/files created later —
+    so it cannot be statically bounded → fail-closed indeterminate. Here B declares
+    a brand-new TOP-LEVEL ``newtop.py``: at runtime ``**/*.py`` (with ``**`` matching
+    zero dirs) WILL hit it, but the stored pattern's ``fnmatch`` misses a top-level
+    file (it demands an intermediate ``/``) → without the fix this falsely reads
+    SAFE-PARALLEL. The directory-segment-wildcard rule catches it → MUST-SERIAL."""
+    pa = _mkproject(tmp_path, "proj-a", files=["src/existing.py"])
+    tasks = [
+        cd._parse_identity(_task(pa, "t-rec", predicted_files=["**/*.py"], repo_branch="a@main"), 0),
+        cd._parse_identity(_task(pa, "t-top", predicted_files=["newtop.py"], repo_branch="a@main"), 1),
+    ]
+    analysis = cd.analyze_batch(tasks)
+    assert _verdict_for(analysis, "t-rec", "t-top") == cd.MUST_SERIAL
+    assert any("indeterminate" in r for p in analysis.pairs for r in p.reasons)
+
+
+def test_glob_static_symlink_prefix_final_wildcard_stays_precise(tmp_path: Path) -> None:
+    """Precision guard for #0b (no over-correction): ``link/*.py`` where ``link`` is
+    a STATIC symlink dir (no wildcard in the directory segment) must NOT be marked
+    indeterminate. _anchor realpath-resolves the static ``link``→``src`` prefix,
+    leaving an anchored ``src/*.py`` whose ONLY wildcard is the final (filename)
+    segment — a precisely-enumerable set. Against a genuinely disjoint task it stays
+    SAFE-PARALLEL, proving the fix keys on a wildcard in a DIRECTORY segment, not on
+    a symlink merely being present in a static prefix."""
+    pa = _mkproject(tmp_path, "proj-a", files=["src/existing.py"])
+    (pa / "link").symlink_to("src")  # static symlink dir, NOT behind a wildcard
+    pb = _mkproject(tmp_path, "proj-b", files=["lib/other.py"])
+    tasks = [
+        cd._parse_identity(_task(pa, "t-linkglob", predicted_files=["link/*.py"], repo_branch="a@main"), 0),
+        cd._parse_identity(_task(pb, "t-ok", predicted_files=["lib/other.py"], repo_branch="b@main"), 1),
+    ]
+    assert cd.analyze_batch(tasks).parallel_safe
+
+
+@pytest.mark.parametrize("pattern", [
+    "l*/*.py",        # ``*`` in the first directory segment (codex case)
+    "**/*.py",        # recursive ``**`` directory segment
+    "?dir/*.py",      # ``?`` in a directory segment
+    "[ab]/*.py",      # ``[`` char-class in a directory segment
+    "src/sub*/x.py",  # wildcard in a MIDDLE (deep) directory segment
+])
+def test_any_directory_segment_metachar_is_indeterminate(tmp_path: Path, pattern: str) -> None:
+    """#0b generalization lock: the fix keys on ANY glob metachar (``*`` / ``?`` /
+    ``[``, incl. ``**``) in ANY non-final segment — not just the codex ``l*`` case,
+    and not just the first segment. Each pattern carries a wildcard in its directory
+    position → fail-closed indeterminate regardless of what exists on disk today. The
+    note-text assertion proves the *directory-segment* rule fired (distinguishing it
+    from a coincidental 'unexpandable glob = 0 matches' indeterminate)."""
+    pa = _mkproject(tmp_path, "proj-a", files=["src/existing.py"])
+    prof = cd.build_conflict_profile(
+        cd._parse_identity(_task(pa, "t-seg", predicted_files=[pattern]), 0)
+    )
+    assert prof.files_indeterminate
+    assert any("directory-segment" in n for n in prof.file_notes)
+
+
 # ─── #1: case-insensitive filesystem path comparison ─────────────────────────
 
 
