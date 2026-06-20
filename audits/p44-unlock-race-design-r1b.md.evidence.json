@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "runner_version": "dual-brain-runner/2026-06-12-evidence-v1",
+  "ts": "2026-06-20T21:31:02+0800",
+  "brief_sha256": "7771b512fbaa1a18acb4c0680abee407a1e9ce0dc99c73994c7d061420dff4b9",
+  "brain_results": [
+    {
+      "brain": "codex",
+      "status": "ok",
+      "verdict": "RED",
+      "artifact_path": "audits/p44-unlock-race-design-r1b.md",
+      "raw_text_sha256": "2dcf3a33dc63b68ee1da71d4d08bb5495d69824f341b17208503ac4c4199dc21"
+    },
+    {
+      "brain": "gemini",
+      "status": "ok",
+      "verdict": "GREEN",
+      "artifact_path": "audits/p44-unlock-race-design-r1b.md",
+      "raw_text_sha256": "8985f570884ca9dba7be95c40ded77695e298b3d10b6b6b274613fba2a77d534"
+    }
+  ],
+  "overall_verdict": "RED"
+}

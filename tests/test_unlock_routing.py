@@ -528,3 +528,54 @@ def test_unknown_after_unlock_fails_closed(home, tmp_path):
     marker = home / PROJECT / "queue" / f"{TASK}.deferred"
     assert marker.exists() and "verify2" in marker.read_text()
     assert (home / PROJECT / ".unlock-cooldown").exists(), "verify-failure ⇒ cooldown bumped"
+
+
+def test_spawn_defers_when_global_mutex_held_by_live_run(home, tmp_path):
+    """sw-coord-p44 unlock concurrency race: the global mutex ``$HANDOFF_ROOT/.unlock.lock``
+    is now acquired BEFORE the lock-state decision for EVERY spawn and held across the
+    auto-unlock→relock critical section. If a concurrent launcher tick (LIVE pid) holds it,
+    a second spawn — even on an already-unlocked screen — must DEFER ``spawn-busy`` (never
+    race the holder's relock / piggyback its auto-unlocked window), NOT open the GUI.
+
+    Disable the fix (drop the top-of-loop ``acquire_unlock_lock``) and an unlocked spawn
+    would sail straight to the GUI while the holder is mid unlock→relock → this test fails."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _seed(home, ws)
+    # A concurrent run holds the mutex: a real, LIVE process pid + a FRESH lockdir mtime
+    # (acquire_unlock_lock returns busy immediately for a live pid).
+    holder = subprocess.Popen(["sleep", "60"])
+    try:
+        lockdir = home / ".unlock.lock"
+        lockdir.mkdir()
+        (lockdir / "pid").write_text(f"{holder.pid}\n", encoding="utf-8")
+        env = _env(home, tmp_path, initial="unlocked", opt_in=False, unlock_ok=True)
+        assert _run(env).returncode == 0
+        assert _read(env, "_OPEN_SINK") == "", "mutex held by a live run → must NOT open the GUI"
+        assert _read(env, "_UNLOCK_SINK") == "", "mutex held → no unlock attempt"
+        marker = home / PROJECT / "queue" / f"{TASK}.deferred"
+        assert marker.exists() and "spawn-busy" in marker.read_text(), "defer reason = spawn-busy"
+        assert (home / PROJECT / "queue" / f"{TASK}.uri").exists(), ".uri kept for retry"
+        assert lockdir.exists(), "the other run's mutex must be left intact (we only defer)"
+    finally:
+        holder.terminate()
+        holder.wait(timeout=10)
+
+
+def test_stale_global_mutex_does_not_wedge_fleet(home, tmp_path):
+    """sw-coord-p44: a STALE ``.unlock.lock`` (dead pid + mtime older than the 180s
+    stale-break) must NOT wedge the fleet — acquire_unlock_lock breaks it and the spawn
+    proceeds. Proves a crashed mutex holder can't permanently block every project's spawn."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    _seed(home, ws)
+    lockdir = home / ".unlock.lock"
+    lockdir.mkdir()
+    (lockdir / "pid").write_text("999999\n", encoding="utf-8")  # out-of-range → reliably dead
+    old = int(time.time()) - 200  # > 180s stale threshold
+    os.utime(lockdir, (old, old))  # set the lockdir mtime LAST (writing pid bumped it)
+    env = _env(home, tmp_path, initial="unlocked", opt_in=False, unlock_ok=True)
+    assert _run(env).returncode == 0
+    assert _read(env, "_OPEN_SINK").strip(), "stale mutex broken → GUI open proceeds (no wedge)"
+    assert not (home / PROJECT / "queue" / f"{TASK}.uri").exists(), ".uri consumed (spawn ran)"
+    assert not lockdir.exists(), "unlocked path releases the mutex after the decision"

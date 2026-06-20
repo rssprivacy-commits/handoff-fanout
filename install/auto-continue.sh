@@ -1104,7 +1104,7 @@ warn_accessibility_once() {
     fi
     : > "$marker" 2>/dev/null || true
     log "ACCESSIBILITY-MISSING: 自动接续无法按 Enter (缺辅助功能权限). 新 tab 仍会打开但需手动按一次 Enter. 修复: System Settings → 隐私与安全性 → 辅助功能, 勾选运行 launchd 的 osascript/Terminal."
-    "$HANDOFF_OSASCRIPT_CMD" -e 'display notification "自动接续无法按 Enter：缺辅助功能权限。tab 已打开，请手动按 Enter，并到 系统设置 → 隐私与安全性 → 辅助功能 授权。" with title "Handoff ⚠️ 辅助功能权限" sound name "Basso"' 2>>"$LOG" || true
+    notify_async 'display notification "自动接续无法按 Enter：缺辅助功能权限。tab 已打开，请手动按 Enter，并到 系统设置 → 隐私与安全性 → 辅助功能 授权。" with title "Handoff ⚠️ 辅助功能权限" sound name "Basso"'
 }
 
 # lock-probe P0 (no-unlock fallback): the launcher fell back to the ioreg lock
@@ -1192,6 +1192,35 @@ screen_is_locked() {
     return 1
 }
 
+# Bounded lock probe for the spawn critical section (codex R2). screen_is_locked under
+# a hard wall-clock cap so a hung probe backend can NEVER hold the global spawn mutex and
+# wedge the fleet: the mutex is now acquired BEFORE the probe, and acquire_unlock_lock's
+# stale-break only fires for a DEAD pid — a live-but-hung holder would block every other
+# project's spawn forever. A timeout ⇒ UNKNOWN(2) ⇒ the caller fails CLOSED (defer +
+# release). The production Quartz `--status` backend already self-bounds
+# (HANDOFF_LOCKCHECK_TIMEOUT, 15s); this OUTER cap (default 20s > inner) also covers the
+# unbounded stdout (HANDOFF_LOCK_CHECK_CMD) and ioreg fallbacks. Used at EVERY
+# screen_is_locked reachable while the spawn mutex is held (codex R2'): the 3 gating
+# probes (_LRC/_RC/_VRC) + do_relock's relock-verify + _post_iter_cleanup's
+# relock-decision + the cold/warm submit recheck. The only bare screen_is_locked left
+# is the definition itself (and inside this wrapper).
+probe_lock_bounded() {
+    local _t="${HANDOFF_LOCKCHECK_OUTER_TIMEOUT:-20}"
+    case "$_t" in ''|*[!0-9]*) _t=20 ;; esac   # sanitize: a non-numeric env must not defeat the cap (codex R2')
+    run_with_timeout "$_t" screen_is_locked
+    local _plb=$?
+    [ "$_plb" = "124" ] && _plb=2   # outer timeout ⇒ UNKNOWN ⇒ caller fails CLOSED
+    return "$_plb"
+}
+
+# Bounded fire-and-forget notification (codex R2'): several notifications can fire while
+# the spawn mutex is held (defer / unlock-fail / relock-fail paths). A hung osascript
+# (wedged WindowServer/NotificationCenter) must not extend the held-mutex window. 10s cap,
+# always non-blocking (|| true). $1 = the full AppleScript passed to `osascript -e`.
+notify_async() {
+    run_with_timeout 10 "$HANDOFF_OSASCRIPT_CMD" -e "$1" >>"$LOG" 2>&1 || true
+}
+
 # Unlock opt-in (R2 P0-1 / full-sweep A1: the per-project `<project>/unlock.enabled`
 # sentinel is the ONLY enabler). Auto-unlock injects the Mac login password, so
 # every project must be enabled deliberately via its own sentinel. The former
@@ -1256,7 +1285,9 @@ defer_uri() {
     fi
     if [ "$do_notify" = "1" ]; then
         : > "$nfile" 2>/dev/null || true
-        "$HANDOFF_OSASCRIPT_CMD" -e 'display notification "锁屏待接续 — 解锁或为该项目开启 unlock" with title "Handoff"' 2>>"$LOG" || true
+        # Bounded (codex R2/R2'): this defer may fire while the spawn mutex is held; a hung
+        # notification must not extend the held-mutex window. Fire-and-forget either way.
+        notify_async 'display notification "锁屏待接续 — 解锁或为该项目开启 unlock" with title "Handoff"'
     fi
     log "DEFER: project=$(basename "$proj_dir") task=$task reason=$reason ticks=$ticks"
     DEFERRED=$((DEFERRED + 1))
@@ -1295,11 +1326,11 @@ unlock_fail_bump() {
     # the marker (manual-only), don't loop every cooldown window.
     if [ "$rc" = "2" ]; then
         nr=$((now + 3153600000))   # ~100y = effectively permanent / manual-clear
-        "$HANDOFF_OSASCRIPT_CMD" -e "display notification \"自动解锁配置错误（无登录密码/环境缺失）— 已停用自动解锁，须人工修复后清除 .unlock-cooldown\" with title \"Handoff ⛔ 解锁配置\" sound name \"Basso\"" 2>>"$LOG" || true
+        notify_async "display notification \"自动解锁配置错误（无登录密码/环境缺失）— 已停用自动解锁，须人工修复后清除 .unlock-cooldown\" with title \"Handoff ⛔ 解锁配置\" sound name \"Basso\""
         log "UNLOCK-CONFIG-ERROR: project=$(basename "$proj_dir") rc=2 — manual-only until marker cleared"
     elif [ "$cnt" -ge "$HANDOFF_UNLOCK_FAIL_THRESHOLD" ]; then
         nr=$((now + HANDOFF_UNLOCK_COOLDOWN))
-        "$HANDOFF_OSASCRIPT_CMD" -e "display notification \"自动解锁连续失败 $cnt 次，已暂停自动解锁（密码错/Keychain 过期?），请人工处理\" with title \"Handoff ⚠️ 解锁\" sound name \"Basso\"" 2>>"$LOG" || true
+        notify_async "display notification \"自动解锁连续失败 $cnt 次，已暂停自动解锁（密码错/Keychain 过期?），请人工处理\" with title \"Handoff ⚠️ 解锁\" sound name \"Basso\""
         log "UNLOCK-COOLDOWN: project=$(basename "$proj_dir") count=$cnt rc=$rc — pause auto-unlock until $nr"
     fi
     printf 'count=%s\nlast_epoch=%s\nnext_retry_epoch=%s\nlast_rc=%s\n' "$cnt" "$now" "$nr" "$rc" > "$m"
@@ -1348,15 +1379,15 @@ do_relock() {
     local cmd; cmd=$(effective_relock_cmd)
     if [ -z "$cmd" ]; then
         RELOCK_FAILED=1; : > "$HANDOFF_ROOT/.relock-failed" 2>/dev/null || true
-        "$HANDOFF_OSASCRIPT_CMD" -e 'display notification "自动解锁后无重新锁屏命令 — 屏幕仍解锁，已停止后续接续，请人工锁屏" with title "Handoff ⛔ 无法重锁" sound name "Basso"' 2>>"$LOG" || true
+        notify_async 'display notification "自动解锁后无重新锁屏命令 — 屏幕仍解锁，已停止后续接续，请人工锁屏" with title "Handoff ⛔ 无法重锁" sound name "Basso"'
         log "RELOCK-FAIL: no relock command — screen left UNLOCKED; halting further spawns"
         return 1
     fi
     run_with_timeout "$HANDOFF_RELOCK_TIMEOUT" $cmd >>"$LOG" 2>&1
     sleep 1
-    if ! screen_is_locked; then
+    if ! probe_lock_bounded; then   # bounded (codex R2'): relock-verify under the held mutex
         RELOCK_FAILED=1; : > "$HANDOFF_ROOT/.relock-failed" 2>/dev/null || true
-        "$HANDOFF_OSASCRIPT_CMD" -e 'display notification "自动接续后重新锁屏失败 — 屏幕可能仍解锁，已停止后续接续，请人工锁屏" with title "Handoff ⚠️ 重锁失败" sound name "Basso"' 2>>"$LOG" || true
+        notify_async 'display notification "自动接续后重新锁屏失败 — 屏幕可能仍解锁，已停止后续接续，请人工锁屏" with title "Handoff ⚠️ 重锁失败" sound name "Basso"'
         log "RELOCK-FAIL: screen not re-locked; halting further spawns"
         return 1
     fi
@@ -1385,7 +1416,7 @@ _post_iter_cleanup() {
     # against a lock screen is forbidden anyway).
     if [ "$UNLOCKED_BY_US" = "1" ]; then
         do_relock
-    elif [ "$MAY_NEED_RELOCK" = "1" ] && ! screen_is_locked; then
+    elif [ "$MAY_NEED_RELOCK" = "1" ] && ! probe_lock_bounded; then   # bounded (codex R2'): cleanup probe under the held mutex
         do_relock
     fi
     UNLOCKED_BY_US=0
@@ -1598,44 +1629,62 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
             continue
         fi
 
-        # ── unlock-pivot gating (design §4): the GUI path needs an unlocked screen ──
+        # ── unlock-pivot gating (design §4) + sw-coord-p44 spawn critical section ──
+        # The GUI path needs an unlocked screen. To close the fleet-wide unlock race
+        # (a concurrent tick auto-unlocks → we spawn → it relocks UNDER our Enter; or a
+        # non-unlock-enabled project piggybacks another's auto-unlocked window), the
+        # lock-state DECISION is made while HOLDING the global mutex, acquired BEFORE
+        # the authoritative probe. The auto-unlock (locked) path then KEEPS the mutex
+        # across unlock→spawn→relock (globally serial, as before). The already-unlocked
+        # path does NOT relock, so it RELEASES the mutex right after the decision and
+        # spawns unguarded — that keeps a hung normal spawn from wedging the WHOLE fleet
+        # (a held mutex + an unbounded GUI osascript would block every other project's
+        # spawn; acquire_unlock_lock's stale-break only fires for a DEAD pid, not a
+        # live-but-hung one — codex R1') and keeps independent unlocked spawns parallel.
         CAFF_PID=""
         UNLOCKED_BY_US=0
         UNLOCK_LOCK_HELD=0
         MAY_NEED_RELOCK=0
-        screen_is_locked; _LRC=$?
+        # Acquire BEFORE the probe so the lock-state decision is atomic w.r.t. another
+        # tick's relock: a concurrent tick mid unlock→relock HOLDS this mutex, so we
+        # block here (defer spawn-busy) instead of racing its relock. A crashed holder
+        # can't wedge us (acquire_unlock_lock's 180s dead-pid stale-break).
+        if ! acquire_unlock_lock; then
+            defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "spawn-busy"; continue
+        fi
+        UNLOCK_LOCK_HELD=1
+        probe_lock_bounded; _LRC=$?   # bounded: a hung probe must not wedge the held mutex (codex R2)
         if [ "$_LRC" = "2" ]; then
             # UNKNOWN lock state ⇒ fail-closed: never GUI-submit blind.
-            defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "lock-unknown"; continue
+            defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "lock-unknown"; _post_iter_cleanup; continue
         fi
         if [ "$_LRC" = "0" ]; then
-            # Locked → must auto-unlock first (UI keystrokes are forbidden locked).
+            # Locked → must auto-unlock first (UI keystrokes are forbidden locked). We
+            # KEEP the mutex through the whole unlock→spawn→relock (released last in
+            # _post_iter_cleanup) so no 2nd tick can race our GUI/Enter or our relock.
             if ! unlock_enabled_for_project "$PROJ_DIR"; then
-                defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "locked-unlock-not-enabled"; continue
+                defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "locked-unlock-not-enabled"; _post_iter_cleanup; continue
             fi
             if unlock_in_cooldown "$PROJ_DIR"; then
-                defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "unlock-cooldown"; continue
+                defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "unlock-cooldown"; _post_iter_cleanup; continue
             fi
             if [ -z "$HANDOFF_UNLOCK_CMD" ]; then
-                defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "unlock-cmd-unset"; continue
+                defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "unlock-cmd-unset"; _post_iter_cleanup; continue
             fi
             # R2 P0-3: never unlock without a way to RE-lock — else we'd strand the
             # Mac unlocked. Require an effective relock cmd (explicit or derived).
             if [ -z "$(effective_relock_cmd)" ]; then
-                defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "relock-cmd-unset"; continue
+                defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "relock-cmd-unset"; _post_iter_cleanup; continue
             fi
-            if ! acquire_unlock_lock; then
-                defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "unlock-busy"; continue
-            fi
-            UNLOCK_LOCK_HELD=1
+            # Mutex already held (acquired above) — no re-acquire.
             # Hold caffeinate across unlock→submit (P1-6: keep system awake so it
             # can't re-lock mid-window). Empty HANDOFF_CAFFEINATE_CMD disables.
             if [ -n "$HANDOFF_CAFFEINATE_CMD" ]; then $HANDOFF_CAFFEINATE_CMD >/dev/null 2>&1 & CAFF_PID=$!; fi
-            # Re-probe under the mutex (P0-2): another tick may have unlocked
-            # already. Three-state (lock-probe P0-1): only rc=1 (genuinely unlocked)
-            # is safe to proceed without unlocking; rc=2 (UNKNOWN — e.g. a Quartz
-            # `--status` timeout) must fail CLOSED, never blind-spawn behind a lock.
-            screen_is_locked; _RC=$?
+            # Final pre-unlock recheck UNDER the mutex (P0-2 / codex R1'): catch an owner
+            # manual-unlock between the decision probe above and here, so we never inject
+            # the login password on an already-unlocked desktop. Three-state (lock-probe
+            # P0-1): rc=2 (UNKNOWN — Quartz `--status` timeout) must fail CLOSED.
+            probe_lock_bounded; _RC=$?   # bounded (codex R2): hung probe ⇒ UNKNOWN ⇒ fail-closed
             if [ "$_RC" = "2" ]; then
                 defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "lock-unknown-premutex"
                 _post_iter_cleanup; continue
@@ -1650,7 +1699,7 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
                 # Verify (lock-probe P0-1): ONLY rc=1 (confirmed unlocked) is success.
                 # rc=0 (still locked) OR rc=2 (UNKNOWN) ⇒ fail CLOSED (defer + cooldown);
                 # never proceed to GUI on an unconfirmed-unlocked screen.
-                screen_is_locked; _VRC=$?
+                probe_lock_bounded; _VRC=$?   # bounded (codex R2): hung verify ⇒ UNKNOWN ⇒ fail-closed
                 if [ "$_VRC" != "1" ]; then
                     unlock_fail_bump "$PROJ_DIR" "$_URC"
                     defer_uri "$PROJ_DIR" "$QUEUE" "$TASK" "unlock-failed-rc$_URC-verify$_VRC"
@@ -1661,11 +1710,17 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
                 UNLOCKED_BY_US=1
                 log "UNLOCK-OK: project=$PROJECT task=$TASK (rc=$_URC)"
             fi
-            # _RC=1 ⇒ another tick already unlocked; proceed to spawn on the
-            # genuinely-unlocked screen (mutex held; UNLOCKED_BY_US stays 0).
-            # R2 P0-2: HOLD the mutex across claim→submit (released in
-            # _post_iter_cleanup) so a 2nd tick can't see the unlocked screen and
-            # race the GUI/Enter. The whole locked-path spawn is globally serial.
+            # _RC=1 ⇒ owner unlocked between the two probes; we did not unlock so we
+            # won't relock — proceed (mutex stays held for this locked-branch spawn).
+        else
+            # _LRC=1 ⇒ genuinely unlocked, decided UNDER the mutex. We did NOT unlock
+            # and will NOT relock, so no concurrent tick can relock under us (one that
+            # would relock holds this mutex → we'd have blocked at acquire). Release the
+            # mutex now and spawn unguarded: keeps a hung normal spawn from blocking the
+            # fleet + keeps independent unlocked spawns parallel. The existing front=Code
+            # submit gate stays the last-line lock-screen defense for the rare
+            # owner-manual-lock-mid-spawn case (unchanged).
+            release_unlock_lock; UNLOCK_LOCK_HELD=0
         fi
 
         # Atomic claim
@@ -1924,7 +1979,7 @@ EOF
                             fi
                             if [ "$_notify" = "1" ]; then
                                 : > "$_nfile" 2>/dev/null || true
-                                "$HANDOFF_OSASCRIPT_CMD" -e 'display notification "接续窗口前台争夺多次未决 — URI 未发，新窗已留桌面，请点击新窗手动粘贴 prompt" with title "Handoff ⚠️ 前台争夺" sound name "Basso"' 2>>"$LOG" || true
+                                notify_async 'display notification "接续窗口前台争夺多次未决 — URI 未发，新窗已留桌面，请点击新窗手动粘贴 prompt" with title "Handoff ⚠️ 前台争夺" sound name "Basso"'
                             fi
                             _post_iter_cleanup
                             continue
@@ -2020,7 +2075,7 @@ EOF
             if [ "$SINGLEPANE_WINDOW" = "1" ]; then
                 _SRC=1
             else
-                _perf_call "$TASK" "screen-is-locked" screen_is_locked; _SRC=$?
+                _perf_call "$TASK" "screen-is-locked" probe_lock_bounded; _SRC=$?   # bounded (codex R2'): under the held mutex on the locked path
             fi
             if [ "$_SRC" != "1" ]; then
                 # P1-6: screen re-locked (or lock state unconfirmable) during the
