@@ -1501,6 +1501,7 @@ _return_spaces_py() {
 # _RETURN_ORIGIN / _RETURN_BEFORE / _RETURN_ANCHOR_WS / _RETURN_ANCHOR_APP / _RETURN_PY.
 _return_precapture() {
     _RETURN_ARMED=0; _RETURN_ORIGIN=""; _RETURN_BEFORE=""; _RETURN_ANCHOR_WS=""; _RETURN_ANCHOR_APP=""; _RETURN_PY=""
+    _RETURN_ORIGIN_TOTAL=""; _RETURN_RAIL_WS=""; _RETURN_RAIL_WIN=""   # sw-coord-p53: topology fingerprint + window-identity rail
     [ -n "$HANDOFF_SPAWNER_FOCUS" ] || return 0
     _return_enabled || return 0
     _RETURN_PY="$(_return_spaces_py)" || { _RETURN_PY=""; return 0; }
@@ -1525,6 +1526,14 @@ _return_precapture() {
     # fail-opens to goto. (Owner workspace paths/App names have no '=', so cut on the first '=' is safe.)
     _RETURN_ANCHOR_WS=$(printf '%s\n' "$_pre" | /usr/bin/sed -n 's/^RETURN_ANCHOR_WS=//p')
     _RETURN_ANCHOR_APP=$(printf '%s\n' "$_pre" | /usr/bin/sed -n 's/^RETURN_ANCHOR_APP=//p')
+    # sw-coord-p53: topology fingerprint (user-desktop count → number-fallback reorder gate) + a
+    # window-identity RAIL (a Code window on origin, captured while active==origin → fresh mapping) →
+    # one-step reorder-safe return for a non-Code / no-anchor owner. Emitted only when capturable →
+    # empty here = graceful degrade (spawn-return falls back to the pre-p53 behavior). Paths have no '='
+    # so cut-on-first-'=' is safe (same as the anchor lines).
+    _RETURN_ORIGIN_TOTAL=$(printf '%s\n' "$_pre" | /usr/bin/sed -n 's/^ORIGIN_TOTAL=//p')
+    _RETURN_RAIL_WS=$(printf '%s\n' "$_pre" | /usr/bin/sed -n 's/^RETURN_RAIL_WS=//p')
+    _RETURN_RAIL_WIN=$(printf '%s\n' "$_pre" | /usr/bin/sed -n 's/^RETURN_RAIL_WIN=//p')
     _RETURN_ARMED=1
 }
 
@@ -1550,6 +1559,16 @@ _return_jump_back() {
     # (keeps NEW∧token). §2.3.4.5 (2026-06-19 singlepane false-ABANDON fix).
     local _anchor="${1:-}" _unique="${2:-0}" _rc _uflag=""
     [ "$_unique" = "1" ] && _uflag="--anchor-token-unique"
+    # sw-coord-p53 (codex R1 #1 fix): pass the rail/topology args ONLY when precapture (the SAME _RETURN_PY
+    # version) actually emitted them → DEPLOY-ORDER-INDEPENDENT. An OLD vscode-spaces.py emits no
+    # ORIGIN_TOTAL / RETURN_RAIL_* wire lines → these vars stay empty → we pass NO unknown args → the old
+    # spawn-return parses cleanly (NO strand). A NEW vscode-spaces.py emits them → we pass them. The
+    # ${arr[@]+"${arr[@]}"} expansion is bash-3.2 + `set -u` safe for an EMPTY array (macOS /bin/bash) and
+    # preserves quoting for workspace paths that contain spaces.
+    local _p53args=()
+    [ -n "${_RETURN_RAIL_WS:-}" ]      && _p53args+=(--rail-ws="$_RETURN_RAIL_WS")
+    [ -n "${_RETURN_RAIL_WIN:-}" ]     && _p53args+=(--rail-win="$_RETURN_RAIL_WIN")
+    [ -n "${_RETURN_ORIGIN_TOTAL:-}" ] && _p53args+=(--origin-total="$_RETURN_ORIGIN_TOTAL")
     # gap C1 (sw-coord-p28): wall-clock timeout — spawn-return does a BOUNDED winlist poll
     # (§2.3.4.5 RETURN_SCAN_MAX_WAIT) then re-activates, but vscode-spaces.py's ensure_winlist() can hang
     # in a first-run `swiftc` compile with no internal ceiling; on this synchronous path that
@@ -1559,6 +1578,7 @@ _return_jump_back() {
     run_with_timeout "${HANDOFF_RETURN_TIMEOUT:-20}" /usr/bin/python3 "$_RETURN_PY" spawn-return \
         --origin="${_RETURN_ORIGIN:--1}" --before="${_RETURN_BEFORE:-}" \
         --anchor-ws="${_RETURN_ANCHOR_WS:-}" --anchor-app="${_RETURN_ANCHOR_APP:-}" \
+        ${_p53args[@]+"${_p53args[@]}"} \
         --anchor-token="$_anchor" $_uflag >>"$LOG" 2>&1
     _rc=$?
     [ "$_rc" -eq 124 ] && log "RETURN-JUMPBACK-TIMEOUT: spawn-return exceeded ${HANDOFF_RETURN_TIMEOUT:-20}s — owner not auto-returned to origin desktop (fail-open)"
