@@ -197,6 +197,39 @@ def _anchor(project_root: str, entry: str) -> str:
     return os.path.realpath(raw)
 
 
+def _anchor_glob(project_root: str, entry: str) -> str:
+    """Anchor a GLOB entry WITHOUT letting ``realpath`` dissolve its wildcard
+    segments — the root-cause fix for the "realpath erases the glob" class.
+
+    ``_anchor`` realpaths the WHOLE joined path. For a glob that is a latent bug: a
+    symlink whose own NAME contains a metachar — a file literally named ``l*.py``,
+    or a directory ``l*`` / ``?x`` / ``[a]`` — is a real on-disk entry, so realpath
+    RESOLVES it and ERASES the wildcard, turning the pattern into a concrete path
+    that no longer ``fnmatch``-matches a colliding sibling → false ``SAFE-PARALLEL``.
+
+    The fix realpaths ONLY the static prefix — the entry segments BEFORE the first
+    one carrying a glob metachar — and keeps every segment from the first wildcard
+    onward LITERAL. realpath therefore never touches a wildcard segment, so a
+    metachar-named symlink in ANY segment (directory OR filename) can never rewrite
+    the pattern. The static prefix is still fully canonicalized (a static symlink
+    dir ``link``→``src`` resolves exactly as ``_anchor`` did), so precision is
+    unchanged. The wildcard boundary is located within the DECLARED entry only — the
+    already-realpath'd ``project_root`` is trusted and never re-splits the prefix,
+    so a metachar that happens to live in the root path can't shift the split.
+
+    Declarations use POSIX ``/``; a Windows ``\\`` is normalized before splitting."""
+    segs = entry.replace("\\", "/").split("/")
+    g = next((i for i, s in enumerate(segs) if _has_glob(s)), len(segs))
+    static = "/".join(segs[:g])               # entry's static prefix (no wildcard)
+    tail = segs[g:]                           # from the first wildcard segment: LITERAL
+    if os.path.isabs(entry):
+        base = static or os.sep
+    else:
+        base = os.path.join(project_root, static) if static else project_root
+    anchored_static = os.path.realpath(base)  # realpath the static prefix ONLY
+    return os.path.join(anchored_static, *tail) if tail else anchored_static
+
+
 def _fs_case_insensitive(path: str) -> bool:
     """Best-effort probe: does the filesystem holding ``path`` treat names
     case-INSENSITIVELY (macOS APFS/HFS+ default, Windows) vs case-sensitively
@@ -348,11 +381,15 @@ def build_conflict_profile(task: Task) -> ConflictProfile:
             # A trailing separator declares a *directory* — capture it before
             # _anchor (realpath strips it).
             declared_dir = entry.endswith("/") or entry.endswith(os.sep)
-            # _anchor realpath-canonicalizes (resolves symlinks in the prefix), so
-            # the static prefix of a glob is canonicalized for free (the glob
-            # metachar tail is a non-existent component → kept literal).
-            anchored = _anchor(project_root, entry)
-            if _has_glob(entry):
+            # Anchor globs with a glob-AWARE canonicalizer: realpath ONLY the static
+            # prefix before the first wildcard segment, never the wildcard segments
+            # themselves. A whole-path realpath would dissolve a symlink whose own
+            # NAME is a metachar (``l*`` / ``l*.py``), ERASING the pattern into a
+            # concrete file → false SAFE-PARALLEL (codex R3/R4/R5). Exact-file entries
+            # still get full realpath (resolves symlink aliases to one canonical path).
+            is_glob = _has_glob(entry)
+            anchored = _anchor_glob(project_root, entry) if is_glob else _anchor(project_root, entry)
+            if is_glob:
                 prof.glob_patterns.add(anchored)
                 # A wildcard in a NON-FINAL (directory) segment makes the glob's
                 # future expansion unbounded — it can match a symlink dir or a

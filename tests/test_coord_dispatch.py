@@ -772,6 +772,89 @@ def test_metachar_named_symlink_segment_closes_whole_class(
     assert any("directory-segment" in n for n in prof.file_notes)
 
 
+# ─── #0d: metachar-NAMED symlink in the FINAL (filename) segment — glob-safe ──
+#          anchoring (codex R5 counter-example) ──────────────────────────────
+
+
+def test_glob_final_segment_metachar_named_symlink_stays_glob_must_serial(
+    tmp_path: Path,
+) -> None:
+    """#0d P0 (codex R5 counter-example): the FINAL-segment wildcard case that the
+    #0b/#0c directory-segment guard deliberately lets through as "precise" (a
+    last-segment ``l*.py`` SHOULD enumerate exactly) is itself corrupted when a
+    literal symlink is NAMED with a metachar — ``pa/l*.py`` (a FILE whose own name
+    contains ``*``) → ``src/existing.py``. ``_anchor``'s whole-path realpath
+    dissolves that symlink, ERASING the entire ``l*.py`` glob into a concrete
+    ``src/existing.py``: the stored "pattern" is no longer a pattern, so A's
+    ``l*.py`` no longer ``fnmatch``-matches B's brand-new ``lib.py`` → false
+    SAFE-PARALLEL, yet at runtime A's ``l*.py`` glob expands onto ``lib.py`` and both
+    clobber it. Glob-safe anchoring realpaths ONLY the static prefix (never the
+    wildcard segment), so the ``l*.py`` pattern SURVIVES → fnmatch hits B's
+    ``lib.py`` (and the leaf-realpath check independently trips on the symlink) →
+    MUST-SERIAL. This closes the realpath-erasure class for the final segment too."""
+    pa = _mkproject(tmp_path, "proj-a", files=["src/existing.py"])
+    (pa / "l*.py").symlink_to("src/existing.py")  # FILE symlink NAMED 'l*.py' (literal '*')
+    tasks = [
+        cd._parse_identity(_task(pa, "t-star", predicted_files=["l*.py"]), 0),
+        cd._parse_identity(_task(pa, "t-newlib", predicted_files=["lib.py"]), 1),
+    ]
+    analysis = cd.analyze_batch(tasks)
+    assert _verdict_for(analysis, "t-star", "t-newlib") == cd.MUST_SERIAL
+    # root-cause assertion: the glob metachar SURVIVES anchoring — the pattern is
+    # NOT realpath-erased into the concrete ``src/existing.py``.
+    prof_a = cd.build_conflict_profile(
+        cd._parse_identity(_task(pa, "t-star", predicted_files=["l*.py"]), 0)
+    )
+    assert any(p.endswith("l*.py") for p in prof_a.glob_patterns), (
+        "glob metachar must survive anchoring (not realpath-erased to a concrete file)"
+    )
+
+
+@pytest.mark.parametrize("linkname,pattern", [
+    ("l?.py", "l?.py"),    # ``?`` in a metachar-named final-segment file symlink
+    ("[a].py", "[a].py"),  # ``[`` char-class metachar-named final-segment symlink
+])
+def test_final_segment_metachar_named_symlink_closes_whole_class(
+    tmp_path: Path, linkname: str, pattern: str
+) -> None:
+    """#0d generalization lock: ANY glob metachar (``*`` above; ``?`` / ``[`` here)
+    in a FINAL-segment glob that is ALSO a literal symlink named with that metachar
+    (``l?.py`` / ``[a].py`` → ``src/existing.py``) would be dissolved by realpath
+    under whole-path anchoring, erasing the pattern → false SAFE-PARALLEL. Glob-safe
+    anchoring keeps the wildcard segment literal so the erasure can never happen; the
+    file set is then flagged indeterminate (the surviving pattern hits the
+    metachar-named symlink and trips the leaf-realpath check, or expands to nothing)
+    → MUST-SERIAL regardless of the metachar — the whole class is closed."""
+    pa = _mkproject(tmp_path, "proj-a", files=["src/existing.py"])
+    (pa / linkname).symlink_to("src/existing.py")  # FILE symlink whose NAME holds the metachar
+    tasks = [
+        cd._parse_identity(_task(pa, "t-seg", predicted_files=[pattern]), 0),
+        cd._parse_identity(_task(pa, "t-newlib", predicted_files=["lib.py"]), 1),
+    ]
+    analysis = cd.analyze_batch(tasks)
+    assert _verdict_for(analysis, "t-seg", "t-newlib") == cd.MUST_SERIAL
+    prof = cd.build_conflict_profile(
+        cd._parse_identity(_task(pa, "t-seg", predicted_files=[pattern]), 0)
+    )
+    assert prof.files_indeterminate
+
+
+def test_glob_final_wildcard_no_metachar_symlink_stays_precise(tmp_path: Path) -> None:
+    """Precision guard for #0d (no over-correction): a final-segment glob with NO
+    metachar-named symlink in play — plain ``src/*.py`` — must still anchor its
+    STATIC prefix and stay a precisely-enumerable set, so a genuinely disjoint task
+    stays SAFE-PARALLEL. Glob-safe anchoring only stops realpath from touching the
+    WILDCARD segment; it must keep resolving the static prefix exactly as before
+    (here ``proj-a`` ≠ ``proj-b``, so the two never collide)."""
+    pa = _mkproject(tmp_path, "proj-a", files=["src/existing.py"])
+    pb = _mkproject(tmp_path, "proj-b", files=["lib/other.py"])
+    tasks = [
+        cd._parse_identity(_task(pa, "t-glob", predicted_files=["src/*.py"], repo_branch="a@main"), 0),
+        cd._parse_identity(_task(pb, "t-ok", predicted_files=["lib/other.py"], repo_branch="b@main"), 1),
+    ]
+    assert cd.analyze_batch(tasks).parallel_safe
+
+
 # ─── #1: case-insensitive filesystem path comparison ─────────────────────────
 
 
