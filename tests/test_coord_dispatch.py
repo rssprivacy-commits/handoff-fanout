@@ -855,6 +855,73 @@ def test_glob_final_wildcard_no_metachar_symlink_stays_precise(tmp_path: Path) -
     assert cd.analyze_batch(tasks).parallel_safe
 
 
+# ─── #0e: glob metachar in the realpath'd STATIC PREFIX — glob.escape the
+#          concrete prefix (codex R6 counter-example) ─────────────────────────
+
+
+def test_glob_metachar_in_realpathd_prefix_stays_literal_is_must_serial(
+    tmp_path: Path,
+) -> None:
+    """#0e P0 (codex R6 counter-example): glob-safe anchoring realpaths the static
+    prefix, but that CONCRETE prefix may itself carry a glob metachar in its REAL
+    name — a dir literally named ``real[ab]`` reached via a static symlink ``link``.
+    Spliced raw, ``real[ab]`` is read as a CHARACTER CLASS: A's ``link/*.py`` pattern
+    ``<pa>/real[ab]/*.py`` glob-expands onto the decoy sibling ``reala/decoy.py`` (NOT
+    the true file) AND fails to ``fnmatch`` B's exact ``real[ab]/foo.py`` → the two
+    file sets read as disjoint → false ``SAFE-PARALLEL``, yet at runtime A's
+    ``link/*.py`` resolves through ``link``→``real[ab]`` and clobbers ``foo.py`` =
+    B's file. ``glob.escape`` makes the prefix a literal (``[``→``[[]``), so the
+    pattern matches the true ``real[ab]/foo.py`` = B's file → MUST-SERIAL."""
+    pa = _mkproject(tmp_path, "proj-a", files=["real[ab]/foo.py", "reala/decoy.py"])
+    (pa / "link").symlink_to("real[ab]")  # static symlink → dir whose REAL name holds '['
+    tasks = [
+        cd._parse_identity(_task(pa, "t-glob", predicted_files=["link/*.py"]), 0),
+        cd._parse_identity(_task(pa, "t-exact", predicted_files=["link/foo.py"]), 1),
+    ]
+    analysis = cd.analyze_batch(tasks)
+    assert _verdict_for(analysis, "t-glob", "t-exact") == cd.MUST_SERIAL
+    # glob.glob-side: the escaped prefix matches the TRUE file, never the decoy sibling.
+    prof = cd.build_conflict_profile(
+        cd._parse_identity(_task(pa, "t-glob", predicted_files=["link/*.py"]), 0)
+    )
+    assert any(p.endswith("real[ab]/foo.py") for p in prof.files_concrete), (
+        "escaped prefix must glob-expand onto the TRUE real[ab]/ file"
+    )
+    assert not any("decoy.py" in p for p in prof.files_concrete), (
+        "escaped prefix must NOT mis-match the decoy sibling reala/"
+    )
+
+
+@pytest.mark.parametrize("realname,decoy", [
+    ("d*x", "dyx"),   # ``*`` in the realpath'd prefix dir's name
+    ("d?x", "dyx"),   # ``?`` in the realpath'd prefix dir's name
+])
+def test_metachar_in_realpathd_prefix_closes_whole_class(
+    tmp_path: Path, realname: str, decoy: str
+) -> None:
+    """#0e generalization lock: ANY glob metachar (``[`` above; ``*`` / ``?`` here) in
+    the realpath'd static prefix's REAL name must be escaped to a literal. Without the
+    escape A's ``link/*.py`` pattern ``<pa>/<realname>/*.py`` glob-expands onto the
+    decoy sibling ``<decoy>/decoy.py`` too — a spurious extra match. ``glob.escape``
+    makes the prefix the exact literal dir, so A's concrete set is EXACTLY the true
+    ``<realname>/foo.py`` = B's exact file (decoy excluded) → MUST-SERIAL, and the
+    whole 'metachar in the concrete prefix' class is closed regardless of metachar."""
+    pa = _mkproject(tmp_path, "proj-a", files=[f"{realname}/foo.py", f"{decoy}/decoy.py"])
+    (pa / "link").symlink_to(realname)  # static symlink → dir whose REAL name holds the metachar
+    tasks = [
+        cd._parse_identity(_task(pa, "t-glob", predicted_files=["link/*.py"]), 0),
+        cd._parse_identity(_task(pa, "t-exact", predicted_files=["link/foo.py"]), 1),
+    ]
+    analysis = cd.analyze_batch(tasks)
+    assert _verdict_for(analysis, "t-glob", "t-exact") == cd.MUST_SERIAL
+    prof = cd.build_conflict_profile(
+        cd._parse_identity(_task(pa, "t-glob", predicted_files=["link/*.py"]), 0)
+    )
+    assert not any("decoy.py" in p for p in prof.files_concrete), (
+        "escaped prefix must match only the true dir, never the decoy sibling"
+    )
+
+
 # ─── #1: case-insensitive filesystem path comparison ─────────────────────────
 
 

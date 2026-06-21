@@ -217,6 +217,17 @@ def _anchor_glob(project_root: str, entry: str) -> str:
     already-realpath'd ``project_root`` is trusted and never re-splits the prefix,
     so a metachar that happens to live in the root path can't shift the split.
 
+    One last layer: the realpath'd static prefix is itself a CONCRETE name, but a
+    symlink target's real name (or a project-root path) may legitimately CONTAIN a
+    glob metachar — a real on-disk dir literally named ``real[ab]``. Spliced raw into
+    the returned pattern, that ``[ab]`` is read as a CHARACTER CLASS by both
+    ``glob.glob`` and ``fnmatch`` downstream, so the pattern mis-expands onto a decoy
+    sibling (``reala/``) and FAILS to fnmatch the true ``real[ab]/`` file → false
+    ``SAFE-PARALLEL``. ``glob.escape`` wraps each metachar in the prefix as a literal
+    (``[``→``[[]``); both engines then treat the escaped prefix as the exact literal
+    name while the DECLARED wildcard tail stays a live pattern. A metachar-free prefix
+    is left byte-identical, so precision is unchanged.
+
     Declarations use POSIX ``/``; a Windows ``\\`` is normalized before splitting."""
     segs = entry.replace("\\", "/").split("/")
     g = next((i for i, s in enumerate(segs) if _has_glob(s)), len(segs))
@@ -227,7 +238,10 @@ def _anchor_glob(project_root: str, entry: str) -> str:
     else:
         base = os.path.join(project_root, static) if static else project_root
     anchored_static = os.path.realpath(base)  # realpath the static prefix ONLY
-    return os.path.join(anchored_static, *tail) if tail else anchored_static
+    # Escape the (concrete) static prefix so a metachar in its REAL name stays a
+    # literal in the pattern; the wildcard tail is the only live glob. A tail-less
+    # path is compared as a string/samefile, never as a pattern → must NOT be escaped.
+    return os.path.join(glob.escape(anchored_static), *tail) if tail else anchored_static
 
 
 def _fs_case_insensitive(path: str) -> bool:
