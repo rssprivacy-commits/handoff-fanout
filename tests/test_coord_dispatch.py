@@ -633,6 +633,58 @@ def test_glob_no_symlink_segment_stays_precise(tmp_path: Path) -> None:
     assert cd.analyze_batch(tasks).parallel_safe
 
 
+# ─── glob ∩ glob fail-open fix (sw-coord-p53 / p51 finding ①) ─────────────────
+
+
+def test_two_globs_sharing_a_future_file_are_must_serial(tmp_path: Path) -> None:
+    """🔴 the fail-open p51/p53 closes: two globs whose CONCRETE expansions are disjoint TODAY but
+    that can BOTH match a future file. ``src/foo*.py`` (→foo_old.py) and ``src/*_new.py``
+    (→bar_new.py) expand disjoint, neither glob fnmatches the other's concrete file, so the old
+    glob-vs-concrete-only gate emitted SAFE-PARALLEL — yet both match a future ``src/foo_new.py``.
+    The glob-vs-glob check fails closed → MUST-SERIAL."""
+    pa = _mkproject(tmp_path, "proj-a", files=["src/foo_old.py", "src/bar_new.py"])
+    tasks = [
+        cd._parse_identity(_task(pa, "t-foo", predicted_files=["src/foo*.py"]), 0),
+        cd._parse_identity(_task(pa, "t-new", predicted_files=["src/*_new.py"]), 1),
+    ]
+    analysis = cd.analyze_batch(tasks)
+    assert _verdict_for(analysis, "t-foo", "t-new") == cd.MUST_SERIAL
+    assert any("may overlap" in r for p in analysis.pairs for r in p.reasons)
+
+
+def test_two_globs_distinct_dirs_stay_safe_parallel(tmp_path: Path) -> None:
+    """Precision guard (no over-serialization): two basename globs in DIFFERENT (literal) dirs can
+    never share a file (no dir-segment wildcard to bridge them) → SAFE-PARALLEL."""
+    pa = _mkproject(tmp_path, "proj-a", files=["src/a_x.py", "lib/b_y.py"])
+    tasks = [
+        cd._parse_identity(_task(pa, "t-src", predicted_files=["src/a*.py"]), 0),
+        cd._parse_identity(_task(pa, "t-lib", predicted_files=["lib/b*.py"]), 1),
+    ]
+    assert cd.analyze_batch(tasks).parallel_safe
+
+
+def test_two_globs_incompatible_suffix_stay_safe_parallel(tmp_path: Path) -> None:
+    """Precision guard: same dir, but provably-incompatible fixed suffixes (``.py`` vs ``.txt``) →
+    no common basename possible → SAFE-PARALLEL."""
+    pa = _mkproject(tmp_path, "proj-a", files=["src/foo.py", "src/notes.txt"])
+    tasks = [
+        cd._parse_identity(_task(pa, "t-py", predicted_files=["src/*.py"]), 0),
+        cd._parse_identity(_task(pa, "t-txt", predicted_files=["src/*.txt"]), 1),
+    ]
+    assert cd.analyze_batch(tasks).parallel_safe
+
+
+def test_two_globs_incompatible_prefix_stay_safe_parallel(tmp_path: Path) -> None:
+    """Precision guard: same dir, provably-incompatible fixed prefixes (``foo`` vs ``bar``) → no
+    common basename possible → SAFE-PARALLEL."""
+    pa = _mkproject(tmp_path, "proj-a", files=["src/foo_a.py", "src/bar_b.py"])
+    tasks = [
+        cd._parse_identity(_task(pa, "t-foo", predicted_files=["src/foo*.py"]), 0),
+        cd._parse_identity(_task(pa, "t-bar", predicted_files=["src/bar*.py"]), 1),
+    ]
+    assert cd.analyze_batch(tasks).parallel_safe
+
+
 # ─── #0b: glob with a DIRECTORY-SEGMENT wildcard → indeterminate (generalized) ─
 
 

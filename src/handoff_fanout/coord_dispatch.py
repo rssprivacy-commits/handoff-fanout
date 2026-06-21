@@ -517,6 +517,66 @@ def _case_key(path: str, fold: bool) -> str:
     return path.casefold() if fold else path
 
 
+def _glob_literal_prefix(pattern: str) -> str:
+    """The fixed leading run of ``pattern`` — chars before the FIRST glob metachar (``* ? [``).
+    Any string the pattern matches MUST start with this."""
+    i = 0
+    for ch in pattern:
+        if ch in _GLOB_META:
+            break
+        i += 1
+    return pattern[:i]
+
+
+def _glob_literal_suffix(pattern: str) -> str:
+    """The fixed trailing run of ``pattern`` — chars after the LAST glob metachar (``* ? [ ]``).
+    Any string the pattern matches MUST end with this. ``]`` is treated as a boundary too (a
+    character class closes there); this only ever SHORTENS the fixed suffix → strictly fail-safe."""
+    j = len(pattern)
+    for ch in reversed(pattern):
+        if ch in _GLOB_META or ch == "]":
+            break
+        j -= 1
+    return pattern[j:]
+
+
+def _globs_may_intersect(g1: str, g2: str, fold: bool) -> bool:
+    """Can two ANCHORED globs both match some common path? FAIL-CLOSED: return True (MAY overlap)
+    unless they can be cheaply PROVEN disjoint. This closes the glob-vs-glob fail-open (p51 finding ①
+    / sw-coord-p53): ``src/foo*.py`` and ``src/*_new.py`` currently expand to disjoint concrete sets
+    but BOTH can match a future ``src/foo_new.py`` — the old ``_files_overlap`` never compared two
+    globs, so it emitted SAFE-PARALLEL for a pair that can collide.
+
+    Both inputs carry a wildcard ONLY in the final segment (a directory-segment wildcard already
+    routed the profile to ``files_indeterminate`` upstream), so disjointness reduces to:
+      1. different (literal, realpath-canonical) directory → provably disjoint (no dir wildcard to
+         bridge them);
+      2. same directory → the two final-segment patterns can share a match unless their FIXED prefixes
+         are incompatible (neither a prefix of the other) or their FIXED suffixes are incompatible
+         (neither a suffix of the other). Anything not provably disjoint by those fixed anchors →
+         True (we do NOT attempt to prove disjointness through the wildcard interior — fail-closed)."""
+    d1, b1 = os.path.split(g1)
+    d2, b2 = os.path.split(g2)
+    # Defense-in-depth (codex p53 audit caveat): this proof ASSUMES the only wildcard is in the FINAL
+    # segment — a directory-segment wildcard is routed to ``files_indeterminate`` upstream and never
+    # reaches here. Should that invariant ever drift, a literal directory comparison could falsely read
+    # two dir-globs as disjoint → fail-open. Fail CLOSED: a surviving metachar in the directory part
+    # cannot be proven disjoint → treat as overlap.
+    if _has_glob(d1) or _has_glob(d2):
+        return True
+    if _case_key(d1, fold) != _case_key(d2, fold):
+        return False  # distinct literal directories → no common file
+    if fold:
+        b1, b2 = b1.casefold(), b2.casefold()
+    p1, p2 = _glob_literal_prefix(b1), _glob_literal_prefix(b2)
+    if not (p1.startswith(p2) or p2.startswith(p1)):
+        return False  # incompatible fixed prefixes → no common basename
+    s1, s2 = _glob_literal_suffix(b1), _glob_literal_suffix(b2)
+    if not (s1.endswith(s2) or s2.endswith(s1)):
+        return False  # incompatible fixed suffixes → no common basename
+    return True  # fail-closed: cannot prove disjoint → treat as overlap
+
+
 def _files_overlap(a: ConflictProfile, b: ConflictProfile) -> tuple[bool, list[str]]:
     """Return (overlap, reasons). Overlap is conservative/fail-closed: an
     indeterminate file set on EITHER side counts as overlap (cannot prove
@@ -557,6 +617,18 @@ def _files_overlap(a: ConflictProfile, b: ConflictProfile) -> tuple[bool, list[s
         hits = sorted(orig for k, orig in a_concrete.items() if fnmatch.fnmatch(k, pk))
         if hits:
             reasons.append(f"{b.task_id} glob {patt!r} matches {a.task_id} files {hits}")
+
+    # glob ∩ glob (sw-coord-p53 fail-open fix / p51 finding ①): two globs that cannot be PROVEN
+    # disjoint both lay claim to a future file → fail-closed overlap. The old gate compared
+    # glob-vs-concrete ONLY, so a pair like ``src/foo*.py`` vs ``src/*_new.py`` (concrete expansions
+    # disjoint TODAY, yet both match a future ``src/foo_new.py``) slipped through as SAFE-PARALLEL.
+    for pa in sorted(a.glob_patterns):
+        for pb in sorted(b.glob_patterns):
+            if _globs_may_intersect(pa, pb, fold):
+                reasons.append(
+                    f"{a.task_id} glob {pa!r} may overlap {b.task_id} glob {pb!r} "
+                    f"(cannot prove disjoint → fail-closed)"
+                )
 
     return (bool(reasons), reasons)
 
