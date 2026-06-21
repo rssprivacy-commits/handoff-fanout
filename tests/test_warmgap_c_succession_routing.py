@@ -34,12 +34,14 @@ from handoff_fanout import spawner_focus as _spawner_focus
 from handoff_fanout.spawn_lock import project_spawn_lock
 
 # The REAL resolver, captured at import BEFORE the conftest autouse ``neutralize_spawner_self_report``
-# pins it to None per-test. spawn-unification Step 1 keeps audit-close succession's EXPLICIT resolve
-# Tier-2-only (``derive_singlepane_focus``) — byte-equivalent to HEAD; the §F.1 convergence onto the
-# shared Tier-1-first ``resolve_spawner_focus_path`` is DEFERRED to Step 2. But ``run_spawn``'s
-# pre-existing Tier-1 fallback (and the new tightening-only project-bind) still go through the real
-# resolver, so the succession-MISS tests below must restore it (mirrors test_spawn_fresh._REAL_RESOLVE
-# / test_spawner_focus._REAL_RESOLVE) to exercise the genuine HEAD path instead of the None mock.
+# pins it to None per-test. spawn-unification Step 2 (§F.1) CONVERGED audit-close succession onto the
+# SHARED Tier-1-first ``resolve_spawner_focus_path``: ``_succession_relay`` now passes the predecessor
+# task as ``run_spawn(self_task=…)`` and lets run_spawn's single resolver place the anchor — the old
+# Tier-2-only ``derive_singlepane_focus`` at the audit-close site is gone. The succession focus tests
+# below therefore restore the real resolver (mirrors test_spawn_fresh._REAL_RESOLVE /
+# test_spawner_focus._REAL_RESOLVE) so they exercise the genuine resolver path, not the conftest None
+# mock. (The conftest ALSO pins Tier-3 ``_derive_self_from_session`` OFF, so these tests see only the
+# Tier-1/Tier-2 resolution — no machine ~/.claude-handoff scan.)
 _REAL_RESOLVE = _spawner_focus.resolve_spawner_focus_path
 
 PROJECT = "demo-proj"
@@ -394,14 +396,27 @@ def test_succession_predecessor_done_write_failure_is_fail_open(
 
 
 def test_succession_self_report_writes_spawner_focus_to_uri(tmp_path, monkeypatch, notify_calls):
-    """djs-jump-return Part A: when the PREDECESSOR coordinator's singlepane workspace file
-    exists, the succession spawn writes ``SPAWNER_FOCUS=<predecessor workspace>`` into the
-    successor .uri — DERIVED from ``--self-task`` (no env channel). The watchdog/code-router
-    focus-jumps the new coordinator window to the PREDECESSOR's desktop (not project-mapped)."""
+    """djs-jump-return Part A (now via §F.1 Tier-1-first resolver): when the PREDECESSOR coordinator's
+    singlepane workspace file exists and the closing coordinator is NOT in a same-project worktree cwd,
+    the succession spawn writes ``SPAWNER_FOCUS=<predecessor workspace>`` into the successor .uri —
+    resolved Tier-2 from the predecessor ``--self-task`` via run_spawn's shared resolver. The
+    watchdog/code-router focus-jumps the new coordinator window to the PREDECESSOR's desktop.
+
+    spawn-unification Step 2: succession focus resolution now flows through
+    ``resolve_spawner_focus_path`` (``run_spawn(self_task=predecessor_task)``), which the conftest
+    autouse pins to None — so this restores the real resolver (like the sibling Tier-1/MISS guards).
+    Tier-3 ``_derive_self_from_session`` stays conftest-neutralized; cwd is a plain dir (no workspace,
+    not under worktrees_root) so Tier-1 misses and Tier-2 (predecessor sidecar) is the path under test."""
+    import os as _os
+
+    monkeypatch.setattr(_spawner_focus, "resolve_spawner_focus_path", _REAL_RESOLVE)
     home = _home(tmp_path, monkeypatch)
     ws = _git_repo(tmp_path)
     _forge_predecessor_sidecar(home)
     pred_ws = _forge_predecessor_workspace(home)
+    plain_cwd = tmp_path / "plain-cwd"  # no .handoff.code-workspace, not under worktrees_root → Tier-1 miss
+    plain_cwd.mkdir()
+    monkeypatch.chdir(plain_cwd)
 
     rc = codex_audit.main_audit_close(_close_argv(ws))
 
@@ -409,8 +424,6 @@ def test_succession_self_report_writes_spawner_focus_to_uri(tmp_path, monkeypatc
     uri_text = (home / PROJECT / "queue" / f"{TASK}.uri").read_text()
     # the SPAWNER_FOCUS line points at the predecessor's OWN workspace (realpath-normalized
     # by the shared validate_spawner_focus gate the produce site re-runs)
-    import os as _os
-
     assert f"SPAWNER_FOCUS={_os.path.realpath(str(pred_ws))}\n" in uri_text
     # still the SUCCESSOR's real-repo workspace + succession sidecar (no regression)
     assert f"WORKSPACE={ws}" in uri_text
@@ -421,9 +434,12 @@ def test_succession_self_report_writes_spawner_focus_to_uri(tmp_path, monkeypatc
 def test_succession_no_predecessor_workspace_omits_spawner_focus_byte_compat(
     tmp_path, monkeypatch, notify_calls
 ):
-    """字节级向后兼容红线: a succession whose predecessor has NO singlepane workspace file
-    (bootstrap leg / file gone) derives None → the .uri carries NO SPAWNER_FOCUS line, exactly
-    like before this feature. Fail-open to today's per-project goto, zero regression."""
+    """FAIL-OPEN floor (字节级向后兼容红线): a succession whose predecessor has NO singlepane workspace
+    file (bootstrap leg / file gone) and whose shared resolver finds nothing → the .uri carries NO
+    SPAWNER_FOCUS line, falling open to today's per-project goto, zero regression. The conftest autouse
+    keeps both ``resolve_spawner_focus_path`` and the Tier-3 seam neutralized (None), so this pins the
+    omit floor when every tier misses (the un-neutralized Tier-1/MISS guards above cover the resolve
+    paths)."""
     home = _home(tmp_path, monkeypatch)
     ws = _git_repo(tmp_path)
     _forge_predecessor_sidecar(home)
@@ -437,93 +453,93 @@ def test_succession_no_predecessor_workspace_omits_spawner_focus_byte_compat(
     assert f"WORKSPACE={ws}" in uri_text
 
 
-def test_succession_stays_tier2_only_even_when_cwd_has_workspace(
-    tmp_path, monkeypatch, notify_calls
-):
-    """REGRESSION (sw-spawn-unify-s1fix) — the divergence the neutralized 'symmetric' test MISSED:
-    audit-close succession resolves SPAWNER_FOCUS via Tier-2 ONLY (``derive_singlepane_focus`` keyed on
-    the predecessor's ``--self-task``), NOT the shared Tier-1-first ``resolve_spawner_focus_path`` that
-    spawn/dump use. Even when the cwd is a worktree-like dir carrying its OWN valid
-    ``.handoff.code-workspace`` — exactly the bait a Tier-1-first resolver WOULD grab — the produced
-    ``.uri`` must point at the PREDECESSOR singlepane workspace, byte-identical to the pre-unification
-    behavior.
+def test_succession_tier1_cwd_wins_over_predecessor_f1(tmp_path, monkeypatch, notify_calls):
+    """§F.1 INTENDED BEHAVIOR CHANGE (spawn-unification Step 2 — this REPLACES the Step-1 guard
+    ``test_succession_stays_tier2_only_even_when_cwd_has_workspace``): audit-close succession now
+    resolves SPAWNER_FOCUS through the SHARED Tier-1-first ``resolve_spawner_focus_path`` (via
+    ``run_spawn(self_task=predecessor_task)``), symmetric with spawn/dump — NOT the old Tier-2-only
+    ``derive_singlepane_focus``. So when the CLOSING coordinator runs from a same-project worktree cwd
+    carrying its OWN valid ``.handoff.code-workspace`` AND a predecessor singlepane sidecar ALSO exists,
+    Tier-1 (the cwd workspace = the worktree coordinator's REAL location) now WINS over the predecessor
+    sidecar. Correct intent: the successor should land where the closing coordinator actually IS.
 
-    The REAL resolver is restored (the conftest autouse neutralizes it to ``None``) so a regression to
-    the Tier-1-first path would REALLY pick the cwd workspace and fail this assertion — the genuine
-    guard the mock-resolver 'symmetric' test could not provide. Closing the §F.1 / design §8.6 asymmetry
-    (audit-close ALSO trying Tier-1) is a DEFERRED behavior-change step, not warn-mode Step 1."""
+    This is NOT a regression — it is the §F.1 / design §8.6 «audit-close also tries Tier-1» convergence
+    that Step 1 deferred (own equivalence guard + canary). The real resolver is restored (conftest
+    autouse neutralizes it); Tier-3 ``_derive_self_from_session`` stays neutralized — irrelevant here,
+    Tier-1 resolves first."""
     import os as _os
 
     home = _home(tmp_path, monkeypatch)
     ws = _git_repo(tmp_path)
     _forge_predecessor_sidecar(home)
-    pred_ws = _forge_predecessor_workspace(home)  # the Tier-2 target (predecessor singlepane workspace)
+    pred_ws = _forge_predecessor_workspace(home)  # Tier-2 target — now LOSES to Tier-1 (the §F.1 flip)
 
-    # Un-neutralize the resolver (shared module object → covers codex_audit / spawn / dump) so a
-    # Tier-1-first regression actually runs and would grab the bait below.
+    # Un-neutralize the resolver (shared module object → covers codex_audit / spawn / dump) so the real
+    # Tier-1-first path runs.
     monkeypatch.setattr(_spawner_focus, "resolve_spawner_focus_path", _REAL_RESOLVE)
 
-    # The Tier-1 BAIT: a worktree-like cwd UNDER this project's worktrees_root carrying its OWN valid
-    # .handoff.code-workspace. A Tier-1-first resolver would grab THIS (it even passes the new
-    # project-binding check, being under worktrees_root(PROJECT)); the correct Tier-2-only path IGNORES it.
-    bait_cwd = home / PROJECT / "worktrees" / "bait-coord"
-    bait_cwd.mkdir(parents=True)
-    bait_ws = bait_cwd / ".handoff.code-workspace"
-    bait_ws.write_text("{}")
-    monkeypatch.chdir(bait_cwd)
+    # A same-project worktree cwd UNDER worktrees_root(PROJECT) carrying its OWN valid
+    # .handoff.code-workspace — the worktree coordinator's REAL location. Tier-1-first grabs THIS (it
+    # passes the project-binding check, being under worktrees_root(PROJECT)).
+    wt_cwd = home / PROJECT / "worktrees" / "closing-coord"
+    wt_cwd.mkdir(parents=True)
+    wt_ws = wt_cwd / ".handoff.code-workspace"
+    wt_ws.write_text("{}")
+    monkeypatch.chdir(wt_cwd)
 
     rc = codex_audit.main_audit_close(_close_argv(ws))
     assert rc == 0
 
     uri_text = (home / PROJECT / "queue" / f"{TASK}.uri").read_text()
-    # Tier-2 wins: SPAWNER_FOCUS = the PREDECESSOR singlepane workspace (byte-identical to pre-unify).
-    assert f"SPAWNER_FOCUS={_os.path.realpath(str(pred_ws))}\n" in uri_text
-    # and NEVER the cwd workspace (the Tier-1 bait) — that's the divergence the reverted P1 prevents.
-    assert _os.path.realpath(str(bait_ws)) not in uri_text
+    # §F.1: Tier-1 (cwd worktree workspace) WINS — successor lands where the closing coordinator is.
+    assert f"SPAWNER_FOCUS={_os.path.realpath(str(wt_ws))}\n" in uri_text
+    # and NO LONGER the predecessor singlepane sidecar (the Tier-2 target the old Step-1 guard asserted).
+    assert _os.path.realpath(str(pred_ws)) not in uri_text
 
 
 def test_succession_miss_from_worktree_cwd_matches_head_tier1_fallback(
     tmp_path, monkeypatch, notify_calls
 ):
-    """TRUE GUARD (sw-spawn-unify-s1fix2) — the un-neutralized COMPLEMENT of the neutralized
-    ``test_succession_no_predecessor_workspace_omits_spawner_focus_byte_compat``: it pins the OTHER
-    half of the Step-1 byte-equivalence contract — the succession MISS path.
+    """TRUE GUARD (sw-spawn-unify-s1fix2 → kept through §F.1 / Step 2) — the un-neutralized COMPLEMENT
+    of the neutralized ``test_succession_no_predecessor_workspace_omits_spawner_focus_byte_compat``: it
+    pins the succession MISS-of-predecessor-workspace path STILL resolving Tier-1 via run_spawn after
+    the §F.1 convergence.
 
-    When the predecessor has NO singlepane workspace file, ``_succession_relay``'s Tier-2-only
-    ``derive_singlepane_focus`` returns ``None`` → ``run_spawn`` is called with ``spawner_focus_path=None``
-    (and no ``self_task``). ``run_spawn``'s OWN pre-existing fallback then fires:
-    ``if spawner_focus is None: resolve_spawner_focus_path(os.getcwd(), …, self_task=None)``. That Tier-1
-    branch is UNCHANGED from HEAD — this Step only ADDED the ``log_anchor_miss`` telemetry call BELOW it
-    (verified: ``git diff HEAD -- src/handoff_fanout/spawn.py`` touches only the additive miss-log). With
-    ``self_task=None`` Tier-2 is skipped, so Tier-1 grabs the CWD's own ``.handoff.code-workspace`` when
-    the cwd is a same-project worktree under ``worktrees_root(PROJECT)``. A succession closed FROM such a
-    worktree cwd therefore emits ``SPAWNER_FOCUS=<cwd workspace>`` — exactly HEAD's pre-existing behavior.
+    When the predecessor has NO singlepane workspace file, the Tier-2 leg
+    (``derive_singlepane_focus(home, PROJECT, predecessor_task)``) misses. Under §F.1 (Step 2),
+    ``_succession_relay`` no longer resolves explicitly — it passes ``self_task=predecessor_task`` to
+    ``run_spawn``, whose shared ``resolve_spawner_focus_path(os.getcwd(), …, self_task=predecessor_task)``
+    tries Tier-1 FIRST: the cwd's own ``.handoff.code-workspace`` when the cwd is a same-project worktree
+    under ``worktrees_root(PROJECT)``. So a succession closed FROM such a worktree cwd emits
+    ``SPAWNER_FOCUS=<cwd workspace>`` — same OUTPUT as HEAD's pre-existing run_spawn Tier-1 fallback (the
+    mechanism moved from «derive→None→run_spawn fallback (self_task=None)» to «run_spawn shared resolver
+    (self_task=predecessor_task), Tier-1 wins», but the resolved anchor is identical for this case).
 
     Why the neutralized sibling can't cover this: the conftest autouse pins ``resolve_spawner_focus_path``
-    to ``None``, so that test only ever asserts the omit and never exercises the real run_spawn Tier-1
-    fallback (its cwd is pytest's tmp dir with no workspace file anyway). Here the REAL resolver is
-    restored (mirroring ``test_succession_stays_tier2_only_even_when_cwd_has_workspace`` above), so the
-    genuine HEAD code path runs and the MISS resolves through Tier-1, not the mock.
+    to ``None``, so that test only ever asserts the omit and never exercises the real Tier-1 resolution
+    (its cwd is pytest's tmp dir with no workspace file anyway). Here the REAL resolver is restored
+    (mirroring ``test_succession_tier1_cwd_wins_over_predecessor_f1`` above; Tier-3
+    ``_derive_self_from_session`` stays conftest-neutralized), so the genuine code path runs and the MISS
+    resolves through Tier-1.
 
-    ADVERSARIAL SELF-PROOF: if a future step (GAP §F.1 / design §8.6 — «audit-close also tries Tier-1»,
-    the deferred asymmetry-closure) removes or rewires ``run_spawn``'s ``if spawner_focus is None``
-    Tier-1 fallback, this assertion flips (SPAWNER_FOCUS vanishes or changes) and the test fails LOUDLY,
-    pointing at the exact line that moved. That is the Step-1 baseline lock this guard exists to provide.
+    ADVERSARIAL SELF-PROOF: if a future change removes ``run_spawn``'s ``if spawner_focus is None``
+    resolution or the Tier-1 branch, this assertion flips (SPAWNER_FOCUS vanishes or changes) and the
+    test fails LOUDLY, pointing at the exact line that moved — the baseline lock this guard provides.
     """
     import os as _os
 
     home = _home(tmp_path, monkeypatch)
     ws = _git_repo(tmp_path)
     _forge_predecessor_sidecar(home)  # succession ROUTE fires (resolvable predecessor nonce) …
-    # … but DELIBERATELY no predecessor workspace file → derive_singlepane_focus → None → the MISS.
+    # … but DELIBERATELY no predecessor workspace file → Tier-2 derive_singlepane_focus → None → the MISS.
 
-    # Un-neutralize the shared resolver (mirrors test_succession_stays_tier2_only_…) so run_spawn's
-    # pre-existing Tier-1 fallback REALLY runs instead of the conftest autouse's None stub.
+    # Un-neutralize the shared resolver (mirrors test_succession_tier1_cwd_wins_over_predecessor_f1) so
+    # run_spawn's Tier-1-first resolution REALLY runs instead of the conftest autouse's None stub.
     monkeypatch.setattr(_spawner_focus, "resolve_spawner_focus_path", _REAL_RESOLVE)
 
     # The cwd is a same-project worktree carrying its OWN valid .handoff.code-workspace, UNDER
     # worktrees_root(PROJECT) so the Tier-1 project-binding check (_tier1_cwd_belongs_to_project)
-    # passes — this is the anchor HEAD's run_spawn fallback resolves when the predecessor WS is absent.
+    # passes — the anchor run_spawn's Tier-1-first resolver grabs when the predecessor WS is absent.
     wt_cwd = home / PROJECT / "worktrees" / "miss-coord"
     wt_cwd.mkdir(parents=True)
     wt_ws = wt_cwd / ".handoff.code-workspace"

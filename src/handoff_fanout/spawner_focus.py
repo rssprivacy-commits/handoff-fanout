@@ -129,6 +129,107 @@ def _tier1_cwd_belongs_to_project(rp: str, *, cfg: _config.Config, project: str 
     return rp == root or rp.startswith(root + os.sep)
 
 
+# ── spawn-unification Step 2 / Tier-3 SESSION IDENTITY (2026-06-22 / sw-su-step2) ────────────────
+# The rf/sf wrong-desktop root cause: a coordinator dispatches a worker (``handoff dump --status
+# active`` / ``handoff spawn``) but supplies NEITHER an explicit ``--spawner-focus-path`` NOR a
+# ``--self-task``, and its cwd is the shared repo root (not a same-project worktree) → Tier-1 AND
+# Tier-2 both miss → the .uri omits SPAWNER_FOCUS → code-router.sh falls back to the stale static
+# desktop map → wrong desktop. dx-spawn-session.sh already auto-derives ``--self-task`` for ITS paths,
+# but the direct ``handoff dump --status active`` / ERP / skills paths do not pass through it. Closing
+# the gap IN THE ENGINE makes every produce path reliable regardless of which (or no) wrapper invoked
+# it (design §8.6 Step 2 «收编中央 producer»). Reuses the SHARED ``dx_session_role`` resolver — the
+# single cross-consumer identity source (memory-guard / coord-guard / dx-spawn all consume it) — rather
+# than building a 2nd identity mechanism. STRICTLY ADDITIVE + FAIL-OPEN (warn-mode: best-effort, never
+# blocks; Step 4 later flips a still-unresolved miss to fail-closed).
+#
+# HONEST SCOPE (sw-su-s2fix 2026-06-22): Tier-3 honors ONLY a ``definite``-confidence supervisor (the
+# worktree marker / worktree sidecar / env role — same conservative predicate coord-guard.py uses),
+# REJECTING the resolver's ``suspected`` singlepane-sidecar identity (whose cwd = the shared repo root is
+# indistinguishable from the owner's everyday session → trusting it risks a REAL-BUT-WRONG anchor). So a
+# SINGLEPANE coordinator dispatching from the repo root is NOT closed by Tier-3 (it resolves to owner/none
+# or supervisor/suspected → both rejected → still MISSES). The fallback-to-0 goal is met by Tier-3
+# (definite-identifiable coordinators) AND Step 4's fail-closed (force singlepane to pass ``--self-task``,
+# i.e. Tier-2) TOGETHER — Tier-3 does NOT, and must not, close the singlepane gap by trusting a suspected
+# identity. See ``_derive_self_from_session`` for the gate.
+
+
+def _load_session_role_resolver():
+    """Load the shared ``dx_session_role.resolve_session_role`` callable via robust importlib, or
+    ``None`` (FAIL-OPEN). Path: ``$DX_SESSION_ROLE_PATH`` override, else
+    ``~/.claude/scripts/dx_session_role.py`` — the SAME file dx-spawn-session.sh loads (single identity
+    source, 不各造身份机制). Any absent file / import error → ``None`` so the caller fail-opens. The
+    module is loaded fresh per call (cheap on the once-per-spawn produce path; avoids a stale resolver
+    surviving a redeploy) and NEVER raises."""
+    path = os.environ.get("DX_SESSION_ROLE_PATH") or os.path.expanduser(
+        "~/.claude/scripts/dx_session_role.py"
+    )
+    if not os.path.isfile(path):
+        return None
+    try:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("_dx_session_role_engine", path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return getattr(mod, "resolve_session_role", None)
+    except Exception:
+        return None
+
+
+def _derive_self_from_session(cwd: str | os.PathLike[str]) -> tuple[str, str] | None:
+    """Return the DISPATCHING coordinator's OWN ``(project, task)`` from the shared session-role
+    resolver, or ``None`` (FAIL-OPEN). Only a ``definite``-confidence ``supervisor`` carrying both
+    ``task`` and ``project`` is honored; everything else → ``None``. NEVER raises.
+
+    CONFIDENCE GATE (sw-su-s2fix 2026-06-22): the shared ``dx_session_role`` resolver tags every
+    identity ``definite`` | ``suspected``. A ``supervisor`` is ``definite`` ONLY when it is grounded in a
+    confident signal — the worktree 🧭中枢 ``window.title`` marker, a worktree ``.singlepane`` sidecar, or
+    an explicit ``HANDOFF_SESSION_ROLE`` env. A singlepane coordinator scanned by cwd, by contrast, is
+    returned ``supervisor / suspected / singlepane-sidecar`` because its cwd (the shared repo root) is
+    INDISTINGUISHABLE from the owner's everyday session at the same cwd (resolver docstring §3) — a
+    UNIQUE sidecar match there is still only weak cwd evidence. Honoring such a ``suspected`` identity
+    would let Tier-3 resolve a REAL-BUT-WRONG workspace (anchor the worker to the wrong desktop). So we
+    accept ONLY ``confidence == "definite"`` — the SAME conservative predicate ``coord-guard.py`` uses to
+    decide whether a session is confidently a coordinator (``role == "supervisor" and confidence ==
+    "definite"``). worker / owner / solo / ambiguous (resolver returns ``None`` task for a ≥2-coordinator
+    scan — uniqueness-or-fail) / contradiction / and now ``suspected`` supervisor all → ``None``.
+
+    HONEST SCOPE (warn-mode Step 2): this makes Tier-3 a BEST-EFFORT closer that fires ONLY for a
+    DEFINITE-identifiable coordinator — a worktree-marker coordinator, or one carrying the env role.
+    A SINGLEPANE coordinator dispatching from the shared repo root resolves to ``owner/none`` (or
+    ``supervisor/suspected`` when a sidecar uniquely matches), and BOTH are rejected here → Tier-3 does
+    NOT fire → that singlepane dispatch still MISSES (omits ``SPAWNER_FOCUS``, falls back to the static
+    desktop map). Closing the singlepane miss needs an explicit ``--self-task`` (Tier-2) or Step 4's
+    fail-closed «force singlepane to pass ``--self-task``» — Tier-3 does not (and must not) close it by
+    trusting a suspected identity. This is the deliberate boundary, not a defect.
+
+    ⚠️ ``cfg.home`` caveat: the shared resolver scans ``~/.claude-handoff`` for its singlepane track
+    (it does not honor ``$HANDOFF_HOME``); the deployed install pins ``HANDOFF_HOME=~/.claude-handoff``
+    so PROD ``cfg.home`` matches. Either way the returned identity is RE-GROUNDED by the caller's
+    :func:`derive_singlepane_focus(home=cfg.home, …)` (which DOES use the passed home), so an identity
+    with no sidecar under ``cfg.home`` resolves no workspace → ``None`` → no mis-jump. This seam is a
+    module-level function so the test suite can neutralize it for hermeticity (conftest autouse)."""
+    resolver = _load_session_role_resolver()
+    if resolver is None:
+        return None
+    try:
+        res = resolver(str(cwd))
+    except Exception:
+        return None
+    if not isinstance(res, dict):
+        return None
+    if (
+        res.get("role") == "supervisor"
+        and res.get("confidence") == "definite"
+        and res.get("task")
+        and res.get("project")
+    ):
+        return (str(res["project"]), str(res["task"]))
+    return None
+
+
 def resolve_spawner_focus_path(
     cwd: str | os.PathLike[str],
     *,
@@ -138,18 +239,26 @@ def resolve_spawner_focus_path(
     self_task: str | None = None,
 ) -> str | None:
     """Return the SPAWNING coordinator's OWN ``.handoff.code-workspace`` realpath (validated through
-    :func:`validate_spawner_focus`, the single security boundary), or ``None``. Two env-independent
-    tiers; NEVER raises (fail-open → caller omits ``SPAWNER_FOCUS`` and the existing goto stands):
+    :func:`validate_spawner_focus`, the single security boundary), or ``None``. THREE env-independent
+    tiers, tried in order; NEVER raises (fail-open → caller omits ``SPAWNER_FOCUS`` and the existing
+    goto stands):
 
       * Tier 1 — WORKTREE: ``<cwd>/.handoff.code-workspace`` (a worktree coordinator always carries one;
         the engine creates worktrees under ``cfg.home/<project>/worktrees`` = an allowed root). The
         resolved candidate must ALSO belong to the target ``project`` (:func:`_tier1_cwd_belongs_to_project`)
         — a cross-project worktree cwd is dropped so it can't mis-resolve another project's workspace.
-      * Tier 2 — SINGLEPANE: :func:`derive_singlepane_focus(home, project, self_task)` → the REAL engine
-        sidecar ``<home>/<proj>/singlepane/<self_task>.handoff.code-workspace`` (the identity a singlepane
-        window can't read from cwd — its cwd is the shared repo root). Requires ``home``/``project``/
-        ``self_task`` (the spawner's OWN task, self-reported via ``--self-task``). Project-bound by
-        construction (the path is built FROM ``project``), so it needs no extra binding check.
+      * Tier 2 — SINGLEPANE (explicit): :func:`derive_singlepane_focus(home, project, self_task)` → the
+        REAL engine sidecar ``<home>/<proj>/singlepane/<self_task>.handoff.code-workspace`` (the identity
+        a singlepane window can't read from cwd — its cwd is the shared repo root). Requires ``home``/
+        ``project``/``self_task`` (the spawner's OWN task, self-reported via ``--self-task``). Project-
+        bound by construction (the path is built FROM ``project``), so it needs no extra binding check.
+      * Tier 3 — SESSION IDENTITY (spawn-unification Step 2): when the dispatcher passed no ``--self-task``
+        and cwd is not a same-project worktree, auto-derive the coordinator's OWN ``(project, task)`` from
+        the shared session-role resolver (:func:`_derive_self_from_session`) and rebuild ITS singlepane
+        workspace. BEST-EFFORT: honors ONLY a ``definite``-confidence coordinator (worktree marker / env
+        role); a SINGLEPANE coordinator from the repo root is ``suspected`` and is REJECTED (real-but-wrong
+        guard), so Tier-3 does NOT close the singlepane miss — that needs explicit ``--self-task`` (Tier-2)
+        / Step 4 fail-closed. Requires only ``home``.
 
     Each candidate is re-validated by ``validate_spawner_focus`` (realpath + ``.handoff.code-workspace``
     suffix + allowed-root) before return, so a path outside the trusted roots is dropped (``None``),
@@ -165,6 +274,23 @@ def resolve_spawner_focus_path(
             rp = validate_spawner_focus(sidecar_ws, cfg=cfg)
             if rp:
                 return rp
+    # Tier 3 — SESSION IDENTITY (spawn-unification Step 2): neither an explicit anchor, a same-project
+    # worktree cwd (Tier-1), nor a ``--self-task`` (Tier-2) resolved — the rf/sf root cause «协调员 dump
+    # 一个 worker 却没带中枢身份». Auto-derive the DISPATCHING coordinator's OWN ``(project, task)`` from
+    # the shared session-role resolver and reconstruct ITS singlepane workspace. Uses the coordinator's
+    # OWN project (from the resolver, NOT the target ``project``), so a cross-project dispatch resolves
+    # too. ``derive_singlepane_focus`` re-grounds the identity against ``home`` (= cfg.home) before the
+    # SAME validate gate, so a foreign/stale identity with no sidecar under this home → ``None``. The
+    # ``_derive_self_from_session`` seam is module-level (conftest neutralizes it for suite hermeticity).
+    if home:
+        derived = _derive_self_from_session(cwd)
+        if derived:
+            coord_project, coord_task = derived
+            sidecar_ws = derive_singlepane_focus(home, coord_project, coord_task)
+            if sidecar_ws:
+                rp = validate_spawner_focus(sidecar_ws, cfg=cfg)
+                if rp:
+                    return rp
     return None
 
 

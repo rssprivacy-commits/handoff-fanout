@@ -48,7 +48,6 @@ from handoff_fanout import atomic
 from handoff_fanout import config as _config
 from handoff_fanout import handoff_precheck as _pc
 from handoff_fanout import memory_baseline as _memory_baseline
-from handoff_fanout import spawner_focus as _spawner_focus
 from handoff_fanout import succession_authority as _authority
 from handoff_fanout import worktree as _worktree
 
@@ -2226,32 +2225,26 @@ def _succession_relay(
     )
     from handoff_fanout import spawn as _spawn
 
-    # SELF-REPORT desktop jump (djs-jump-return 2026-06-14): make the successor coordinator
-    # window be BORN on the PREDECESSOR coordinator's desktop (not the project-mapped one) by
-    # writing its own workspace path as ``SPAWNER_FOCUS=`` in the worker .uri → the watchdog's
-    # code-router focus-jumps there. The path is DERIVED from the predecessor's self-reported task
-    # (``--self-task``), NOT the env channel p19 proved dead on a panel-spawned singlepane window.
-    # ``derive_singlepane_focus`` returns None for a bootstrap leg (no engine singlepane file) and
-    # ``run_spawn`` re-validates through the SAME ``validate_spawner_focus`` gate, so an absent/odd
-    # value simply fail-opens to today's per-project goto (byte-identical .uri). predecessor_task is
-    # None only on a path that never reaches here with a nonce — defensive.
+    # SELF-REPORT desktop jump (djs-jump-return 2026-06-14 → spawn-unification §F.1 2026-06-22): make the
+    # successor coordinator window be BORN on the PREDECESSOR coordinator's ACTUAL desktop. We pass the
+    # predecessor's self-reported task (``--self-task``, carried here as ``predecessor_task``) as
+    # ``run_spawn``'s ``self_task`` and let run_spawn resolve the anchor through the SHARED Tier-1-first
+    # ``resolve_spawner_focus_path`` — the SAME resolver spawn.py / dump.py use (design §8.6 / GAP §F.1:
+    # audit-close converges onto the symmetric resolver instead of its old Tier-2-only
+    # ``derive_singlepane_focus``). run_spawn re-validates every candidate through the SAME
+    # ``validate_spawner_focus`` gate; an unresolvable anchor fail-opens to today's per-project goto AND
+    # records the anchor-miss telemetry. predecessor_task is None only on a bootstrap path that never
+    # reaches here with a nonce — run_spawn then resolves via Tier-1/Tier-3 alone (defensive).
     #
-    # spawn-unification Step 1 (2026-06-22 / sw-spawn-unify-s1fix): this site stays Tier-2-ONLY
-    # (``derive_singlepane_focus``) — NOT the shared Tier-1-first ``resolve_spawner_focus_path`` that
-    # spawn.py / dump.py use. Converging audit-close onto the symmetric resolver so it ALSO tries
-    # Tier-1 (cwd ``.handoff.code-workspace``) — design §8.6 / GAP §F.1 «audit-close also tries
-    # Tier-1» — is a REAL behavior change, NOT zero-behavior warn-mode: running audit-close from any
-    # worktree cwd that carries a ``.handoff.code-workspace`` while a predecessor sidecar also exists
-    # would make the new ``.uri`` point at the cwd workspace where the old one points at the
-    # predecessor sidecar. That asymmetry-closure is therefore DEFERRED to its own dedicated step
-    # (which carries its own byte-equivalence audit + canary); Step 1 is observe-only. Keeping this
-    # Tier-2-only is byte-identical to the pre-unification succession ``.uri``. (The anchor-miss
-    # telemetry is unchanged: ``run_spawn`` still records a miss when ITS own resolution yields None.)
-    spawner_focus_path = (
-        _spawner_focus.derive_singlepane_focus(home, project, predecessor_task)
-        if predecessor_task
-        else None
-    )
+    # §F.1 INTENDED BEHAVIOR CHANGE (Step 2 — no longer byte-identical to pre-unification HEAD; carries
+    # its own equivalence guard + canary, NOT a regression): when audit-close runs from a worktree cwd
+    # that carries its OWN ``.handoff.code-workspace`` AND a predecessor sidecar ALSO exists, Tier-1-first
+    # now picks the cwd workspace where the old Tier-2-only path picked the predecessor sidecar. This is
+    # MORE correct — the successor should land where the CLOSING coordinator ACTUALLY is: a worktree
+    # coordinator = its cwd workspace (Tier-1); a singlepane coordinator = the predecessor sidecar
+    # (Tier-2, because its repo-root cwd isn't under worktrees_root so Tier-1 is project-bind-dropped).
+    # Tier-1-first covers BOTH. The succession MISS path (no predecessor workspace) still resolves Tier-1
+    # via run_spawn, exactly as HEAD did.
     spawn_rc = _spawn.run_spawn(
         project=project,
         task=successor_task,
@@ -2261,7 +2254,7 @@ def _succession_relay(
         prompt=prompt_text,
         succession_token=str(token_path),
         predecessor_nonce=predecessor_nonce,
-        spawner_focus_path=spawner_focus_path,
+        self_task=predecessor_task,
     )
     if spawn_rc != 0:
         # codex MUST#5: the remedy depends on whether the spawn burned the token —

@@ -111,6 +111,10 @@ def test_derive_returns_none_on_empty_identity(isolated_handoff_home, project, t
 # winlist here). Captured BEFORE the conftest autouse neutralizes the public name, so these tests hit
 # the real implementation (dump/spawn see the neutralized None — suite hermeticity).
 _REAL_RESOLVE = spawner_focus.resolve_spawner_focus_path
+# spawn-unification Step 2: the real Tier-3 seam, captured before the conftest autouse pins it to None,
+# so the seam's OWN tests (which load a stub resolver from $DX_SESSION_ROLE_PATH) exercise the genuine
+# implementation rather than the neutralize stub.
+_REAL_DERIVE_SELF = spawner_focus._derive_self_from_session
 
 
 def _worktree_cwd(home: Path, project: str = "erp-system", task: str = "erp-dev-coord-33") -> Path:
@@ -275,3 +279,233 @@ def test_log_anchor_miss_is_non_blocking_on_unwritable_home(tmp_path):
     spawner_focus.log_anchor_miss(
         home=bogus_home, project="p", task="t", cwd="/c", isolation="x", reason="r",
     )
+
+
+# ─── Tier 3 SESSION IDENTITY (spawn-unification Step 2 / sw-su-step2) ────────────────────────────────
+# When no explicit anchor, no same-project worktree cwd (Tier-1), and no --self-task (Tier-2) resolved,
+# the engine recovers the DISPATCHING coordinator's OWN (project, task) from the shared session-role
+# resolver (``_derive_self_from_session``) and rebuilds ITS singlepane workspace. This closes the rf/sf
+# wrong-desktop root cause for every produce path uniformly (a coordinator that forgot --self-task still
+# emits SPAWNER_FOCUS). The conftest autouse pins the seam to None for hermeticity; these tests re-set it
+# to a controlled identity (Tier-3 RESOLVE tests) or exercise the real seam via $DX_SESSION_ROLE_PATH.
+
+
+def test_resolve_focus_tier3_session_identity(isolated_handoff_home, monkeypatch):
+    """Tier-1 (cwd) + Tier-2 (no self_task) both miss → Tier-3 derives the coordinator's (project, task)
+    from the session resolver and resolves ITS singlepane sidecar workspace."""
+    home = isolated_handoff_home
+    coord_ws = home / "rakeforge" / "singlepane" / "rf-coord-3.handoff.code-workspace"
+    coord_ws.parent.mkdir(parents=True)
+    coord_ws.write_text("{}")
+    monkeypatch.setattr(
+        spawner_focus, "_derive_self_from_session", lambda cwd: ("rakeforge", "rf-coord-3")
+    )
+    plain = home / "shared-repo-root"  # repo-root cwd: no workspace, not a worktree → Tier-1 miss
+    plain.mkdir()
+    got = _REAL_RESOLVE(plain, cfg=_config.load(), home=home, project="rakeforge")
+    assert got == os.path.realpath(str(coord_ws))
+
+
+def test_resolve_focus_tier3_uses_coordinator_project_not_target(isolated_handoff_home, monkeypatch):
+    """Tier-3 rebuilds the workspace under the COORDINATOR's OWN project (from the resolver), NOT the
+    target ``project`` — so a cross-project dispatch (coordinator in handoff-fanout dispatching FOR
+    rakeforge) still resolves the coordinator's real workspace."""
+    home = isolated_handoff_home
+    coord_ws = home / "handoff-fanout" / "singlepane" / "sw-coord-9.handoff.code-workspace"
+    coord_ws.parent.mkdir(parents=True)
+    coord_ws.write_text("{}")
+    monkeypatch.setattr(
+        spawner_focus, "_derive_self_from_session", lambda cwd: ("handoff-fanout", "sw-coord-9")
+    )
+    plain = home / "shared-repo-root"
+    plain.mkdir()
+    got = _REAL_RESOLVE(plain, cfg=_config.load(), home=home, project="rakeforge")  # target ≠ coord proj
+    assert got == os.path.realpath(str(coord_ws))
+
+
+def test_resolve_focus_tier3_none_when_no_coord_sidecar(isolated_handoff_home, monkeypatch):
+    """Re-grounding floor: a resolver identity whose singlepane workspace does NOT exist under cfg.home
+    → None (a stale/foreign identity never produces a mis-jump)."""
+    home = isolated_handoff_home
+    monkeypatch.setattr(
+        spawner_focus, "_derive_self_from_session", lambda cwd: ("ghost-proj", "ghost-coord")
+    )
+    plain = home / "shared-repo-root"
+    plain.mkdir()
+    assert _REAL_RESOLVE(plain, cfg=_config.load(), home=home, project="ghost-proj") is None
+
+
+def test_resolve_focus_tier2_explicit_wins_over_tier3(isolated_handoff_home, monkeypatch):
+    """Precedence: an explicit ``--self-task`` (Tier-2) resolves BEFORE Tier-3 is consulted — the seam
+    is wired to a DIFFERENT identity to prove precedence, not coincidence."""
+    home = isolated_handoff_home
+    tier2_ws = home / "demo" / "singlepane" / "explicit-coord.handoff.code-workspace"
+    tier2_ws.parent.mkdir(parents=True)
+    tier2_ws.write_text("{}")
+    other_ws = home / "other" / "singlepane" / "other-coord.handoff.code-workspace"
+    other_ws.parent.mkdir(parents=True)
+    other_ws.write_text("{}")
+    monkeypatch.setattr(
+        spawner_focus, "_derive_self_from_session", lambda cwd: ("other", "other-coord")
+    )
+    plain = home / "shared-repo-root"
+    plain.mkdir()
+    got = _REAL_RESOLVE(
+        plain, cfg=_config.load(), home=home, project="demo", self_task="explicit-coord"
+    )
+    assert got == os.path.realpath(str(tier2_ws))  # Tier-2 explicit, never Tier-3's other-coord
+
+
+# ─── Tier-3 CONFIDENCE GATE end-to-end (sw-su-s2fix) ─────────────────────────────────────────────────
+# These drive the REAL ``_derive_self_from_session`` seam (restored over the conftest neutralization) via
+# a ``$DX_SESSION_ROLE_PATH`` stub resolver, through the REAL ``resolve_spawner_focus_path``, with the
+# coordinator's singlepane sidecar PRESENT ON DISK — so the ONLY thing that decides whether Tier-3 emits
+# the workspace is the ``confidence == "definite"`` gate (not a monkeypatched lambda). Pins Tier-3's three
+# states: ① definite supervisor → fires; ② suspected singlepane-sidecar → REJECTED though the sidecar
+# exists (adversarial: drop the gate → ② resolves the workspace → test fails); ③ owner/worker → None.
+
+
+def _write_role_stub(tmp_path: Path, role_dict: dict) -> Path:
+    """Write a one-function ``dx_session_role`` stand-in returning ``role_dict`` (no machine dependency)."""
+    stub = tmp_path / "stub_role_resolver.py"
+    stub.write_text(f"def resolve_session_role(cwd, env=None):\n    return {role_dict!r}\n")
+    return stub
+
+
+def test_resolve_focus_tier3_real_seam_accepts_definite_supervisor(
+    isolated_handoff_home, monkeypatch, tmp_path
+):
+    """① DEFINITE supervisor (worktree-marker / env identity) with a real sidecar → Tier-3 fires and
+    resolves the coordinator's workspace, running the genuine confidence-gated seam end-to-end."""
+    home = isolated_handoff_home
+    coord_ws = _singlepane_ws(home, "erp-system", "erp-coord-7")
+    monkeypatch.setattr(spawner_focus, "_derive_self_from_session", _REAL_DERIVE_SELF)  # un-neutralize
+    monkeypatch.setenv(
+        "DX_SESSION_ROLE_PATH",
+        str(_write_role_stub(tmp_path, {
+            "role": "supervisor", "confidence": "definite", "source": "marker",
+            "task": "erp-coord-7", "project": "erp-system",
+        })),
+    )
+    plain = home / "shared-repo-root"
+    plain.mkdir()
+    got = _REAL_RESOLVE(plain, cfg=_config.load(), home=home, project="erp-system")
+    assert got == os.path.realpath(str(coord_ws))
+
+
+def test_resolve_focus_tier3_real_seam_rejects_suspected_singlepane_identity(
+    isolated_handoff_home, monkeypatch, tmp_path
+):
+    """② ADVERSARIAL GUARD: the coordinator's REAL singlepane sidecar EXISTS, so if the resolver's
+    ``suspected`` singlepane-sidecar identity were honored Tier-3 WOULD resolve that workspace. The
+    confidence gate is the ONLY thing returning None here — remove ``confidence == "definite"`` from
+    ``_derive_self_from_session`` and this assertion flips to the workspace path (true guard, not a
+    mock-tautology). This is exactly the real-but-wrong anchor codex flagged."""
+    home = isolated_handoff_home
+    _singlepane_ws(home, "erp-system", "erp-coord-7")  # sidecar present → would resolve if accepted
+    monkeypatch.setattr(spawner_focus, "_derive_self_from_session", _REAL_DERIVE_SELF)
+    monkeypatch.setenv(
+        "DX_SESSION_ROLE_PATH",
+        str(_write_role_stub(tmp_path, {
+            "role": "supervisor", "confidence": "suspected", "source": "singlepane-sidecar",
+            "task": "erp-coord-7", "project": "erp-system",
+        })),
+    )
+    plain = home / "shared-repo-root"
+    plain.mkdir()
+    assert _REAL_RESOLVE(plain, cfg=_config.load(), home=home, project="erp-system") is None
+
+
+@pytest.mark.parametrize(
+    "role_dict",
+    [
+        {"role": "owner", "confidence": "definite", "source": "none", "task": None, "project": None},
+        {"role": "worker", "confidence": "suspected", "source": "cwd",
+         "task": "wk-3", "project": "erp-system"},
+    ],
+)
+def test_resolve_focus_tier3_real_seam_none_for_owner_or_worker(
+    isolated_handoff_home, monkeypatch, tmp_path, role_dict
+):
+    """③ owner / worker identity → Tier-3 never fires (None) even with a same-name sidecar on disk —
+    only a supervisor identity is ever a Tier-3 candidate."""
+    home = isolated_handoff_home
+    _singlepane_ws(home, "erp-system", "wk-3")  # exists; a worker/owner identity still must not anchor
+    monkeypatch.setattr(spawner_focus, "_derive_self_from_session", _REAL_DERIVE_SELF)
+    monkeypatch.setenv("DX_SESSION_ROLE_PATH", str(_write_role_stub(tmp_path, role_dict)))
+    plain = home / "shared-repo-root"
+    plain.mkdir()
+    assert _REAL_RESOLVE(plain, cfg=_config.load(), home=home, project="erp-system") is None
+
+
+# ─── _derive_self_from_session (the Tier-3 seam itself) ──────────────────────────────────────────────
+
+
+def test_derive_self_from_session_returns_definite_supervisor_identity(monkeypatch, tmp_path):
+    """The seam loads the shared resolver from ``$DX_SESSION_ROLE_PATH`` (a stub here — no machine
+    dependency) and returns (project, task) for a ``definite`` supervisor carrying both. ``definite`` is
+    the worktree-marker / worktree-sidecar / env path — the only confidence Tier-3 trusts (sw-su-s2fix)."""
+    stub = tmp_path / "stub_role.py"
+    stub.write_text(
+        "def resolve_session_role(cwd, env=None):\n"
+        "    return {'role': 'supervisor', 'task': 'c-7', 'project': 'p',\n"
+        "            'confidence': 'definite', 'source': 'marker'}\n"
+    )
+    monkeypatch.setenv("DX_SESSION_ROLE_PATH", str(stub))
+    assert _REAL_DERIVE_SELF("/anywhere") == ("p", "c-7")
+
+
+def test_derive_self_from_session_rejects_suspected_supervisor(monkeypatch, tmp_path):
+    """CONFIDENCE GATE (sw-su-s2fix): a ``supervisor`` resolved with ``confidence='suspected'`` —
+    the singlepane-sidecar identity whose cwd (shared repo root) is indistinguishable from the owner's
+    everyday session — is REJECTED (→ None) even though it carries BOTH task and project. Honoring it
+    would let Tier-3 anchor the worker to a real-but-WRONG desktop. ADVERSARIAL SELF-PROOF: drop the
+    ``confidence == "definite"`` clause in ``_derive_self_from_session`` and this returns ('p','c-7') →
+    this test fails → it is a genuine guard, not a tautology."""
+    stub = tmp_path / "stub_role_suspected.py"
+    stub.write_text(
+        "def resolve_session_role(cwd, env=None):\n"
+        "    return {'role': 'supervisor', 'task': 'c-7', 'project': 'p',\n"
+        "            'confidence': 'suspected', 'source': 'singlepane-sidecar'}\n"
+    )
+    monkeypatch.setenv("DX_SESSION_ROLE_PATH", str(stub))
+    assert _REAL_DERIVE_SELF("/anywhere") is None
+
+
+@pytest.mark.parametrize(
+    "role_dict",
+    [
+        {"role": "worker", "task": "w-1", "project": "p", "confidence": "suspected"},
+        {"role": "owner", "task": None, "project": None, "confidence": "definite"},
+        # ambiguous scan → resolver gives no task
+        {"role": "supervisor", "task": None, "project": "p", "confidence": "definite"},
+        {"role": "supervisor", "task": "c-7", "project": None, "confidence": "definite"},
+        {"role": "contradiction", "task": "c-7", "project": "p", "confidence": "definite"},
+        # confidence gate (sw-su-s2fix): a supervisor WITH task+project but NOT definite is rejected
+        {"role": "supervisor", "task": "c-7", "project": "p", "confidence": "suspected"},
+        # defensive: a malformed identity missing the confidence key entirely is also rejected
+        {"role": "supervisor", "task": "c-7", "project": "p"},
+    ],
+)
+def test_derive_self_from_session_none_for_non_definite_or_incomplete(monkeypatch, tmp_path, role_dict):
+    """Only a ``definite`` ``supervisor`` with BOTH task and project is honored — worker / owner /
+    ambiguous (no task) / contradiction / ``suspected`` supervisor / missing-confidence → None (never a
+    guessed identity, never a real-but-wrong anchor from a weak-evidence identity)."""
+    stub = tmp_path / "stub_role.py"
+    stub.write_text(f"def resolve_session_role(cwd, env=None):\n    return {role_dict!r}\n")
+    monkeypatch.setenv("DX_SESSION_ROLE_PATH", str(stub))
+    assert _REAL_DERIVE_SELF("/anywhere") is None
+
+
+def test_derive_self_from_session_fail_open_when_resolver_absent(monkeypatch, tmp_path):
+    """Resolver file absent → None (FAIL-OPEN), never raises."""
+    monkeypatch.setenv("DX_SESSION_ROLE_PATH", str(tmp_path / "does-not-exist.py"))
+    assert _REAL_DERIVE_SELF("/anywhere") is None
+
+
+def test_derive_self_from_session_fail_open_when_resolver_raises(monkeypatch, tmp_path):
+    """A resolver that raises → None (FAIL-OPEN) — a broken identity source never breaks a spawn."""
+    stub = tmp_path / "stub_boom.py"
+    stub.write_text("def resolve_session_role(cwd, env=None):\n    raise RuntimeError('boom')\n")
+    monkeypatch.setenv("DX_SESSION_ROLE_PATH", str(stub))
+    assert _REAL_DERIVE_SELF("/anywhere") is None

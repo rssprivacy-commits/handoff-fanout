@@ -70,10 +70,17 @@ def neutralize_spawner_self_report(monkeypatch: pytest.MonkeyPatch) -> None:
     exists. Tests that exercise the resolver ITSELF call the real implementation captured before this
     autouse runs (see ``test_spawner_focus._REAL_RESOLVE``); tests that want dump/spawn to see a focus
     re-``monkeypatch.setattr`` it, which wins (runs after).
+
+    spawn-unification Step 2: the resolver's NEW Tier-3 (``_derive_self_from_session`` → the shared
+    ``dx_session_role`` resolver) is ALSO pinned OFF here — otherwise a ``_REAL_RESOLVE`` test (which
+    runs the real resolver) would scan the machine's real ``~/.claude-handoff`` for the dispatching
+    coordinator's identity, breaking hermeticity / determinism. Dedicated Tier-3 tests re-set this seam
+    to a controlled ``(project, task)`` (which wins, running after).
     """
     from handoff_fanout import spawner_focus as _sf
 
     monkeypatch.setattr(_sf, "resolve_spawner_focus_path", lambda *a, **k: None)
+    monkeypatch.setattr(_sf, "_derive_self_from_session", lambda *a, **k: None)
 
 
 @pytest.fixture
