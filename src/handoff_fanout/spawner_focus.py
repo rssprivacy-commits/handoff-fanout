@@ -17,8 +17,10 @@ must NEVER raise or block a spawn/dump.
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -99,6 +101,34 @@ def derive_singlepane_focus(home: str | os.PathLike[str], project: str, task: st
 # per-project goto is unchanged (字节级向后兼容).
 
 
+def _tier1_cwd_belongs_to_project(rp: str, *, cfg: _config.Config, project: str | None) -> bool:
+    """spawn-unification Step 1 hardening (2026-06-22 / sw-spawn-unify-s1fix): a Tier-1 ``cwd``
+    workspace must belong to the TARGET ``project`` — not merely live under an allowed root.
+
+    :func:`validate_spawner_focus` only proves the candidate is an existing ``.handoff.code-workspace``
+    under a TRUSTED root (the handoff home / ``~/.claude-handoff`` / temp). But EVERY project's
+    worktrees live under that SAME home, so the gate alone cannot tell project A's worktree from
+    project B's. Running a spawn / succession from project B's worktree cwd while dispatching FOR
+    project A would then let Tier-1 grab B's workspace (cross-project mis-resolution → the worker is
+    born on the wrong project's coordinator desktop). This is a TIGHTENING-ONLY check: the normal flow
+    — a same-project worktree coordinator dispatching a same-project worker — resolves its cwd UNDER
+    ``worktrees_root(cfg, project)`` and passes unchanged; only a cross-project cwd is dropped (the
+    resolver then falls through to Tier-2 / ``None``). When no target ``project`` is supplied there is
+    nothing to bind to, so the historical Tier-1 behavior is preserved (the sole such caller is the
+    raw unit test — every production caller passes ``project``). NEVER raises (fail-open)."""
+    if not project:
+        return True
+    from handoff_fanout import worktree as _worktree
+
+    try:
+        root = os.path.realpath(str(_worktree.worktrees_root(cfg, project)))
+    except Exception:
+        # Can't determine where this project's worktrees live → DROP the Tier-1 candidate (the
+        # resolver falls through to Tier-2 / None). Same fail-open guarantee as the rest of the module.
+        return False
+    return rp == root or rp.startswith(root + os.sep)
+
+
 def resolve_spawner_focus_path(
     cwd: str | os.PathLike[str],
     *,
@@ -112,11 +142,14 @@ def resolve_spawner_focus_path(
     tiers; NEVER raises (fail-open → caller omits ``SPAWNER_FOCUS`` and the existing goto stands):
 
       * Tier 1 — WORKTREE: ``<cwd>/.handoff.code-workspace`` (a worktree coordinator always carries one;
-        the engine creates worktrees under ``cfg.home/<project>/worktrees`` = an allowed root).
+        the engine creates worktrees under ``cfg.home/<project>/worktrees`` = an allowed root). The
+        resolved candidate must ALSO belong to the target ``project`` (:func:`_tier1_cwd_belongs_to_project`)
+        — a cross-project worktree cwd is dropped so it can't mis-resolve another project's workspace.
       * Tier 2 — SINGLEPANE: :func:`derive_singlepane_focus(home, project, self_task)` → the REAL engine
         sidecar ``<home>/<proj>/singlepane/<self_task>.handoff.code-workspace`` (the identity a singlepane
         window can't read from cwd — its cwd is the shared repo root). Requires ``home``/``project``/
-        ``self_task`` (the spawner's OWN task, self-reported via ``--self-task``).
+        ``self_task`` (the spawner's OWN task, self-reported via ``--self-task``). Project-bound by
+        construction (the path is built FROM ``project``), so it needs no extra binding check.
 
     Each candidate is re-validated by ``validate_spawner_focus`` (realpath + ``.handoff.code-workspace``
     suffix + allowed-root) before return, so a path outside the trusted roots is dropped (``None``),
@@ -124,7 +157,7 @@ def resolve_spawner_focus_path(
     cand = os.path.join(str(cwd), ".handoff.code-workspace")
     if os.path.isfile(cand):
         rp = validate_spawner_focus(cand, cfg=cfg)
-        if rp:
+        if rp and _tier1_cwd_belongs_to_project(rp, cfg=cfg, project=project):
             return rp
     if home and project and self_task:
         sidecar_ws = derive_singlepane_focus(home, project, self_task)
@@ -133,3 +166,48 @@ def resolve_spawner_focus_path(
             if rp:
                 return rp
     return None
+
+
+# ── spawn-unification Step 1 (2026-06-22 / sw-spawn-unify-step1) ─────────────────────────────────
+# Telemetry: turn the otherwise-SILENT "no SPAWNER_FOCUS → code-router.sh falls back to the static
+# projects.json desktop map" event (the root cause of workers landing on the wrong / owner's desktop)
+# into a VISIBLE, COUNTABLE record. ``spawn`` and ``dump`` call this directly the moment their anchor
+# resolution yields None; an audit-close succession records its miss via the ``run_spawn`` it invokes
+# (which calls this when ITS own resolution yields None) — audit-close does not call it directly. The
+# call is made BEFORE the existing fail-open omit-the-line behavior, which is left BYTE-IDENTICAL (this
+# Step is warn-mode: observe, never block). The canary later proves this count trends to ~0 before
+# Step 4 flips the resolution miss to fail-closed.
+
+
+def log_anchor_miss(
+    *,
+    home: str | os.PathLike[str],
+    project: str,
+    task: str | None,
+    cwd: str | os.PathLike[str],
+    isolation: str | None,
+    reason: str,
+) -> None:
+    """Append ONE JSON line ``{ts, task, project, cwd, isolation, reason}`` to
+    ``<home>/<project>/spawn-anchor-miss.log``.
+
+    STRICTLY ADDITIVE + NON-BLOCKING by contract (same fail-open guarantee as the resolver itself): a
+    telemetry write must NEVER raise / block a spawn or dump, so every failure (unwritable dir, disk
+    full, odd ``home``) is swallowed. The caller's omit-the-``SPAWNER_FOCUS``-line behavior is
+    unchanged whether this logs or not."""
+    try:
+        log_dir = os.path.join(str(home), project)
+        os.makedirs(log_dir, exist_ok=True)
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "task": task,
+            "project": project,
+            "cwd": str(cwd),
+            "isolation": isolation,
+            "reason": reason,
+        }
+        with open(os.path.join(log_dir, "spawn-anchor-miss.log"), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        # fail-open: telemetry is never load-bearing — a missed log line must not break a spawn/dump.
+        pass

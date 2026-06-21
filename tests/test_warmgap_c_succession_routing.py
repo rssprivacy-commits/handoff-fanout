@@ -30,7 +30,17 @@ from pathlib import Path
 import pytest
 
 from handoff_fanout import atomic, codex_audit, dump, handoff_precheck, spawn
+from handoff_fanout import spawner_focus as _spawner_focus
 from handoff_fanout.spawn_lock import project_spawn_lock
+
+# The REAL resolver, captured at import BEFORE the conftest autouse ``neutralize_spawner_self_report``
+# pins it to None per-test. spawn-unification Step 1 keeps audit-close succession's EXPLICIT resolve
+# Tier-2-only (``derive_singlepane_focus``) — byte-equivalent to HEAD; the §F.1 convergence onto the
+# shared Tier-1-first ``resolve_spawner_focus_path`` is DEFERRED to Step 2. But ``run_spawn``'s
+# pre-existing Tier-1 fallback (and the new tightening-only project-bind) still go through the real
+# resolver, so the succession-MISS tests below must restore it (mirrors test_spawn_fresh._REAL_RESOLVE
+# / test_spawner_focus._REAL_RESOLVE) to exercise the genuine HEAD path instead of the None mock.
+_REAL_RESOLVE = _spawner_focus.resolve_spawner_focus_path
 
 PROJECT = "demo-proj"
 TASK = "coord-leg-8"  # the SUCCESSOR (audit-close --task)
@@ -424,6 +434,115 @@ def test_succession_no_predecessor_workspace_omits_spawner_focus_byte_compat(
     assert rc == 0
     uri_text = (home / PROJECT / "queue" / f"{TASK}.uri").read_text()
     assert "SPAWNER_FOCUS=" not in uri_text, "no workspace → no jump line (byte-compat)"
+    assert f"WORKSPACE={ws}" in uri_text
+
+
+def test_succession_stays_tier2_only_even_when_cwd_has_workspace(
+    tmp_path, monkeypatch, notify_calls
+):
+    """REGRESSION (sw-spawn-unify-s1fix) — the divergence the neutralized 'symmetric' test MISSED:
+    audit-close succession resolves SPAWNER_FOCUS via Tier-2 ONLY (``derive_singlepane_focus`` keyed on
+    the predecessor's ``--self-task``), NOT the shared Tier-1-first ``resolve_spawner_focus_path`` that
+    spawn/dump use. Even when the cwd is a worktree-like dir carrying its OWN valid
+    ``.handoff.code-workspace`` — exactly the bait a Tier-1-first resolver WOULD grab — the produced
+    ``.uri`` must point at the PREDECESSOR singlepane workspace, byte-identical to the pre-unification
+    behavior.
+
+    The REAL resolver is restored (the conftest autouse neutralizes it to ``None``) so a regression to
+    the Tier-1-first path would REALLY pick the cwd workspace and fail this assertion — the genuine
+    guard the mock-resolver 'symmetric' test could not provide. Closing the §F.1 / design §8.6 asymmetry
+    (audit-close ALSO trying Tier-1) is a DEFERRED behavior-change step, not warn-mode Step 1."""
+    import os as _os
+
+    home = _home(tmp_path, monkeypatch)
+    ws = _git_repo(tmp_path)
+    _forge_predecessor_sidecar(home)
+    pred_ws = _forge_predecessor_workspace(home)  # the Tier-2 target (predecessor singlepane workspace)
+
+    # Un-neutralize the resolver (shared module object → covers codex_audit / spawn / dump) so a
+    # Tier-1-first regression actually runs and would grab the bait below.
+    monkeypatch.setattr(_spawner_focus, "resolve_spawner_focus_path", _REAL_RESOLVE)
+
+    # The Tier-1 BAIT: a worktree-like cwd UNDER this project's worktrees_root carrying its OWN valid
+    # .handoff.code-workspace. A Tier-1-first resolver would grab THIS (it even passes the new
+    # project-binding check, being under worktrees_root(PROJECT)); the correct Tier-2-only path IGNORES it.
+    bait_cwd = home / PROJECT / "worktrees" / "bait-coord"
+    bait_cwd.mkdir(parents=True)
+    bait_ws = bait_cwd / ".handoff.code-workspace"
+    bait_ws.write_text("{}")
+    monkeypatch.chdir(bait_cwd)
+
+    rc = codex_audit.main_audit_close(_close_argv(ws))
+    assert rc == 0
+
+    uri_text = (home / PROJECT / "queue" / f"{TASK}.uri").read_text()
+    # Tier-2 wins: SPAWNER_FOCUS = the PREDECESSOR singlepane workspace (byte-identical to pre-unify).
+    assert f"SPAWNER_FOCUS={_os.path.realpath(str(pred_ws))}\n" in uri_text
+    # and NEVER the cwd workspace (the Tier-1 bait) — that's the divergence the reverted P1 prevents.
+    assert _os.path.realpath(str(bait_ws)) not in uri_text
+
+
+def test_succession_miss_from_worktree_cwd_matches_head_tier1_fallback(
+    tmp_path, monkeypatch, notify_calls
+):
+    """TRUE GUARD (sw-spawn-unify-s1fix2) — the un-neutralized COMPLEMENT of the neutralized
+    ``test_succession_no_predecessor_workspace_omits_spawner_focus_byte_compat``: it pins the OTHER
+    half of the Step-1 byte-equivalence contract — the succession MISS path.
+
+    When the predecessor has NO singlepane workspace file, ``_succession_relay``'s Tier-2-only
+    ``derive_singlepane_focus`` returns ``None`` → ``run_spawn`` is called with ``spawner_focus_path=None``
+    (and no ``self_task``). ``run_spawn``'s OWN pre-existing fallback then fires:
+    ``if spawner_focus is None: resolve_spawner_focus_path(os.getcwd(), …, self_task=None)``. That Tier-1
+    branch is UNCHANGED from HEAD — this Step only ADDED the ``log_anchor_miss`` telemetry call BELOW it
+    (verified: ``git diff HEAD -- src/handoff_fanout/spawn.py`` touches only the additive miss-log). With
+    ``self_task=None`` Tier-2 is skipped, so Tier-1 grabs the CWD's own ``.handoff.code-workspace`` when
+    the cwd is a same-project worktree under ``worktrees_root(PROJECT)``. A succession closed FROM such a
+    worktree cwd therefore emits ``SPAWNER_FOCUS=<cwd workspace>`` — exactly HEAD's pre-existing behavior.
+
+    Why the neutralized sibling can't cover this: the conftest autouse pins ``resolve_spawner_focus_path``
+    to ``None``, so that test only ever asserts the omit and never exercises the real run_spawn Tier-1
+    fallback (its cwd is pytest's tmp dir with no workspace file anyway). Here the REAL resolver is
+    restored (mirroring ``test_succession_stays_tier2_only_even_when_cwd_has_workspace`` above), so the
+    genuine HEAD code path runs and the MISS resolves through Tier-1, not the mock.
+
+    ADVERSARIAL SELF-PROOF: if a future step (GAP §F.1 / design §8.6 — «audit-close also tries Tier-1»,
+    the deferred asymmetry-closure) removes or rewires ``run_spawn``'s ``if spawner_focus is None``
+    Tier-1 fallback, this assertion flips (SPAWNER_FOCUS vanishes or changes) and the test fails LOUDLY,
+    pointing at the exact line that moved. That is the Step-1 baseline lock this guard exists to provide.
+    """
+    import os as _os
+
+    home = _home(tmp_path, monkeypatch)
+    ws = _git_repo(tmp_path)
+    _forge_predecessor_sidecar(home)  # succession ROUTE fires (resolvable predecessor nonce) …
+    # … but DELIBERATELY no predecessor workspace file → derive_singlepane_focus → None → the MISS.
+
+    # Un-neutralize the shared resolver (mirrors test_succession_stays_tier2_only_…) so run_spawn's
+    # pre-existing Tier-1 fallback REALLY runs instead of the conftest autouse's None stub.
+    monkeypatch.setattr(_spawner_focus, "resolve_spawner_focus_path", _REAL_RESOLVE)
+
+    # The cwd is a same-project worktree carrying its OWN valid .handoff.code-workspace, UNDER
+    # worktrees_root(PROJECT) so the Tier-1 project-binding check (_tier1_cwd_belongs_to_project)
+    # passes — this is the anchor HEAD's run_spawn fallback resolves when the predecessor WS is absent.
+    wt_cwd = home / PROJECT / "worktrees" / "miss-coord"
+    wt_cwd.mkdir(parents=True)
+    wt_ws = wt_cwd / ".handoff.code-workspace"
+    wt_ws.write_text("{}")
+    monkeypatch.chdir(wt_cwd)
+
+    rc = codex_audit.main_audit_close(_close_argv(ws))
+    assert rc == 0
+
+    queue = home / PROJECT / "queue"
+    # the succession route DID fire (spawn-shaped sidecar) — this is the relay path, not legacy.
+    sidecar = json.loads((queue / f"{TASK}.singlepane").read_text())
+    assert sidecar["role"] == "supervisor_succession"
+
+    uri_text = (queue / f"{TASK}.uri").read_text()
+    # MISS → run_spawn's pre-existing Tier-1 fallback grabs the worktree cwd workspace = HEAD behavior,
+    # NOT omit. (The neutralized sibling asserts omit only because its resolver is mocked to None.)
+    assert f"SPAWNER_FOCUS={_os.path.realpath(str(wt_ws))}\n" in uri_text
+    # the successor's real-repo workspace is still present (no regression).
     assert f"WORKSPACE={ws}" in uri_text
 
 

@@ -647,6 +647,20 @@ def run_spawn(
             self_task=self_task,
         )
 
+    # spawn-unification Step 1 (2026-06-22): neither the CLI/env hint nor the symmetric resolver
+    # found an anchor → the worker .uri carries NO SPAWNER_FOCUS and code-router.sh falls back to the
+    # static desktop map (the wrong-desktop root cause). Behavior is UNCHANGED (fail-open omit), but
+    # record the miss so it stops being silent. Non-blocking by contract.
+    if spawner_focus is None:
+        _spawner_focus.log_anchor_miss(
+            home=cfg.home,
+            project=project,
+            task=task,
+            cwd=os.getcwd(),
+            isolation=isolation,
+            reason="spawn:anchor-unresolved",
+        )
+
     common = dict(
         cfg=cfg,
         project=project,

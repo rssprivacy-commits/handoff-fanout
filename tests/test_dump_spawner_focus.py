@@ -107,6 +107,27 @@ def test_active_dump_no_focus_line_when_env_absent(tmp_path, monkeypatch):
     assert text == f"WORKSPACE={ws}\nURI={dump.build_uri(_config.load(), PROJECT, TASK)}\n"
 
 
+def test_active_dump_anchor_miss_logged_uri_byte_compat(tmp_path, monkeypatch):
+    """spawn-unification Step 1: when no anchor resolves, the .uri stays byte-identical (the assert
+    above) AND the miss is recorded — one JSON line to <home>/<project>/spawn-anchor-miss.log. The
+    telemetry lands in a SEPARATE file, so it never perturbs the launcher-visible .uri."""
+    home = tmp_path / "handoff"
+    home.mkdir()
+    (home / "config.json").write_text("{}")
+    ws = _bare_and_clone(tmp_path)
+    monkeypatch.delenv("HANDOFF_WINDOW_FOCUS_PATH", raising=False)
+
+    assert _active_dump(home, ws, monkeypatch) == 0
+    miss_log = home / PROJECT / "spawn-anchor-miss.log"
+    lines = miss_log.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["project"] == PROJECT
+    assert rec["task"] == TASK
+    assert rec["reason"] == "dump:anchor-unresolved"
+    assert rec["isolation"] == "singlepane"  # shared-tree active dump (worktree_info is None)
+
+
 def test_active_dump_writes_spawner_focus_from_self_id(tmp_path, monkeypatch):
     """mp-locate-return (sw-coord-p22): env absent, but env-independent self-identification resolves the
     coordinator's OWN workspace → the additive ``SPAWNER_FOCUS=<path>`` line (the worktree/singlepane

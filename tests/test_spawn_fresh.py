@@ -264,6 +264,49 @@ def test_spawner_focus_path_invalid_dropped_fail_open(tmp_path, monkeypatch):
     assert "SPAWNER_FOCUS" not in _uri_lines(home, project="focus-proj2", task="wh-focus2")
 
 
+# ─── spawn-unification Step 1: anchor-miss telemetry (warn-mode, zero behavior change) ───────────
+
+
+def _anchor_miss_lines(home: Path, project: str = PROJECT) -> list[dict]:
+    log = home / project / "spawn-anchor-miss.log"
+    if not log.exists():
+        return []
+    return [json.loads(ln) for ln in log.read_text(encoding="utf-8").splitlines()]
+
+
+def test_spawn_anchor_miss_logged_and_uri_unchanged(tmp_path, monkeypatch):
+    """spawn-unification Step 1: a spawn with NO resolvable anchor (conftest pins the resolver to None)
+    still produces a byte-compatible .uri WITHOUT SPAWNER_FOCUS (zero behavior change) AND records ONE
+    anchor-miss telemetry line — turning the silent static-map fallback into a countable signal."""
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+
+    rc = spawn.main(_argv(isolation="singlepane", workspace=repo))
+    assert rc == 0
+    # zero behavior change: the .uri is exactly the pre-feature byte-compat form (no SPAWNER_FOCUS).
+    assert "SPAWNER_FOCUS" not in _uri_lines(home)
+    # but the miss is now VISIBLE + COUNTABLE.
+    misses = _anchor_miss_lines(home)
+    assert len(misses) == 1
+    assert misses[0]["project"] == PROJECT
+    assert misses[0]["task"] == TASK
+    assert misses[0]["isolation"] == "singlepane"
+    assert misses[0]["reason"] == "spawn:anchor-unresolved"
+
+
+def test_spawn_anchor_hit_logs_no_miss(tmp_path, monkeypatch):
+    """Symmetric guard: when an anchor DOES resolve (valid --spawner-focus-path), NO miss is logged."""
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    spawner = home / "some-proj" / "singlepane" / "coord-x.handoff.code-workspace"
+    spawner.parent.mkdir(parents=True)
+    spawner.write_text("{}")
+    rc = spawn.main(_argv(isolation="singlepane", workspace=repo, spawner_focus_path=str(spawner)))
+    assert rc == 0
+    assert _uri_lines(home)["SPAWNER_FOCUS"] == os.path.realpath(str(spawner))
+    assert _anchor_miss_lines(home) == []  # hit → no telemetry
+
+
 # ─── singlepane DISPATCH end-to-end: --self-task drives the Tier-2 SPAWNER_FOCUS ────────────────
 # The conftest autouse ``neutralize_spawner_self_report`` pins ``resolve_spawner_focus_path`` to None
 # for every dump/spawn integration test (suite hermeticity) — so NO existing test proved the REAL

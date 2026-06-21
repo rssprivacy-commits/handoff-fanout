@@ -2235,6 +2235,18 @@ def _succession_relay(
     # ``run_spawn`` re-validates through the SAME ``validate_spawner_focus`` gate, so an absent/odd
     # value simply fail-opens to today's per-project goto (byte-identical .uri). predecessor_task is
     # None only on a path that never reaches here with a nonce — defensive.
+    #
+    # spawn-unification Step 1 (2026-06-22 / sw-spawn-unify-s1fix): this site stays Tier-2-ONLY
+    # (``derive_singlepane_focus``) — NOT the shared Tier-1-first ``resolve_spawner_focus_path`` that
+    # spawn.py / dump.py use. Converging audit-close onto the symmetric resolver so it ALSO tries
+    # Tier-1 (cwd ``.handoff.code-workspace``) — design §8.6 / GAP §F.1 «audit-close also tries
+    # Tier-1» — is a REAL behavior change, NOT zero-behavior warn-mode: running audit-close from any
+    # worktree cwd that carries a ``.handoff.code-workspace`` while a predecessor sidecar also exists
+    # would make the new ``.uri`` point at the cwd workspace where the old one points at the
+    # predecessor sidecar. That asymmetry-closure is therefore DEFERRED to its own dedicated step
+    # (which carries its own byte-equivalence audit + canary); Step 1 is observe-only. Keeping this
+    # Tier-2-only is byte-identical to the pre-unification succession ``.uri``. (The anchor-miss
+    # telemetry is unchanged: ``run_spawn`` still records a miss when ITS own resolution yields None.)
     spawner_focus_path = (
         _spawner_focus.derive_singlepane_focus(home, project, predecessor_task)
         if predecessor_task

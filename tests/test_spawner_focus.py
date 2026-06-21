@@ -179,3 +179,99 @@ def test_resolve_focus_tier2_skipped_without_self_task(isolated_handoff_home):
     _singlepane_ws(home, "p", "co")  # sidecar exists, but no self_task to point at it
     plain = home / "p"
     assert _REAL_RESOLVE(plain, cfg=_config.load(), home=home, project="p") is None
+
+
+# ─── Tier-1 project binding (sw-spawn-unify-s1fix) ──────────────────────────────────────────────
+# validate_spawner_focus only proves "an existing .handoff.code-workspace under a TRUSTED root" — and
+# EVERY project's worktrees live under that SAME root — so without this binding, a spawn/succession run
+# from project B's worktree cwd while dispatching FOR project A would mis-resolve B's workspace (worker
+# born on the wrong project's coordinator desktop). Tightening-only: same-project cwd passes unchanged;
+# only a cross-project cwd is dropped (→ Tier-2 / None).
+
+
+def test_resolve_tier1_dropped_when_cwd_belongs_to_other_project(isolated_handoff_home):
+    """Cross-project mis-grab blocked: cwd is project-B's worktree (a valid .handoff.code-workspace
+    under an allowed root) but we resolve FOR project-A → Tier-1 is dropped (None, NOT B's workspace)."""
+    home = isolated_handoff_home
+    cwd_b = _worktree_cwd(home, "project-b", "b-coord-1")
+    got = _REAL_RESOLVE(cwd_b, cfg=_config.load(), home=home, project="project-a")
+    assert got is None  # B's Tier-1 workspace must NOT be returned for project-a
+
+
+def test_resolve_tier1_other_project_falls_through_to_tier2(isolated_handoff_home):
+    """The cross-project Tier-1 drop still lets the correct project-A Tier-2 sidecar resolve: the cwd
+    workspace is B's (dropped), the self-reported project-A singlepane sidecar wins."""
+    home = isolated_handoff_home
+    cwd_b = _worktree_cwd(home, "project-b", "b-coord-2")
+    a_sidecar = _singlepane_ws(home, "project-a", "a-coord-9")
+    got = _REAL_RESOLVE(
+        cwd_b, cfg=_config.load(), home=home, project="project-a", self_task="a-coord-9"
+    )
+    assert got == os.path.realpath(str(a_sidecar))  # Tier-2 (project-a) — never B's Tier-1
+
+
+def test_resolve_tier1_same_project_cwd_passes_unchanged(isolated_handoff_home):
+    """Tightening-only invariant: the normal flow — a same-project worktree coordinator dispatching a
+    same-project worker — resolves its OWN cwd workspace via Tier-1 exactly as before (binding passes)."""
+    home = isolated_handoff_home
+    cwd_a = _worktree_cwd(home, "project-a", "a-coord-1")
+    got = _REAL_RESOLVE(cwd_a, cfg=_config.load(), home=home, project="project-a")
+    assert got == os.path.realpath(str(cwd_a / ".handoff.code-workspace"))
+
+
+# ─── log_anchor_miss (spawn-unification Step 1 / sw-spawn-unify-step1) ───────────────────────────
+# The telemetry that turns the silent "no SPAWNER_FOCUS → static-map fallback → wrong desktop" event
+# into a countable JSON line. STRICTLY ADDITIVE + NON-BLOCKING (a telemetry write never breaks a
+# spawn/dump). The producers (spawn/dump/audit-close) call it the moment anchor resolution yields None.
+import json as _json  # noqa: E402
+
+
+def test_log_anchor_miss_writes_one_json_line_with_all_fields(tmp_path):
+    spawner_focus.log_anchor_miss(
+        home=tmp_path,
+        project="demo-proj",
+        task="wk-7",
+        cwd="/some/cwd",
+        isolation="singlepane",
+        reason="spawn:anchor-unresolved",
+    )
+    log = tmp_path / "demo-proj" / "spawn-anchor-miss.log"
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    rec = _json.loads(lines[0])
+    assert set(rec) == {"ts", "task", "project", "cwd", "isolation", "reason"}
+    assert rec["task"] == "wk-7"
+    assert rec["project"] == "demo-proj"
+    assert rec["cwd"] == "/some/cwd"
+    assert rec["isolation"] == "singlepane"
+    assert rec["reason"] == "spawn:anchor-unresolved"
+    assert rec["ts"]  # ISO-8601 UTC timestamp present
+
+
+def test_log_anchor_miss_appends_across_calls(tmp_path):
+    for i in range(3):
+        spawner_focus.log_anchor_miss(
+            home=tmp_path, project="p", task=f"t{i}", cwd="/c", isolation=None,
+            reason="dump:anchor-unresolved",
+        )
+    log = tmp_path / "p" / "spawn-anchor-miss.log"
+    assert len(log.read_text(encoding="utf-8").splitlines()) == 3
+
+
+def test_log_anchor_miss_tolerates_none_task_and_isolation(tmp_path):
+    """A dump producer may not know the worker task / isolation — None must serialize cleanly."""
+    spawner_focus.log_anchor_miss(
+        home=tmp_path, project="p", task=None, cwd="/c", isolation=None, reason="dump:anchor-unresolved",
+    )
+    rec = _json.loads((tmp_path / "p" / "spawn-anchor-miss.log").read_text().splitlines()[0])
+    assert rec["task"] is None and rec["isolation"] is None
+
+
+def test_log_anchor_miss_is_non_blocking_on_unwritable_home(tmp_path):
+    """Contract: a telemetry write must NEVER raise — an unwritable home is swallowed (fail-open)."""
+    bogus_home = tmp_path / "afile"
+    bogus_home.write_text("not a dir")  # makedirs(<afile>/p) will fail → swallowed
+    # must not raise
+    spawner_focus.log_anchor_miss(
+        home=bogus_home, project="p", task="t", cwd="/c", isolation="x", reason="r",
+    )

@@ -809,7 +809,14 @@ def build_uri(cfg: _config.Config, project: str, task: str) -> str:
     return cfg.uri_template.format(prompt=encoded)
 
 
-def _spawner_focus_line(cfg: _config.Config, project: str, self_task: str | None = None) -> str:
+def _spawner_focus_line(
+    cfg: _config.Config,
+    project: str,
+    self_task: str | None = None,
+    *,
+    worker_task: str | None = None,
+    isolation: str | None = None,
+) -> str:
     """Emit the additive ``SPAWNER_FOCUS=<path>`` line — the SPAWNING coordinator's OWN
     ``.handoff.code-workspace`` — so the watchdog/code-router runs the EXISTING ``focus-jump``
     (``code <workspace>`` → macOS slides to its Space in ONE native step) and the worker is born on the
@@ -833,6 +840,18 @@ def _spawner_focus_line(cfg: _config.Config, project: str, self_task: str | None
             home=cfg.home,
             project=project,
             self_task=self_task,
+        )
+    if not rp:
+        # spawn-unification Step 1 (2026-06-22): no anchor → the .uri omits SPAWNER_FOCUS and
+        # code-router.sh falls back to the static desktop map (wrong-desktop root cause). Behavior
+        # UNCHANGED (byte-identical fail-open), but record the miss instead of staying silent.
+        _spawner_focus.log_anchor_miss(
+            home=cfg.home,
+            project=project,
+            task=worker_task,
+            cwd=os.getcwd(),
+            isolation=isolation or "dump",
+            reason="dump:anchor-unresolved",
         )
     return f"SPAWNER_FOCUS={rp}\n" if rp else ""
 
@@ -1066,7 +1085,9 @@ def write_active_dump(
     # §3.7 — atomic .uri write (see the .md note above). direct-jump-spawn: append the
     # SPAWNER_FOCUS line when this dump runs in a coordinator terminal (fail-open → "").
     atomic.atomic_replace(
-        uri_path, f"WORKSPACE={workspace}\nURI={uri}\n{_spawner_focus_line(cfg, project, self_task)}"
+        uri_path,
+        f"WORKSPACE={workspace}\nURI={uri}\n"
+        f"{_spawner_focus_line(cfg, project, self_task, worker_task=task, isolation='worktree' if worktree_info else 'singlepane')}",
     )
     print(f"[dump] wrote {uri_path}")
 
@@ -1290,7 +1311,19 @@ def handle_open_batch(
     roadmap_excerpt = get_roadmap_excerpt(cfg, project)
     # mp-locate-return: resolve the coordinator's own focus PATH ONCE and reuse for every sub-task .uri
     # (it's the same coordinator window for all sub-tasks).
-    _focus_line = _spawner_focus_line(cfg, project, getattr(args, "self_task", None))
+    # spawn-unification Step 1 (sw-spawn-unify-s1fix / codex #2): because the focus resolves ONCE for
+    # the whole batch, this records AT MOST ONE anchor-miss per batch (keyed on ``batch_id``), not one
+    # per sub-task .uri — intentional, since the miss is a property of the SHARED coordinator anchor,
+    # not of each sub-task. The AUTHORITATIVE per-worker fallback canary is the ENGINE's per-produce
+    # log (``spawn.run_spawn`` calls ``log_anchor_miss`` once per actual ``handoff spawn``), so this
+    # coarse batch-level record is a convenience signal, not the canary count — no per-uri undercount.
+    _focus_line = _spawner_focus_line(
+        cfg,
+        project,
+        getattr(args, "self_task", None),
+        worker_task=batch_id,
+        isolation="singlepane",
+    )
 
     for idx, st in enumerate(sub_tasks):
         sub_id = st["id"]
@@ -1435,7 +1468,8 @@ def trigger_fan_in_if_ready(
     # terminal (fail-open → ""; the fan-in tab lands on the spawner's desktop too).
     atomic.atomic_replace(
         queue_dir / f"{fan_in_task}.uri",
-        f"WORKSPACE={workspace}\nURI={uri}\n{_spawner_focus_line(cfg, project, self_task)}",
+        f"WORKSPACE={workspace}\nURI={uri}\n"
+        f"{_spawner_focus_line(cfg, project, self_task, worker_task=fan_in_task, isolation='singlepane')}",
     )
     print(f"[trigger-fan-in] wrote queue/{fan_in_task}.{{md,uri}} + fan-in.env")
 
