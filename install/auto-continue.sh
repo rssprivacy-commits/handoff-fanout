@@ -375,6 +375,20 @@ _wins_contain() {
     printf '%s\n' "$1" | /usr/bin/grep -Fq -- "$2"
 }
 
+# Does <title> contain <token> as a WHOLE kebab-token (not a substring of a longer id)? Mirrors
+# status_board._title_mentions_task (R2 codex #7: `task-1` must NOT match `task-10`). Task ids are
+# kebab-case + spawn nonces are hex — both [A-Za-z0-9_-], so the token is bounded by anything
+# outside that class (space, ·, [, EOL …). Empty token ⇒ return 1 (no token = no claim of identity;
+# the SAFE direction for the foreign-window veto, which treats "not provably ours" as foreign). The
+# token here is always a task id / hex nonce (regex-metachar-free) but is escaped defensively so a
+# pathological token can never inject a pattern.
+_title_has_token() {  # <title> <token>
+    [ -n "$2" ] || return 1
+    local _re
+    _re=$(printf '%s' "$2" | /usr/bin/sed 's/[^A-Za-z0-9_-]/\\&/g')
+    printf '%s' "$1" | /usr/bin/grep -Eq "(^|[^A-Za-z0-9_-])${_re}([^A-Za-z0-9_-]|\$)"
+}
+
 # Window-level frontmost helpers (2026-06-03 code-r-clobber fix / dual-brain codex+Gemini).
 # `is_frontmost_code` only proves the *app* is Code — insufficient for a cold worktree spawn that
 # opens its OWN window competing with the owner's other Code windows. These resolve *which* window
@@ -394,14 +408,16 @@ frontmost_code_window_name() {
     end tell' 2>/dev/null
 }
 
-# 0 = the frontmost Code window's title contains <task> (THE task window has focus).
+# 0 = the frontmost Code window's title carries <task> as a WHOLE kebab-token (THE task window
+# has focus). Whole-token (not a loose substring) is the symmetric twin of the discriminator's
+# foreign-window veto (sw-coord-p51): a concurrent sibling whose id SUPERSTRING-contains ours
+# (live e.g. erp-dev-coord-7 vs erp-dev-coord-77) must never be mis-read as our window on the
+# HAPPY path — which is more dangerous than the discriminator path because it then auto-submits
+# (presses Enter) into that window. `_title_has_token` returns 0 on a whole-token hit, 1 otherwise.
 target_window_frontmost() {
     local task="$1" name
     name=$(frontmost_code_window_name)
-    case "$name" in
-        *"$task"*) return 0 ;;
-        *) return 1 ;;
-    esac
+    _title_has_token "$name" "$task"
 }
 
 # Poll until THE task window is frontmost (cold spawn render+focus), up to <secs> (default 8). 0=ready.
@@ -1858,12 +1874,21 @@ EOF
                     else
                         _p_app=$(printf '%s\n' "$_probe_out" | /usr/bin/sed -n 's/^FRONT_APP://p' | /usr/bin/head -1)
                         _p_win=$(printf '%s\n' "$_probe_out" | /usr/bin/sed -n 's/^FRONT_WIN://p' | /usr/bin/head -1)
-                        if _wins_contain "$_snap_wins" "$_focus_token" || _wins_contain "$_snap_wins" "$TASK"; then
+                        # WHOLE-token + PER-SPAWN identity (sw-coord-p51 R2+R3 / codex P0): the retry
+                        # tick's "does my target window exist / is it already front?" checks MUST be
+                        # whole-kebab-token (not substring — else demo-coord-77 reads as demo-coord-7),
+                        # AND must key on $_focus_token ONLY — the per-spawn identity (the singlepane
+                        # spawn nonce when present, the task id otherwise). NOT "$_focus_token OR $TASK":
+                        # for singlepane $TASK is NOT per-spawn, so a STALE same-task window with an OLD
+                        # nonce ("project · task · worker · oldnonce [singlepane]") whole-token-matches
+                        # $TASK and would be accepted as "target already frontmost" → skip code -n + waits
+                        # + discriminator → URI + Enter×3 into the stale window (codex R2 RED). The nonce
+                        # is exactly what proves "THIS is the window we just launched". _title_has_token
+                        # over the newline-joined snapshot blob = per-window whole-token (newlines bound).
+                        if _title_has_token "$_snap_wins" "$_focus_token"; then
                             _skip_code_n=1
-                            if [ "$_p_app" = "Code" ]; then
-                                case "$_p_win" in
-                                    *"$_focus_token"*|*"$TASK"*) _front_verified=1 ;;
-                                esac
+                            if [ "$_p_app" = "Code" ] && _title_has_token "$_p_win" "$_focus_token"; then
+                                _front_verified=1
                             fi
                             if [ "$_front_verified" = "1" ]; then
                                 log "FOCUS-RETRY: target window already frontmost — skipping code -n + waits. project=$PROJECT task=$TASK"
@@ -1905,17 +1930,20 @@ EOF
                         if [ "$_snap_ok" = "1" ]; then
                             log "FOCUS-RETRY: target window in background — skipping code -n, straight to raise. project=$PROJECT task=$TASK"
                         fi
-                    elif wait_target_window_frontmost "$TASK" "${HANDOFF_WIN_FRONT_SECS:-3}"; then
+                    elif wait_target_window_frontmost "$_focus_token" "${HANDOFF_WIN_FRONT_SECS:-3}"; then
                         _primary_ok=1
                     else
                         log "PERF[$TASK]: wait-frontmost TIMED OUT (${HANDOFF_WIN_FRONT_SECS:-3}s) → AXRaise fallback"
                     fi
                     if [ "$_primary_ok" != "1" ]; then
-                        # fallback: AXRaise THE task window (nonce token first), then re-wait for IT
-                        # (not merely the Code app — else the URI/Enter could still target a wrong
-                        # window; R2 codex). Best-effort; a miss raises nothing (v2 hardening).
-                        raise_task_window "$_focus_token" "$TASK"
-                        wait_target_window_frontmost "$TASK" 2 || _focus_ok=0
+                        # fallback: AXRaise THE task window by its PER-SPAWN identity ($_focus_token =
+                        # the singlepane nonce when present, else the task id) — NOT the bare task id
+                        # (sw-coord-p51 R3 / codex P0): for singlepane the task id also matches a STALE
+                        # same-task window, so raising/awaiting by $TASK could pull a stale window front
+                        # and auto-submit into it. Re-wait keys on the same $_focus_token. Best-effort; a
+                        # miss raises nothing (v2 hardening).
+                        raise_task_window "$_focus_token"
+                        wait_target_window_frontmost "$_focus_token" 2 || _focus_ok=0
                     fi
                 fi
                 _perf_mark "$TASK" "wait-frontmost"
@@ -1940,11 +1968,47 @@ EOF
                     _d_out=$(probe_code_windows)
                     _d_app=$(printf '%s\n' "$_d_out" | /usr/bin/sed -n 's/^FRONT_APP://p' | /usr/bin/head -1)
                     _d_win=$(printf '%s\n' "$_d_out" | /usr/bin/sed -n 's/^FRONT_WIN://p' | /usr/bin/head -1)
+                    # ── POSITIVE-IDENTITY discriminator (sw-coord-p51 R2+R3 / 2026-06-21; auto-continue.log
+                    #    L186215; dual-brain codex+gemini, RED→RED→GREEN) ──
+                    # ROOT CAUSE: on an UNLOCKED desktop, independent project spawns run in PARALLEL
+                    # (intentional — the unlocked-spawn path is unguarded so a hung GUI osascript can't
+                    # wedge the whole fleet). A concurrent project's `code -n` opens ITS window AFTER
+                    # this task's pre-open snapshot, so that window is ALSO ∉ this snapshot. The OLD rule
+                    # "front ∉ snapshot ⇒ my fresh window whose title merely lags ⇒ dispatch" then mis-read
+                    # the foreign window as ours and pasted THIS task's prompt into it (incident:
+                    # erp-dev-coord-77's prompt → fateforge's worker window). The dual-brain re-audit showed
+                    # the ∉-snapshot heuristic is UNSOUND under concurrency for BOTH populated AND markerless
+                    # foreign windows — and the live press-now default (Enter×3, zero-check) removed the
+                    # downstream Enter gate that used to withhold on a mis-dispatch, so a wrong-window
+                    # dispatch now AUTO-SUBMITS.
+                    # FIX (positive PER-SPAWN identity, fail-closed): dispatch ONLY into a front Code window
+                    # whose title POSITIVELY carries our $_focus_token as a WHOLE kebab-token. $_focus_token
+                    # is the PER-SPAWN identity (set ~L1781): the singlepane spawn NONCE when present, else
+                    # the task id (worktree, or legacy singlepane without a nonce) — NOT "$TASK OR nonce",
+                    # because for singlepane $TASK also matches a STALE same-task window (old nonce) and would
+                    # auto-submit into it (R2 codex). Title-only evidence can never prove a markerless /
+                    # foreign / stale-nonce window is ours, so everything else fail-closes (defer + bounded
+                    # retry, cap HANDOFF_FOCUS_DEFER_MAX=5 → actionable failed ack; the retry tick re-probes
+                    # and dispatches the instant our $_focus_token-bearing title renders). The whole focus
+                    # path (this discriminator, the retry tick, the happy-path wait, raise) keys on the SAME
+                    # $_focus_token — consistent with the submit gate's nonce.
+                    # IDENTITY-RENDER timing (codex R3): a WORKTREE own window carries its token immediately
+                    # — the window opens on …/worktrees/<task>, so even the pre-settings folder-basename title
+                    # == the task id (== $_focus_token) → matched by the upstream wait_target_window_frontmost
+                    # happy path at once. A NONCE-bearing SINGLEPANE own window does NOT: its pre-settings
+                    # title is the workspace basename "<task>.handoff (Workspace)" (the task, NOT the nonce);
+                    # the nonce appears only once VS Code loads the injected window.title — so a singlepane
+                    # spawn FAIL-CLOSES (defer → retry) until that nonce-bearing title renders, then dispatches.
+                    # That is intentional: with the live press-now default (Enter×3, zero-check) there is NO
+                    # downstream nonce gate, so this PRE-URI nonce gate is the required safety (not merely
+                    # "the same dependency moved earlier"). The pre-open snapshot is no longer consulted for
+                    # the dispatch decision.
                     _dispatch=0
-                    if [ "$_snap_ok" = "1" ] && [ "$_d_app" = "Code" ] && [ -n "$_d_win" ] && \
-                       ! printf '%s\n' "$_snap_wins" | /usr/bin/grep -Fxq -- "$_d_win"; then
+                    if [ "$_d_app" = "Code" ] && [ -n "$_d_win" ] && _title_has_token "$_d_win" "$_focus_token"; then
                         _dispatch=1
-                        log "FOCUS-DISCRIMINATOR: front Code window not in the pre-open snapshot → fresh window with a lagging title — dispatching. front_title=$_d_win project=$PROJECT task=$TASK"
+                        log "FOCUS-DISCRIMINATOR: front Code window POSITIVELY carries our per-spawn token (whole-token) → dispatching. front_title=$_d_win project=$PROJECT task=$TASK"
+                    else
+                        log "FOCUS-FAILCLOSED: front Code window does NOT positively carry our identity (task=$TASK token=$_focus_token) — withholding to avoid a concurrent-spawn mis-dispatch. front_app=$_d_app front_title=$_d_win project=$PROJECT task=$TASK"
                     fi
                     if [ "$_dispatch" != "1" ]; then
                         _matched_by="none"
@@ -2036,6 +2100,28 @@ EOF
             # 主人第二洞察：粘完 1~2s 就能 Enter，等太久(原 8s)反而给别窗口抢前台的机会 → settle 缩到 2s。
             # 真提交 ~1-2s 内 transcript 就增长；没增长(粘贴还没好/被抢前台)由 cold_submit_with_retry 的
             # 快速重试 + 「mismatch 则 AXRaise 抬回前台」兜底（AXRaise 不破坏输入框焦点，实测坐实）。
+            # ── 主人立法 2026-06-20: 粘贴后零检查·立刻连按 Enter ×3 ──────────────────────────
+            # owner 命令「任何开窗(worker/新中枢)，粘贴指令之后马上 Enter，禁止两个动作之间添加任何
+            # 动作」+ 明确选「完全零检查·立刻按」(accept residual risk: Enter 可能落别处/你的终端)。
+            # 粘贴(open-uri)后极短 settle 让 URI 落地，然后连按 3 次覆盖冷渲染时序——无就绪/落窗/锁/
+            # 无障碍/前台任何检查或等待。逃生阀: HANDOFF_PRESS_NOW=0 → 回旧的 gated 提交(保在 else)。
+            if [ "${HANDOFF_PRESS_NOW:-1}" = "1" ]; then
+                sleep "${HANDOFF_PRESS_SETTLE:-0}"   # 主人立法: 粘完立刻按, 中间零等待 (空输入框上的 Enter 是 no-op, ×3 覆盖异步落地)
+                _pn_ok=0
+                for _pn in 1 2 3; do
+                    "$HANDOFF_OSASCRIPT_CMD" -e 'tell application "System Events" to keystroke return' 2>>"$LOG" && _pn_ok=1
+                    [ "$_pn" -lt 3 ] && sleep "${HANDOFF_PRESS_GAP:-0.4}"
+                done
+                if [ "$_pn_ok" = "1" ]; then
+                    log "AUTO-SUBMIT: Enter x3 pressed immediately (zero-check / 主人立法 2026-06-20) for project=$PROJECT task=$TASK"
+                    write_ack "$PROJ_DIR" "$TASK" "submitted" "Enter x3 pressed immediately (zero-check, owner directive 2026-06-20)"
+                    _RETURN_DISPATCHED=1
+                else
+                    warn_accessibility_once
+                    log "WARN: osascript keystroke failed (accessibility missing?) project=$PROJECT task=$TASK"
+                    write_ack "$PROJ_DIR" "$TASK" "failed" "osascript keystroke failed (accessibility missing?)"
+                fi
+            else
             if [ "$COLD_WINDOW" = "1" ]; then
                 sleep "${HANDOFF_COLD_RENDER_SECS:-0.5}"   # 主人立法 2026-06-06: 粘完 0.5s 直接 Enter, 之间无任何搅焦动作
             elif [ "$SINGLEPANE_WINDOW" = "1" ]; then
@@ -2247,6 +2333,7 @@ EOF
                 log "ABORT-SUBMIT: frontmost is '$front_app' (not Code) — Enter 未按, 主人需手动按一次 Enter"
                 write_ack "$PROJ_DIR" "$TASK" "failed" "frontmost was '$front_app' not Code, abort osascript Enter"
             fi
+            fi   # ── close 主人立法 2026-06-20 press-now wrapper (else = legacy gated submit, HANDOFF_PRESS_NOW=0) ──
             # djs-jump-return: the URI dispatched (window opened on A + prompt injected) and the whole
             # submit sequence is done — NOW snap the owner's view back to origin (B). mp-locate-return
             # P2-live-1: gated POSITIVELY on _RETURN_DISPATCHED (set ONLY where a submit actually

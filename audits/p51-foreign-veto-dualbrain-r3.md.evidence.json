@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "runner_version": "dual-brain-runner/2026-06-12-evidence-v1",
+  "ts": "2026-06-21T21:01:46+0800",
+  "brief_sha256": "069d0c1dc4e1cfed323935dc6f7c6d7515d260c684532353913f2995d09f6dcd",
+  "brain_results": [
+    {
+      "brain": "codex",
+      "status": "ok",
+      "verdict": "RED",
+      "artifact_path": "audits/p51-foreign-veto-dualbrain-r3.md",
+      "raw_text_sha256": "44c96152d489a30b74854e7ffc5283cd8745fe3d6fae4c5e1cd0d79cd152aa6c"
+    },
+    {
+      "brain": "gemini",
+      "status": "ok",
+      "verdict": "GREEN",
+      "artifact_path": "audits/p51-foreign-veto-dualbrain-r3.md",
+      "raw_text_sha256": "440a21747d98664237bf7073a8e5c466c8eccde8f15cbab8ab5c16060bccd6e6"
+    }
+  ],
+  "overall_verdict": "RED"
+}

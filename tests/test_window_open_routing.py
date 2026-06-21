@@ -353,21 +353,25 @@ def test_singlepane_submit_gates_on_spawn_nonce(home, tmp_path):
 def test_singlepane_withholds_enter_when_title_lacks_nonce(home, tmp_path):
     """SINGLEPANE: a front window whose title carries the TASK token but the WRONG nonce (stale /
     guessed / sibling window) must NOT receive the Enter — the spawn_nonce is the gate, not the task.
-    The window still opens (`-n`), only the synthetic Enter is withheld. sw-sp-enter-retry: the
-    bounded retries re-gate on the same nonce, so NO press fires across the whole budget either."""
+    sw-coord-p51 R3 (codex R2 must-fix): the per-spawn NONCE is now the DISPATCH identity too
+    ($_focus_token, never `$TASK` for a nonce-bearing singlepane), so a wrong-nonce window is rejected
+    at the DISCRIMINATOR and the URI is never even dispatched into it (pre-R3 it was dispatched via the
+    `$TASK` match and only the submit-time nonce gate withheld the Enter — a real fail-open the press-
+    now default would have auto-submitted). The window still opens (`-n`); the dispatch fail-closes."""
     task = "wh-sp"
     nonce = "deadbeefcafef00d"
     ws = tmp_path / "repo"
     ws.mkdir()
     _seed(home, ws, task, heartbeat=True)
     _singlepane_sidecar(home, tmp_path, task, nonce)
-    # title carries the task token but a DIFFERENT nonce → the nonce gate withholds the Enter
+    # title carries the task token but a DIFFERENT nonce → the nonce-keyed identity rejects it
     env = _env(home, tmp_path, front_window=f"{PROJECT} · {task} · worker · 0000000000000000 [singlepane]")
     env["HANDOFF_SP_RETRY_MAX"] = "1"  # bounded fast: 1 retry suffices to prove the withhold
     assert _run(env).returncode == 0
     assert " -n " in f" {_code_log(tmp_path)} ", "singlepane still opens the dedicated window"
     assert _read(tmp_path / "key.log") == "", "Enter withheld when the front window lacks the spawn_nonce"
-    assert _ack(home, task, "failed")
+    assert _read(tmp_path / "open.log") == "", "URI must NOT be dispatched into a wrong-nonce window (R3)"
+    assert "FOCUS-FAILCLOSED" in _log(home), "the wrong-nonce front must fail-closed at the discriminator"
     assert not _ack(home, task, "submitted")
 
 
@@ -407,15 +411,12 @@ def test_cold_worktree_spawn_forces_new_window_with_dash_n(home, tmp_path):
 
 
 def test_cold_focus_assert_blocks_enter_when_task_window_not_frontmost(home, tmp_path):
-    """The synthetic Enter must NOT fire if the frontmost window isn't THE task window — and on that
-    mismatch the launcher must AXRaise the task window back to front (owner: "if it's not on top, let it
-    be on top, then Enter") so a later attempt can submit. AXRaise preserves the editor focus (proven
-    live); only the removed focus chord broke it.
-
-    focus-drift v2 note: the hardened raise only AXRaises a window that EXISTS (enumerate-first),
-    so the task window is modeled in ``code_wins``; the frontmost stranger window is NOT in the
-    pre-open snapshot (it appeared post-snapshot) → the discriminator still dispatches the URI and
-    the Enter is withheld by the readiness gate — the pre-v2 contract of this test, unchanged."""
+    """The synthetic Enter must NOT fire if the frontmost window isn't THE task window — under
+    positive-identity (sw-coord-p51 R2/R3) this is STRENGTHENED: a front window that does not
+    positively carry our token is not DISPATCHED into at all. The discriminator fail-closes (defer +
+    retry) BEFORE the URI, so the prompt can never reach a wrong window (the old path dispatched then
+    relied on the submit gate to withhold the Enter). The task window is still AXRaised back to front
+    (enumerate-first; modeled in ``code_wins``) so a later tick can submit once it is frontmost."""
     task = "cold-wrongwin"
     ws = _cold_ws(tmp_path, task)
     _seed(home, ws, task)
@@ -424,9 +425,10 @@ def test_cold_focus_assert_blocks_enter_when_task_window_not_frontmost(home, tmp
                code_wins=[f"demo · {task} [worktree] — x.py"])
     assert _run(env).returncode == 0
     assert _read(tmp_path / "key.log") == "", "Enter must NOT be pressed onto a wrong window"
-    assert "AXRaise" in _read(tmp_path / "osa.log"), "on mismatch the task window must be AXRaised back to front"
-    assert _ack(home, task, "failed"), "abort must record a truthful `failed` ack (manual Enter needed)"
-    assert not _ack(home, task, "submitted"), "must not claim submitted when Enter was withheld"
+    assert _read(tmp_path / "open.log") == "", "URI must NOT be dispatched into a window we can't prove is ours"
+    assert "AXRaise" in _read(tmp_path / "osa.log"), "the task window must still be AXRaised back to front"
+    assert "FOCUS-FAILCLOSED" in _log(home), "a non-identifying front must fail-closed (defer), not dispatch"
+    assert not _ack(home, task, "submitted"), "must not claim submitted when nothing was dispatched"
 
 
 def test_cold_submit_succeeds_first_try_no_double(home, tmp_path):
@@ -550,20 +552,23 @@ def test_cold_submit_logs_readiness_verified_before_enter(home, tmp_path):
     assert _ack(home, task, "failed")
 
 
-def test_cold_submit_withholds_enter_until_ready_then_times_out(home, tmp_path):
-    """When focus NEVER settles on the prompt input (here: the task window is never frontmost → the readiness gate
-    only ever sees a mismatch), NO Enter is ever sent and the gate honestly times out (rc=5, 'focus never settled')
-    — never a blind Enter onto the empty sidebar / a wrong window (the trust-preserving WITHHOLD)."""
+def test_cold_tokenless_front_fails_closed_before_submit(home, tmp_path):
+    """Under positive-identity (sw-coord-p51 R2/R3) a front window whose title lacks our token can NOT
+    be proven ours, so the launcher fail-closes at the DISCRIMINATOR (defer + retry) and never
+    dispatches the URI — the synthetic Enter therefore can never land on a wrong window. (The old path
+    dispatched into the ∉-snapshot window and relied on the cold-submit readiness gate to time out
+    rc=5 'focus never settled'; that submit-gate WITHHOLD is still covered by the token-bearing
+    ``wrong_ready`` test test_cold_submit_withholds_when_focused_input_lacks_task_token.)"""
     task = "cold-diag-mismatch"
     ws = _cold_ws(tmp_path, task)
     _seed(home, ws, task)
     _cold_transcript(tmp_path, ws)
-    env = _env(home, tmp_path, front_window="some-other-project — z.py")  # title lacks token → gate sees mismatch
+    env = _env(home, tmp_path, front_window="some-other-project — z.py")  # no token → not provably ours
     assert _run(env).returncode == 0
-    log = _log(home)
-    assert "focus never settled on the prompt input" in log, "a never-ready submit must log rc=5 (Enter withheld)"
-    assert _read(tmp_path / "key.log") == "", "NO Enter is ever sent when readiness never arrives"
-    assert _ack(home, task, "failed")
+    assert _read(tmp_path / "open.log") == "", "URI must NOT be dispatched into an unprovable window"
+    assert _read(tmp_path / "key.log") == "", "NO Enter onto a window we can't prove is ours"
+    assert "FOCUS-FAILCLOSED" in _log(home), "the positive-identity fail-closed must be logged"
+    assert not _ack(home, task, "submitted")
 
 
 def test_cold_submit_withholds_when_focused_input_lacks_task_token(home, tmp_path):

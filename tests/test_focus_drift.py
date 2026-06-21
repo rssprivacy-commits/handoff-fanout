@@ -301,34 +301,57 @@ def test_contention_fail_closed_withholds_uri_and_defers(home, tmp_path):
     assert "matched_by=none" in log, "no Code window carries the task token here → matched_by=none"
 
 
-# ─── 2. 标题滞后: fresh window, title not bound yet → URI still dispatched ───────────
+# ─── 2. TOKENLESS 滞后窗(不能证明是我们的) → fail-closed (sw-coord-p51 R2 positive-identity) ─
 
 
-def test_title_lag_front_window_not_in_snapshot_dispatches(home, tmp_path):
-    """A cold boot / slow render: the frontmost Code window's name is NOT in the pre-open
-    snapshot → it IS the window we just opened (its title merely lags) → the URI is dispatched
-    exactly as before (zero regression on the wh-coord-11 class of spawn; the Enter stays
-    nonce/readiness-gated downstream)."""
+def test_title_lag_tokenless_front_fails_closed(home, tmp_path):
+    """sw-coord-p51 R2 (dual-brain): under PARALLEL cross-project spawns, a TOKENLESS front window
+    (∉ snapshot) can NOT be proven to be ours — it could be a concurrent sibling whose own title
+    has not rendered yet. The old "∉ snapshot ⇒ mine, dispatch" rule auto-submitted into that
+    foreign window (live press-now removed the Enter gate). Positive-identity: a front title with
+    NO whole-token match on our task/nonce → fail-closed (defer + retry). (A REAL own lagging
+    worktree window's title carries the task as its folder basename, so it dispatches via the
+    happy path — see test_realistic_lagging_own_window_dispatches — not this synthetic untitled
+    one.)"""
     task = "fd-lag"
     ws = _cold_ws(tmp_path, task)
     _seed(home, ws, task)
     tr = _cold_transcript(tmp_path, ws)
-    # front window = a fresh untitled window; snapshot only knows the owner's window
     env = _env(
         home,
         tmp_path,
-        front_window="Untitled (Workspace)",
+        front_window="Untitled (Workspace)",  # no token → not provably ours
         code_wins=[OWNER_WIN],
         grow_transcript=tr,
     )
     assert _run(env, tmp_path).returncode == 0
-    assert "vscode://anthropic.claude-code" in _read(tmp_path / "open.log"), (
-        "URI must be dispatched"
-    )
-    assert _ack(home, task, "spawned").exists(), "spawned ack written on dispatch"
-    assert not (home / PROJECT / "queue" / f"{task}.uri").exists(), ".uri consumed"
-    assert _marker_count(home, task) is None, "no contention marker on a dispatched spawn"
-    assert "FOCUS-DISCRIMINATOR" in _log(home), "the dispatch decision must be logged"
+    assert _read(tmp_path / "open.log") == "", "tokenless front must NOT receive the URI"
+    assert (home / PROJECT / "queue" / f"{task}.uri").exists(), ".uri restored for a retry tick"
+    assert not _ack(home, task, "spawned").exists(), "nothing dispatched into an unprovable window"
+    assert _read(tmp_path / "key.log") == "", "no Enter near a fail-closed dispatch"
+    assert _marker_count(home, task) == 1, "fail-closed pass bumps the focus_contended counter"
+    assert "FOCUS-FAILCLOSED" in _log(home), "the positive-identity fail-closed must be logged"
+
+
+# ─── 2b. 真实滞后自窗(folder-basename = task token) → 经 happy-path positive-identity 照发 ──
+
+
+def test_realistic_lagging_own_window_dispatches(home, tmp_path):
+    """No regression for REAL spawns: a genuine own worktree window's title carries the task token
+    even before settings render (the title == the worktree folder basename == the task id). That
+    positive whole-token identity is matched by the upstream frontmost-wait happy path → the URI
+    dispatches + auto-submits, exactly as a real cold spawn does."""
+    task = "fd-reallag"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    tr = _cold_transcript(tmp_path, ws)
+    # realistic pre-settings worktree title = the folder basename = the task id (whole-token)
+    env = _env(home, tmp_path, front_window=task, grow_transcript=tr, grow_on_attempt=1)
+    assert _run(env, tmp_path).returncode == 0
+    assert "vscode://anthropic.claude-code" in _read(tmp_path / "open.log"), "real own window dispatches"
+    assert _ack(home, task, "spawned").exists(), "spawned ack on a positive-identity dispatch"
+    assert _marker_count(home, task) is None, "no contention marker on a clean dispatch"
+    assert "FOCUS-FAILCLOSED" not in _log(home), "a token-bearing own window must NOT fail-closed"
 
 
 # ─── 3. 有界放弃: 5th consecutive contention → actionable failed ack ─────────────────
@@ -572,15 +595,17 @@ def test_probe_failure_on_retry_tick_skips_code_n_and_defers(home, tmp_path):
     )
 
 
-# ─── 11. PROBE:OK 空快照: Code 无窗 + 新窗标题滞后 → 照发（首窗零回归） ────────────────
+# ─── 11. PROBE:OK 空快照 + TOKENLESS 前窗 → fail-closed (空快照不再盲信 / R2 positive-identity) ─
 
 
-def test_probe_ok_empty_snapshot_still_dispatches(home, tmp_path):
-    """fdv2-fix1 zero-regression guard: "PROBE:OK + zero WIN: lines" is a LEGAL empty snapshot
-    (Code genuinely had no windows before ``code -n`` — the first-window spawn). The fresh
-    front window (title still lagging) is ∉ the empty snapshot → the discriminator must STILL
-    dispatch. This pins the fix to distinguishing failed-probe (no PROBE:OK → fail-closed)
-    from legal-empty (PROBE:OK → trusted), instead of blanket-deferring empty snapshots."""
+def test_probe_ok_empty_snapshot_tokenless_front_fails_closed(home, tmp_path):
+    """sw-coord-p51 R2: a LEGAL empty snapshot ("PROBE:OK + zero WIN:") no longer auto-trusts a
+    TOKENLESS front window. Under parallel cross-project spawns even an empty pre-open snapshot
+    can race (a concurrent sibling's window appears front before ours), so a markerless/tokenless
+    front window is NOT provably ours → fail-closed. (A real first-window spawn carries the task
+    token in its folder-basename title and dispatches via the happy path.) This still distinguishes
+    failed-probe (no PROBE:OK) from legal-empty — both now fail-closed for a tokenless front, but a
+    token-bearing front would dispatch."""
     task = "fd-empty"
     ws = _cold_ws(tmp_path, task)
     _seed(home, ws, task)
@@ -589,12 +614,11 @@ def test_probe_ok_empty_snapshot_still_dispatches(home, tmp_path):
         home, tmp_path, front_window="Untitled (Workspace)", code_wins=None, grow_transcript=tr
     )
     assert _run(env, tmp_path).returncode == 0
-    assert "vscode://anthropic.claude-code" in _read(tmp_path / "open.log"), (
-        "URI must dispatch on a legal empty snapshot"
-    )
-    assert _ack(home, task, "spawned").exists()
-    assert _marker_count(home, task) is None, "no contention marker on a dispatched spawn"
-    assert "FOCUS-DISCRIMINATOR" in _log(home), "the dispatch decision must be logged"
+    assert _read(tmp_path / "open.log") == "", "tokenless front must NOT receive the URI"
+    assert (home / PROJECT / "queue" / f"{task}.uri").exists(), ".uri restored for a retry tick"
+    assert not _ack(home, task, "spawned").exists()
+    assert _marker_count(home, task) == 1, "fail-closed pass bumps the counter"
+    assert "FOCUS-FAILCLOSED" in _log(home), "the positive-identity fail-closed must be logged"
 
 
 # ─── 12. 窗口名含换行: probe 在 AppleScript 源头清洗 + 判别方向不变 ────────────────────
@@ -655,3 +679,93 @@ def test_stale_focus_marker_cleared_when_task_finished(home, tmp_path):
     assert not _marker(home, stale).exists(), "stale marker must be cleared"
     assert "FOCUS-HOUSEKEEPING" in _log(home), "the housekeeping action must be logged"
     assert _marker(home, live).exists(), "a live task's marker must survive housekeeping"
+
+
+# ─── 14. 并发跨项目误派: 别项目并发 spawn 的窗持前台 → positive-identity fail-closed ──────
+
+def test_concurrent_foreign_handoff_window_fails_closed(home, tmp_path):
+    """sw-coord-p51 (auto-continue.log L186215): on an unlocked desktop independent project
+    spawns run in PARALLEL, so a concurrent project's window opens AFTER this task's pre-open
+    snapshot and is ALSO ∉ snapshot — the bare ∉-snapshot rule mis-dispatched THIS task's prompt
+    into it (erp-dev-coord-77's prompt → fateforge's worker window). Positive-identity: the front
+    title carries fateforge's task/nonce, NOT erp-dev-coord-77's → no whole-token match on ours →
+    fail-closed, never dispatch."""
+    task = "erp-dev-coord-77"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    _cold_transcript(tmp_path, ws)
+    # the concurrent fateforge worker window holds front; it carries fateforge's identity, not ours
+    foreign = "fateforge · ff-ci-prepush-gate-fix · worker · 9b72d0597435c595 [worktree] — Execute"
+    env = _env(home, tmp_path, front_window=foreign, code_wins=[OWNER_WIN])
+    assert _run(env, tmp_path).returncode == 0
+    assert _read(tmp_path / "open.log") == "", "foreign concurrent window must NOT receive the URI"
+    assert (home / PROJECT / "queue" / f"{task}.uri").exists(), ".uri restored for a retry tick"
+    assert not _ack(home, task, "spawned").exists(), "nothing dispatched into the foreign window"
+    assert _read(tmp_path / "key.log") == "", "no Enter near a fail-closed dispatch"
+    assert "FOCUS-FAILCLOSED" in _log(home), "the positive-identity fail-closed must be logged"
+    assert _marker_count(home, task) == 1, "fail-closed pass bumps the focus_contended counter"
+
+
+# ─── 15. 边界精度: 别 task id 含本 task id 作子串 → 仍 fail-closed (whole-token) ─────────
+
+def test_foreign_superstring_token_boundary_fails_closed(home, tmp_path):
+    """The positive-identity check is whole-kebab-token bounded (status_board._title_mentions_task
+    parity): a foreign window for task `demo-coord-77` must NOT be read as 'ours' merely because
+    our task `demo-coord-7` is a SUBSTRING of it — it must still fail-closed (a loose substring
+    match would treat the foreign window as ours → re-open the mis-dispatch hole)."""
+    task = "demo-coord-7"
+    ws = _cold_ws(tmp_path, task)
+    _seed(home, ws, task)
+    _cold_transcript(tmp_path, ws)
+    foreign = "demo · demo-coord-77 · worker · abcdef0123456789 [worktree] — x"
+    env = _env(home, tmp_path, front_window=foreign, code_wins=[OWNER_WIN])
+    assert _run(env, tmp_path).returncode == 0
+    assert _read(tmp_path / "open.log") == "", "substring-overlap foreign window must fail-closed"
+    assert "FOCUS-FAILCLOSED" in _log(home), "the boundary-aware fail-closed must fire"
+    assert not _ack(home, task, "spawned").exists()
+
+
+# ─── 16. singlepane TOKENLESS 前窗(只显示 repo 文件夹名, 无 task/nonce) → fail-closed ──────
+
+def test_singlepane_tokenless_front_fails_closed(home, tmp_path):
+    """A SINGLEPANE spawn whose front window shows only the inner repo folder name (no task id, no
+    nonce) cannot be proven ours under parallel spawns → fail-closed. (A REAL singlepane lagging
+    title is "<task>.handoff (Workspace)" — the generated workspace file basename — which carries
+    the task token and dispatches via the happy path; this synthetic "repo (Workspace)" is the
+    tokenless case the positive-identity gate must refuse.)"""
+    import json
+
+    task = "fd-spmarkerless"
+    nonce = "00ff11ee22dd33cc"
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    _seed(home, ws, task)
+    ws_file = tmp_path / "sp" / f"{task}.handoff.code-workspace"
+    ws_file.parent.mkdir(parents=True, exist_ok=True)
+    ws_file.write_text(
+        json.dumps(
+            {
+                "folders": [{"path": str(ws)}],
+                "settings": {"window.title": f"{PROJECT} · {task} · worker · {nonce} [singlepane]"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (home / PROJECT / "queue" / f"{task}.singlepane").write_text(
+        json.dumps(
+            {
+                "workspace": str(ws_file),
+                "role": "worker",
+                "close_policy": "keep",
+                "spawn_nonce": nonce,
+                "predecessor_nonce": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    # front = a tokenless title (only the repo folder name; neither task nor nonce)
+    env = _env(home, tmp_path, front_window="repo (Workspace)", code_wins=[OWNER_WIN])
+    assert _run(env, tmp_path).returncode == 0
+    assert _read(tmp_path / "open.log") == "", "tokenless singlepane front must NOT receive the URI"
+    assert not _ack(home, task, "spawned").exists()
+    assert "FOCUS-FAILCLOSED" in _log(home), "the positive-identity fail-closed must be logged"

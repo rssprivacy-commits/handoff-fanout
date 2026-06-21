@@ -521,43 +521,52 @@ def test_swallowed_enter_retries_and_confirms(home, tmp_path):
 # ─── 5. front-mismatch at submit time → nonce-first raise → retry confirms ───────────
 
 
-def test_front_mismatch_raises_then_retry_confirms(home, tmp_path):
-    """The URI dispatched via the title-lag discriminator (front = a fresh untitled window ∉
-    snapshot), so at submit time the front window lacks the nonce → attempt 1 presses nothing
-    (mismatch) → the machinery raises THE task window (nonce-first, existing
-    raise_task_window) → the retry gate then matches + the input still carries 🆔 → ONE press
-    → confirmed."""
+def test_singlepane_non_nonce_front_fails_closed(home, tmp_path):
+    """Positive-identity (sw-coord-p51 R2/R3): a singlepane spawn whose frontmost window does NOT
+    carry the per-spawn NONCE (here a generic 'Untitled (Workspace)' — neither task nor nonce has
+    rendered) can not be proven ours → the discriminator fail-closes (defer + retry), never
+    dispatching the URI/Enter into it. The OLD path dispatched into the ∉-snapshot untitled window and
+    recovered via a submit-time raise; under positive-identity the recovery is the NEXT retry tick
+    re-probing once the nonce-bearing title renders (covered by
+    test_focus_drift::test_uri_success_clears_marker_and_retry_skips_code_n_when_front)."""
     task = "sp-raise"
     repo = _seed_singlepane(home, tmp_path, task)
-    tdir = _transcript_dir(tmp_path, repo)
-    title = _sp_title(task)
+    _transcript_dir(tmp_path, repo)
     env = _env(
         home,
         tmp_path,
-        front_window="Untitled (Workspace)",  # ∉ snapshot → discriminator dispatches
-        code_wins=[OWNER_WIN, title],
-        input_value=f"🆔{task} the pasted prompt",
-        new_jsonl=tdir / "new-sess.jsonl",
-        new_jsonl_text=f'{{"text":"🆔{task} session started"}}',
-        jsonl_on_press=1,
-        raise_sets_front=title,  # the raise actually brings OUR window front
-        enum_hit_only_after_open=True,  # pre-URI raise misses; submit-time raise hits
+        front_window="Untitled (Workspace)",  # neither task nor nonce → not provably ours
+        code_wins=[OWNER_WIN],
     )
-    # generous readiness budget so the integer-second deadline can't truncate the first-press loop
-    # before its mismatch→raise→retry iterations run (needs >=2; the press is early once raised).
-    env["HANDOFF_SP_FIRST_READY_SECS"] = "3"
     assert _run(env, tmp_path).returncode == 0
-    sub = _ack(home, task, "submitted")
-    assert sub.exists(), "raise + marker-gated retry must recover a front-mismatch"
-    assert _presses(tmp_path) == 1, "no press ever lands on the wrong window"
-    log = _log(home)
-    # sw-coord-p34: front-mismatch on the FIRST press is now handled INSIDE the wall-clock
-    # readiness poll (singlepane_first_press_gated logs "SP-FIRST-PRESS: gate=mismatch …"), then it
-    # raises + keeps polling and presses on the next READY read → outcome=confirmed (rc=0). (Pre-p34
-    # the blind first press logged the orchestrator-level "outcome=front-mismatch".)
-    assert "SP-FIRST-PRESS: gate=mismatch" in log, "the first-press poll saw the mismatch + raised"
-    assert "outcome=confirmed" in log
-    assert "handoff-window-raise" in _read(tmp_path / "osa.log"), "the nonce-first raise fired"
+    assert _presses(tmp_path) == 0, "no press onto a non-identifying window"
+    assert not _ack(home, task, "submitted").exists(), "nothing dispatched/submitted into an unprovable window"
+    assert "FOCUS-FAILCLOSED" in _log(home), "the positive-identity fail-closed must be logged"
+
+
+def test_singlepane_stale_same_task_wrong_nonce_fails_closed(home, tmp_path):
+    """codex R2 must-fix regression (sw-coord-p51 R3): a STALE same-task singlepane window carries the
+    task id but an OLD nonce ('demo · sp-stale · worker · OLDNONCE [singlepane]'). It whole-token-
+    matches $TASK but NOT the current spawn nonce. The dispatch identity keys on the per-spawn NONCE
+    ($_focus_token) ONLY — never `$TASK` for a nonce-bearing singlepane — so the stale window is NOT
+    accepted as ours → fail-closed (no URI, no Enter into the stale session). A $TASK-accepting check
+    (the pre-R3 `_focus_token OR $TASK`) would auto-submit THIS spawn's prompt into the stale window."""
+    task = "sp-stale"
+    repo = _seed_singlepane(home, tmp_path, task)  # current spawn nonce = NONCE (deadbeefcafef00d)
+    _transcript_dir(tmp_path, repo)
+    stale = f"{PROJECT} · {task} · worker · 00000000deadbeef [singlepane]"  # same task, DIFFERENT nonce
+    env = _env(
+        home,
+        tmp_path,
+        front_window=stale,
+        code_wins=[OWNER_WIN, stale],
+    )
+    assert _run(env, tmp_path).returncode == 0
+    assert _presses(tmp_path) == 0, "no press into a stale same-task (wrong-nonce) window"
+    assert not _ack(home, task, "submitted").exists(), (
+        "a stale wrong-nonce window must never receive this spawn's prompt (codex R2 fail-open)"
+    )
+    assert "FOCUS-FAILCLOSED" in _log(home), "stale same-task wrong-nonce front must fail-closed"
 
 
 # ─── 6. input never ready → first press WITHHELD → honest rc=5 (NOT a blind press) ────
