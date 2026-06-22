@@ -53,6 +53,7 @@ OLD_READY_SCHEMA_VERSION = EVIDENCE_SCHEMA_VERSION
 SCHEMA_VERSION = 2
 SPECIAL_MARKERS = {
     "_fanin_triggered",
+    "_fanin_blocked",  # Step 4 (sw-s4-fix): a fan-in refused fail-closed by the anchor gate (codex #3)
     "_fan_in_started",
     "_fan_in_heartbeat",
     "_fan_in_done",
@@ -947,6 +948,24 @@ def write_active_dump(
     # ``_succession_relay``; the spawn writes the baseline itself, audit-close sends the
     # single notification — never a double 响). Default False = byte-identical v0
     # behavior for every caller (CLI / batch / fan-in / skill / tests).
+    #
+    # spawn-unification Step 4 (codex-RED #1 / sw-s4-fix): SELF-GATE at the writer boundary.
+    # main() resolves + gates the AnchorDecision at the command entry and threads it in
+    # (anchor_decision not None) — but the writer is the CONTRACT boundary (design §2.4: "4 writers
+    # ... block 在任何产物前 return EXIT_FAIL_CLOSED"), so a writer reached DIRECTLY (the watchdog
+    # fan-in / unit tests / any future caller bypassing main's entry) must gate ITSELF before the
+    # FIRST artifact (.md / ack / sidecar / .uri) — otherwise an enforce+miss coordinator spawn writes
+    # a half-product. Only the SPAWNING path needs it, matching main()'s exact gate predicate
+    # (status=="active" AND not suppressed — a terminal done/blocked close unlinks the .uri = no spawn;
+    # the suppressed succession ledger gates on the spawn side). When main already threaded a decision
+    # in, we DON'T re-gate (it's already gated; re-running would double-log a dry_run block-intent).
+    # Warn-mode (default, empty enforce list) → gate returns None → byte-identical (the disable-fix
+    # guard test asserts this).
+    if anchor_decision is None and status == "active" and not suppress_spawn_artifacts:
+        anchor_decision = _dump_anchor_decision(cfg, project, self_task=self_task)
+        gate_rc = _anchor_gate(anchor_decision, cfg=cfg, project=project, task=task)
+        if gate_rc is not None:
+            return gate_rc
     roadmap_excerpt = get_roadmap_excerpt(cfg, project)
     # ``workspace`` is the successor's tree (a worktree under isolation, else the
     # source tree); ``source_workspace`` is the closing session's tree used only for
@@ -1141,10 +1160,8 @@ def write_active_dump(
     # ── PUBLISH: write the .uri trigger LAST (all sidecars now exist) ────────────
     # §3.7 — atomic .uri write (see the .md note above). direct-jump-spawn: append the
     # SPAWNER_FOCUS line when this dump runs in a coordinator terminal (fail-open → "").
-    # Step 4: consume the entry-resolved decision (single-parse); a direct caller without one
-    # computes its own (still single-parse for that path).
-    if anchor_decision is None:
-        anchor_decision = _dump_anchor_decision(cfg, project, self_task=self_task)
+    # Step 4: consume the SINGLE pre-resolved decision — main() threaded it in, else the top-of-
+    # function self-gate resolved it (so it is never None on this spawning publish path); no re-read.
     atomic.atomic_replace(
         uri_path,
         f"WORKSPACE={workspace}\nURI={uri}\n"
@@ -1356,6 +1373,18 @@ def handle_open_batch(
     except ValueError as e:
         raise SystemExit(f"❌ Gate A failed: {e}") from e
 
+    # spawn-unification Step 4 (codex-RED #1 / sw-s4-fix): SELF-GATE at the writer boundary. main()
+    # resolves + gates the decision and threads it in (anchor_decision not None); a DIRECT caller
+    # (unit tests / any future caller bypassing main's entry) must gate ITSELF BEFORE creating
+    # batch_dir / manifest.json / any sub-task .md/.uri, so an enforce+miss fan-out leaves NO
+    # half-product (this whole path always spawns sub-task .uris — no terminal variant — so the gate
+    # is unconditional when self-resolving). Warn-mode (default) → gate returns None → byte-identical.
+    if anchor_decision is None:
+        anchor_decision = _dump_anchor_decision(cfg, project, self_task=getattr(args, "self_task", None))
+        gate_rc = _anchor_gate(anchor_decision, cfg=cfg, project=project, task=batch_id)
+        if gate_rc is not None:
+            return gate_rc
+
     batch_dir = handoff_root() / project / "batches" / batch_id
     if batch_dir.exists():
         raise SystemExit(f"❌ batch_dir already exists: {batch_dir}")
@@ -1379,9 +1408,8 @@ def handle_open_batch(
     # not of each sub-task. The AUTHORITATIVE per-worker fallback canary is the ENGINE's per-produce
     # log (``spawn.run_spawn`` calls ``log_anchor_miss`` once per actual ``handoff spawn``), so this
     # coarse batch-level record is a convenience signal, not the canary count — no per-uri undercount.
-    # Step 4: consume the entry-resolved decision (single-parse); a direct caller computes its own.
-    if anchor_decision is None:
-        anchor_decision = _dump_anchor_decision(cfg, project, self_task=getattr(args, "self_task", None))
+    # Step 4: consume the SINGLE pre-resolved decision — main() threaded it in, else the self-gate
+    # above resolved it (never None here); no re-read (design §2.4/§2.5 single-parse, TOCTOU-free).
     _focus_line = _spawner_focus_line(
         anchor_decision,
         home=cfg.home,
@@ -1503,13 +1531,32 @@ def trigger_fan_in_if_ready(
     if decision is None:
         decision = _dump_anchor_decision(cfg, project, self_task=self_task, callsite="fan-in")
     if _anchor_gate(decision, cfg=cfg, project=project, task=fan_in_task) is not None:
+        # Step 4 (codex #3 / sw-s4-fix): a fail-closed fan-in refusal must be MACHINE-DISTINGUISHABLE
+        # from the other False returns (incomplete / sibling-already-triggered). We keep the bool
+        # contract (return False — existing callers treat all "no fan-in this round" alike + re-poll)
+        # and the loud stderr, and ALSO drop a ``_fanin_blocked`` sentinel so the watchdog / an
+        # operator can tell "refused under enforce, anchor unresolved" apart from "still waiting".
+        # The sub-task .done markers and the absence of _fanin_triggered keep it RE-DISPATCHABLE; the
+        # sentinel is cleared the moment a later attempt clears the gate (below). Best-effort, never
+        # load-bearing (same fail-open contract as the telemetry logs).
+        try:
+            (batch_dir / "_fanin_blocked").write_text(
+                f"{now_iso()} anchor unresolved under enforce ({decision.miss_reason})\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
         print(
             f"❌ [trigger-fan-in] anchor unresolved under enforce — fan-in for batch {batch_id} "
             "refused (fail-closed); sub-task results preserved, re-dispatchable once the "
-            "coordinator anchor resolves.",
+            "coordinator anchor resolves (signal: _fanin_blocked).",
             file=sys.stderr,
         )
         return False
+
+    # Past the gate (anchor resolved, or warn / dry_run / non-coordinator origin): clear any stale
+    # refusal sentinel from an earlier blocked attempt so it never lingers (Step 4 codex #3).
+    (batch_dir / "_fanin_blocked").unlink(missing_ok=True)
 
     if not atomic.atomic_create(batch_dir / "_fanin_triggered"):
         print("[trigger-fan-in] sibling already triggered, exiting")

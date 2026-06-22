@@ -552,3 +552,171 @@ def test_spawn_default_argv_origin_is_coordinator():
         ["--project", "p", "--task-id", "t", "--isolation", "singlepane", "--prompt", "x"]
     )
     assert ns.origin == "coordinator"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# #1 WRITER-BOUNDARY self-gate (codex-RED, sw-s4-fix). main() resolves + gates
+# the AnchorDecision and threads it in; but a writer reached DIRECTLY (the
+# watchdog fan-in / unit tests / ANY future caller bypassing main's entry gate)
+# must gate ITSELF before touching the first artifact — the writer is the
+# contract boundary (design §2.4 "4 writers ... block 在任何产物前 return
+# EXIT_FAIL_CLOSED"), it must not assume the caller gated first.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _direct_baseline() -> dict:
+    return {"git_head": "deadbeef", "branch": "main", "dirty": False}
+
+
+def _batch_args(manifest_path: Path):
+    import types
+
+    return types.SimpleNamespace(open_batch=str(manifest_path), self_task=None)
+
+
+def _write_manifest(tmp_path: Path, batch_id: str = "b1") -> Path:
+    manifest = {
+        "schema_version": dump.SCHEMA_VERSION,
+        "batch_id": batch_id,
+        "fan_in_task": f"{batch_id}-fanin",
+        "sub_tasks": [
+            {"id": "s-a", "brief": "a", "depends_on": [],
+             "file_ownership": [{"type": "exact", "path": "a.py"}]},
+            {"id": "s-b", "brief": "b", "depends_on": [],
+             "file_ownership": [{"type": "exact", "path": "b.py"}]},
+        ],
+    }
+    p = tmp_path / "manifest.json"
+    p.write_text(json.dumps(manifest), encoding="utf-8")
+    return p
+
+
+def test_write_active_dump_direct_enforce_miss_self_gates(tmp_path, monkeypatch):
+    """#1 codex-RED: write_active_dump called DIRECTLY (anchor_decision=None — no pre-gated decision
+    threaded in) under enforce + coordinator + miss → EXIT_FAIL_CLOSED with ZERO artifacts. Proves the
+    writer self-gates BEFORE its first artifact rather than relying on main() having gated."""
+    _home(tmp_path, monkeypatch, {"spawner_anchor_enforce_projects": [PROJECT]})
+    ws = _git_ws(tmp_path)
+    cfg = _config.load()
+    queue_dir = cfg.queue_dir(PROJECT)
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    rc = dump.write_active_dump(
+        cfg=cfg, project=PROJECT, task=TASK, workspace=ws, next_brief="b", status="active",
+        tests=None, baseline=_direct_baseline(), queue_dir=queue_dir, anchor_decision=None,
+    )
+    assert rc == dump._EXIT_FAIL_CLOSED
+    assert list(queue_dir.iterdir()) == []  # no .md / .uri / .singlepane half-product
+    assert not (cfg.ack_dir(PROJECT) / f"{TASK}.queued").exists()
+
+
+def test_write_active_dump_direct_warn_still_writes(tmp_path, monkeypatch):
+    """#1 disable-fix guard: the SAME direct call under WARN (no enforce) must still publish the .uri
+    byte-identical (no SPAWNER_FOCUS). The new self-gate must NOT touch the default path."""
+    _home(tmp_path, monkeypatch, {})
+    ws = _git_ws(tmp_path)
+    cfg = _config.load()
+    queue_dir = cfg.queue_dir(PROJECT)
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    rc = dump.write_active_dump(
+        cfg=cfg, project=PROJECT, task=TASK, workspace=ws, next_brief="b", status="active",
+        tests=None, baseline=_direct_baseline(), queue_dir=queue_dir, anchor_decision=None,
+    )
+    assert rc == 0
+    uri = (queue_dir / f"{TASK}.uri").read_text()
+    assert uri == f"WORKSPACE={ws}\nURI={dump.build_uri(cfg, PROJECT, TASK)}\n"
+
+
+def test_write_active_dump_direct_terminal_done_not_gated(tmp_path, monkeypatch):
+    """#1: a DIRECT terminal (done) write under enforce + miss must NOT be gated — a done close unlinks
+    the .uri (no spawn = no wrong-desktop risk). Mirrors main()'s status-aware gate predicate."""
+    _home(tmp_path, monkeypatch, {"spawner_anchor_enforce_projects": [PROJECT]})
+    ws = _git_ws(tmp_path)
+    cfg = _config.load()
+    queue_dir = cfg.queue_dir(PROJECT)
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    rc = dump.write_active_dump(
+        cfg=cfg, project=PROJECT, task=TASK, workspace=ws, next_brief="b", status="done",
+        tests=None, baseline=_direct_baseline(), queue_dir=queue_dir, anchor_decision=None,
+    )
+    assert rc == 0  # terminal close is never blocked by the anchor gate
+    assert (queue_dir / f"{TASK}.done").exists()
+
+
+def test_handle_open_batch_direct_enforce_miss_self_gates(tmp_path, monkeypatch):
+    """#1 codex-RED: handle_open_batch called DIRECTLY (anchor_decision=None) under enforce + miss →
+    EXIT_FAIL_CLOSED BEFORE batch_dir / manifest.json / any sub-task .md/.uri are created."""
+    _home(tmp_path, monkeypatch, {"spawner_anchor_enforce_projects": [PROJECT]})
+    ws = _git_ws(tmp_path)
+    cfg = _config.load()
+    queue_dir = cfg.queue_dir(PROJECT)
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    manifest = _write_manifest(tmp_path)
+    rc = dump.handle_open_batch(_batch_args(manifest), cfg, ws, PROJECT, queue_dir, None)
+    assert rc == dump._EXIT_FAIL_CLOSED
+    assert not (dump.handoff_root() / PROJECT / "batches" / "b1").exists()  # no batch_dir/manifest
+    assert list(queue_dir.iterdir()) == []  # no sub-task .md/.uri half-product
+
+
+def test_handle_open_batch_direct_warn_still_opens(tmp_path, monkeypatch):
+    """#1 disable-fix guard: the same direct handle_open_batch under WARN opens the batch normally."""
+    _home(tmp_path, monkeypatch, {})
+    ws = _git_ws(tmp_path)
+    cfg = _config.load()
+    queue_dir = cfg.queue_dir(PROJECT)
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(dump, "STAGGER_SPAWN_SECONDS", 0)
+    manifest = _write_manifest(tmp_path)
+    rc = dump.handle_open_batch(_batch_args(manifest), cfg, ws, PROJECT, queue_dir, None)
+    assert rc == 0
+    assert (queue_dir / "s-a.uri").exists() and (queue_dir / "s-b.uri").exists()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# #3 fan-in REFUSAL observability (codex orange, sw-s4-fix). A fan-in refused by
+# the anchor gate must be machine-distinguishable from 'not ready' /
+# 'sibling already triggered' — WITHOUT mis-reporting the sub-task close as
+# failed (batch-done stays 0) and WITHOUT consuming the re-dispatch token.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _open_warn_batch(tmp_path, monkeypatch):
+    """Open a 2-sub-task batch under WARN (an enforce config would fail-closed at OPEN time), mark both
+    sub-tasks .done, and return (ws, queue_dir, batch_dir) ready for a fan-in attempt."""
+    _home(tmp_path, monkeypatch, {})
+    ws = _git_ws(tmp_path)
+    cfg = _config.load()
+    queue_dir = cfg.queue_dir(PROJECT)
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(dump, "STAGGER_SPAWN_SECONDS", 0)
+    manifest = _write_manifest(tmp_path)
+    assert dump.handle_open_batch(_batch_args(manifest), cfg, ws, PROJECT, queue_dir, None) == 0
+    batch_dir = dump.handoff_root() / PROJECT / "batches" / "b1"
+    (batch_dir / "s-a.done").write_text("done\n")
+    (batch_dir / "s-b.done").write_text("done\n")
+    return ws, queue_dir, batch_dir
+
+
+def test_fan_in_refused_under_enforce_writes_sentinel(tmp_path, monkeypatch):
+    """#3: a fan-in refused by the anchor gate (enforce + coordinator + miss) drops a `_fanin_blocked`
+    sentinel (machine-distinguishable signal) WITHOUT creating `_fanin_triggered` or the fan-in .uri,
+    and WITHOUT touching the sub-task .done markers — so it stays re-dispatchable once the anchor
+    resolves. (return is still False — the bool contract is preserved for existing callers.)"""
+    ws, queue_dir, batch_dir = _open_warn_batch(tmp_path, monkeypatch)
+    enforce_cfg = _cfg(enforce=[PROJECT])
+    fired = dump.trigger_fan_in_if_ready(PROJECT, ws, "b1", queue_dir, cfg=enforce_cfg)
+    assert fired is False
+    assert (batch_dir / "_fanin_blocked").exists()          # NEW machine-observable refusal signal
+    assert not (batch_dir / "_fanin_triggered").exists()    # not consumed → re-dispatchable
+    assert not (queue_dir / "b1-fanin.uri").exists()        # no fan-in window intent published
+    assert (batch_dir / "s-a.done").exists() and (batch_dir / "s-b.done").exists()  # sub-tasks intact
+
+
+def test_fan_in_success_clears_stale_sentinel(tmp_path, monkeypatch):
+    """#3: once the anchor resolves, a successful fan-in CLEARS a stale `_fanin_blocked` sentinel from
+    an earlier refusal (no stale state lingers in batch_dir)."""
+    ws, queue_dir, batch_dir = _open_warn_batch(tmp_path, monkeypatch)
+    (batch_dir / "_fanin_blocked").write_text("stale\n")  # simulate a prior refusal
+    cfg = _config.load()  # warn → gate passes → fan-in fires
+    assert dump.trigger_fan_in_if_ready(PROJECT, ws, "b1", queue_dir, cfg=cfg) is True
+    assert not (batch_dir / "_fanin_blocked").exists()   # stale signal cleared on success
+    assert (batch_dir / "_fanin_triggered").exists()
