@@ -183,6 +183,34 @@ class Config:
     # ``HANDOFF_RETRO_BYPASS`` always runs the gate regardless of this list.
     mandate_projects: list[str] = field(default_factory=list)
     mandate_projects_configured: bool = False
+    # ── spawn-unification Step 4: per-project anchor fail-closed roll-out ──────────
+    # Three-phase, per-project enforcement of «a coordinator dispatch whose spawner
+    # anchor cannot be resolved is REFUSED, not silently landed on the wrong desktop»
+    # (design Step 4 §4.1). DEFAULT = warn (zero behavior change): a project absent
+    # from BOTH lists takes the legacy fail-open omit path. ``spawner_anchor_dry_run_projects``
+    # runs the full new decision but only RECORDS a would-block (LOG_BLOCK_INTENT) — the
+    # ≥24h shadow buffer before flipping real block. ``spawner_anchor_enforce_projects`` is
+    # the real fail-closed phase. A project in BOTH → enforce wins (take the stricter, codex
+    # R2). ``spawner_anchor_system_allow`` is the SINGLE source of a system-origin无锚 exemption
+    # (cron/bootstrap headless entrypoints) — a config list (NOT inheritable, no token; design
+    # §2.2 v3). Unlike ``mandate_projects`` (a security mandate that fails CLOSED on an empty
+    # list = enforce-everywhere), these default OPEN (warn): an accidental empty must NOT flip
+    # every project to fail-closed mid-roll-out (禁静默 behavior-change). ``*_configured`` mirrors
+    # ``mandate_projects_configured`` (records whether ANY project is explicitly enforced) so the
+    # «空列表 vs 缺键» distinction is observable. The fail-CLOSED direction lives in
+    # ``config_trusted``: a present-but-corrupt config (parse/schema failure) must NEVER silently
+    # degrade an enforce-able dispatch to warn (codex R2 «一个 config 坏 = 防线静默消失»).
+    spawner_anchor_dry_run_projects: list[str] = field(default_factory=list)
+    spawner_anchor_enforce_projects: list[str] = field(default_factory=list)
+    spawner_anchor_enforce_configured: bool = False
+    spawner_anchor_system_allow: list[str] = field(default_factory=list)
+    # ``True`` when this Config was parsed from a trusted source (absent file = clean defaults,
+    # or a present file that read + parsed). A present-but-untrustworthy config (unreadable /
+    # corrupt JSON) sets this ``False`` via ``_fail_closed_config`` so the Step 4 anchor decision
+    # fails CLOSED instead of reading the (now-empty) enforce list as "warn everywhere" (design
+    # §4.1 config fail-safe). Distinct from ``unified_spawn_enabled``: an EXPLICIT owner kill
+    # (``unified_spawn_enabled: false``) parses fine and stays ``config_trusted=True``.
+    config_trusted: bool = True
     # ── Per-session git worktree isolation (opt-in / default OFF) ──────────────
     # Each spawned session works in its own ``git worktree`` instead of the shared
     # main tree, so one session's ``git stash`` / ``reset --hard`` / pytest can't
@@ -306,7 +334,9 @@ def _fail_closed_config(home: Path, cfg_path: Path, err: Exception) -> Config:
         "config.json to re-enable.",
         file=sys.stderr,
     )
-    return Config(home=home, unified_spawn_enabled=False)
+    # config_trusted=False so the Step 4 anchor decision fails CLOSED for an enforce-able
+    # dispatch rather than reading the (now-empty) enforce list as "warn" (design §4.1 fail-safe).
+    return Config(home=home, unified_spawn_enabled=False, config_trusted=False)
 
 
 def _from_dict(data: dict, home: Path) -> Config:
@@ -377,6 +407,7 @@ def _from_dict(data: dict, home: Path) -> Config:
         ],
         audit_code_roots_configured="audit_code_repo_roots" in data,
         **_parse_mandate_projects(data),
+        **_parse_anchor_projects(data),
         **_parse_worktree(data),
         **_parse_reclaim(data),
     )
@@ -568,4 +599,34 @@ def _parse_mandate_projects(data: dict) -> dict:
     return {
         "mandate_projects": projects,
         "mandate_projects_configured": bool(projects),
+    }
+
+
+def _anchor_slug_list(data: dict, key: str) -> list[str]:
+    """Parse a Step 4 anchor project list defensively (mirrors ``worktree_projects`` /
+    ``singlepane_projects``): only a JSON list of non-empty strings survives; any non-list
+    (absent / bare-string typo / object) → ``[]``. A bare string ``"hf"`` must NOT iterate
+    into chars ``['h','f']`` (the mandate-parser footgun) — guard ``isinstance(list)`` first."""
+    raw = data.get(key)
+    return [str(p) for p in raw if isinstance(p, str) and p] if isinstance(raw, list) else []
+
+
+def _parse_anchor_projects(data: dict) -> dict:
+    """Parse the Step 4 anchor fail-closed roll-out lists (design §4.1).
+
+    Default-OPEN (warn), the OPPOSITE of ``_parse_mandate_projects``: a project absent from
+    both ``spawner_anchor_dry_run_projects`` and ``spawner_anchor_enforce_projects`` is warn
+    (legacy fail-open) — so an accidental empty / absent key can NEVER flip a project to
+    fail-closed mid-roll-out. ``spawner_anchor_enforce_configured`` mirrors
+    ``mandate_projects_configured`` (records whether any project is explicitly enforced) so the
+    «空列表 vs 缺键» distinction is testable. The fail-CLOSED direction (corrupt config) is
+    carried by ``config_trusted`` (set in ``_fail_closed_config``), NOT here — a valid config
+    with empty lists legitimately means "nothing enforced yet".
+    """
+    enforce = _anchor_slug_list(data, "spawner_anchor_enforce_projects")
+    return {
+        "spawner_anchor_dry_run_projects": _anchor_slug_list(data, "spawner_anchor_dry_run_projects"),
+        "spawner_anchor_enforce_projects": enforce,
+        "spawner_anchor_enforce_configured": bool(enforce),
+        "spawner_anchor_system_allow": _anchor_slug_list(data, "spawner_anchor_system_allow"),
     }

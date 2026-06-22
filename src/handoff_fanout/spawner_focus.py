@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -294,6 +296,180 @@ def resolve_spawner_focus_path(
     return None
 
 
+# ── spawn-unification Step 4 (2026-06-22 / sw-s4-impl) — fail-closed machinery ──────────────────
+# Turn an anchor-resolution MISS on a coordinator dispatch from today's SILENT fail-open (omit
+# SPAWNER_FOCUS → code-router.sh static-map fallback → wrong desktop) into an explicit fail-CLOSED
+# refuse (design Step 4). DEFAULT = warn (config enforce lists empty) = BYTE-IDENTICAL to Step 1+2.
+# The machinery here is PURE decision (origin trust matrix + per-project enforcement) — the actual
+# resolution still happens ONCE per produce path (spawn resolves its own path; dump resolves at its
+# command entry), and the writers consume the decision verbatim (design §2.4/§2.5 single-parse).
+#
+# ORIGIN TRUST MODEL (design §2.2 v3/v4 铁律): leniency (allow-no-anchor) comes ONLY from
+# NON-inheritable sources — a config allow-list (system), a physical front TTY (interactive), or
+# in-process pytest (test). An env var can only ADD strictness (HANDOFF_UNATTENDED demotes
+# interactive), NEVER grant an exemption → an inherited env can only make a dispatch STRICTER, so the
+# "inherited exemption env" backdoor is structurally impossible. Any un-provable signal → coordinator
+# (the strictest origin = anchor required).
+
+ORIGIN_COORDINATOR = "coordinator"
+ORIGIN_INTERACTIVE = "interactive"
+ORIGIN_SYSTEM = "system"
+ORIGIN_TEST = "test"
+ORIGINS = (ORIGIN_COORDINATOR, ORIGIN_INTERACTIVE, ORIGIN_SYSTEM, ORIGIN_TEST)
+
+ENFORCE_WARN = "warn"
+ENFORCE_DRY_RUN = "dry_run"
+ENFORCE_BLOCK = "block"
+
+# anchor-unresolved is kept DISTINCT from Step 6's isolation-unresolved (design §4.2): the two
+# fail-closed reasons / error messages must never be conflated.
+MISS_REASON_ANCHOR = "anchor-unresolved"
+
+
+@dataclass(frozen=True)
+class AnchorDecision:
+    """The once-computed verdict for a single produce path (design §2.4). Immutable so the 4 dump
+    writers can only CONSUME it (never re-derive). ``origin_source`` is LOG-ONLY (``cli`` | ``default``)
+    — v3 deleted env-reported origin trust, so it carries no authority, only provenance for the log."""
+
+    focus_line: str | None  # validated "SPAWNER_FOCUS=<path>\n" (the single resolution result) or None
+    required: bool  # effective origin == coordinator AND project under an enforce phase (§2.4)
+    origin: str  # the EFFECTIVE origin after the §4.2 trust matrix (post-demotion)
+    origin_source: str  # cli | default (log-only; no trust use — §2.2 v3)
+    enforcement: str  # warn | dry_run | block (§4.1 per-project phase)
+    miss_reason: str | None  # MISS_REASON_ANCHOR when focus_line is None, else None
+
+
+def _front_tty() -> bool:
+    """True IFF BOTH stdin and stdout are a real terminal — a NECESSARY (non-sufficient) gate for the
+    interactive exemption (design §2.2 v4 / R3 codex). A headless chain (no controlling tty) physically
+    cannot pass this, so it can never obtain the interactive exemption even if it forgets to set
+    HANDOFF_UNATTENDED — root-cause fix for the §7-2a "forgot the strictness env" weak point. NEVER
+    raises (a closed/odd fd → not a tty)."""
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def _in_process_pytest() -> bool:
+    """True IFF running INSIDE pytest (the ``test`` origin's exemption signal). Deliberately an
+    in-process probe (``sys.modules``), NOT an env var: a production-inheritable ``HANDOFF_TEST_MODE``
+    would violate «env only授 strictness» and let a leaked env grant leniency (design §2.2 v4 codex R3)."""
+    return "pytest" in sys.modules
+
+
+def _effective_origin(origin: str | None, *, cfg: _config.Config, project: str) -> str:
+    """Apply the design §4.2 trust matrix → the EFFECTIVE origin (coordinator after any demotion).
+
+    Leniency only from NON-inheritable sources; an unknown / un-provable signal → coordinator (most
+    strict). Demotions: interactive without a front TTY OR with HANDOFF_UNATTENDED set → coordinator;
+    system whose project is not in the config allow-list → coordinator; test outside in-process pytest
+    → coordinator. NEVER raises."""
+    o = origin if origin in ORIGINS else ORIGIN_COORDINATOR
+    if o == ORIGIN_COORDINATOR:
+        return ORIGIN_COORDINATOR
+    if o == ORIGIN_INTERACTIVE:
+        # HANDOFF_UNATTENDED present (ANY value) = the automated-chain marker → demote (env adds
+        # strictness only). No TTY → demote (headless chain physically can't be exempt).
+        if _front_tty() and "HANDOFF_UNATTENDED" not in os.environ:
+            return ORIGIN_INTERACTIVE
+        return ORIGIN_COORDINATOR
+    if o == ORIGIN_SYSTEM:
+        allow = getattr(cfg, "spawner_anchor_system_allow", ()) or ()
+        return ORIGIN_SYSTEM if project in allow else ORIGIN_COORDINATOR
+    if o == ORIGIN_TEST:
+        return ORIGIN_TEST if _in_process_pytest() else ORIGIN_COORDINATOR
+    return ORIGIN_COORDINATOR
+
+
+def _anchor_enforcement(cfg: _config.Config, project: str) -> str:
+    """Per-project enforcement phase (design §4.1): ``warn`` | ``dry_run`` | ``block``.
+
+    CONFIG FAIL-SAFE (codex R2 «一个 config 坏 = 防线静默消失»): a present-but-corrupt config
+    (``config_trusted=False``) → ``block`` — NEVER silently degrade an enforce-able dispatch to warn
+    off a config we couldn't parse. Otherwise: an explicit ``enforce`` list membership → ``block``;
+    a ``dry_run`` list membership → ``dry_run``; else ``warn``. Overlap (a project in BOTH lists) →
+    ``block`` wins (the stricter — checked first; design §4.1 table)."""
+    if not getattr(cfg, "config_trusted", True):
+        return ENFORCE_BLOCK
+    if project in (getattr(cfg, "spawner_anchor_enforce_projects", ()) or ()):
+        return ENFORCE_BLOCK
+    if project in (getattr(cfg, "spawner_anchor_dry_run_projects", ()) or ()):
+        return ENFORCE_DRY_RUN
+    return ENFORCE_WARN
+
+
+def make_anchor_decision(
+    resolved_path: str | None,
+    *,
+    cfg: _config.Config,
+    home: str | os.PathLike[str],
+    project: str,
+    origin: str = ORIGIN_COORDINATOR,
+    origin_source: str = "cli",
+    cwd: str | os.PathLike[str],
+    callsite: str = "spawn",
+) -> AnchorDecision:
+    """Build the :class:`AnchorDecision` from an ALREADY-resolved+validated focus path (or ``None``).
+
+    PURE decision — NO resolution here, so ``spawn`` (which resolved its own ``--spawner-focus-path`` /
+    self-id path) and ``dump`` (which resolves once at its command entry) feed the SAME machinery
+    without a second cwd/env/cfg read (design §2.5 TOCTOU). Computes the effective origin (§4.2 matrix),
+    the per-project enforcement (§4.1), ``required`` (a coordinator dispatch under an enforce phase),
+    and the miss reason. A system-origin无锚 pass-through is AUDIT-logged here (design §2.2 codex R3:
+    every system exemption must be observable). NEVER raises (the decision must not break a spawn/dump)."""
+    focus_line = f"SPAWNER_FOCUS={resolved_path}\n" if resolved_path else None
+    eff = _effective_origin(origin, cfg=cfg, project=project)
+    enforcement = _anchor_enforcement(cfg, project)
+    required = eff == ORIGIN_COORDINATOR and enforcement != ENFORCE_WARN
+    miss_reason = MISS_REASON_ANCHOR if resolved_path is None else None
+    if eff == ORIGIN_SYSTEM and resolved_path is None:
+        log_system_anchor_audit(home=home, project=project, callsite=callsite, cwd=cwd)
+    return AnchorDecision(
+        focus_line=focus_line,
+        required=required,
+        origin=eff,
+        origin_source=origin_source if origin_source in ("cli", "default") else "default",
+        enforcement=enforcement,
+        miss_reason=miss_reason,
+    )
+
+
+def resolve_anchor_decision(
+    cwd: str | os.PathLike[str],
+    *,
+    cfg: _config.Config,
+    home: str | os.PathLike[str],
+    project: str,
+    self_task: str | None = None,
+    origin: str = ORIGIN_COORDINATOR,
+    origin_source: str = "cli",
+    env_focus_path: str | None = None,
+    callsite: str = "dump",
+) -> AnchorDecision:
+    """The SINGLE resolution+decision point for the dump command entry (design §2.4): validate the env
+    focus hint (``$HANDOFF_WINDOW_FOCUS_PATH``), else self-resolve via
+    :func:`resolve_spawner_focus_path` EXACTLY ONCE, then build the decision. The 4 dump writers consume
+    the returned object verbatim — no second read of cwd/env/cfg downstream (TOCTOU eliminated). NEVER
+    raises."""
+    rp = validate_spawner_focus(env_focus_path, cfg=cfg) if env_focus_path else None
+    if not rp:
+        rp = resolve_spawner_focus_path(
+            cwd, cfg=cfg, home=home, project=project, self_task=self_task
+        )
+    return make_anchor_decision(
+        rp,
+        cfg=cfg,
+        home=home,
+        project=project,
+        origin=origin,
+        origin_source=origin_source,
+        cwd=cwd,
+        callsite=callsite,
+    )
+
+
 # ── spawn-unification Step 1 (2026-06-22 / sw-spawn-unify-step1) ─────────────────────────────────
 # Telemetry: turn the otherwise-SILENT "no SPAWNER_FOCUS → code-router.sh falls back to the static
 # projects.json desktop map" event (the root cause of workers landing on the wrong / owner's desktop)
@@ -336,4 +512,68 @@ def log_anchor_miss(
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception:
         # fail-open: telemetry is never load-bearing — a missed log line must not break a spawn/dump.
+        pass
+
+
+def log_block_intent(
+    *,
+    home: str | os.PathLike[str],
+    project: str,
+    task: str | None,
+    cwd: str | os.PathLike[str],
+    origin: str,
+    enforcement: str,
+    reason: str,
+) -> None:
+    """Append ONE JSON line to ``<home>/<project>/spawn-anchor-block-intent.log`` — the dry_run /
+    shadow record (design §4.1 phase 2): a dispatch that the ENFORCE phase WOULD have blocked, logged
+    WITHOUT changing behavior so the ≥24-48h buffer can prove would-block→0 before flipping real block.
+    Same fail-open / non-blocking contract as :func:`log_anchor_miss`."""
+    try:
+        log_dir = os.path.join(str(home), project)
+        os.makedirs(log_dir, exist_ok=True)
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "task": task,
+            "project": project,
+            "cwd": str(cwd),
+            "origin": origin,
+            "enforcement": enforcement,
+            "would_block": True,
+            "reason": reason,
+        }
+        with open(
+            os.path.join(log_dir, "spawn-anchor-block-intent.log"), "a", encoding="utf-8"
+        ) as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def log_system_anchor_audit(
+    *,
+    home: str | os.PathLike[str],
+    project: str,
+    callsite: str,
+    cwd: str | os.PathLike[str],
+) -> None:
+    """Append ONE JSON line ``{ts, project, callsite, cwd}`` to
+    ``<home>/<project>/spawn-anchor-system-audit.log`` — every system-origin无锚 exemption (design
+    §2.2 codex R3: a system pass-through must be observable so over-broad use is catchable, enabling
+    a future ``(project, callsite)`` tightening). Same fail-open / non-blocking contract as
+    :func:`log_anchor_miss`."""
+    try:
+        log_dir = os.path.join(str(home), project)
+        os.makedirs(log_dir, exist_ok=True)
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "project": project,
+            "callsite": callsite,
+            "cwd": str(cwd),
+        }
+        with open(
+            os.path.join(log_dir, "spawn-anchor-system-audit.log"), "a", encoding="utf-8"
+        ) as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
         pass

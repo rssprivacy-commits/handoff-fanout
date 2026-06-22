@@ -809,51 +809,107 @@ def build_uri(cfg: _config.Config, project: str, task: str) -> str:
     return cfg.uri_template.format(prompt=encoded)
 
 
-def _spawner_focus_line(
+_EXIT_FAIL_CLOSED = 2  # spawn.py parity — a fail-closed dump writes nothing publishable.
+
+
+def _dump_anchor_decision(
     cfg: _config.Config,
     project: str,
-    self_task: str | None = None,
     *,
+    self_task: str | None = None,
+    origin: str = _spawner_focus.ORIGIN_COORDINATOR,
+    callsite: str = "dump",
+) -> _spawner_focus.AnchorDecision:
+    """Resolve the spawning coordinator's anchor EXACTLY ONCE (``$HANDOFF_WINDOW_FOCUS_PATH`` →
+    env-independent self-id) and build the Step 4 :class:`~handoff_fanout.spawner_focus.AnchorDecision`
+    (design §2.4). The dump command entry computes this once and threads the SAME object to every
+    writer; a writer reached directly (the watchdog's fan-in / unit tests) computes its own via this
+    helper — still single-parse for that path. NEVER raises."""
+    return _spawner_focus.resolve_anchor_decision(
+        os.getcwd(),
+        cfg=cfg,
+        home=cfg.home,
+        project=project,
+        self_task=self_task,
+        origin=origin,
+        env_focus_path=os.environ.get("HANDOFF_WINDOW_FOCUS_PATH"),
+        callsite=callsite,
+    )
+
+
+def _anchor_gate(
+    decision: _spawner_focus.AnchorDecision,
+    *,
+    cfg: _config.Config,
+    project: str,
+    task: str | None,
+) -> int | None:
+    """Step 4 fail-closed gate (design §2.4). Returns an exit code the caller must ``return`` BEFORE
+    writing ANY artifact (so a blocked dispatch leaves no half-product ``.uri``), or ``None`` to
+    proceed:
+
+      * required coordinator dispatch + anchor MISS + enforce(block) → ``EXIT_FAIL_CLOSED`` + a clear
+        指引 to stderr;
+      * same but enforce(``dry_run``) → record the would-block (``LOG_BLOCK_INTENT``) + proceed (the
+        ≥24-48h shadow buffer; behavior unchanged);
+      * warn / a resolved anchor / a legitimate non-coordinator origin → ``None`` (existing fail-open).
+    """
+    if not (decision.required and decision.focus_line is None):
+        return None
+    if decision.enforcement == _spawner_focus.ENFORCE_BLOCK:
+        print(
+            "❌ [dump] cannot resolve the coordinator workspace dispatching this worker (anchor "
+            f"{decision.miss_reason}). A singlepane coordinator must pass --self-task <its own task "
+            "id>; a worktree coordinator must dump from its own cwd; if there is genuinely no "
+            "coordinator desktop (manual / owner / cron / bootstrap) pass an explicit "
+            "--origin {interactive|system}. No spawn artifacts were written (fail-closed).",
+            file=sys.stderr,
+        )
+        return _EXIT_FAIL_CLOSED
+    if decision.enforcement == _spawner_focus.ENFORCE_DRY_RUN:
+        _spawner_focus.log_block_intent(
+            home=cfg.home,
+            project=project,
+            task=task,
+            cwd=os.getcwd(),
+            origin=decision.origin,
+            enforcement=decision.enforcement,
+            reason="dump:anchor-unresolved",
+        )
+    return None
+
+
+def _spawner_focus_line(
+    decision: _spawner_focus.AnchorDecision,
+    *,
+    home: Path,
+    project: str,
     worker_task: str | None = None,
     isolation: str | None = None,
 ) -> str:
-    """Emit the additive ``SPAWNER_FOCUS=<path>`` line — the SPAWNING coordinator's OWN
-    ``.handoff.code-workspace`` — so the watchdog/code-router runs the EXISTING ``focus-jump``
-    (``code <workspace>`` → macOS slides to its Space in ONE native step) and the worker is born on the
-    coordinator's desktop. Two sources, in order:
+    """Emit the additive ``SPAWNER_FOCUS=<path>`` line from the ONCE-resolved ``decision`` — the
+    SPAWNING coordinator's OWN ``.handoff.code-workspace`` so the watchdog/code-router runs the
+    EXISTING one-step ``focus-jump`` and the worker is born on the coordinator's desktop.
 
-      1. direct-jump-spawn (2026-06-13): ``$HANDOFF_WINDOW_FOCUS_PATH`` (a coordinator terminal that
-         got the env). The env channel is empty in an extension-auto-spawned agent shell (p19/p21).
-      2. mp-locate-return (2026-06-14 / sw-coord-p22 §1): env-independent SELF-IDENTIFICATION —
-         :func:`spawner_focus.resolve_spawner_focus_path` derives the coordinator's own workspace from
-         ``os.getcwd()`` (worktree Tier-1) or ``derive_singlepane_focus(home, project, self_task)``
-         (singlepane Tier-2, from the spawner's self-reported ``--self-task``).
-
-    Both go through the SAME ``validate_spawner_focus`` security gate (single boundary). FAIL-OPEN: no
-    valid focus from either → ``""`` so the ``.uri`` stays byte-identical to the pre-feature form
-    (向后兼容). Never raises — a UX hint must not block dump."""
-    rp = _spawner_focus.validate_spawner_focus(os.environ.get("HANDOFF_WINDOW_FOCUS_PATH"), cfg=cfg)
-    if not rp:
-        rp = _spawner_focus.resolve_spawner_focus_path(
-            os.getcwd(),
-            cfg=cfg,
-            home=cfg.home,
-            project=project,
-            self_task=self_task,
-        )
-    if not rp:
+    spawn-unification Step 4: this CONSUMES the pre-resolved :class:`AnchorDecision` and NEVER re-reads
+    cwd/env/cfg (design §2.4/§2.5 — single resolution, no TOCTOU). The block/dry_run决策 already ran at
+    the dump command entry (:func:`_anchor_gate`) BEFORE any artifact, so this helper only renders the
+    line. FAIL-OPEN: no anchor → ``""`` (the ``.uri`` stays byte-identical to the pre-feature form,
+    向后兼容) + record the Step 1 miss telemetry. Never raises — a UX hint must not block dump."""
+    if decision.focus_line is None:
         # spawn-unification Step 1 (2026-06-22): no anchor → the .uri omits SPAWNER_FOCUS and
         # code-router.sh falls back to the static desktop map (wrong-desktop root cause). Behavior
         # UNCHANGED (byte-identical fail-open), but record the miss instead of staying silent.
         _spawner_focus.log_anchor_miss(
-            home=cfg.home,
+            home=home,
             project=project,
             task=worker_task,
             cwd=os.getcwd(),
             isolation=isolation or "dump",
             reason="dump:anchor-unresolved",
         )
-    return f"SPAWNER_FOCUS={rp}\n" if rp else ""
+        return ""
+    return decision.focus_line
 
 
 # ─── single-task dump (default mode) ────────────────────────────────────────
@@ -878,6 +934,7 @@ def write_active_dump(
     is_coordinator: bool = False,
     suppress_spawn_artifacts: bool = False,
     self_task: str | None = None,
+    anchor_decision: _spawner_focus.AnchorDecision | None = None,
 ) -> int:
     # warmgap-C §1a: ``suppress_spawn_artifacts=True`` (Python-keyword-only, NEVER a CLI
     # flag — a public flag would be a legal bypass of the spawn-side G4 contract) keeps
@@ -1084,10 +1141,14 @@ def write_active_dump(
     # ── PUBLISH: write the .uri trigger LAST (all sidecars now exist) ────────────
     # §3.7 — atomic .uri write (see the .md note above). direct-jump-spawn: append the
     # SPAWNER_FOCUS line when this dump runs in a coordinator terminal (fail-open → "").
+    # Step 4: consume the entry-resolved decision (single-parse); a direct caller without one
+    # computes its own (still single-parse for that path).
+    if anchor_decision is None:
+        anchor_decision = _dump_anchor_decision(cfg, project, self_task=self_task)
     atomic.atomic_replace(
         uri_path,
         f"WORKSPACE={workspace}\nURI={uri}\n"
-        f"{_spawner_focus_line(cfg, project, self_task, worker_task=task, isolation='worktree' if worktree_info else 'singlepane')}",
+        f"{_spawner_focus_line(anchor_decision, home=cfg.home, project=project, worker_task=task, isolation='worktree' if worktree_info else 'singlepane')}",
     )
     print(f"[dump] wrote {uri_path}")
 
@@ -1256,6 +1317,7 @@ def handle_open_batch(
     workspace: Path,
     project: str,
     queue_dir: Path,
+    anchor_decision: _spawner_focus.AnchorDecision | None = None,
 ) -> int:
     manifest_input = Path(args.open_batch)
     if not manifest_input.exists():
@@ -1317,10 +1379,13 @@ def handle_open_batch(
     # not of each sub-task. The AUTHORITATIVE per-worker fallback canary is the ENGINE's per-produce
     # log (``spawn.run_spawn`` calls ``log_anchor_miss`` once per actual ``handoff spawn``), so this
     # coarse batch-level record is a convenience signal, not the canary count — no per-uri undercount.
+    # Step 4: consume the entry-resolved decision (single-parse); a direct caller computes its own.
+    if anchor_decision is None:
+        anchor_decision = _dump_anchor_decision(cfg, project, self_task=getattr(args, "self_task", None))
     _focus_line = _spawner_focus_line(
-        cfg,
-        project,
-        getattr(args, "self_task", None),
+        anchor_decision,
+        home=cfg.home,
+        project=project,
         worker_task=batch_id,
         isolation="singlepane",
     )
@@ -1401,6 +1466,7 @@ def trigger_fan_in_if_ready(
     queue_dir: Path,
     cfg: _config.Config | None = None,
     self_task: str | None = None,
+    decision: _spawner_focus.AnchorDecision | None = None,
 ) -> bool:
     """If all sub-tasks have ``.done``/``.blocked``, atomic-create the trigger and dump fan-in."""
     if cfg is None:
@@ -1428,13 +1494,30 @@ def trigger_fan_in_if_ready(
         )
         return False
 
+    # spawn-unification Step 4: the fan-in .uri triggers a NEW window (design §2.4 "fan-in 不例外"),
+    # so a coordinator anchor-miss under enforce must fail-closed HERE — BEFORE _fanin_triggered and
+    # any fan-in artifact — so the sub-tasks' .done markers are preserved and the fan-in stays
+    # re-dispatchable once the anchor resolves. Direct callers (watchdog) compute their own decision
+    # (single-parse for that path). Warn-mode (default) → gate is a no-op → byte-identical.
+    fan_in_task = manifest["fan_in_task"]
+    if decision is None:
+        decision = _dump_anchor_decision(cfg, project, self_task=self_task, callsite="fan-in")
+    if _anchor_gate(decision, cfg=cfg, project=project, task=fan_in_task) is not None:
+        print(
+            f"❌ [trigger-fan-in] anchor unresolved under enforce — fan-in for batch {batch_id} "
+            "refused (fail-closed); sub-task results preserved, re-dispatchable once the "
+            "coordinator anchor resolves.",
+            file=sys.stderr,
+        )
+        return False
+
     if not atomic.atomic_create(batch_dir / "_fanin_triggered"):
         print("[trigger-fan-in] sibling already triggered, exiting")
         return False
 
     print(f"[trigger-fan-in] ✅ batch {batch_id} complete, dumping fan-in")
     baseline = detect_baseline(workspace, cfg=cfg, project=project)
-    fan_in_task = manifest["fan_in_task"]
+    # fan_in_task already read above (before the Step 4 anchor gate).
 
     write_role_env(batch_dir / "fan-in.env", HANDOFF_ROLE_FAN_IN, batch_id, workspace)
     content = templates.build_fan_in_handoff_md(
@@ -1469,7 +1552,7 @@ def trigger_fan_in_if_ready(
     atomic.atomic_replace(
         queue_dir / f"{fan_in_task}.uri",
         f"WORKSPACE={workspace}\nURI={uri}\n"
-        f"{_spawner_focus_line(cfg, project, self_task, worker_task=fan_in_task, isolation='singlepane')}",
+        f"{_spawner_focus_line(decision, home=cfg.home, project=project, worker_task=fan_in_task, isolation='singlepane')}",
     )
     print(f"[trigger-fan-in] wrote queue/{fan_in_task}.{{md,uri}} + fan-in.env")
 
@@ -1487,6 +1570,7 @@ def handle_batch_done(
     workspace: Path,
     project: str,
     queue_dir: Path,
+    anchor_decision: _spawner_focus.AnchorDecision | None = None,
 ) -> int:
     if not args.batch_id:
         raise SystemExit("❌ --batch-done requires --batch-id")
@@ -1514,7 +1598,8 @@ def handle_batch_done(
     # stale sweep doesn't mis-flag a completed sub-task.
     (batch_dir / f"{sub_task_id}.heartbeat").unlink(missing_ok=True)
     trigger_fan_in_if_ready(project, workspace, args.batch_id, queue_dir, cfg=cfg,
-                            self_task=getattr(args, "self_task", None))
+                            self_task=getattr(args, "self_task", None),
+                            decision=anchor_decision)
     return 0
 
 
@@ -1524,6 +1609,7 @@ def handle_batch_blocked(
     workspace: Path,
     project: str,
     queue_dir: Path,
+    anchor_decision: _spawner_focus.AnchorDecision | None = None,
 ) -> int:
     if not args.batch_id:
         raise SystemExit("❌ --batch-blocked requires --batch-id")
@@ -1553,7 +1639,8 @@ def handle_batch_blocked(
     # Terminal state — same heartbeat cleanup as the batch-done path.
     (batch_dir / f"{sub_task_id}.heartbeat").unlink(missing_ok=True)
     trigger_fan_in_if_ready(project, workspace, args.batch_id, queue_dir, cfg=cfg,
-                            self_task=getattr(args, "self_task", None))
+                            self_task=getattr(args, "self_task", None),
+                            decision=anchor_decision)
     return 0
 
 
@@ -1855,6 +1942,17 @@ def _build_parser() -> argparse.ArgumentParser:
              "so the worker focus-jumps to the coordinator's desktop. Omit for worktree coordinators "
              "(Tier-1 uses cwd) or when no self-identification is wanted (fail-open).",
     )
+    ap.add_argument(
+        "--origin", default=_spawner_focus.ORIGIN_COORDINATOR,
+        choices=list(_spawner_focus.ORIGINS),
+        help="spawn-unification Step 4: who is dispatching (default coordinator — an automated "
+             "中枢→worker dispatch that MUST resolve an anchor). PER-INVOCATION, never inherited: "
+             "leniency (allow-no-anchor) comes only from non-inheritable signals — 'system' ⟺ project "
+             "∈ config spawner_anchor_system_allow, 'interactive' ⟺ a real front TTY without "
+             "HANDOFF_UNATTENDED, 'test' ⟺ in-process pytest. Under an enforce-phase project a "
+             "coordinator anchor-miss is fail-closed; default = warn (config lists empty → zero "
+             "behavior change).",
+    )
     ap.add_argument("--blocked-reason", default="")
     ap.add_argument("--tests", default="")
     ap.add_argument("--dry-run", action="store_true")
@@ -1988,7 +2086,20 @@ def main(argv: list[str] | None = None, *, suppress_spawn_artifacts: bool = Fals
         return gate_result.exit_code
 
     if args.open_batch:
-        return handle_open_batch(args, cfg, workspace, project, queue_dir)
+        # spawn-unification Step 4: the fan-out sub-task .uris carry the coordinator anchor → resolve
+        # the decision ONCE (design §2.4 唯一解析点 for this path) and fail-closed BEFORE writing any
+        # batch artifact, then thread it to the writer (no re-resolve). Warn-mode (default) → no-op.
+        anchor_decision = _dump_anchor_decision(
+            cfg, project, self_task=getattr(args, "self_task", None),
+            origin=getattr(args, "origin", _spawner_focus.ORIGIN_COORDINATOR),
+        )
+        gate_rc = _anchor_gate(anchor_decision, cfg=cfg, project=project, task=args.batch_id)
+        if gate_rc is not None:
+            return gate_rc
+        return handle_open_batch(args, cfg, workspace, project, queue_dir, anchor_decision)
+    # batch_done / batch_blocked record the sub-task result then MAYBE fan in: the anchor decision is
+    # resolved lazily inside ``trigger_fan_in_if_ready`` only when a fan-in actually fires (so a
+    # non-spawning terminal sub-task close adds no resolve — surgical, matches pre-Step-4 timing).
     if args.batch_done:
         return handle_batch_done(args, cfg, workspace, project, queue_dir)
     if args.batch_blocked:
@@ -2025,6 +2136,24 @@ def main(argv: list[str] | None = None, *, suppress_spawn_artifacts: bool = Fals
     # explicitly here — the source tree is never moved by worktree creation, so this
     # is the same SHA, but the explicit anchor documents R1-C1.
     old_head: str | None = None
+    # spawn-unification Step 4: an ACTIVE worker spawn carries the coordinator anchor → resolve the
+    # decision ONCE here (the SINGLE解析点 for this path, design §2.4) and fail-closed BEFORE the
+    # worktree-resolution step below (which would CREATE a worktree) and before write_active_dump
+    # touches ANY artifact (.md / sidecar / old_ready / .uri) — so a blocked dispatch leaves NO
+    # half-product, not even an orphan worktree (原子无半产物). The decision is then threaded to
+    # write_active_dump (no re-resolve). Only the spawning, non-dry-run, non-suppressed active path
+    # needs it (a terminal close unlinks the .uri = no spawn → no resolve; the suppressed succession
+    # ledger publishes its window intent later via the spawn side, which gates itself). Warn-mode
+    # (default) → gate is a no-op → byte-identical.
+    anchor_decision: _spawner_focus.AnchorDecision | None = None
+    if args.status == "active" and not args.dry_run and not suppress_spawn_artifacts:
+        anchor_decision = _dump_anchor_decision(
+            cfg, project, self_task=getattr(args, "self_task", None),
+            origin=getattr(args, "origin", _spawner_focus.ORIGIN_COORDINATOR),
+        )
+        gate_rc = _anchor_gate(anchor_decision, cfg=cfg, project=project, task=args.task)
+        if gate_rc is not None:
+            return gate_rc
     # warmgap-C fix1 MUST-1: worktree resolution is a WINDOW-INTENT step, so the
     # suppressed (succession-route) dump must skip it entirely — the succession spawn
     # always opens a singlepane window on the SOURCE tree (coordinator invariant,
@@ -2119,6 +2248,7 @@ def main(argv: list[str] | None = None, *, suppress_spawn_artifacts: bool = Fals
                 is_coordinator=getattr(args, "coordinator", False),
                 suppress_spawn_artifacts=suppress_spawn_artifacts,
                 self_task=getattr(args, "self_task", None),
+                anchor_decision=anchor_decision,
             )
     except SinglepaneBusy as e:
         print(

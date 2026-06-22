@@ -507,6 +507,7 @@ def run_spawn(
     wave_id: str | None = None,
     spawner_focus_path: str | None = None,
     self_task: str | None = None,
+    origin: str = _spawner_focus.ORIGIN_COORDINATOR,
 ) -> int:
     """Orchestrate one fresh spawn. Returns ``0`` on success, ``2`` fail-closed (never raises for a
     semantic error; never returns the retro RETRY code 4).
@@ -649,8 +650,8 @@ def run_spawn(
 
     # spawn-unification Step 1 (2026-06-22): neither the CLI/env hint nor the symmetric resolver
     # found an anchor → the worker .uri carries NO SPAWNER_FOCUS and code-router.sh falls back to the
-    # static desktop map (the wrong-desktop root cause). Behavior is UNCHANGED (fail-open omit), but
-    # record the miss so it stops being silent. Non-blocking by contract.
+    # static desktop map (the wrong-desktop root cause). Step 1 records the miss so it stops being
+    # silent; Step 4 (below) flips that miss to fail-closed for an enforce-phase coordinator dispatch.
     if spawner_focus is None:
         _spawner_focus.log_anchor_miss(
             home=cfg.home,
@@ -660,6 +661,39 @@ def run_spawn(
             isolation=isolation,
             reason="spawn:anchor-unresolved",
         )
+        # spawn-unification Step 4: build the decision from the ALREADY-resolved (None) anchor — PURE
+        # decision, no second resolution. DEFAULT = warn (config enforce lists empty) → required is
+        # False → NEITHER branch fires → byte-identical Step-1 fail-open omit. A system-origin无锚
+        # pass-through is audit-logged inside make_anchor_decision.
+        decision = _spawner_focus.make_anchor_decision(
+            None,
+            cfg=cfg,
+            home=cfg.home,
+            project=project,
+            origin=origin,
+            cwd=os.getcwd(),
+            callsite="spawn",
+        )
+        if decision.required and decision.enforcement == _spawner_focus.ENFORCE_BLOCK:
+            _err(
+                f"cannot resolve the coordinator workspace that dispatched you (anchor "
+                f"{decision.miss_reason}). A singlepane coordinator must pass --self-task <its own "
+                "task id>; a worktree coordinator must dispatch from its own cwd; if there is "
+                "genuinely no coordinator desktop (manual / owner / cron / bootstrap) pass an "
+                "explicit --origin {interactive|system}."
+            )
+            return EXIT_FAIL_CLOSED
+        if decision.required and decision.enforcement == _spawner_focus.ENFORCE_DRY_RUN:
+            # Shadow phase: record the would-block but DON'T block (design §4.1 phase 2).
+            _spawner_focus.log_block_intent(
+                home=cfg.home,
+                project=project,
+                task=task,
+                cwd=os.getcwd(),
+                origin=decision.origin,
+                enforcement=decision.enforcement,
+                reason="spawn:anchor-unresolved",
+            )
 
     common = dict(
         cfg=cfg,
@@ -749,6 +783,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "coordinator's workspace via derive_singlepane_focus(home, project, self_task) so the worker "
         "focus-jumps to its desktop. Worktree coordinators use cwd (Tier-1, no --self-task). Fail-open.",
     )
+    p.add_argument(
+        "--origin",
+        default=_spawner_focus.ORIGIN_COORDINATOR,
+        choices=list(_spawner_focus.ORIGINS),
+        help="spawn-unification Step 4: who is dispatching (default coordinator — an automated "
+        "中枢→worker dispatch that MUST resolve an anchor). PER-INVOCATION, never inherited: leniency "
+        "(allow-no-anchor) comes only from non-inheritable signals — 'system' ⟺ project ∈ config "
+        "spawner_anchor_system_allow, 'interactive' ⟺ a real front TTY without HANDOFF_UNATTENDED, "
+        "'test' ⟺ in-process pytest. Under an enforce-phase project a coordinator anchor-miss is "
+        "fail-closed; default = warn (config lists empty → zero behavior change).",
+    )
     return p
 
 
@@ -768,6 +813,7 @@ def main(argv: list[str] | None = None) -> int:
         wave_id=args.wave_id,
         spawner_focus_path=args.spawner_focus_path,
         self_task=args.self_task,
+        origin=args.origin,
     )
 
 
