@@ -129,3 +129,129 @@ def test_corrupt_config_other_fields_stay_safe_default(tmp_path):
     assert cfg.worker_isolation == {}
     assert cfg.worktree_mode == "off"
     assert cfg.worker_isolation_for("anything") is None
+
+
+# ─── Step 6 config unification: resolve_isolation precedence (engine-only) ─────
+# The unified per-project EFFECTIVE isolation accessor:
+#   a. explicit worker_isolation[project]  >
+#   b. worker_isolation["default"]          >
+#   c. legacy fallback (singlepane_projects / worktree_projects, DEPRECATED) >
+#   d. None  (caller fail-closed).
+# Must be byte-behavior-identical with the CURRENT live config (empty worker_isolation,
+# populated singlepane_projects) — proven by test_resolve_isolation_backward_compat_*.
+
+
+def test_multiwindow_is_a_valid_mode(tmp_path):
+    # erp = multiwindow per design §8.5: walks the spawn anchor, no git isolation, no
+    # singlepane sidecar. It must parse and resolve as an explicit mode.
+    (tmp_path / "config.json").write_text('{"worker_isolation": {"erp": "multiwindow"}}')
+    cfg = C.load(home=tmp_path)
+    assert cfg.worker_isolation_for("erp") == "multiwindow"
+    assert cfg.resolve_isolation("erp") == "multiwindow"
+
+
+def test_resolve_isolation_explicit_beats_default_and_legacy(tmp_path):
+    # Precedence (a): an explicit per-project mode wins over the "default" key AND any
+    # legacy list membership for the same slug.
+    (tmp_path / "config.json").write_text(
+        '{"worker_isolation": {"erp": "worktree", "default": "singlepane"},'
+        ' "singlepane_projects": ["erp"]}'
+    )
+    cfg = C.load(home=tmp_path)
+    assert cfg.resolve_isolation("erp") == "worktree"
+
+
+def test_resolve_isolation_default_key_for_unlisted(tmp_path):
+    # Precedence (b): a project with no explicit entry and not in any legacy list resolves
+    # to the reserved "default" key.
+    (tmp_path / "config.json").write_text(
+        '{"worker_isolation": {"default": "multiwindow"}}'
+    )
+    cfg = C.load(home=tmp_path)
+    assert cfg.resolve_isolation("anything-unlisted") == "multiwindow"
+
+
+def test_resolve_isolation_default_beats_legacy(tmp_path):
+    # Precedence (b) > (c): when a project is not explicit but a "default" key is set,
+    # the default wins over legacy list membership.
+    (tmp_path / "config.json").write_text(
+        '{"worker_isolation": {"default": "worktree"}, "singlepane_projects": ["wilde-hexe"]}'
+    )
+    cfg = C.load(home=tmp_path)
+    assert cfg.resolve_isolation("wilde-hexe") == "worktree"
+
+
+def test_resolve_isolation_legacy_singlepane_fallback(tmp_path):
+    # Precedence (c): no explicit, no default → legacy singlepane_projects membership.
+    (tmp_path / "config.json").write_text('{"singlepane_projects": ["wilde-hexe"]}')
+    cfg = C.load(home=tmp_path)
+    assert cfg.resolve_isolation("wilde-hexe") == "singlepane"
+
+
+def test_resolve_isolation_legacy_worktree_fallback(tmp_path):
+    # Precedence (c): legacy worktree_projects membership when singlepane doesn't match.
+    (tmp_path / "config.json").write_text('{"worktree_projects": ["erp"]}')
+    cfg = C.load(home=tmp_path)
+    assert cfg.resolve_isolation("erp") == "worktree"
+
+
+def test_resolve_isolation_singlepane_legacy_wins_over_worktree_legacy(tmp_path):
+    # Within the legacy fallback, singlepane is checked first (the brief's order c:
+    # singlepane → elif worktree). A slug in BOTH legacy lists resolves singlepane.
+    (tmp_path / "config.json").write_text(
+        '{"singlepane_projects": ["dual"], "worktree_projects": ["dual"]}'
+    )
+    cfg = C.load(home=tmp_path)
+    assert cfg.resolve_isolation("dual") == "singlepane"
+
+
+def test_resolve_isolation_none_when_nothing_matches(tmp_path):
+    # Precedence (d): no explicit, no default, no legacy → None (caller fail-closed).
+    (tmp_path / "config.json").write_text("{}")
+    cfg = C.load(home=tmp_path)
+    assert cfg.resolve_isolation("ghost") is None
+
+
+def test_resolve_isolation_unknown_mode_dropped_then_legacy(tmp_path):
+    # A typo'd explicit mode is dropped at parse time (→ not in worker_isolation), so
+    # resolution falls through to the next precedence tier, not to the bad value.
+    (tmp_path / "config.json").write_text(
+        '{"worker_isolation": {"erp": "worktre"}, "singlepane_projects": ["erp"]}'
+    )
+    cfg = C.load(home=tmp_path)
+    # explicit dropped → no default → legacy singlepane membership.
+    assert cfg.resolve_isolation("erp") == "singlepane"
+
+
+def test_resolve_isolation_unknown_default_dropped_to_none(tmp_path):
+    # A typo'd "default" value is dropped at parse → no valid default → no legacy → None.
+    (tmp_path / "config.json").write_text('{"worker_isolation": {"default": "banana"}}')
+    cfg = C.load(home=tmp_path)
+    assert cfg.resolve_isolation("anything") is None
+
+
+def test_resolve_isolation_backward_compat_with_live_shaped_config(tmp_path):
+    # CRITICAL backward-compat invariant: with a config shaped like the LIVE one
+    # (populated singlepane_projects, EMPTY/absent worker_isolation),
+    #   resolve_isolation(p) == "singlepane"  IFF  p in singlepane_projects.
+    live_singlepane = ["wilde-hexe", "sdgf-runner", "xunyin", "styleforge", "mindpersist"]
+    (tmp_path / "config.json").write_text(
+        '{"singlepane_projects": ' + str(live_singlepane).replace("'", '"') + "}"
+    )
+    cfg = C.load(home=tmp_path)
+    assert cfg.worker_isolation == {}  # live shape: no explicit map
+    for p in live_singlepane:
+        assert cfg.resolve_isolation(p) == "singlepane"
+    # A project NOT in the list resolves to None (no spurious singlepane).
+    assert cfg.resolve_isolation("erp") is None
+    assert cfg.resolve_isolation("not-a-project") is None
+
+
+def test_resolve_isolation_does_not_change_worker_isolation_for(tmp_path):
+    # worker_isolation_for stays EXPLICIT-only (its consumer = the dump.py concurrency
+    # guard, which must NOT start firing under config migration). The legacy fallback
+    # lives ONLY in resolve_isolation.
+    (tmp_path / "config.json").write_text('{"singlepane_projects": ["wilde-hexe"]}')
+    cfg = C.load(home=tmp_path)
+    assert cfg.resolve_isolation("wilde-hexe") == "singlepane"  # legacy via resolve
+    assert cfg.worker_isolation_for("wilde-hexe") is None  # explicit-only, NOT routed

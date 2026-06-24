@@ -264,8 +264,46 @@ class Config:
 
         ``None`` means the caller MUST fail closed (design §2.2 / §8: never guess an
         isolation mode — the wrong one is a parallel-clobber or broken-isolation bug).
+
+        EXPLICIT-only by design: this is the accessor for the dump-time concurrency guard
+        (``singlepane_worker_guard``), which must NOT change its firing under a config
+        migration. The unified EFFECTIVE accessor (with legacy fallback) is
+        ``resolve_isolation`` — keep these two distinct.
         """
         return self.worker_isolation.get(project)
+
+    def resolve_isolation(self, project: str) -> str | None:
+        """EFFECTIVE worker isolation mode for ``project`` (Step 6 unified accessor).
+
+        Precedence (design §2.2 / Step 6 «配置合一»):
+          a. explicit ``worker_isolation[project]`` (an auditable per-project choice);
+          b. else the reserved global ``worker_isolation["default"]`` key;
+          c. else the **legacy fallback (DEPRECATED, transition-only)** — membership in
+             ``singlepane_projects`` → ``"singlepane"``, elif ``worktree_projects`` →
+             ``"worktree"`` — so a config that has NOT migrated yet (the current live
+             shape: populated ``singlepane_projects``, empty ``worker_isolation``) is
+             byte-behavior-identical;
+          d. else ``None`` (caller MUST fail closed — never guess a mode).
+
+        Only ``_VALID_ISOLATION_MODES`` reach (a)/(b): the parse drops typos and the
+        reserved ``"default"`` value is validated the same way, so an invalid mode falls
+        THROUGH to the next tier rather than routing a spawn down an unrecognized path.
+        Distinct from ``worker_isolation_for`` (explicit-only, no legacy fallback): the
+        concurrency guard keeps explicit-only semantics so it does not start firing as
+        chains migrate from the legacy lists. The legacy tier is the migration ramp and is
+        expected to retire once every project carries an explicit ``worker_isolation``.
+        """
+        explicit = self.worker_isolation.get(project)
+        if explicit is not None:
+            return explicit
+        default = self.worker_isolation.get("default")
+        if default is not None:
+            return default
+        if project in self.singlepane_projects:
+            return "singlepane"
+        if project in self.worktree_projects:
+            return "worktree"
+        return None
 
     def queue_dir(self, project: str) -> Path:
         return self.home / project / "queue"
@@ -482,18 +520,20 @@ def _parse_unified_spawn_enabled(data: dict) -> bool:
     return True
 
 
-_VALID_ISOLATION_MODES = ("worktree", "singlepane")
+_VALID_ISOLATION_MODES = ("worktree", "singlepane", "multiwindow")
 
 
 def _parse_worker_isolation(data: dict) -> dict[str, str]:
-    """Parse ``worker_isolation`` (``{slug: "worktree"|"singlepane"}``), defensively.
+    """Parse ``worker_isolation`` (``{slug: "worktree"|"singlepane"|"multiwindow"}``), defensively.
 
     Mirrors ``_parse_project_inject_blocks``: only a dict maps to gated values; any
     non-dict (absent / typo / list) yields ``{}``. Within it, only string slugs whose
-    value is one of the two KNOWN isolation modes survive — a typo'd mode (``"worktre"``)
-    or a non-string value is dropped, so ``worker_isolation_for`` returns ``None`` and the
-    caller fails closed (design §2.2 no-guess). A bad shape can never route a spawn down an
-    unrecognized isolation path.
+    value is one of the KNOWN isolation modes (``_VALID_ISOLATION_MODES``) survive — a
+    typo'd mode (``"worktre"``) or a non-string value is dropped, so ``worker_isolation_for``
+    returns ``None`` and the caller fails closed (design §2.2 no-guess). A bad shape can
+    never route a spawn down an unrecognized isolation path. The reserved ``"default"``
+    slug (Step 6) is an ordinary string key — it passes the slug check and feeds
+    ``resolve_isolation``'s global-default tier.
     """
     raw = data.get("worker_isolation")
     if not isinstance(raw, dict):

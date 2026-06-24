@@ -447,3 +447,60 @@ def test_non_coordinator_write_failure_stays_non_fatal(tmp_path: Path, capsys) -
     )
     assert "(non-fatal) could not write singlepane workspace" in capsys.readouterr().out
     assert not (qd / "wh-solo-2.singlepane").exists()
+
+
+# ─── Step 6 config unification: the sidecar consumer routes via resolve_isolation ──
+# The opt-in decision (`project not in cfg.singlepane_projects`) is migrated to
+# `cfg.resolve_isolation(project) != "singlepane"`. With the LIVE-shaped config (empty
+# worker_isolation, populated singlepane_projects) the result is byte-IDENTICAL; an
+# explicit multiwindow/worktree resolution correctly suppresses the singlepane sidecar.
+
+
+def test_sidecar_decision_byte_identical_for_live_shaped_config(tmp_path: Path) -> None:
+    # Backward-compat: with the live shape (no worker_isolation), resolve_isolation falls
+    # through to legacy singlepane membership → an opted-in project still writes its sidecar.
+    cfg = _cfg(tmp_path, ["wilde-hexe"])
+    assert cfg.worker_isolation == {}  # live shape
+    qd = tmp_path / "wilde-hexe" / "queue"
+    qd.mkdir(parents=True)
+    real_repo = tmp_path / "repo"
+    real_repo.mkdir()
+    dump.maybe_write_singlepane_sidecar(
+        cfg,
+        "wilde-hexe",
+        "wh-live",
+        real_repo,
+        qd,
+        worktree_active=False,
+        role="worker",
+        close_policy="keep",
+        spawn_nonce=_NONCE,
+    )
+    assert (qd / "wh-live.singlepane").exists()  # identical to pre-Step-6 behavior
+
+
+def test_explicit_multiwindow_suppresses_singlepane_sidecar(tmp_path: Path) -> None:
+    # A project resolving to "multiwindow" is NOT singlepane → no sidecar (and a stale one
+    # is cleaned). Even though it's also in the legacy singlepane_projects list, the explicit
+    # worker_isolation entry wins via resolve_isolation precedence.
+    cfg = _config._from_dict(
+        {"worker_isolation": {"erp": "multiwindow"}, "singlepane_projects": ["erp"]},
+        home=tmp_path,
+    )
+    assert cfg.resolve_isolation("erp") == "multiwindow"
+    qd = tmp_path / "erp" / "queue"
+    qd.mkdir(parents=True)
+    stale = qd / "erp-mw.singlepane"
+    stale.write_text("stale-optin")
+    dump.maybe_write_singlepane_sidecar(
+        cfg,
+        "erp",
+        "erp-mw",
+        tmp_path,
+        qd,
+        worktree_active=False,
+        role="worker",
+        close_policy="keep",
+        spawn_nonce=_NONCE,
+    )
+    assert not stale.exists()  # multiwindow → not singlepane → no sidecar, stale cleaned

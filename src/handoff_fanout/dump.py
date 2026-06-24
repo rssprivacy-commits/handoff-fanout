@@ -567,7 +567,11 @@ def maybe_write_singlepane_sidecar(
     every non-coordinator sidecar stays byte-identical (golden-locked)."""
     sidecar = queue_dir / f"{task}.singlepane"
     forced = is_coordinator and not worktree_active  # MUST-1: config cannot opt a 中枢 out
-    if worktree_active or (not forced and project not in cfg.singlepane_projects):
+    # Step 6 config unification: the opt-in test now routes through the unified EFFECTIVE
+    # isolation accessor. With the current live config (no ``worker_isolation``) it falls
+    # through to legacy ``singlepane_projects`` membership → byte-identical; an explicit
+    # ``multiwindow``/``worktree`` resolution → not singlepane → no sidecar (correct).
+    if worktree_active or (not forced and cfg.resolve_isolation(project) != "singlepane"):
         sidecar.unlink(missing_ok=True)
         return
     try:
