@@ -87,6 +87,33 @@ def test_build_handoff_md_contains_timeout_caveat():
     )
 
 
+def test_build_handoff_md_contains_retrieval_pull_section():
+    """retrieval-pull L1: §0.5 guidance section is present, between §0 and the
+    heartbeat step, and names the back-reference flag (warn-mode keystone)."""
+    md = _render_handoff()
+    assert "§0.5 retrieval-pull" in md
+    assert "--predecessor-lesson-backref" in md
+    # the dispositions the incoming coordinator must use
+    assert "已应用" in md
+    assert "已被取代" in md
+    assert "不相关" in md
+    # warn-mode is stated plainly
+    assert "warn-mode" in md
+    # ordering: after the §0 audit block, before the heartbeat step
+    assert (
+        md.index("§0 上任审计")
+        < md.index("§0.5 retrieval-pull")
+        < md.index("第一步: 启动 heartbeat")
+    )
+
+
+def test_build_handoff_md_section_zero_unchanged():
+    """The existing §0 audit block must stay intact (only an additive §0.5)."""
+    md = _render_handoff()
+    assert "§0 上任审计 — 核对前任 retro evidence" in md
+    assert "前任无 retro.evidence.json" in md
+
+
 def _render_sub_task(sub_task_id: str = "sub-foo", project: str = "demo") -> str:
     return templates.build_sub_task_handoff_md(
         task="parent-task",

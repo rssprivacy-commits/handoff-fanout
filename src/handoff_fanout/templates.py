@@ -180,6 +180,27 @@ fi
 
 **Phase D — codex 审计门禁状态** (mandate ON / flipped 2026-05-30): old_ready 的 `codex_audit_hash` / `codex_audit_mode` / `next_session_forced_task` 为审计门禁元数据 (spec §6 Phase D)。`HANDOFF_AUDIT_MANDATE=1` **已拨** (三路径: `.zshenv` + `launchctl setenv` + `auto-continue.plist EnvironmentVariables`) → 上面的 forced-follow-up 检查现为**工具层硬拒** (非会话自律): 前任 codex 审计走 bypass 时下一棒接了别的 task = §0 拦下。详 `docs/PROTOCOL.md` Part II §14 (codex 审计闸 / bypass / forced follow-up)。
 
+## §0.5 retrieval-pull — 调出前任 lesson + 强制回引 (warn-mode / 学习闭环 keystone)
+
+> **触发**: 中枢接棒开张 — §0 验完前任**真复盘了**之后，本步把"前任的坑"真正**调出来用上**。
+> **为什么**: 闸只卡"存了没"、从不卡"下一棒读没读、用没用"(Goodhart)。让沉淀对**接棒人承重** = 经验真累积、不反复踩坑。这是学习闭环的 keystone。
+
+1. **调出前任 lesson** (按本任务域 trigger-keyword 匹配)：grep 中枢 memory 目录的 `lesson-*<本链前缀>*` / 前任 task-id，读其 `## 当前有效摘要` 段。
+```bash
+LESSON_DIR="$HOME/.claude/projects/-Users-chenmingzhong-Projects-{project}/memory"
+ls "$LESSON_DIR"/lesson-*.md 2>/dev/null | tail -3   # 或按链前缀 grep
+```
+2. **为每条调出的 lesson 产一条结构化回引**：`前任课 X → 已应用 (applied) / 已被取代 (superseded, 附新课名) / 不相关 (not_relevant, 因 Y)`。
+3. **在你自己首次交棒时把回引一并提交** (折进同一份 retro evidence)：
+```bash
+handoff audit-close ... \
+  --predecessor-lesson-backref <lesson>=applied \
+  --predecessor-lesson-backref <lesson-old>=superseded:<lesson-new> \
+  --predecessor-lesson-backref <lesson-x>=not_relevant:<原因>
+# 或一次性给 JSON 数组: --predecessor-lesson-backref-file <backref.json>
+```
+4. **当前为 warn-mode**: 缺回引只**记 shadow log**(`$HANDOFF_HOME/{project}/retrieval-pull-shadow.log`)、**不阻断**。它存在是为了让"下一棒读你的课"成为**承重项**、而非"存了打勾"的形式合规——别把它当 checkbox，它是唯一难作弊的学习信号(独立消费者给前任沉淀打分)。
+
 ## 第一步: 启动 heartbeat (v5.1+ / 529 风暴防御 / v4.1 单 task 模式)
 
 > **触发**: 主人 5/29 'API Error 会话裸跑' 根因 — v4.1 单 task spawn 后若卡死 / 529 overloaded 没人接手。

@@ -313,6 +313,47 @@ def test_R16_sibling_moved_head_triggers_realign(handoff_home, workspace):
     assert new_payload["evidence_hash"] == handoff_precheck.compute_evidence_hash(new_payload)
 
 
+def test_R16b_realign_preserves_predecessor_lesson_backref(handoff_home, workspace):
+    """retrieval-pull L1: a sibling-HEAD re-align must NOT silently erase a present
+    predecessor_lesson_backref (same preservation guarantee codex_audit has) — the
+    re-align refreshes the HEAD binding, it does not re-consume lessons."""
+    backref = [
+        {"predecessor_lesson": "lesson-p61", "disposition": "applied"},
+        {
+            "predecessor_lesson": "lesson-old",
+            "disposition": "superseded",
+            "reason": "lesson-new replaces it",
+        },
+    ]
+    payload = handoff_precheck.build_evidence(
+        task_id=TASK,
+        project=PROJECT,
+        workspace=workspace,
+        phase0={k: {"status": "✅"} for k in handoff_precheck.PHASE0_KEYS},
+        phase1={k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS},
+        predecessor_lesson_backref=backref,
+    )
+    h0 = payload["head_at_precheck"]
+    payload["head_at_precheck_timestamp"] = (datetime.now(UTC) - timedelta(seconds=120)).isoformat(
+        timespec="seconds"
+    )
+    payload["evidence_hash"] = handoff_precheck.compute_evidence_hash(payload)
+    ev = _write_evidence(handoff_home, payload)
+    (workspace / "sibling.txt").write_text("x")
+    subprocess.run(["git", "add", "sibling.txt"], cwd=workspace, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "sibling work"], cwd=workspace, check=True)
+    h1 = handoff_precheck._git(["rev-parse", "HEAD"], workspace)
+    assert h0 != h1
+
+    code, err = _run_dump(workspace=workspace, retro_evidence=ev)
+    assert code == 0, f"re-align should pass; got: {err}"
+    new_payload = json.loads(ev.read_text())
+    assert new_payload["head_at_precheck"] == h1
+    # the field survived the rebuild + the rehash covers it
+    assert new_payload["predecessor_lesson_backref"] == backref
+    assert new_payload["evidence_hash"] == handoff_precheck.compute_evidence_hash(new_payload)
+
+
 def test_R17_dirty_tree_does_not_realign(handoff_home, workspace):
     """1-B safety: if the working tree is dirty (session work not fully
     committed), re-align is refused — retro claims may be incomplete — and the
@@ -836,3 +877,279 @@ def test_gate_whitespace_only_reason_rejected(handoff_home, workspace):
     code, err = _run_dump(workspace=workspace, retro_evidence=ev)
     assert code == 4
     assert "phase0-status-missing-reason" in err
+
+
+# ─── predecessor_lesson_backref (retrieval-pull keystone / warn-mode L1) ──────
+#
+# The new OPTIONAL field on retro evidence: a structured back-reference recording
+# which predecessor lesson the closing session consumed at start, and what it did
+# with it. WARN-MODE invariant: when the field is not supplied, the produced
+# evidence dict (and its hash) must be byte-for-byte identical to today's.
+
+
+def _backref(lesson="lesson-sw-coord-p61-2026-06-24", disp="applied", reason=None):
+    entry = {"predecessor_lesson": lesson, "disposition": disp}
+    if reason is not None:
+        entry["reason"] = reason
+    return entry
+
+
+def test_backref_omitted_is_byte_identical(workspace, monkeypatch):
+    """真阴 / byte-identical: omitting the param yields the SAME payload + hash as
+    today (the conditional-fold invariant — zero behavior change in warn-mode).
+
+    Freeze the time-derived fields so the three build_evidence calls cannot straddle
+    a 1-second boundary under full-suite load — otherwise generated_at /
+    head_at_precheck_timestamp (both via _iso_now) and last_commit_age_sec would
+    differ across calls and the strong full-dict + hash equality assertions would
+    flake (the conditional-fold itself is byte-correct; this isolates that property)."""
+    monkeypatch.setattr(handoff_precheck, "_iso_now", lambda: "2026-06-24T00:00:00+00:00")
+    monkeypatch.setattr(handoff_precheck, "_last_commit_age_sec", lambda *a, **k: 42)
+    without = handoff_precheck.build_evidence(
+        task_id=TASK,
+        project=PROJECT,
+        workspace=workspace,
+        nonce="fixed-nonce",
+        phase0={k: {"status": "✅"} for k in handoff_precheck.PHASE0_KEYS},
+        phase1={k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS},
+    )
+    # Passing None / [] must be identical to not passing it at all.
+    with_none = handoff_precheck.build_evidence(
+        task_id=TASK,
+        project=PROJECT,
+        workspace=workspace,
+        nonce="fixed-nonce",
+        phase0={k: {"status": "✅"} for k in handoff_precheck.PHASE0_KEYS},
+        phase1={k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS},
+        predecessor_lesson_backref=None,
+    )
+    with_empty = handoff_precheck.build_evidence(
+        task_id=TASK,
+        project=PROJECT,
+        workspace=workspace,
+        nonce="fixed-nonce",
+        phase0={k: {"status": "✅"} for k in handoff_precheck.PHASE0_KEYS},
+        phase1={k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS},
+        predecessor_lesson_backref=[],
+    )
+    assert "predecessor_lesson_backref" not in without
+    assert with_none == without
+    assert with_empty == without
+    assert with_none["evidence_hash"] == without["evidence_hash"]
+    assert with_empty["evidence_hash"] == without["evidence_hash"]
+
+
+def test_backref_present_is_hashed(workspace, monkeypatch):
+    """真阳: supplying the field includes it in the payload AND folds it into the
+    hash (binding it — tampering invalidates evidence_hash).
+
+    Freeze time so the cross-call hash INEQUALITY below genuinely proves the
+    backref drove the difference (not incidental timestamp drift across the two
+    build_evidence calls)."""
+    monkeypatch.setattr(handoff_precheck, "_iso_now", lambda: "2026-06-24T00:00:00+00:00")
+    monkeypatch.setattr(handoff_precheck, "_last_commit_age_sec", lambda *a, **k: 42)
+    entries = [_backref(disp="applied")]
+    payload = handoff_precheck.build_evidence(
+        task_id=TASK,
+        project=PROJECT,
+        workspace=workspace,
+        nonce="fixed-nonce",
+        phase0={k: {"status": "✅"} for k in handoff_precheck.PHASE0_KEYS},
+        phase1={k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS},
+        predecessor_lesson_backref=entries,
+    )
+    assert payload["predecessor_lesson_backref"] == [
+        {
+            "predecessor_lesson": "lesson-sw-coord-p61-2026-06-24",
+            "disposition": "applied",
+        }
+    ]
+    # The stored hash matches a fresh recompute (the field was in scope).
+    assert payload["evidence_hash"] == handoff_precheck.compute_evidence_hash(payload)
+    # And it differs from a payload WITHOUT the field (proves it is hashed).
+    baseline = handoff_precheck.build_evidence(
+        task_id=TASK,
+        project=PROJECT,
+        workspace=workspace,
+        nonce="fixed-nonce",
+        phase0={k: {"status": "✅"} for k in handoff_precheck.PHASE0_KEYS},
+        phase1={k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS},
+    )
+    assert payload["evidence_hash"] != baseline["evidence_hash"]
+
+
+def test_backref_normalizes_to_three_keys(workspace):
+    """A non-applied disposition keeps its reason; extra keys are dropped to the
+    canonical 3-key shape (predecessor_lesson / disposition / reason)."""
+    entries = [
+        _backref(lesson="lesson-old", disp="superseded", reason="lesson-new replaces it"),
+        {
+            "predecessor_lesson": "lesson-x",
+            "disposition": "not_relevant",
+            "reason": "different domain",
+            "junk": "dropped",
+        },
+    ]
+    payload = handoff_precheck.build_evidence(
+        task_id=TASK,
+        project=PROJECT,
+        workspace=workspace,
+        phase0={k: {"status": "✅"} for k in handoff_precheck.PHASE0_KEYS},
+        phase1={k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS},
+        predecessor_lesson_backref=entries,
+    )
+    got = payload["predecessor_lesson_backref"]
+    assert got[0] == {
+        "predecessor_lesson": "lesson-old",
+        "disposition": "superseded",
+        "reason": "lesson-new replaces it",
+    }
+    assert got[1] == {
+        "predecessor_lesson": "lesson-x",
+        "disposition": "not_relevant",
+        "reason": "different domain",
+    }
+    assert "junk" not in got[1]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        [{"predecessor_lesson": "x", "disposition": "bogus"}],  # invalid disposition
+        [{"predecessor_lesson": "x", "disposition": "superseded"}],  # missing reason
+        [{"predecessor_lesson": "x", "disposition": "not_relevant", "reason": "  "}],  # blank reason
+        [{"disposition": "applied"}],  # missing predecessor_lesson
+        [{"predecessor_lesson": "", "disposition": "applied"}],  # empty predecessor_lesson
+        ["not-a-dict"],  # not a dict
+        [{"predecessor_lesson": 123, "disposition": "applied"}],  # non-str lesson
+    ],
+)
+def test_backref_malformed_raises_valueerror(workspace, bad):
+    """盲区: garbage can't be hashed in — _validate_backref raises ValueError."""
+    with pytest.raises(ValueError):
+        handoff_precheck.build_evidence(
+            task_id=TASK,
+            project=PROJECT,
+            workspace=workspace,
+            phase0={k: {"status": "✅"} for k in handoff_precheck.PHASE0_KEYS},
+            phase1={k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS},
+            predecessor_lesson_backref=bad,
+        )
+
+
+def test_backref_not_a_list_raises(workspace):
+    """A non-list backref argument (e.g. a bare dict) is rejected."""
+    with pytest.raises(ValueError):
+        handoff_precheck.build_evidence(
+            task_id=TASK,
+            project=PROJECT,
+            workspace=workspace,
+            phase0={k: {"status": "✅"} for k in handoff_precheck.PHASE0_KEYS},
+            phase1={k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS},
+            predecessor_lesson_backref={"predecessor_lesson": "x", "disposition": "applied"},
+        )
+
+
+def test_gate_accepts_evidence_with_backref(handoff_home, workspace):
+    """gate-acceptance: an evidence file carrying the new field passes the EXISTING
+    dump retro gate unchanged (the gate re-hashes over all fields, so the optional
+    field rides through with no gate change)."""
+    payload = handoff_precheck.build_evidence(
+        task_id=TASK,
+        project=PROJECT,
+        workspace=workspace,
+        phase0={k: {"status": "✅"} for k in handoff_precheck.PHASE0_KEYS},
+        phase1={k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS},
+        predecessor_lesson_backref=[_backref(disp="applied")],
+    )
+    ev = _write_evidence(handoff_home, payload)
+    code, err = _run_dump(workspace=workspace, retro_evidence=ev)
+    assert code == 0, err
+    assert (handoff_home / PROJECT / "queue" / f"{TASK}.md").exists()
+
+
+def test_cli_backref_flag_parses(handoff_home, workspace, monkeypatch, capsys):
+    """CLI: --predecessor-lesson-backref lesson=superseded:newlesson parses into
+    the right dict and is written into the evidence file."""
+    out = handoff_home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json"
+    rc = handoff_precheck.main(
+        [
+            "--task",
+            TASK,
+            "--project",
+            PROJECT,
+            "--workspace",
+            str(workspace),
+            "--output",
+            str(out),
+            "--predecessor-lesson-backref",
+            "lesson-old=superseded:lesson-new replaces it",
+            "--predecessor-lesson-backref",
+            "lesson-keep=applied",
+        ]
+    )
+    assert rc == 0
+    body = json.loads(out.read_text())
+    assert body["predecessor_lesson_backref"] == [
+        {
+            "predecessor_lesson": "lesson-old",
+            "disposition": "superseded",
+            "reason": "lesson-new replaces it",
+        },
+        {"predecessor_lesson": "lesson-keep", "disposition": "applied"},
+    ]
+
+
+def test_cli_backref_malformed_clean_exit(handoff_home, workspace):
+    """Malformed CLI backref → clean nonzero exit (not a traceback)."""
+    out = handoff_home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json"
+    rc = handoff_precheck.main(
+        [
+            "--task",
+            TASK,
+            "--project",
+            PROJECT,
+            "--workspace",
+            str(workspace),
+            "--output",
+            str(out),
+            "--predecessor-lesson-backref",
+            "lesson-old=bogus_disposition",
+        ]
+    )
+    assert rc != 0
+    assert not out.exists()
+
+
+def test_cli_backref_file_wins_over_flags(handoff_home, workspace):
+    """When both --predecessor-lesson-backref-file and flags are given, the file
+    wins (documented precedence)."""
+    bf = handoff_home / "backref.json"
+    bf.write_text(
+        json.dumps(
+            [{"predecessor_lesson": "from-file", "disposition": "applied"}]
+        ),
+        encoding="utf-8",
+    )
+    out = handoff_home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json"
+    rc = handoff_precheck.main(
+        [
+            "--task",
+            TASK,
+            "--project",
+            PROJECT,
+            "--workspace",
+            str(workspace),
+            "--output",
+            str(out),
+            "--predecessor-lesson-backref",
+            "from-flag=applied",
+            "--predecessor-lesson-backref-file",
+            str(bf),
+        ]
+    )
+    assert rc == 0
+    body = json.loads(out.read_text())
+    assert body["predecessor_lesson_backref"] == [
+        {"predecessor_lesson": "from-file", "disposition": "applied"}
+    ]

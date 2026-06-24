@@ -474,6 +474,106 @@ def test_old_ready_omits_cross_repo_anchor_for_same_repo(tmp_path, monkeypatch):
     assert "code_repo_head" not in body
 
 
+def test_old_ready_surfaces_predecessor_lesson_backref(tmp_path, monkeypatch):
+    """retrieval-pull L1: when the evidence carries predecessor_lesson_backref,
+    _write_old_ready surfaces it additively (so the §0 audit / fleet canary can
+    read it without re-parsing the evidence file)."""
+    from handoff_fanout import dump
+
+    home = tmp_path / "handoff"
+    monkeypatch.setenv("HANDOFF_HOME", str(home))
+    ws = tmp_path / "ws"
+    _git_init_commit(ws)
+
+    backref = [
+        {"predecessor_lesson": "lesson-sw-coord-p61", "disposition": "applied"},
+        {
+            "predecessor_lesson": "lesson-old",
+            "disposition": "superseded",
+            "reason": "lesson-new replaces it",
+        },
+    ]
+    payload = {
+        "schema_version": "5.5.0",
+        "nonce": "backref-test",
+        "phase0": {"tests": {"status": "✅"}, "memory": {"status": "✅"}},
+        "phase1": {k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS},
+        "predecessor_lesson_backref": backref,
+    }
+    evidence = home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json"
+    evidence.parent.mkdir(parents=True, exist_ok=True)
+    evidence.write_text(json.dumps(payload), encoding="utf-8")
+
+    out = dump._write_old_ready(
+        project=PROJECT,
+        task=TASK,
+        workspace=ws,
+        evidence_path=evidence,
+        ack_dir=home / PROJECT / "ack",
+        home=home,
+    )
+    assert out is not None
+    body = json.loads(out.read_text())
+    assert body["predecessor_lesson_backref"] == backref
+
+
+def test_old_ready_omits_backref_when_absent(tmp_path, monkeypatch):
+    """Byte-stable: evidence without the field → old_ready does NOT add the key."""
+    from handoff_fanout import dump
+
+    home = tmp_path / "handoff"
+    monkeypatch.setenv("HANDOFF_HOME", str(home))
+    ws = tmp_path / "ws"
+    _git_init_commit(ws)
+
+    evidence = _write_evidence_with_codex_audit(home, None)
+    out = dump._write_old_ready(
+        project=PROJECT,
+        task=TASK,
+        workspace=ws,
+        evidence_path=evidence,
+        ack_dir=home / PROJECT / "ack",
+        home=home,
+    )
+    assert out is not None
+    body = json.loads(out.read_text())
+    assert "predecessor_lesson_backref" not in body
+
+
+def test_old_ready_ignores_non_list_backref(tmp_path, monkeypatch):
+    """A malformed (non-list) backref value in evidence is ignored, not surfaced —
+    old_ready never carries garbage."""
+    from handoff_fanout import dump
+
+    home = tmp_path / "handoff"
+    monkeypatch.setenv("HANDOFF_HOME", str(home))
+    ws = tmp_path / "ws"
+    _git_init_commit(ws)
+
+    payload = {
+        "schema_version": "5.5.0",
+        "nonce": "bad-backref",
+        "phase0": {"tests": {"status": "✅"}, "memory": {"status": "✅"}},
+        "phase1": {k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS},
+        "predecessor_lesson_backref": "not-a-list",
+    }
+    evidence = home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json"
+    evidence.parent.mkdir(parents=True, exist_ok=True)
+    evidence.write_text(json.dumps(payload), encoding="utf-8")
+
+    out = dump._write_old_ready(
+        project=PROJECT,
+        task=TASK,
+        workspace=ws,
+        evidence_path=evidence,
+        ack_dir=home / PROJECT / "ack",
+        home=home,
+    )
+    assert out is not None
+    body = json.loads(out.read_text())
+    assert "predecessor_lesson_backref" not in body
+
+
 # ─── Phase 4e R2 gap-close — codex R1 P0/P1 regressions ─────────────────────
 #
 # These pin the fixes for the 2026-05-29 codex R1 audit of the Phase 4d

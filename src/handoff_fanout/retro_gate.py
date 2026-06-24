@@ -1266,6 +1266,13 @@ def _attempt_realign(
         # invalidates these runs; that is Phase B's job, not re-align's.
         if "codex_audit" in payload:
             new_payload["codex_audit"] = payload["codex_audit"]
+        # Likewise preserve the retrieval-pull back-reference verbatim — re-align
+        # refreshes the HEAD binding, it does NOT re-consume predecessor lessons, so
+        # a sibling-HEAD move must not silently erase the recorded back-reference
+        # (same rationale as codex_audit above). build_evidence above did not receive
+        # it (the gate has no CLI to re-supply it), so copy it from the original.
+        if "predecessor_lesson_backref" in payload:
+            new_payload["predecessor_lesson_backref"] = payload["predecessor_lesson_backref"]
         # The in-process builder must have observed the same HEAD we validated;
         # if not (e.g. its rev-parse failed → "(unknown)"), abort this attempt.
         if new_payload.get("head_at_precheck") != head_now:

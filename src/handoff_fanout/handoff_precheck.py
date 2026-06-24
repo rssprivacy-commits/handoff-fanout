@@ -89,6 +89,16 @@ PHASE_STATUS_VALID = {"✅", "⚠️", "❌", "skip"}
 # that emits evidence) require one. ✅ ("done") needs no explanation.
 STATUS_REQUIRING_REASON = {"⚠️", "❌", "skip"}
 
+# ─── retrieval-pull (predecessor_lesson_backref) vocabulary ─────────────────
+# The optional structured back-reference a closing session records for each
+# predecessor lesson it consumed at session start (component 1 / L1 keystone):
+# 前任课 X → 已应用 (applied) / 已被取代 (superseded, name the new lesson) /
+# 不相关 (not_relevant, give the reason). A non-"applied" disposition REQUIRES a
+# reason — the same "a non-✅ claim is meaningless without a reason" invariant the
+# phase status carries. This field is OPTIONAL (warn-mode L1): when omitted the
+# evidence payload is byte-for-byte identical to a pre-backref payload.
+BACKREF_DISPOSITIONS = ("applied", "superseded", "not_relevant")
+
 MODE_NORMAL = "normal"
 MODE_FORENSIC_RETRO = "forensic_retro"
 MODE_VALID = {MODE_NORMAL, MODE_FORENSIC_RETRO}
@@ -310,6 +320,57 @@ def merge_phase_status(
     return out
 
 
+# ─── retrieval-pull back-reference validation ───────────────────────────────
+
+
+def _validate_backref(entries: object) -> list[dict]:
+    """Normalize + validate the ``predecessor_lesson_backref`` list.
+
+    Each entry must be a dict with a non-empty ``predecessor_lesson`` (str) and a
+    ``disposition`` in :data:`BACKREF_DISPOSITIONS`; ``reason`` (str) is REQUIRED
+    and non-empty when the disposition is not ``"applied"`` (for ``"superseded"``
+    it should name the new lesson). Raises :class:`ValueError` on any malformed
+    entry so garbage can never be folded into the hashed payload. Returns a fresh
+    list of dicts normalized to exactly the canonical keys (extra keys dropped).
+    """
+    if not isinstance(entries, list):
+        raise ValueError(
+            f"predecessor_lesson_backref must be a list of dicts; got {type(entries).__name__}"
+        )
+    out: list[dict] = []
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"predecessor_lesson_backref[{i}] must be a dict; got {type(entry).__name__}"
+            )
+        lesson = entry.get("predecessor_lesson")
+        if not isinstance(lesson, str) or not lesson.strip():
+            raise ValueError(
+                f"predecessor_lesson_backref[{i}].predecessor_lesson must be a non-empty str"
+            )
+        disposition = entry.get("disposition")
+        if disposition not in BACKREF_DISPOSITIONS:
+            raise ValueError(
+                f"predecessor_lesson_backref[{i}].disposition must be one of "
+                f"{list(BACKREF_DISPOSITIONS)}; got {disposition!r}"
+            )
+        norm: dict = {
+            "predecessor_lesson": lesson.strip(),
+            "disposition": disposition,
+        }
+        reason = entry.get("reason")
+        reason_stripped = reason.strip() if isinstance(reason, str) else ""
+        if disposition != "applied" and not reason_stripped:
+            raise ValueError(
+                f"predecessor_lesson_backref[{i}].reason is required (non-empty) when "
+                f"disposition={disposition!r} (for 'superseded', name the new lesson)"
+            )
+        if reason_stripped:
+            norm["reason"] = reason_stripped
+        out.append(norm)
+    return out
+
+
 # ─── evidence builder ───────────────────────────────────────────────────────
 
 
@@ -323,6 +384,7 @@ def build_evidence(
     phase0: dict | None = None,
     phase1: dict | None = None,
     codex_audit: dict | None = None,
+    predecessor_lesson_backref: list[dict] | None = None,
 ) -> dict:
     """Assemble + hash a retro-evidence payload.
 
@@ -336,6 +398,14 @@ def build_evidence(
     the schema version), so existing flows are unaffected. When present it is
     folded into the hashed payload — tampering with the block invalidates
     ``evidence_hash``.
+
+    ``predecessor_lesson_backref`` (retrieval-pull / L1 keystone) is the optional
+    structured back-reference recording which predecessor lessons this closing
+    session consumed and what it did with each (see :func:`_validate_backref`).
+    Omitted / empty → the payload is byte-for-byte identical to today's (warn-mode
+    invariant). When supplied it is validated then folded into the hashed payload
+    (so it is bound to the evidence — an independent consumer's score the next
+    session can't silently forge).
     """
     if mode not in MODE_VALID:
         raise ValueError(f"mode must be one of {sorted(MODE_VALID)}; got {mode!r}")
@@ -369,6 +439,10 @@ def build_evidence(
         payload["nonce"] = nonce
     if codex_audit is not None:
         payload["codex_audit"] = codex_audit
+    # retrieval-pull (L1): fold in ONLY when supplied & non-empty — exactly the
+    # conditional-fold pattern above. Absent → byte-identical to today (warn-mode).
+    if predecessor_lesson_backref:
+        payload["predecessor_lesson_backref"] = _validate_backref(predecessor_lesson_backref)
     payload["evidence_hash"] = compute_evidence_hash(payload)
     return payload
 
@@ -455,6 +529,56 @@ def _load_phase_file(path: Path | None) -> dict:
         raise SystemExit(f"❌ --phase-status-file invalid JSON: {e}") from e
 
 
+def parse_backref_kv(values: list[str] | None) -> list[dict]:
+    """Parse ``--predecessor-lesson-backref lesson=disposition[:reason]`` pairs.
+
+    Grammar mirrors :func:`_parse_phase_kv`: ``lesson=disposition`` or
+    ``lesson=disposition:reason text here`` (the reason is everything after the
+    first ``:``, verbatim). Returns a list of raw dicts (NOT yet validated — the
+    builder's :func:`_validate_backref` is the single validation point). Raises
+    :class:`SystemExit` for a missing ``=`` (a CLI grammar error), so the caller
+    surfaces a clean message, not a traceback.
+    """
+    out: list[dict] = []
+    if not values:
+        return out
+    for raw in values:
+        if "=" not in raw:
+            raise SystemExit(
+                f"❌ --predecessor-lesson-backref must be lesson=disposition[:reason]: {raw!r}"
+            )
+        lesson, rest = raw.split("=", 1)
+        lesson = lesson.strip()
+        rest = rest.strip()
+        if ":" in rest:
+            disposition, reason = rest.split(":", 1)
+            entry: dict = {"predecessor_lesson": lesson, "disposition": disposition.strip()}
+            reason = reason.strip()
+            if reason:
+                entry["reason"] = reason
+        else:
+            entry = {"predecessor_lesson": lesson, "disposition": rest}
+        out.append(entry)
+    return out
+
+
+def _load_backref_file(path: Path | None) -> list[dict] | None:
+    """Load a JSON-array backref file. ``None`` when no path; raises SystemExit on
+    a missing file or non-array / invalid JSON (clean CLI error, not a traceback).
+    The contents are NOT validated here — the builder validates."""
+    if not path:
+        return None
+    if not path.exists():
+        raise SystemExit(f"❌ --predecessor-lesson-backref-file not found: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"❌ --predecessor-lesson-backref-file invalid JSON: {e}") from e
+    if not isinstance(data, list):
+        raise SystemExit("❌ --predecessor-lesson-backref-file must be a JSON array of objects")
+    return data
+
+
 def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="handoff-precheck",
@@ -495,6 +619,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="JSON file with {phase0:{item:status}, phase1:{item:status}}",
     )
     ap.add_argument(
+        "--predecessor-lesson-backref",
+        action="append",
+        default=[],
+        dest="predecessor_lesson_backref",
+        help="retrieval-pull (warn-mode L1): repeatable; "
+        "lesson=disposition[:reason] where disposition ∈ "
+        f"{list(BACKREF_DISPOSITIONS)} (reason required for non-'applied'), e.g. "
+        "--predecessor-lesson-backref lesson-old=superseded:lesson-new replaces it",
+    )
+    ap.add_argument(
+        "--predecessor-lesson-backref-file",
+        default=None,
+        dest="predecessor_lesson_backref_file",
+        help="path to a JSON array of backref objects; when given it REPLACES the "
+        "--predecessor-lesson-backref flags (file wins)",
+    )
+    ap.add_argument(
         "--no-lock",
         action="store_true",
         help="skip precheck.lock acquisition (advanced; for forensic batch only)",
@@ -532,6 +673,30 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(reason_err + "\n")
         return 1
 
+    # retrieval-pull (L1): the file REPLACES the flags (file wins) — warn if both.
+    backref_file = _load_backref_file(
+        Path(args.predecessor_lesson_backref_file)
+        if args.predecessor_lesson_backref_file
+        else None
+    )
+    if backref_file is not None:
+        if args.predecessor_lesson_backref:
+            sys.stderr.write(
+                "WARN backref-file-wins: both --predecessor-lesson-backref and "
+                "--predecessor-lesson-backref-file given; the file replaces the flags\n"
+            )
+        backref_raw: list[dict] | None = backref_file
+    else:
+        backref_raw = parse_backref_kv(args.predecessor_lesson_backref) or None
+    # Validate now so a malformed input is a clean nonzero exit (not a traceback)
+    # BEFORE we acquire the lock or write anything.
+    if backref_raw:
+        try:
+            _validate_backref(backref_raw)
+        except ValueError as e:
+            sys.stderr.write(f"ERR-FATAL backref-invalid: {e}\n")
+            return 1
+
     output = (
         Path(args.output)
         if args.output
@@ -547,6 +712,7 @@ def main(argv: list[str] | None = None) -> int:
             nonce=args.nonce,
             phase0=p0,
             phase1=p1,
+            predecessor_lesson_backref=backref_raw,
         )
         write_evidence(payload, output)
         sys.stdout.write(f"OK precheck-written: {output}\n")

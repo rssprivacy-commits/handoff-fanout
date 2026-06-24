@@ -466,3 +466,61 @@ def test_coordinator_done_close_issues_no_token(tmp_path, monkeypatch):
     assert rc == 0, rc
     assert (home / PROJECT / "queue" / f"{TASK}.done").exists()
     assert _tokens(home) == []
+
+
+# ─── retrieval-pull L1: --predecessor-lesson-backref plumbed into evidence ─────
+
+
+def test_audit_close_plumbs_backref_into_evidence(tmp_path, monkeypatch):
+    """audit-close --predecessor-lesson-backref folds the structured back-reference
+    into the retro evidence it builds (the coordinator's own consumption record)."""
+    home = _home(tmp_path, monkeypatch)
+    ws = _git_repo(tmp_path)
+
+    argv = _close_argv(ws) + [
+        "--predecessor-lesson-backref",
+        "lesson-sw-coord-p61=applied",
+        "--predecessor-lesson-backref",
+        "lesson-old=superseded:lesson-new replaces it",
+    ]
+    rc = codex_audit.main_audit_close(argv)
+    assert rc == 0, rc
+
+    evidence = json.loads(
+        (home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json").read_text()
+    )
+    assert evidence["predecessor_lesson_backref"] == [
+        {"predecessor_lesson": "lesson-sw-coord-p61", "disposition": "applied"},
+        {
+            "predecessor_lesson": "lesson-old",
+            "disposition": "superseded",
+            "reason": "lesson-new replaces it",
+        },
+    ]
+    # surfaced into old_ready too (additive)
+    old_ready = json.loads((home / PROJECT / "ack" / f"{TASK}.old_ready").read_text())
+    assert old_ready["predecessor_lesson_backref"] == evidence["predecessor_lesson_backref"]
+
+
+def test_audit_close_without_backref_omits_field(tmp_path, monkeypatch):
+    """Byte-stable: a close WITHOUT the flag produces evidence with no backref field."""
+    home = _home(tmp_path, monkeypatch)
+    ws = _git_repo(tmp_path)
+
+    assert codex_audit.main_audit_close(_close_argv(ws)) == 0
+    evidence = json.loads(
+        (home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json").read_text()
+    )
+    assert "predecessor_lesson_backref" not in evidence
+
+
+def test_audit_close_backref_malformed_clean_exit(tmp_path, monkeypatch, capsys):
+    """A malformed CLI backref → clean nonzero exit (not a traceback) and no evidence
+    written."""
+    home = _home(tmp_path, monkeypatch)
+    ws = _git_repo(tmp_path)
+
+    argv = _close_argv(ws) + ["--predecessor-lesson-backref", "lesson-x=bogus"]
+    rc = codex_audit.main_audit_close(argv)
+    assert rc != 0
+    assert not (home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json").exists()

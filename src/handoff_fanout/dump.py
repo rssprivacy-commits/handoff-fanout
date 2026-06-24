@@ -1082,6 +1082,18 @@ def write_active_dump(
                 f"{project}/{task}"
             )
 
+        # retrieval-pull (L1 / component 6): WARN-only — record whether this closing
+        # session left a structured back-reference to a predecessor lesson. The retro
+        # gate already passed (we are on the active-dump success path); this only
+        # appends to a shadow log and NEVER blocks / changes the exit code (warn-mode).
+        _retrieval_pull_warn(
+            home=cfg.home,
+            project=project,
+            task=task,
+            evidence_path=retro_evidence_path,
+            is_coordinator=is_coordinator,
+        )
+
     # ack/<task>.worktree — record the worktree (path/branch/base/integration) so
     # prune/gc can find + reclaim it, and the §0/fan-in steps can trace it. Written
     # BEFORE the .uri publish (same ordering rule as old_ready). Only for a CREATED
@@ -1277,6 +1289,15 @@ def _write_old_ready(
             old_ready["code_repo"] = code_repo
             old_ready["code_repo_head"] = code_repo_head
 
+    # retrieval-pull (L1): surface the closing session's predecessor_lesson_backref
+    # so the §0 new-session audit + the fleet learning canary can read it without
+    # re-parsing the evidence file. Additive-when-present: a non-list / absent value
+    # is ignored → old_ready stays byte-stable for the common case. old_ready is
+    # unhashed; the value is copied from the already-hashed evidence, not recomputed.
+    backref = payload.get("predecessor_lesson_backref")
+    if isinstance(backref, list) and backref:
+        old_ready["predecessor_lesson_backref"] = backref
+
     ack_dir.mkdir(parents=True, exist_ok=True)
     out = ack_dir / f"{task}.old_ready"
     atomic.write_with_fsync(
@@ -1285,6 +1306,54 @@ def _write_old_ready(
     )
     print(f"[dump] wrote {out}")
     return out
+
+
+def _retrieval_pull_warn(
+    *,
+    home: Path,
+    project: str,
+    task: str,
+    evidence_path: Path,
+    is_coordinator: bool,
+) -> None:
+    """retrieval-pull WARN-mode validator (component 6 / L1).
+
+    Runs AFTER the retro gate passed on an ACTIVE dump. Inspects the closing
+    session's evidence for ``predecessor_lesson_backref`` and appends one
+    structured JSON line to ``<HANDOFF_HOME>/<project>/retrieval-pull-shadow.log``:
+    ``{ts, task, project, is_coordinator, has_backref, backref_count, would_block}``.
+
+    ``would_block = is_coordinator and not has_backref`` — the condition a FUTURE
+    owner-gated enforce-flip would block on. In warn-mode it is **logged only**:
+    this function NEVER blocks, NEVER raises, NEVER touches the dump exit code, and
+    NEVER prints the would-block to stdout (keeping dump output byte-stable for
+    parsers). Any error (unreadable evidence, unwritable log) is swallowed — the
+    whole body is best-effort under a single try/except.
+    """
+    try:
+        backref: object = None
+        try:
+            payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                backref = payload.get("predecessor_lesson_backref")
+        except (OSError, json.JSONDecodeError):
+            backref = None
+        has_backref = isinstance(backref, list) and bool(backref)
+        record = {
+            "ts": now_iso(),
+            "task": task,
+            "project": project,
+            "is_coordinator": bool(is_coordinator),
+            "has_backref": has_backref,
+            "backref_count": len(backref) if isinstance(backref, list) else 0,
+            "would_block": bool(is_coordinator) and not has_backref,
+        }
+        log_path = home / project / "retrieval-pull-shadow.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 — fail-soft by contract; never affect the dump
+        pass
 
 
 def _maybe_pbcopy(content: str) -> None:

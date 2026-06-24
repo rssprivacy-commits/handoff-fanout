@@ -2416,6 +2416,23 @@ def main_audit_close(argv: list[str] | None = None) -> int:
     # retro evidence phase status (forwarded to precheck-style build)
     ap.add_argument("--phase0-status", action="append", default=[])
     ap.add_argument("--phase1-status", action="append", default=[])
+    # retrieval-pull (warn-mode L1): the closing coordinator's structured back-reference
+    # to predecessor lessons it consumed (folded into the same retro evidence). Mirrors
+    # the handoff precheck CLI: repeatable flags OR a JSON-array file (file wins).
+    ap.add_argument(
+        "--predecessor-lesson-backref",
+        action="append",
+        default=[],
+        dest="predecessor_lesson_backref",
+        help="repeatable; lesson=disposition[:reason] (disposition ∈ "
+        f"{list(_pc.BACKREF_DISPOSITIONS)}; reason required for non-'applied')",
+    )
+    ap.add_argument(
+        "--predecessor-lesson-backref-file",
+        default=None,
+        dest="predecessor_lesson_backref_file",
+        help="path to a JSON array of backref objects (REPLACES the flags — file wins)",
+    )
     args = ap.parse_args(argv)
 
     if not _pc.TASK_ID_RE.match(args.task):
@@ -2504,6 +2521,29 @@ def main_audit_close(argv: list[str] | None = None) -> int:
     if reason_err:
         sys.stderr.write(reason_err + "\n")
         return 1
+
+    # retrieval-pull (L1): the file REPLACES the flags (file wins). Validate now so a
+    # malformed input is a clean nonzero exit BEFORE the lock / any artifact is written.
+    backref_file = _pc._load_backref_file(
+        Path(args.predecessor_lesson_backref_file)
+        if args.predecessor_lesson_backref_file
+        else None
+    )
+    if backref_file is not None:
+        if args.predecessor_lesson_backref:
+            sys.stderr.write(
+                "WARN backref-file-wins: both --predecessor-lesson-backref and "
+                "--predecessor-lesson-backref-file given; the file replaces the flags\n"
+            )
+        backref_raw: list[dict] | None = backref_file
+    else:
+        backref_raw = _pc.parse_backref_kv(args.predecessor_lesson_backref) or None
+    if backref_raw:
+        try:
+            _pc._validate_backref(backref_raw)
+        except ValueError as e:
+            sys.stderr.write(f"ERR-FATAL backref-invalid: {e}\n")
+            return 1
 
     # R2 P1: the entire audit snapshot — validate run records, read dispositions,
     # build the block, write evidence, dump — must run under ONE held critical
@@ -2602,6 +2642,7 @@ def main_audit_close(argv: list[str] | None = None) -> int:
                 phase0=p0,
                 phase1=p1,
                 codex_audit=block,
+                predecessor_lesson_backref=backref_raw,
             )
             out = _pc.precheck_dir(project) / f"{args.task}.retro.evidence.json"
             _pc.write_evidence(evidence, out)
