@@ -354,6 +354,42 @@ def test_R16b_realign_preserves_predecessor_lesson_backref(handoff_home, workspa
     assert new_payload["evidence_hash"] == handoff_precheck.compute_evidence_hash(new_payload)
 
 
+def test_R16c_realign_preserves_lesson_disposition(handoff_home, workspace):
+    """component 5 / L2: a sibling-HEAD re-align must NOT silently erase a present
+    lesson_disposition (same preservation guarantee as backref / codex_audit) — the
+    re-align refreshes the HEAD binding, it does not re-decide the lesson outcome."""
+    lesson_disposition = {
+        "disposition": "no_novel_lesson_attested",
+        "reason": "routine relay, nothing novel",
+    }
+    payload = handoff_precheck.build_evidence(
+        task_id=TASK,
+        project=PROJECT,
+        workspace=workspace,
+        phase0={k: {"status": "✅"} for k in handoff_precheck.PHASE0_KEYS},
+        phase1={k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS},
+        lesson_disposition=lesson_disposition,
+    )
+    h0 = payload["head_at_precheck"]
+    payload["head_at_precheck_timestamp"] = (datetime.now(UTC) - timedelta(seconds=120)).isoformat(
+        timespec="seconds"
+    )
+    payload["evidence_hash"] = handoff_precheck.compute_evidence_hash(payload)
+    ev = _write_evidence(handoff_home, payload)
+    (workspace / "sibling.txt").write_text("x")
+    subprocess.run(["git", "add", "sibling.txt"], cwd=workspace, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "sibling work"], cwd=workspace, check=True)
+    h1 = handoff_precheck._git(["rev-parse", "HEAD"], workspace)
+    assert h0 != h1
+
+    code, err = _run_dump(workspace=workspace, retro_evidence=ev)
+    assert code == 0, f"re-align should pass; got: {err}"
+    new_payload = json.loads(ev.read_text())
+    assert new_payload["head_at_precheck"] == h1
+    assert new_payload["lesson_disposition"] == lesson_disposition
+    assert new_payload["evidence_hash"] == handoff_precheck.compute_evidence_hash(new_payload)
+
+
 def test_R17_dirty_tree_does_not_realign(handoff_home, workspace):
     """1-B safety: if the working tree is dirty (session work not fully
     committed), re-align is refused — retro claims may be incomplete — and the
@@ -1153,3 +1189,195 @@ def test_cli_backref_file_wins_over_flags(handoff_home, workspace):
     assert body["predecessor_lesson_backref"] == [
         {"predecessor_lesson": "from-file", "disposition": "applied"}
     ]
+
+
+# ─── lesson_disposition (component 5 / honest "no new lesson" / warn-mode L2) ──
+#
+# The new OPTIONAL single-value field: what this hop did about CAPTURING a lesson
+# ({new_lesson, no_novel_lesson_attested, carried_forward}; the latter two require a
+# reason). WARN-MODE invariant: when not supplied, the produced evidence dict (and its
+# hash) must be byte-for-byte identical to today's (same conditional-fold as backref).
+
+
+def test_lesson_disposition_omitted_is_byte_identical(workspace, monkeypatch):
+    """真阴 / byte-identical: omitting lesson_disposition (None / {}) yields the SAME
+    payload + hash as today (the conditional-fold invariant — zero behavior change).
+
+    Freeze the time-derived fields so the three build_evidence calls cannot straddle a
+    1-second boundary under full-suite load (generated_at / head_at_precheck_timestamp
+    via _iso_now, last_commit_age_sec) — otherwise the strong full-dict + hash equality
+    assertions flake (the p62 flaky-test root cause; this isolates the fold property)."""
+    monkeypatch.setattr(handoff_precheck, "_iso_now", lambda: "2026-06-24T00:00:00+00:00")
+    monkeypatch.setattr(handoff_precheck, "_last_commit_age_sec", lambda *a, **k: 42)
+    common = dict(
+        task_id=TASK,
+        project=PROJECT,
+        workspace=workspace,
+        nonce="fixed-nonce",
+        phase0={k: {"status": "✅"} for k in handoff_precheck.PHASE0_KEYS},
+        phase1={k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS},
+    )
+    without = handoff_precheck.build_evidence(**common)
+    with_none = handoff_precheck.build_evidence(**common, lesson_disposition=None)
+    with_empty = handoff_precheck.build_evidence(**common, lesson_disposition={})
+    assert "lesson_disposition" not in without
+    assert with_none == without
+    assert with_empty == without
+    assert with_none["evidence_hash"] == without["evidence_hash"]
+    assert with_empty["evidence_hash"] == without["evidence_hash"]
+
+
+def test_lesson_disposition_present_is_hashed(workspace, monkeypatch):
+    """真阳: supplying the field includes it AND folds it into the hash (binding it)."""
+    monkeypatch.setattr(handoff_precheck, "_iso_now", lambda: "2026-06-24T00:00:00+00:00")
+    monkeypatch.setattr(handoff_precheck, "_last_commit_age_sec", lambda *a, **k: 42)
+    common = dict(
+        task_id=TASK,
+        project=PROJECT,
+        workspace=workspace,
+        nonce="fixed-nonce",
+        phase0={k: {"status": "✅"} for k in handoff_precheck.PHASE0_KEYS},
+        phase1={k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS},
+    )
+    payload = handoff_precheck.build_evidence(
+        **common,
+        lesson_disposition={
+            "disposition": "no_novel_lesson_attested",
+            "reason": "routine feature, nothing novel",
+        },
+    )
+    assert payload["lesson_disposition"] == {
+        "disposition": "no_novel_lesson_attested",
+        "reason": "routine feature, nothing novel",
+    }
+    assert payload["evidence_hash"] == handoff_precheck.compute_evidence_hash(payload)
+    baseline = handoff_precheck.build_evidence(**common)
+    assert payload["evidence_hash"] != baseline["evidence_hash"]
+
+
+def test_lesson_disposition_new_lesson_reason_optional(workspace):
+    """``new_lesson`` is the unremarkable default — its reason is optional and an extra
+    key is dropped to the canonical shape."""
+    payload = handoff_precheck.build_evidence(
+        task_id=TASK,
+        project=PROJECT,
+        workspace=workspace,
+        phase0={k: {"status": "✅"} for k in handoff_precheck.PHASE0_KEYS},
+        phase1={k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS},
+        lesson_disposition={"disposition": "new_lesson", "junk": "dropped"},
+    )
+    assert payload["lesson_disposition"] == {"disposition": "new_lesson"}
+
+
+def test_lesson_disposition_carried_forward_keeps_reason(workspace):
+    """``carried_forward`` keeps its reason (and requires it)."""
+    payload = handoff_precheck.build_evidence(
+        task_id=TASK,
+        project=PROJECT,
+        workspace=workspace,
+        phase0={k: {"status": "✅"} for k in handoff_precheck.PHASE0_KEYS},
+        phase1={k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS},
+        lesson_disposition={"disposition": "carried_forward", "reason": "p62 still applies"},
+    )
+    assert payload["lesson_disposition"] == {
+        "disposition": "carried_forward",
+        "reason": "p62 still applies",
+    }
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"disposition": "bogus"},  # invalid enum
+        {"disposition": "no_novel_lesson_attested"},  # missing required reason
+        {"disposition": "carried_forward", "reason": "  "},  # blank reason
+        {"reason": "x"},  # missing disposition
+        "not-a-dict",  # not a dict
+    ],
+)
+def test_lesson_disposition_malformed_raises_valueerror(workspace, bad):
+    """盲区: garbage can't be hashed in — _validate_lesson_disposition raises ValueError."""
+    with pytest.raises(ValueError):
+        handoff_precheck.build_evidence(
+            task_id=TASK,
+            project=PROJECT,
+            workspace=workspace,
+            phase0={k: {"status": "✅"} for k in handoff_precheck.PHASE0_KEYS},
+            phase1={k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS},
+            lesson_disposition=bad,
+        )
+
+
+def test_gate_accepts_evidence_with_lesson_disposition(handoff_home, workspace):
+    """gate-acceptance: evidence carrying the new field passes the EXISTING dump retro
+    gate unchanged (the gate re-hashes over all fields, so it rides through)."""
+    payload = handoff_precheck.build_evidence(
+        task_id=TASK,
+        project=PROJECT,
+        workspace=workspace,
+        phase0={k: {"status": "✅"} for k in handoff_precheck.PHASE0_KEYS},
+        phase1={k: {"status": "✅"} for k in handoff_precheck.PHASE1_KEYS},
+        lesson_disposition={"disposition": "new_lesson"},
+    )
+    ev = _write_evidence(handoff_home, payload)
+    code, err = _run_dump(workspace=workspace, retro_evidence=ev)
+    assert code == 0, err
+    assert (handoff_home / PROJECT / "queue" / f"{TASK}.md").exists()
+
+
+def test_cli_lesson_disposition_flag_parses(handoff_home, workspace):
+    """CLI: --lesson-disposition <enum>:reason parses into the right dict and is written
+    into the evidence file."""
+    out = handoff_home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json"
+    rc = handoff_precheck.main(
+        [
+            "--task",
+            TASK,
+            "--project",
+            PROJECT,
+            "--workspace",
+            str(workspace),
+            "--output",
+            str(out),
+            "--lesson-disposition",
+            "no_novel_lesson_attested:routine feature: nothing novel",
+        ]
+    )
+    assert rc == 0
+    body = json.loads(out.read_text())
+    # the reason is everything after the FIRST colon (verbatim, inner colons kept)
+    assert body["lesson_disposition"] == {
+        "disposition": "no_novel_lesson_attested",
+        "reason": "routine feature: nothing novel",
+    }
+
+
+def test_cli_lesson_disposition_omitted_no_field(handoff_home, workspace):
+    """Byte-stable: a precheck WITHOUT the flag produces evidence with no field."""
+    out = handoff_home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json"
+    rc = handoff_precheck.main(
+        ["--task", TASK, "--project", PROJECT, "--workspace", str(workspace), "--output", str(out)]
+    )
+    assert rc == 0
+    assert "lesson_disposition" not in json.loads(out.read_text())
+
+
+def test_cli_lesson_disposition_malformed_clean_exit(handoff_home, workspace):
+    """Malformed CLI value (bad enum) → clean nonzero exit (not a traceback)."""
+    out = handoff_home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json"
+    rc = handoff_precheck.main(
+        [
+            "--task",
+            TASK,
+            "--project",
+            PROJECT,
+            "--workspace",
+            str(workspace),
+            "--output",
+            str(out),
+            "--lesson-disposition",
+            "bogus_enum",
+        ]
+    )
+    assert rc != 0
+    assert not out.exists()

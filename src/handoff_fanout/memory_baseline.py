@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -46,6 +47,116 @@ SCHEMA_VERSION = 1
 VERIFY_OK = "ok"  # snapshot proof: ≥1 file added / hash changed vs the baseline
 VERIFY_WEAK_OK = "weak-ok"  # fallback mtime proof (no baseline)
 VERIFY_WARN = "warn"  # no proof found — WARN-only this slice (A.5)
+
+# ─── component 4 (L2): substance floor (WARN-mode shadow, NOT a gate) ─────────
+# VERIFY_OK proves "≥1 *.md changed" — but that fires on touching open-loops.md with
+# NO net-new lesson (the exact Goodhart hole, spec §0). classify_substance below adds a
+# SEPARATE best-effort signal: substance is MET iff the ``added`` set carries ≥1 net-new
+# ``lesson-*.md`` clearing a LENIENT shape floor. Open-loops / MEMORY.md / other *.md-only
+# changes ⇒ THIN — deliberately: that is the hole, and component 5's
+# ``no_novel_lesson_attested`` is the honest escape valve for genuinely lesson-less hops.
+# 🔴 RED LINE (spec §2 组件4): this is a CHEAP FLOOR, never load-bearing — an LLM can
+# fake a lesson's shape in 5 seconds. The real defense is component 1 (independent
+# consumer scoring). Nothing here ever blocks; it shadow-logs the would-block signal only.
+SUBSTANCE_MET = "met"
+SUBSTANCE_THIN = "thin"
+
+# Lenient shape floor (tuned so a REAL lesson passes — test against lesson-sw-coord-p62):
+_SUBSTANCE_MIN_BYTES = 400  # a one-line touch can't be a real lesson
+# ≥1 of these substance markers (a real lesson explains a pit / root cause / rule).
+_SUBSTANCE_MARKERS = ("坑", "根因", "规则", "教训", "lesson", "why")
+# ≥1 concrete reference: a file:line-ish token OR a git-SHA-ish token OR a [[wikilink]].
+_REF_FILE_LINE_RE = re.compile(r"\w+\.\w+:\d+")
+_REF_GIT_SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
+_REF_WIKILINK_RE = re.compile(r"\[\[[^\]]+\]\]")
+# A net-new lesson file: basename ``lesson-*.md`` (recursive — added paths are relpaths).
+_LESSON_BASENAME_RE = re.compile(r"(^|/)lesson-[^/]*\.md$")
+
+
+def _lesson_file_qualifies(path: Path) -> bool:
+    """A net-new ``lesson-*.md`` clears the lenient shape floor iff ALL hold: size ≥ a
+    small minimum, ≥1 substance marker, ≥1 concrete reference (file:line / git-SHA /
+    [[wikilink]]). Best-effort: an unreadable file does NOT qualify (it can't be graded).
+    Markers are matched case-insensitively (an English ``Lesson`` / ``WHY`` heading counts).
+    """
+    try:
+        if path.stat().st_size < _SUBSTANCE_MIN_BYTES:
+            return False
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    low = text.lower()
+    if not any(m.lower() in low for m in _SUBSTANCE_MARKERS):
+        return False
+    has_ref = bool(
+        _REF_FILE_LINE_RE.search(text)
+        or _REF_GIT_SHA_RE.search(text)
+        or _REF_WIKILINK_RE.search(text)
+    )
+    return has_ref
+
+
+def classify_substance(added: list[str], mem_dir: Path) -> tuple[bool, str]:
+    """component 4 substance classifier (WARN-mode shadow signal — NEVER a gate).
+
+    ``added`` = the relpaths newly present vs the dispatch baseline (from
+    :func:`verify_sedimentation`'s diff). ``mem_dir`` = the project memory dir those
+    relpaths are under. Returns ``(substance_met, detail)``:
+
+      * MET  — ≥1 ``added`` entry is a ``lesson-*.md`` clearing the lenient shape floor
+        (:func:`_lesson_file_qualifies`).
+      * THIN — every ``added`` entry is a non-lesson *.md (open-loops / MEMORY / etc.) or
+        a too-short / marker-less / reference-less new lesson.
+
+    Best-effort by contract: any error degrades to THIN with a reason, never raises.
+    """
+    try:
+        qualifying: list[str] = []
+        candidates: list[str] = []
+        for rel in added:
+            if not _LESSON_BASENAME_RE.search(rel):
+                continue
+            candidates.append(rel)
+            if _lesson_file_qualifies(mem_dir / rel):
+                qualifying.append(rel)
+        if qualifying:
+            return True, f"net-new qualifying lesson(s): {qualifying}"
+        if candidates:
+            return False, (
+                f"net-new lesson file(s) {candidates} present but none clear the shape "
+                f"floor (≥{_SUBSTANCE_MIN_BYTES}B + a substance marker + a file:line/"
+                "SHA/[[wikilink]] reference)"
+            )
+        return False, (
+            "no net-new lesson-*.md in the added set (only open-loops/MEMORY/other *.md "
+            "changed — that is the Goodhart hole; use lesson_disposition="
+            "no_novel_lesson_attested if there was genuinely nothing to record)"
+        )
+    except Exception as e:  # noqa: BLE001 — best-effort shadow signal, never raise
+        return False, f"substance-classify-error: {e}"
+
+
+def added_lessons_since_baseline(
+    *, home: Path, project: str, self_task: str, workspace: Path
+) -> tuple[list[str], Path]:
+    """Best-effort: recompute the ``added`` relpath set vs the dispatch baseline plus the
+    ``mem_dir`` they live under, for the component-4 substance shadow. Returns
+    ``([], mem_dir)`` when there is no baseline / on any error — the substance signal is a
+    pure SHADOW (component 1 is the real defense), so it degrades silently to "no adds".
+    Kept SEPARATE from :func:`verify_sedimentation` so that function's (status, detail)
+    contract and its callers stay byte-for-byte unchanged."""
+    mem_dir = memory_dir_for_workspace(workspace)
+    try:
+        baseline = _load_baseline(home, project, self_task)
+        if baseline is None:
+            return [], mem_dir
+        mem_dir = Path(baseline.get("memory_dir") or mem_dir)
+        current = snapshot_memory_files(mem_dir)
+        old = baseline.get("files") or {}
+        added = sorted(set(current) - set(old))
+        return added, mem_dir
+    except Exception:  # noqa: BLE001 — shadow signal; degrade to "no adds"
+        return [], mem_dir
 
 
 def _now_iso() -> str:

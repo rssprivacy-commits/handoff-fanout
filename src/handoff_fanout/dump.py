@@ -1298,6 +1298,15 @@ def _write_old_ready(
     if isinstance(backref, list) and backref:
         old_ready["predecessor_lesson_backref"] = backref
 
+    # component 5 (L2): surface the closing session's lesson_disposition so the fleet
+    # learning canary can read it without re-parsing the evidence file. Additive-when-
+    # present: a non-dict / absent value is ignored → old_ready stays byte-stable for
+    # the common case. old_ready is unhashed; the value is copied from the already-
+    # hashed evidence, not recomputed.
+    lesson_disposition = payload.get("lesson_disposition")
+    if isinstance(lesson_disposition, dict) and lesson_disposition:
+        old_ready["lesson_disposition"] = lesson_disposition
+
     ack_dir.mkdir(parents=True, exist_ok=True)
     out = ack_dir / f"{task}.old_ready"
     atomic.write_with_fsync(

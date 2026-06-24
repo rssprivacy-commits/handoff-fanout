@@ -524,3 +524,53 @@ def test_audit_close_backref_malformed_clean_exit(tmp_path, monkeypatch, capsys)
     rc = codex_audit.main_audit_close(argv)
     assert rc != 0
     assert not (home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json").exists()
+
+
+def test_audit_close_plumbs_lesson_disposition_into_evidence(tmp_path, monkeypatch):
+    """audit-close --lesson-disposition folds the component-5 record into the retro
+    evidence AND surfaces it into old_ready (present-only, additive)."""
+    home = _home(tmp_path, monkeypatch)
+    ws = _git_repo(tmp_path)
+
+    argv = _close_argv(ws) + [
+        "--lesson-disposition",
+        "no_novel_lesson_attested:routine relay, nothing novel",
+    ]
+    rc = codex_audit.main_audit_close(argv)
+    assert rc == 0, rc
+
+    evidence = json.loads(
+        (home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json").read_text()
+    )
+    assert evidence["lesson_disposition"] == {
+        "disposition": "no_novel_lesson_attested",
+        "reason": "routine relay, nothing novel",
+    }
+    old_ready = json.loads((home / PROJECT / "ack" / f"{TASK}.old_ready").read_text())
+    assert old_ready["lesson_disposition"] == evidence["lesson_disposition"]
+
+
+def test_audit_close_without_lesson_disposition_omits_field(tmp_path, monkeypatch):
+    """Byte-stable: a close WITHOUT the flag produces evidence + old_ready with no field."""
+    home = _home(tmp_path, monkeypatch)
+    ws = _git_repo(tmp_path)
+
+    assert codex_audit.main_audit_close(_close_argv(ws)) == 0
+    evidence = json.loads(
+        (home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json").read_text()
+    )
+    assert "lesson_disposition" not in evidence
+    old_ready = json.loads((home / PROJECT / "ack" / f"{TASK}.old_ready").read_text())
+    assert "lesson_disposition" not in old_ready
+
+
+def test_audit_close_lesson_disposition_malformed_clean_exit(tmp_path, monkeypatch, capsys):
+    """A malformed --lesson-disposition → clean nonzero exit, no evidence written."""
+    home = _home(tmp_path, monkeypatch)
+    ws = _git_repo(tmp_path)
+
+    argv = _close_argv(ws) + ["--lesson-disposition", "no_novel_lesson_attested"]  # missing reason
+    rc = codex_audit.main_audit_close(argv)
+    assert rc != 0
+    assert "lesson-disposition-invalid" in capsys.readouterr().err
+    assert not (home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json").exists()

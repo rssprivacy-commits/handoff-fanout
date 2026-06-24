@@ -99,6 +99,22 @@ STATUS_REQUIRING_REASON = {"⚠️", "❌", "skip"}
 # evidence payload is byte-for-byte identical to a pre-backref payload.
 BACKREF_DISPOSITIONS = ("applied", "superseded", "not_relevant")
 
+# ─── lesson_disposition vocabulary (component 5 / L2 — honest "no new lesson") ─
+# The optional single-value record of what this hop did about CAPTURING a lesson
+# (distinct from BACKREF_DISPOSITIONS above, which records consuming PREDECESSOR
+# lessons): 新课 (new_lesson) / earned 显式「本棒例行·无新课」(no_novel_lesson_attested) /
+# 沿用前任课无新增 (carried_forward). The fleet learning canary (built later) uses
+# this to EXCLUDE honest lesson-less hops from its lessons-per-handoff denominator,
+# so nobody is forced to manufacture cargo-cult lessons just to clear the floor.
+# ``no_novel_lesson_attested`` and ``carried_forward`` REQUIRE a reason (an honest
+# attestation must say WHY there was nothing novel / what was carried) — ``new_lesson``
+# is the unremarkable default and its reason is OPTIONAL. This field is OPTIONAL
+# (warn-mode L2): when omitted the evidence payload is byte-for-byte identical to a
+# pre-lesson_disposition payload (the same conditional-fold invariant as backref).
+LESSON_DISPOSITIONS = ("new_lesson", "no_novel_lesson_attested", "carried_forward")
+# The two dispositions whose meaning is an ASSERTION of absence — they must justify it.
+LESSON_DISPOSITIONS_REQUIRING_REASON = ("no_novel_lesson_attested", "carried_forward")
+
 MODE_NORMAL = "normal"
 MODE_FORENSIC_RETRO = "forensic_retro"
 MODE_VALID = {MODE_NORMAL, MODE_FORENSIC_RETRO}
@@ -371,6 +387,41 @@ def _validate_backref(entries: object) -> list[dict]:
     return out
 
 
+def _validate_lesson_disposition(value: object) -> dict:
+    """Normalize + validate the ``lesson_disposition`` single value (component 5).
+
+    ``value`` must be a dict with a ``disposition`` in :data:`LESSON_DISPOSITIONS`
+    and, for the two absence-asserting dispositions
+    (:data:`LESSON_DISPOSITIONS_REQUIRING_REASON`), a non-empty ``reason`` (str) —
+    an honest "no new lesson" must say WHY. ``new_lesson`` may carry an optional
+    reason. Raises :class:`ValueError` on any malformed input so garbage can never
+    be folded into the hashed payload. Returns a fresh dict normalized to exactly
+    the canonical keys (``disposition`` + optional ``reason``; extra keys dropped).
+    """
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"lesson_disposition must be a dict; got {type(value).__name__}"
+        )
+    disposition = value.get("disposition")
+    if disposition not in LESSON_DISPOSITIONS:
+        raise ValueError(
+            f"lesson_disposition.disposition must be one of "
+            f"{list(LESSON_DISPOSITIONS)}; got {disposition!r}"
+        )
+    norm: dict = {"disposition": disposition}
+    reason = value.get("reason")
+    reason_stripped = reason.strip() if isinstance(reason, str) else ""
+    if disposition in LESSON_DISPOSITIONS_REQUIRING_REASON and not reason_stripped:
+        raise ValueError(
+            f"lesson_disposition.reason is required (non-empty) when "
+            f"disposition={disposition!r} (attest WHY there was no novel lesson / "
+            "what was carried forward)"
+        )
+    if reason_stripped:
+        norm["reason"] = reason_stripped
+    return norm
+
+
 # ─── evidence builder ───────────────────────────────────────────────────────
 
 
@@ -385,6 +436,7 @@ def build_evidence(
     phase1: dict | None = None,
     codex_audit: dict | None = None,
     predecessor_lesson_backref: list[dict] | None = None,
+    lesson_disposition: dict | None = None,
 ) -> dict:
     """Assemble + hash a retro-evidence payload.
 
@@ -406,6 +458,14 @@ def build_evidence(
     invariant). When supplied it is validated then folded into the hashed payload
     (so it is bound to the evidence — an independent consumer's score the next
     session can't silently forge).
+
+    ``lesson_disposition`` (component 5 / L2) is the optional single-value record of
+    what this hop did about CAPTURING a lesson ({new_lesson, no_novel_lesson_attested,
+    carried_forward}; the latter two require a reason — see
+    :func:`_validate_lesson_disposition`). It lets the fleet canary exclude honest
+    lesson-less hops from its denominator so nobody manufactures cargo-cult lessons.
+    Same conditional-fold invariant: omitted → byte-identical; supplied → validated
+    then folded into the hashed payload.
     """
     if mode not in MODE_VALID:
         raise ValueError(f"mode must be one of {sorted(MODE_VALID)}; got {mode!r}")
@@ -443,6 +503,10 @@ def build_evidence(
     # conditional-fold pattern above. Absent → byte-identical to today (warn-mode).
     if predecessor_lesson_backref:
         payload["predecessor_lesson_backref"] = _validate_backref(predecessor_lesson_backref)
+    # component 5 (L2): fold in ONLY when supplied — same conditional-fold pattern.
+    # Absent → byte-identical to today (warn-mode). Present → validated then hashed.
+    if lesson_disposition:
+        payload["lesson_disposition"] = _validate_lesson_disposition(lesson_disposition)
     payload["evidence_hash"] = compute_evidence_hash(payload)
     return payload
 
@@ -579,6 +643,31 @@ def _load_backref_file(path: Path | None) -> list[dict] | None:
     return data
 
 
+def parse_lesson_disposition(value: str | None) -> dict | None:
+    """Parse a single ``--lesson-disposition <enum>[:reason]`` value (component 5).
+
+    Grammar reuses the ``:``-split from :func:`_parse_phase_kv`: ``<enum>`` or
+    ``<enum>:reason text here`` (the reason is everything after the first ``:``,
+    verbatim). The enum values never contain a ``:`` so the split is unambiguous.
+    Returns ``None`` when no value was given (so it stays an omitted optional →
+    byte-identical evidence), else a raw dict ``{"disposition": ..., "reason"?: ...}``
+    (NOT yet validated — the builder's :func:`_validate_lesson_disposition` is the
+    single validation point).
+    """
+    if value is None:
+        return None
+    raw = value.strip()
+    if ":" in raw:
+        disposition, reason = raw.split(":", 1)
+        entry: dict = {"disposition": disposition.strip()}
+        reason = reason.strip()
+        if reason:
+            entry["reason"] = reason
+    else:
+        entry = {"disposition": raw}
+    return entry
+
+
 def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="handoff-precheck",
@@ -634,6 +723,15 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="predecessor_lesson_backref_file",
         help="path to a JSON array of backref objects; when given it REPLACES the "
         "--predecessor-lesson-backref flags (file wins)",
+    )
+    ap.add_argument(
+        "--lesson-disposition",
+        default=None,
+        dest="lesson_disposition",
+        help="component 5 (warn-mode L2): single value <enum>[:reason] where enum ∈ "
+        f"{list(LESSON_DISPOSITIONS)} (reason required for "
+        f"{list(LESSON_DISPOSITIONS_REQUIRING_REASON)}), e.g. "
+        "--lesson-disposition no_novel_lesson_attested:routine feature, nothing novel",
     )
     ap.add_argument(
         "--no-lock",
@@ -697,6 +795,16 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"ERR-FATAL backref-invalid: {e}\n")
             return 1
 
+    # component 5 (L2): parse + validate now so a malformed value is a clean nonzero
+    # exit BEFORE the lock / any artifact is written (mirrors the backref pre-check).
+    lesson_disp_raw = parse_lesson_disposition(args.lesson_disposition)
+    if lesson_disp_raw:
+        try:
+            _validate_lesson_disposition(lesson_disp_raw)
+        except ValueError as e:
+            sys.stderr.write(f"ERR-FATAL lesson-disposition-invalid: {e}\n")
+            return 1
+
     output = (
         Path(args.output)
         if args.output
@@ -713,6 +821,7 @@ def main(argv: list[str] | None = None) -> int:
             phase0=p0,
             phase1=p1,
             predecessor_lesson_backref=backref_raw,
+            lesson_disposition=lesson_disp_raw,
         )
         write_evidence(payload, output)
         sys.stdout.write(f"OK precheck-written: {output}\n")
