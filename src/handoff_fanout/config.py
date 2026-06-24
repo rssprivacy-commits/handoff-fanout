@@ -204,6 +204,17 @@ class Config:
     spawner_anchor_enforce_projects: list[str] = field(default_factory=list)
     spawner_anchor_enforce_configured: bool = False
     spawner_anchor_system_allow: list[str] = field(default_factory=list)
+    # ── B1 (learning-loop component 6 / L1): retrieval-pull ENFORCE roll-out ──────
+    # A COORDINATOR ACTIVE handoff whose retro evidence carries NO
+    # ``predecessor_lesson_backref`` AND NO ``no_novel_lesson_attested`` disposition is
+    # REFUSED — the closing coordinator must read its predecessor's lesson + record a
+    # backref, or honestly attest there was no novel lesson. DEFAULT-OFF (empty list =
+    # warn/no-op fleet-wide, like the Step 4 anchor lists — NOT ``mandate_projects``: an
+    # accidental empty must never flip every chain to fail-closed). Owner flips a project
+    # (or ``"*"``) in. Emergency one-key rollback = a kill-switch sentinel file (see
+    # ``dump._retrieval_pull_enforce_enabled``), so a fleet-wide misfire is disabled WITHOUT
+    # a config edit. Fail-SAFE-OFF: a corrupt config / unreadable evidence never blocks.
+    retrieval_pull_enforce_projects: list[str] = field(default_factory=list)
     # ``True`` when this Config was parsed from a trusted source (absent file = clean defaults,
     # or a present file that read + parsed). A present-but-untrustworthy config (unreadable /
     # corrupt JSON) sets this ``False`` via ``_fail_closed_config`` so the Step 4 anchor decision
@@ -446,6 +457,11 @@ def _from_dict(data: dict, home: Path) -> Config:
         audit_code_roots_configured="audit_code_repo_roots" in data,
         **_parse_mandate_projects(data),
         **_parse_anchor_projects(data),
+        # B1: default-OFF retrieval-pull enforce roll-out list (reuses the slug-list parser;
+        # absent/typo/non-list → [] = no project enforced = warn/no-op, the safe default).
+        retrieval_pull_enforce_projects=_anchor_slug_list(
+            data, "retrieval_pull_enforce_projects"
+        ),
         **_parse_worktree(data),
         **_parse_reclaim(data),
     )

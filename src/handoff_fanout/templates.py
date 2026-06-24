@@ -181,7 +181,7 @@ fi
 
 **Phase D — codex 审计门禁状态** (mandate ON / flipped 2026-05-30): old_ready 的 `codex_audit_hash` / `codex_audit_mode` / `next_session_forced_task` 为审计门禁元数据 (spec §6 Phase D)。`HANDOFF_AUDIT_MANDATE=1` **已拨** (三路径: `.zshenv` + `launchctl setenv` + `auto-continue.plist EnvironmentVariables`) → 上面的 forced-follow-up 检查现为**工具层硬拒** (非会话自律): 前任 codex 审计走 bypass 时下一棒接了别的 task = §0 拦下。详 `docs/PROTOCOL.md` Part II §14 (codex 审计闸 / bypass / forced follow-up)。
 
-## §0.5 retrieval-pull — 调出前任 lesson + 强制回引 (warn-mode / 学习闭环 keystone)
+## §0.5 retrieval-pull — 调出前任 lesson + 强制回引 (enforce 闸 / 学习闭环 keystone)
 
 > **触发**: 中枢接棒开张 — §0 验完前任**真复盘了**之后，本步把"前任的坑"真正**调出来用上**。
 > **为什么**: 闸只卡"存了没"、从不卡"下一棒读没读、用没用"(Goodhart)。让沉淀对**接棒人承重** = 经验真累积、不反复踩坑。这是学习闭环的 keystone。
@@ -200,7 +200,8 @@ handoff audit-close ... \
   --predecessor-lesson-backref <lesson-x>=not_relevant:<原因>
 # 或一次性给 JSON 数组: --predecessor-lesson-backref-file <backref.json>
 ```
-4. **当前为 warn-mode**: 缺回引只**记 shadow log**(`$HANDOFF_HOME/{project}/retrieval-pull-shadow.log`)、**不阻断**。它存在是为了让"下一棒读你的课"成为**承重项**、而非"存了打勾"的形式合规——别把它当 checkbox，它是唯一难作弊的学习信号(独立消费者给前任沉淀打分)。
+4. **真无新课时的诚实出口** (component 5)：本棒确属例行、确无可沉淀的新课 → 用 `--lesson-disposition no_novel_lesson_attested:<理由>` 显式声明（**禁**拿它当偷懒旁路——它要求一句诚实理由）。
+5. **这是 enforce 硬闸 (B1 / 项目在 `retrieval_pull_enforce_projects` 内时生效)**：中枢 active 交棒**缺回引 (`--predecessor-lesson-backref`) 且缺 `no_novel_lesson_attested` 声明 → dump 被拒 (`ERR-RETRY`)**、不产任何 artifact——读了前任的课、记下回引（或诚实声明无新课）再 re-dump。**为什么硬闸**：闸只卡"存了没"、从不卡"下一棒读没读用没用"(Goodhart)，让沉淀对**接棒人承重**=经验真累积、不反复踩坑，这是学习闭环 keystone；它是唯一难作弊的学习信号(独立消费者给前任沉淀打分)、别把它当 checkbox。default-OFF；一键回滚 `touch $HANDOFF_HOME/{project}/.retrieval-pull-enforce-off`。
 
 ## 第一步: 启动 heartbeat (v5.1+ / 529 风暴防御 / v4.1 单 task 模式)
 

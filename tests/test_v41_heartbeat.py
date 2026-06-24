@@ -89,7 +89,8 @@ def test_build_handoff_md_contains_timeout_caveat():
 
 def test_build_handoff_md_contains_retrieval_pull_section():
     """retrieval-pull L1: §0.5 guidance section is present, between §0 and the
-    heartbeat step, and names the back-reference flag (warn-mode keystone)."""
+    heartbeat step, names the back-reference flag, and (B1) describes the enforce gate +
+    the honest no_novel_lesson_attested escape."""
     md = _render_handoff()
     assert "§0.5 retrieval-pull" in md
     assert "--predecessor-lesson-backref" in md
@@ -97,8 +98,9 @@ def test_build_handoff_md_contains_retrieval_pull_section():
     assert "已应用" in md
     assert "已被取代" in md
     assert "不相关" in md
-    # warn-mode is stated plainly
-    assert "warn-mode" in md
+    # B1: the enforce gate + the component-5 honest escape are stated plainly
+    assert "enforce" in md
+    assert "no_novel_lesson_attested" in md
     # ordering: after the §0 audit block, before the heartbeat step
     assert (
         md.index("§0 上任审计")

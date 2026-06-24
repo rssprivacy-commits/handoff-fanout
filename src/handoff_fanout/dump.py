@@ -884,6 +884,82 @@ def _anchor_gate(
     return None
 
 
+def _retrieval_pull_enforce_enabled(cfg: _config.Config, project: str) -> bool:
+    """B1 (learning-loop component 6 / L1): is the retrieval-pull ENFORCE gate ON for
+    ``project``? DEFAULT-OFF + fail-SAFE-OFF.
+
+    ON iff the project (or ``"*"``) is in ``cfg.retrieval_pull_enforce_projects`` AND no
+    kill-switch sentinel is present. The kill-switch —
+    ``$HANDOFF_HOME/<project>/.retrieval-pull-enforce-off`` (per-project) or
+    ``$HANDOFF_HOME/.retrieval-pull-enforce-off`` (fleet-wide) — is the one-key rollback: a
+    fleet-wide misfire is disabled WITHOUT a config edit. Any filesystem error → OFF (never
+    block a handoff because a sentinel ``stat`` raised)."""
+    projects = getattr(cfg, "retrieval_pull_enforce_projects", [])
+    if project not in projects and "*" not in projects:
+        return False
+    try:
+        if (cfg.home / project / ".retrieval-pull-enforce-off").exists():
+            return False
+        if (cfg.home / ".retrieval-pull-enforce-off").exists():
+            return False
+    except OSError:
+        return False
+    return True
+
+
+def _run_retrieval_pull_gate(
+    args: argparse.Namespace, project: str, cfg: _config.Config
+) -> int | None:
+    """B1 retrieval-pull ENFORCE gate (learning-loop component 6 / L1). DEFAULT-OFF.
+
+    A COORDINATOR ACTIVE handoff whose retro evidence carries NO
+    ``predecessor_lesson_backref`` AND NO ``no_novel_lesson_attested`` disposition is
+    REFUSED (``EXIT_RETRY``): the closing coordinator must read its predecessor's lesson and
+    record a back-reference, or honestly attest there was nothing novel to learn. Returns an
+    exit code the caller MUST ``return`` BEFORE any artifact is written (so a blocked handoff
+    leaves no half-product), or ``None`` to proceed.
+
+    Returns ``None`` (no-op, byte-identical to the pre-B1 path) when: the gate is disabled
+    (default — empty enforce list / kill-switch present), the dump is not a coordinator
+    ACTIVE handoff, there is no evidence to inspect, the requirement is already met, or the
+    evidence is unreadable (fail-SAFE-OFF — never block on an I/O error)."""
+    # Only a coordinator ACTIVE handoff spawns a successor that should pull the predecessor
+    # lesson — a worker spawn / a terminal done|blocked close is out of scope.
+    if args.status != "active" or not getattr(args, "coordinator", False):
+        return None
+    evidence_path = (
+        Path(args.retro_evidence) if getattr(args, "retro_evidence", None) else None
+    )
+    if evidence_path is None:
+        return None
+    if not _retrieval_pull_enforce_enabled(cfg, project):
+        return None
+    try:
+        payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None  # fail-SAFE-OFF: an unreadable evidence never blocks a handoff
+    if not isinstance(payload, dict):
+        return None
+    backref = payload.get("predecessor_lesson_backref")
+    has_backref = isinstance(backref, list) and bool(backref)
+    disp = payload.get("lesson_disposition")
+    attested = (
+        isinstance(disp, dict) and disp.get("disposition") == "no_novel_lesson_attested"
+    )
+    if has_backref or attested:
+        return None  # requirement met — predecessor lesson read+recorded, or honestly attested
+    print(
+        "❌ [dump] ERR-RETRY retrieval-pull-no-backref: this coordinator handoff did not read "
+        "its predecessor's lesson. Read it, then re-dump with --predecessor-lesson-backref "
+        "<lesson>=applied|superseded:<new>|not_relevant:<why> (one per predecessor lesson), "
+        "OR — if there was genuinely no novel lesson to carry — --lesson-disposition "
+        "no_novel_lesson_attested:<reason>. No artifacts were written (fail-closed). One-key "
+        f"rollback: touch {cfg.home}/{project}/.retrieval-pull-enforce-off",
+        file=sys.stderr,
+    )
+    return retro_gate.EXIT_RETRY
+
+
 def _spawner_focus_line(
     decision: _spawner_focus.AnchorDecision,
     *,
@@ -1093,18 +1169,6 @@ def write_active_dump(
                 "(evidence vanished/unreadable); §0 new-session audit can't verify "
                 f"{project}/{task}"
             )
-
-        # retrieval-pull (L1 / component 6): WARN-only — record whether this closing
-        # session left a structured back-reference to a predecessor lesson. The retro
-        # gate already passed (we are on the active-dump success path); this only
-        # appends to a shadow log and NEVER blocks / changes the exit code (warn-mode).
-        _retrieval_pull_warn(
-            home=cfg.home,
-            project=project,
-            task=task,
-            evidence_path=retro_evidence_path,
-            is_coordinator=is_coordinator,
-        )
 
     # ack/<task>.worktree — record the worktree (path/branch/base/integration) so
     # prune/gc can find + reclaim it, and the §0/fan-in steps can trace it. Written
@@ -1327,54 +1391,6 @@ def _write_old_ready(
     )
     print(f"[dump] wrote {out}")
     return out
-
-
-def _retrieval_pull_warn(
-    *,
-    home: Path,
-    project: str,
-    task: str,
-    evidence_path: Path,
-    is_coordinator: bool,
-) -> None:
-    """retrieval-pull WARN-mode validator (component 6 / L1).
-
-    Runs AFTER the retro gate passed on an ACTIVE dump. Inspects the closing
-    session's evidence for ``predecessor_lesson_backref`` and appends one
-    structured JSON line to ``<HANDOFF_HOME>/<project>/retrieval-pull-shadow.log``:
-    ``{ts, task, project, is_coordinator, has_backref, backref_count, would_block}``.
-
-    ``would_block = is_coordinator and not has_backref`` — the condition a FUTURE
-    owner-gated enforce-flip would block on. In warn-mode it is **logged only**:
-    this function NEVER blocks, NEVER raises, NEVER touches the dump exit code, and
-    NEVER prints the would-block to stdout (keeping dump output byte-stable for
-    parsers). Any error (unreadable evidence, unwritable log) is swallowed — the
-    whole body is best-effort under a single try/except.
-    """
-    try:
-        backref: object = None
-        try:
-            payload = json.loads(evidence_path.read_text(encoding="utf-8"))
-            if isinstance(payload, dict):
-                backref = payload.get("predecessor_lesson_backref")
-        except (OSError, json.JSONDecodeError):
-            backref = None
-        has_backref = isinstance(backref, list) and bool(backref)
-        record = {
-            "ts": now_iso(),
-            "task": task,
-            "project": project,
-            "is_coordinator": bool(is_coordinator),
-            "has_backref": has_backref,
-            "backref_count": len(backref) if isinstance(backref, list) else 0,
-            "would_block": bool(is_coordinator) and not has_backref,
-        }
-        log_path = home / project / "retrieval-pull-shadow.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except Exception:  # noqa: BLE001 — fail-soft by contract; never affect the dump
-        pass
 
 
 def _maybe_pbcopy(content: str) -> None:
@@ -2221,6 +2237,16 @@ def main(argv: list[str] | None = None, *, suppress_spawn_artifacts: bool = Fals
     if gate_result is not None and not gate_result.is_ok:
         gate_result.emit()
         return gate_result.exit_code
+
+    # B1 (learning-loop component 6 / L1): retrieval-pull ENFORCE gate (DEFAULT-OFF). A
+    # coordinator ACTIVE handoff that didn't read its predecessor's lesson (no
+    # predecessor_lesson_backref) and didn't honestly attest no_novel_lesson_attested is
+    # REFUSED here — BEFORE any artifact (.md / sidecar / old_ready / .uri) — so a blocked
+    # handoff leaves no half-product. Disabled by default (empty
+    # retrieval_pull_enforce_projects) → returns None → byte-identical to the pre-B1 path.
+    rp_rc = _run_retrieval_pull_gate(args, project, cfg)
+    if rp_rc is not None:
+        return rp_rc
 
     if args.open_batch:
         # spawn-unification Step 4: the fan-out sub-task .uris carry the coordinator anchor → resolve
