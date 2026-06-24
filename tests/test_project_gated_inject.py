@@ -148,3 +148,134 @@ def test_project_inject_blocks_degenerate_shapes_fail_safe(tmp_path: Path) -> No
         home=tmp_path,
     )
     assert cfg.project_inject_blocks == {"erp-system": ["good"]}
+
+
+# ---------------------------------------------------------------------------
+# A2 — singlepane self-continuation carries ``--self-task <this-task>``.
+#
+# Root cause: ``build_handoff_md`` only injected ``{wt_args}`` (worktree's
+# ``--project/--workspace``); singlepane got nothing, so the §-1 self-continuation
+# commands could not resolve the spawner anchor (Tier-2) and fell back to the static
+# desktop table. Fix: dump computes ``self_task_args = " --self-task <task>"`` iff
+# ``cfg.resolve_isolation(project) == "singlepane"`` and threads it into the three §-1
+# command blocks (precheck / dump / audit-run+audit-disposition+audit-close).
+#
+# Invariant pinned here: ANY non-singlepane mode (worktree / multiwindow / default /
+# unconfigured) → ``""`` → byte-identical handoff.md (worktree path is golden-locked).
+# ---------------------------------------------------------------------------
+
+# The three §-1 command tokens each generated handoff carries; with the fix, a singlepane
+# self-continuation appends ``--self-task <task>`` to each.
+_SELF_TASK_BLOCK_PREFIXES = (
+    "handoff precheck",
+    "handoff dump",
+    "handoff audit-run",
+    "handoff audit-disposition",
+    "handoff audit-close",
+)
+
+
+def _render_handoff_for(cfg: _config.Config, project: str, task: str, tmp_path: Path) -> str:
+    """Render exactly as ``dump`` does, deriving ``self_task_args`` from the effective
+    isolation mode (the same one-liner that lives at both real call sites)."""
+    self_task_args = (
+        f" --self-task {task}" if cfg.resolve_isolation(project) == "singlepane" else ""
+    )
+    return templates.build_handoff_md(
+        task=task,
+        project=project,
+        workspace=tmp_path,
+        next_brief="do the thing",
+        status="active",
+        tests=None,
+        baseline={"git_head": "abc123"},
+        roadmap_excerpt="(none)",
+        inject_blocks=[],
+        handoff_home=cfg.home,
+        handoff_md_path=tmp_path / f"{task}.md",
+        self_task_args=self_task_args,
+    )
+
+
+def test_singlepane_handoff_carries_self_task(tmp_path: Path) -> None:
+    """A singlepane project's §-1 precheck / dump / audit-close blocks each carry
+    ``--self-task <this-session's-task>`` (value = THIS task, not next-task)."""
+    cfg = _config._from_dict(
+        {"worker_isolation": {"wilde-hexe": "singlepane"}}, home=tmp_path
+    )
+    md = _render_handoff_for(cfg, "wilde-hexe", "sw-coord-p64", tmp_path)
+    # The self-task token threads its OWN task id (the handoff being generated).
+    assert " --self-task sw-coord-p64" in md
+    # Each §-1 command line that carries --task <next-task-id> now also carries --self-task.
+    for line in md.splitlines():
+        if any(line.lstrip().startswith(p) for p in _SELF_TASK_BLOCK_PREFIXES):
+            if "--task <next-task-id>" in line:
+                assert "--self-task sw-coord-p64" in line, f"missing --self-task on: {line!r}"
+
+
+def test_worktree_handoff_has_no_self_task(tmp_path: Path) -> None:
+    """A worktree project (legacy fallback) → not singlepane → NO --self-task anywhere."""
+    cfg = _config._from_dict({"worktree_projects": ["erp-system"]}, home=tmp_path)
+    md = _render_handoff_for(cfg, "erp-system", "erp-t1", tmp_path)
+    assert "--self-task" not in md
+
+
+def test_default_and_unconfigured_handoff_have_no_self_task(tmp_path: Path) -> None:
+    """default-key=multiwindow and a wholly-unconfigured project → not singlepane →
+    NO --self-task (only singlepane opts in)."""
+    cfg = _config._from_dict(
+        {"worker_isolation": {"default": "multiwindow"}}, home=tmp_path
+    )
+    assert "--self-task" not in _render_handoff_for(cfg, "anything", "t1", tmp_path)
+
+    cfg_empty = _config._from_dict({}, home=tmp_path)
+    # resolve_isolation -> None (fail-closed) -> not "singlepane" -> no self-task.
+    assert "--self-task" not in _render_handoff_for(cfg_empty, "unconfigured", "t1", tmp_path)
+
+
+def test_worktree_byte_identity_with_empty_self_task(tmp_path: Path) -> None:
+    """The golden lock: passing ``self_task_args=""`` (the non-singlepane value) renders
+    BYTE-IDENTICAL to omitting the new kwarg entirely (the pre-A2 caller signature). This
+    is what guarantees the worktree handoff is unchanged."""
+
+    # Explicit literal kwargs (no heterogeneous ``**dict`` unpack — that defeats Pyright's
+    # per-argument narrowing). ``self_task_args`` is the ONLY varying input: None ==> omit
+    # the kwarg entirely (exercise the default ""); "" ==> pass it explicitly.
+    def _render_worktree(self_task_args: str | None) -> str:
+        if self_task_args is None:
+            return templates.build_handoff_md(
+                task="erp-t1",
+                project="erp-system",
+                workspace=tmp_path,
+                next_brief="do the thing",
+                status="active",
+                tests=None,
+                baseline={"git_head": "abc123"},
+                roadmap_excerpt="(none)",
+                inject_blocks=[],
+                handoff_home=tmp_path,
+                handoff_md_path=tmp_path / "erp-t1.md",
+                worktree_info={"status": "created"},
+            )
+        return templates.build_handoff_md(
+            task="erp-t1",
+            project="erp-system",
+            workspace=tmp_path,
+            next_brief="do the thing",
+            status="active",
+            tests=None,
+            baseline={"git_head": "abc123"},
+            roadmap_excerpt="(none)",
+            inject_blocks=[],
+            handoff_home=tmp_path,
+            handoff_md_path=tmp_path / "erp-t1.md",
+            worktree_info={"status": "created"},
+            self_task_args=self_task_args,
+        )
+
+    legacy = _render_worktree(None)  # no self_task_args (default "")
+    explicit_empty = _render_worktree("")
+    assert legacy == explicit_empty
+    # And the worktree --project/--workspace injection is still present (not regressed).
+    assert "--project erp-system" in legacy
+    assert "--self-task" not in legacy

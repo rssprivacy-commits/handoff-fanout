@@ -108,6 +108,7 @@ def build_handoff_md(
     handoff_home: Path,
     handoff_md_path: Path,
     worktree_info: dict | None = None,
+    self_task_args: str = "",
 ) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     baseline_block = _format_baseline_block(baseline)
@@ -293,7 +294,7 @@ touch {handoff_home}/{project}/queue/{task}.done      # 仅停本 task
 cd {workspace}
 # 1) 生成 retro evidence (Phase 0 五项 + Phase 1 五类显式声明 / status enum 见 §7.13)
 handoff precheck \\
-    --task <next-task-id>{wt_args} \\
+    --task <next-task-id>{wt_args}{self_task_args} \\
     --phase0-status memory=✅ --phase0-status tests=✅ \\
     --phase0-status audit=✅ --phase0-status commit=✅ \\
     --phase0-status code_review=✅ \\
@@ -304,7 +305,7 @@ handoff precheck \\
 
 # 2) dump 时传 --retro-evidence; HANDOFF_RETRO_MANDATE=1 强制激活 gate
 handoff dump \\
-    --task <next-task-id>{wt_args} \\
+    --task <next-task-id>{wt_args}{self_task_args} \\
     --next "<next-task-brief>" \\
     --status active \\
     --tests "<test-files>" \\
@@ -340,12 +341,12 @@ handoff dump \\
 ```bash
 cd {workspace}
 # 1) 跑 codex 审计 → 登记机器产物 (按 spec §3 / Phase B 已能记录)
-handoff audit-run --task <next-task-id>{wt_args} --run-index 1 ...   # 写 codex-findings.json + sidecar manifest
-handoff audit-disposition --task <next-task-id>{wt_args} ...        # 每个 P0/P1 一条 disposition
+handoff audit-run --task <next-task-id>{wt_args}{self_task_args} --run-index 1 ...   # 写 codex-findings.json + sidecar manifest
+handoff audit-disposition --task <next-task-id>{wt_args}{self_task_args} ...        # 每个 P0/P1 一条 disposition
 
 # 2) audit-close: full 模式 (有代码改动) — 把审计块折进 evidence + dump 一气呵成
 handoff audit-close \\
-    --task <next-task-id>{wt_args} --next "<brief>" --status active \\
+    --task <next-task-id>{wt_args}{self_task_args} --next "<brief>" --status active \\
     --audit-mode full_codex_audit --run-record '<run-record-json>' \\
     --phase0-status memory=✅ ... --phase1-status codex=✅ ...
 ```

@@ -978,6 +978,13 @@ def write_active_dump(
         source_workspace = workspace
 
     md_path = queue_dir / f"{task}.md"
+    # singlepane self-continuation must carry --self-task <this-session's-task> so the
+    # successor's engine can resolve the spawner anchor (Tier-2). The value is THIS
+    # session's own task. Non-singlepane (worktree/default/unconfigured) → "" →
+    # byte-identical handoff.md (worktree golden-locked path stays untouched).
+    self_task_args = (
+        f" --self-task {task}" if cfg.resolve_isolation(project) == "singlepane" else ""
+    )
     handoff_content = templates.build_handoff_md(
         task=task,
         project=project,
@@ -991,6 +998,7 @@ def write_active_dump(
         handoff_home=cfg.home,
         handoff_md_path=md_path,
         worktree_info=worktree_info,
+        self_task_args=self_task_args,
     )
     # Crash-/kill-atomic single-task write (temp+os.replace). A supervisor kill
     # mid-dump must never leave a partial .md the launcher then misreads. The
@@ -2310,6 +2318,13 @@ def main(argv: list[str] | None = None, *, suppress_spawn_artifacts: bool = Fals
     if args.dry_run:
         roadmap_excerpt = get_roadmap_excerpt(cfg, project)
         md_path = queue_dir / f"{args.task}.md"
+        # singlepane self-continuation carries --self-task <this-session's-task> (the
+        # spawner anchor for Tier-2 resolution); non-singlepane → "" → byte-identical.
+        self_task_args = (
+            f" --self-task {args.task}"
+            if cfg.resolve_isolation(project) == "singlepane"
+            else ""
+        )
         content = templates.build_handoff_md(
             task=args.task,
             project=project,
@@ -2323,6 +2338,7 @@ def main(argv: list[str] | None = None, *, suppress_spawn_artifacts: bool = Fals
             handoff_home=cfg.home,
             handoff_md_path=md_path,
             worktree_info=worktree_info,
+            self_task_args=self_task_args,
         )
         print("=" * 60)
         print(f"DRY-RUN: target paths\n  {md_path}\n  {queue_dir / f'{args.task}.uri'}")
