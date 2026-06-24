@@ -2131,53 +2131,6 @@ def _report_g3_sedimentation(self_task: str | None, project: str, workspace: Pat
         sys.stderr.write(f"WARN G3-no-sedimentation: {detail}\n")
     else:
         sys.stdout.write(f"OK G3-sedimentation: {detail}\n")
-    # component 4 (L2): when sedimentation was PROVEN (VERIFY_OK), additionally check
-    # whether a net-new QUALIFYING lesson actually backs it — VERIFY_OK fires on any
-    # *.md change, so "touch open-loops, write no lesson" passes G3 (the Goodhart hole).
-    # WARN-mode shadow ONLY: log the would-block signal + a stderr WARN when thin; NEVER
-    # block, NEVER change rc, NEVER pollute stdout. The existing OK line above still prints.
-    if status == _memory_baseline.VERIFY_OK:
-        _report_g3_substance(self_task, project, workspace)
-
-
-def _report_g3_substance(self_task: str | None, project: str, workspace: Path) -> None:
-    """component 4 (L2) G3 SUBSTANCE shadow — WARN-mode only, NEVER blocks/raises/touches
-    rc/pollutes stdout. Mirrors :func:`dump._retrieval_pull_warn` exactly: the whole body
-    is one best-effort try/except. Called ONLY from :func:`_report_g3_sedimentation` after
-    a VERIFY_OK (sedimentation proven), and only on the coordinator relay path that already
-    runs that check (no new call site). Appends ONE structured JSON line to
-    ``<HANDOFF_HOME>/<project>/g3-substance-shadow.log`` and, when substance is THIN, emits
-    a human ``WARN G3-substance-thin`` to STDERR (matching the existing WARN style)."""
-    try:
-        home = _config.home_dir()
-        added, mem_dir = _memory_baseline.added_lessons_since_baseline(
-            home=home, project=project, self_task=self_task or "", workspace=workspace
-        )
-        substance_met, detail = _memory_baseline.classify_substance(added, mem_dir)
-        would_block = not substance_met  # this fn only runs when sedimentation is proven
-        added_lessons = [
-            rel for rel in added if _memory_baseline._LESSON_BASENAME_RE.search(rel)
-        ]
-        record = {
-            "ts": datetime.now(UTC).isoformat(timespec="seconds"),
-            "project": project,
-            "self_task": self_task,
-            "substance_met": bool(substance_met),
-            "would_block": bool(would_block),
-            "added_lessons": added_lessons,
-            "detail": detail,
-        }
-        log_path = home / project / "g3-substance-shadow.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-        if not substance_met:
-            sys.stderr.write(
-                f"WARN G3-substance-thin: sedimentation proven but no net-new qualifying "
-                f"lesson backs it — {detail} (WARN mode; relay proceeds)\n"
-            )
-    except Exception:  # noqa: BLE001 — fail-soft by contract; never affect the relay
-        pass
 
 
 # ─── warmgap-C: succession routing (token 闸凭证 → 路由凭证) ──────────────────
