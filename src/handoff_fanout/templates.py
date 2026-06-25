@@ -203,6 +203,27 @@ handoff audit-close ... \
 4. **真无新课时的诚实出口** (component 5)：本棒确属例行、确无可沉淀的新课 → 用 `--lesson-disposition no_novel_lesson_attested:<理由>` 显式声明（**禁**拿它当偷懒旁路——它要求一句诚实理由）。
 5. **这是 enforce 硬闸 (B1 / 项目在 `retrieval_pull_enforce_projects` 内时生效)**：中枢 active 交棒**缺回引 (`--predecessor-lesson-backref`) 且缺 `no_novel_lesson_attested` 声明 → dump 被拒 (`ERR-RETRY`)**、不产任何 artifact——读了前任的课、记下回引（或诚实声明无新课）再 re-dump。**为什么硬闸**：闸只卡"存了没"、从不卡"下一棒读没读用没用"(Goodhart)，让沉淀对**接棒人承重**=经验真累积、不反复踩坑，这是学习闭环 keystone；它是唯一难作弊的学习信号(独立消费者给前任沉淀打分)、别把它当 checkbox。default-OFF；一键回滚 `touch $HANDOFF_HOME/{project}/.retrieval-pull-enforce-off`。
 
+## §0.6 closeout obligations — 交棒前记录复盘义务向量 (warn-mode / 第三 status-vector)
+
+> **触发**: 中枢接棒后，一路干到**自己交棒**那一刻，记录这一棒的"复盘义务覆盖" —— 把软文字规则⑬「交棒前先复盘」机器化成一个 scope-by-delivery 的向量。
+> **为什么**: 软规则只靠自律、抓不到"做了 80% 报成 100%"。这个向量把"复盘义务"拆成 6 条按交付范围裁剪的 key，每条要么 ✅（有 artifact 背书）要么 `skip:<理由>`（本棒 N/A，必带为何不适用）——让"有没有真复盘"可机器读。它是软规则⑬的可校验影子（"复盘义务的机器化版"）。
+
+1. **6 个 key + scope-by-delivery 含义**（按本棒**实际交付**裁剪，不适用就 `skip:<理由>`）：
+   - `sedimentation_always` — **每棒必做**（lesson + retro evidence），应 ✅。
+   - `audit` — 仅**有代码改动**时适用。
+   - `doc_mapping` — 仅 **instructions / architecture / config** 改动时适用。
+   - `release` — 仅有**用户可见交付**时适用。
+   - `sync_pipeline` — 仅 **artifacts** 改动时适用。
+   - `postmortem` — 仅**本棒有事故 / 回归**时适用。
+2. **怎么用**（在你自己交棒的 `audit-close` 上加 flag，折进同一份 retro evidence）：
+```bash
+handoff audit-close ... \\
+  --closeout-status sedimentation_always=✅ \\
+  --closeout-status audit=✅ \\
+  --closeout-status release=skip:no user-visible change this hop
+```
+3. **warn-mode 非阻断**：缺向量**永不 block** —— 仅当项目在 `closeout_obligations_warn_projects` 内（DEFAULT-OFF）才出一条 advisory 提醒补 `--closeout-status`，handoff 照常推进。一键静默：`touch $HANDOFF_HOME/{project}/.closeout-obligations-warn-off`。
+
 ## 第一步: 启动 heartbeat (v5.1+ / 529 风暴防御 / v4.1 单 task 模式)
 
 > **触发**: 主人 5/29 'API Error 会话裸跑' 根因 — v4.1 单 task spawn 后若卡死 / 529 overloaded 没人接手。
@@ -349,7 +370,8 @@ handoff audit-disposition --task <next-task-id>{wt_args}{self_task_args} ...    
 handoff audit-close \\
     --task <next-task-id>{wt_args}{self_task_args} --next "<brief>" --status active \\
     --audit-mode full_codex_audit --run-record '<run-record-json>' \\
-    --phase0-status memory=✅ ... --phase1-status codex=✅ ...
+    --phase0-status memory=✅ ... --phase1-status codex=✅ ... \\
+    --closeout-status sedimentation_always=✅ --closeout-status audit=✅
 ```
 
 **4 模式** (gate 在 Phase D 机器裁定 / Phase C 仅记录): `full_codex_audit` (有代码改动) / `empty_diff_attestation` (diff 为空) / `docs_only_light_audit` (纯文档, prompts/CLAUDE.md/schema/SQL 不算) / `codex_unavailable_bypass` (codex 不可用)。

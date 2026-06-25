@@ -27,8 +27,9 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from handoff_fanout import codex_audit
 from handoff_fanout import config as _config
-from handoff_fanout import dump, handoff_precheck
+from handoff_fanout import dump, handoff_precheck, templates
 
 PROJECT = "demo"
 TASK = "demo-task"
@@ -593,3 +594,133 @@ def test_realign_preserves_closeout(handoff_home, workspace):
     assert new_payload["head_at_precheck"] == h1
     assert new_payload["closeout_obligations"] == closeout
     assert new_payload["evidence_hash"] == handoff_precheck.compute_evidence_hash(new_payload)
+
+
+# ─── 7. audit-close --closeout-status (the L2a engine path / 中枢交棒) ──────────
+# The coordinator relay (中枢交棒) goes through audit-close, NOT precheck — so the flag has to
+# round-trip through main_audit_close into the SAME retro evidence the inner dump consumes. These
+# exercise that path end-to-end via the no-code empty_diff_attestation mode (base = HEAD).
+
+
+def _audit_close_argv(workspace, *, closeout=None):
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=workspace, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    argv = [
+        "--task", TASK, "--project", PROJECT, "--workspace", str(workspace),
+        "--next", "spawn next task", "--audit-mode", "empty_diff_attestation",
+        "--status", "active", "--audit-base", head,
+    ]
+    for k in handoff_precheck.PHASE0_KEYS:
+        argv += ["--phase0-status", f"{k}=✅"]
+    for k in handoff_precheck.PHASE1_KEYS:
+        argv += ["--phase1-status", f"{k}=✅"]
+    for pair in closeout or []:
+        argv += ["--closeout-status", pair]
+    return argv
+
+
+def _audit_close_evidence_path(home):
+    return home / PROJECT / "precheck" / f"{TASK}.retro.evidence.json"
+
+
+def test_audit_close_closeout_round_trips(handoff_home, workspace, monkeypatch):
+    """L2a 真阳: audit-close --closeout-status folds the (normalized) vector into the retro
+    evidence + binds it into evidence_hash — the path a real 中枢交棒 uses."""
+    monkeypatch.delenv("HANDOFF_AUDIT_MANDATE", raising=False)
+    rc = codex_audit.main_audit_close(
+        _audit_close_argv(
+            workspace,
+            closeout=["sedimentation_always=✅", "release=skip:no user-visible change this hop"],
+        )
+    )
+    assert rc == 0, rc
+    ev = json.loads(_audit_close_evidence_path(handoff_home).read_text())
+    assert ev["closeout_obligations"] == {
+        "sedimentation_always": {"status": "✅"},
+        "release": {"status": "skip", "reason": "no user-visible change this hop"},
+    }
+    assert ev["evidence_hash"] == handoff_precheck.compute_evidence_hash(ev)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "release=skip",  # skip (N/A) with no reason
+        "not_a_real_key=✅",  # unknown closeout key (enum)
+        "audit=bogus",  # invalid status enum
+    ],
+)
+def test_audit_close_closeout_malformed_clean_exit(handoff_home, workspace, monkeypatch, bad):
+    """L2a 盲区: a malformed --closeout-status → clean nonzero exit with ERR-FATAL BEFORE the lock
+    or any artifact (mirrors the backref / lesson pre-check — validation is pre-lock)."""
+    monkeypatch.delenv("HANDOFF_AUDIT_MANDATE", raising=False)
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+    rc = codex_audit.main_audit_close(_audit_close_argv(workspace, closeout=[bad]))
+    assert rc == 1
+    assert "ERR-FATAL closeout-status-invalid" in err.getvalue()
+    # validation is BEFORE the lock / build_evidence → no evidence + no published handoff
+    assert not _audit_close_evidence_path(handoff_home).exists()
+    assert not (handoff_home / PROJECT / "queue" / f"{TASK}.uri").exists()
+
+
+def test_audit_close_closeout_omitted_byte_identical(handoff_home, workspace, monkeypatch):
+    """L2a 🔴 invariant (the pure-plumbing guarantee): omitting --closeout-status yields evidence
+    with NO closeout_obligations key, byte-identical to the pre-patch payload. Proven by the
+    conditional-fold self-evidence: the WITH-flag payload minus the closeout key (hash recomputed)
+    reproduces the WITHOUT-flag payload exactly.
+
+    Freeze the two time-derived fields so the ONLY difference between the two audit-close runs is
+    the closeout vector (HEAD does not move between them → no re-align). Freeze _iso_now to the
+    REAL current value (not a fixed literal) so the timestamp stays near-now and the inner dump's
+    head-freshness gate accepts it across both runs."""
+    monkeypatch.delenv("HANDOFF_AUDIT_MANDATE", raising=False)
+    frozen_now = handoff_precheck._iso_now()  # real now → valid drift for the inner dump gate
+    monkeypatch.setattr(handoff_precheck, "_iso_now", lambda: frozen_now)
+    monkeypatch.setattr(handoff_precheck, "_last_commit_age_sec", lambda *a, **k: 42)
+    ev_path = _audit_close_evidence_path(handoff_home)
+
+    assert codex_audit.main_audit_close(_audit_close_argv(workspace)) == 0
+    without = json.loads(ev_path.read_text())
+    assert "closeout_obligations" not in without
+
+    assert (
+        codex_audit.main_audit_close(
+            _audit_close_argv(workspace, closeout=["sedimentation_always=✅"])
+        )
+        == 0
+    )
+    with_flag = json.loads(ev_path.read_text())
+    assert with_flag["closeout_obligations"] == {"sedimentation_always": {"status": "✅"}}
+
+    # strip the only added key, re-hash → must reproduce the omitted payload byte-for-byte
+    stripped = {k: v for k, v in with_flag.items() if k != "closeout_obligations"}
+    stripped["evidence_hash"] = handoff_precheck.compute_evidence_hash(stripped)
+    assert stripped == without
+    assert without["evidence_hash"] == stripped["evidence_hash"]
+
+
+# ─── 8. onboarding template teaches the closeout vector (the L2b future-proof lever) ──
+
+
+def test_template_renders_closeout_guidance():
+    """L2b: every engine-spawned coordinator reads this one template, so the §0.6 teaching block +
+    the §-1.5 audit-close example must carry the closeout guidance (heading, all 6 keys, the flag,
+    and the per-project rollback path)."""
+    from pathlib import Path
+
+    md = templates.build_handoff_md(
+        task=TASK, project=PROJECT, workspace=Path("/tmp/ws"),
+        next_brief="x", status="active", tests=None, baseline={},
+        roadmap_excerpt="r", inject_blocks=[], handoff_home=Path("/tmp/hh"),
+        handoff_md_path=Path("/tmp/h.md"),
+    )
+    assert "§0.6 closeout obligations" in md
+    assert "--closeout-status" in md
+    for k in handoff_precheck.CLOSEOUT_KEYS:
+        assert k in md
+    assert f"/{PROJECT}/.closeout-obligations-warn-off" in md  # {project} placeholder rendered
+    # §-1.5 audit-close example carries a --closeout-status demonstration line
+    i = md.find("full_codex_audit --run-record")
+    assert "--closeout-status sedimentation_always=✅" in md[i:i + 260]

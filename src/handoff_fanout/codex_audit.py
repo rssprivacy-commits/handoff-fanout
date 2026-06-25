@@ -2444,6 +2444,20 @@ def main_audit_close(argv: list[str] | None = None) -> int:
         f"{list(_pc.LESSON_DISPOSITIONS)} (reason required for "
         f"{list(_pc.LESSON_DISPOSITIONS_REQUIRING_REASON)})",
     )
+    # closeout_obligations (warn-mode L3 / the third status-vector): the closing coordinator's
+    # scope-by-delivery closeout contract (folded into the same retro evidence). Mirrors the
+    # handoff precheck CLI: repeatable key=status[:reason] flags. The dump-side gate that reads
+    # it is WARN-ONLY (advisory, never blocks) — see dump._run_closeout_obligations_gate.
+    ap.add_argument(
+        "--closeout-status",
+        action="append",
+        default=[],
+        dest="closeout_status",
+        help="closeout_obligations (warn-mode, third vector): repeatable; key=status[:reason] "
+        f"where key ∈ {list(_pc.CLOSEOUT_KEYS)} and status ∈ {sorted(_pc.PHASE_STATUS_VALID)}. ✅ "
+        "needs no reason; ⚠️/❌/skip require one ('skip' encodes an N/A item → give why it does "
+        "not apply), e.g. --closeout-status release=skip:no user-visible change this hop",
+    )
     args = ap.parse_args(argv)
 
     if not _pc.TASK_ID_RE.match(args.task):
@@ -2566,6 +2580,17 @@ def main_audit_close(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"ERR-FATAL lesson-disposition-invalid: {e}\n")
             return 1
 
+    # closeout_obligations (third vector / warn-mode): parse with the SAME key=status[:reason]
+    # grammar the phase flags use, then validate now so a malformed value is a clean nonzero
+    # exit BEFORE the lock / any artifact is written (mirrors the backref / lesson pre-check).
+    closeout_raw = _pc._parse_phase_kv(args.closeout_status) or None
+    if closeout_raw:
+        try:
+            _pc._validate_closeout(closeout_raw)
+        except ValueError as e:
+            sys.stderr.write(f"ERR-FATAL closeout-status-invalid: {e}\n")
+            return 1
+
     # R2 P1: the entire audit snapshot — validate run records, read dispositions,
     # build the block, write evidence, dump — must run under ONE held critical
     # section so a concurrent audit-run / audit-disposition can't mutate the
@@ -2665,6 +2690,7 @@ def main_audit_close(argv: list[str] | None = None) -> int:
                 codex_audit=block,
                 predecessor_lesson_backref=backref_raw,
                 lesson_disposition=lesson_disp_raw,
+                closeout_obligations=closeout_raw,
             )
             out = _pc.precheck_dir(project) / f"{args.task}.retro.evidence.json"
             _pc.write_evidence(evidence, out)
