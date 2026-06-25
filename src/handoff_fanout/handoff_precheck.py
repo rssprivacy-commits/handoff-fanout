@@ -115,6 +115,33 @@ LESSON_DISPOSITIONS = ("new_lesson", "no_novel_lesson_attested", "carried_forwar
 # The two dispositions whose meaning is an ASSERTION of absence — they must justify it.
 LESSON_DISPOSITIONS_REQUIRING_REASON = ("no_novel_lesson_attested", "carried_forward")
 
+# ─── closeout_obligations vocabulary (the third status-vector / warn-mode) ──────
+# The optional THIRD status-vector (after PHASE0_KEYS / PHASE1_KEYS): a scope-by-delivery
+# closeout contract that turns the soft text rule ⑬「交棒前先复盘」into a machine-checkable
+# vector. It separates the two things that rule conflated:
+#   * sedimentation_always — lesson + retro-evidence, done on EVERY coordinator handoff (✅).
+#   * the rest (audit / doc_mapping / release / sync_pipeline / postmortem) — done BY-DELIVERY,
+#     each either an artifact-pass (✅) or an explicit N/A (skip + reason).
+# Each item reuses the phase status vocabulary (:data:`PHASE_STATUS_VALID`); ``skip`` is already
+# in :data:`STATUS_REQUIRING_REASON`, so an N/A item NATURALLY requires a reason ("N/A + why").
+# This vector is OPTIONAL and uses the same CONDITIONAL-FOLD invariant as
+# ``predecessor_lesson_backref`` / ``lesson_disposition`` (NOT the always-present merge that
+# phase0/phase1 use): when omitted the evidence payload is byte-for-byte identical to a
+# pre-closeout payload (DEFAULT-OFF = zero behavior change). Semantics: sedimentation_always =
+# every hop (should be ✅); audit = only when there were code changes; doc_mapping = only when
+# instructions/architecture/config changed; release = only on user-visible delivery;
+# sync_pipeline = only when artifacts changed; postmortem = only when this hop had an
+# incident/regression. The dump-side gate is WARN-ONLY (advisory, never blocking) — see
+# ``dump._run_closeout_obligations_gate``. Spec: ``docs/PROTOCOL.md`` Part II §13.5.
+CLOSEOUT_KEYS = (
+    "sedimentation_always",
+    "audit",
+    "doc_mapping",
+    "release",
+    "sync_pipeline",
+    "postmortem",
+)
+
 MODE_NORMAL = "normal"
 MODE_FORENSIC_RETRO = "forensic_retro"
 MODE_VALID = {MODE_NORMAL, MODE_FORENSIC_RETRO}
@@ -422,6 +449,56 @@ def _validate_lesson_disposition(value: object) -> dict:
     return norm
 
 
+def _validate_closeout(value: object) -> dict:
+    """Normalize + validate the ``closeout_obligations`` status-vector (the third vector).
+
+    Mirrors the conditional-fold validators above (:func:`_validate_backref` /
+    :func:`_validate_lesson_disposition`): a fail-fast validator whose job is to guarantee
+    garbage can NEVER be folded into the hashed payload. ``value`` must be a dict mapping a
+    key in :data:`CLOSEOUT_KEYS` to a status entry (a ``{"status": ..., "reason"?: ...}`` dict,
+    or a bare status string — both forms are accepted, mirroring :func:`merge_phase_status`).
+    Each status must be in :data:`PHASE_STATUS_VALID`; a status in
+    :data:`STATUS_REQUIRING_REASON` (⚠️/❌/skip — including the ``skip`` that encodes "N/A")
+    REQUIRES a non-empty ``reason``, so an N/A item naturally carries its justification.
+
+    Unknown-key policy: an unknown top-level key (not in :data:`CLOSEOUT_KEYS`) raises
+    :class:`ValueError`. This is DELIBERATELY stricter than :func:`merge_phase_status` (which
+    silently DROPS unknown phase keys): like the other two conditional-fold validators this is
+    a fail-fast guard, the keys ARE an enum, and an unrecognized obligation name is malformed
+    input that must not ride into the hashed payload. Extra keys WITHIN an entry dict are
+    dropped to the canonical shape (same as :func:`_validate_backref`). Returns a fresh dict
+    normalized to exactly ``{key: {"status": ..., "reason"?: ...}}`` (canonical keys only).
+    """
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"closeout_obligations must be a dict; got {type(value).__name__}"
+        )
+    out: dict = {}
+    for key, entry in value.items():
+        if key not in CLOSEOUT_KEYS:
+            raise ValueError(
+                f"closeout_obligations key {key!r} must be one of {list(CLOSEOUT_KEYS)}"
+            )
+        status, reason = _status_and_reason(entry)
+        if status not in PHASE_STATUS_VALID:
+            raise ValueError(
+                f"closeout_obligations[{key!r}].status must be one of "
+                f"{sorted(PHASE_STATUS_VALID)}; got {status!r}"
+            )
+        reason_stripped = reason.strip() if isinstance(reason, str) else ""
+        if status in STATUS_REQUIRING_REASON and not reason_stripped:
+            raise ValueError(
+                f"closeout_obligations[{key!r}].reason is required (non-empty) when "
+                f"status={status!r} (only ✅ may omit it; 'skip' encodes an N/A item, so "
+                "give the reason it does not apply)"
+            )
+        norm: dict = {"status": status}
+        if reason_stripped:
+            norm["reason"] = reason_stripped
+        out[key] = norm
+    return out
+
+
 # ─── evidence builder ───────────────────────────────────────────────────────
 
 
@@ -437,6 +514,7 @@ def build_evidence(
     codex_audit: dict | None = None,
     predecessor_lesson_backref: list[dict] | None = None,
     lesson_disposition: dict | None = None,
+    closeout_obligations: dict | None = None,
 ) -> dict:
     """Assemble + hash a retro-evidence payload.
 
@@ -466,6 +544,14 @@ def build_evidence(
     lesson-less hops from its denominator so nobody manufactures cargo-cult lessons.
     Same conditional-fold invariant: omitted → byte-identical; supplied → validated
     then folded into the hashed payload.
+
+    ``closeout_obligations`` (the third status-vector / warn-mode) is the optional
+    scope-by-delivery closeout contract ({sedimentation_always, audit, doc_mapping, release,
+    sync_pipeline, postmortem}; each ✅ artifact-pass or skip+reason N/A — see
+    :func:`_validate_closeout`). SAME conditional-fold invariant as the two above: omitted /
+    empty → the payload is byte-for-byte identical to today's (DEFAULT-OFF = zero behavior
+    change); supplied → validated then folded into the hashed payload. The dump-side gate that
+    reads it is WARN-ONLY (advisory, never blocking).
     """
     if mode not in MODE_VALID:
         raise ValueError(f"mode must be one of {sorted(MODE_VALID)}; got {mode!r}")
@@ -507,6 +593,11 @@ def build_evidence(
     # Absent → byte-identical to today (warn-mode). Present → validated then hashed.
     if lesson_disposition:
         payload["lesson_disposition"] = _validate_lesson_disposition(lesson_disposition)
+    # closeout_obligations (third vector): fold in ONLY when supplied — same conditional-fold
+    # pattern. Absent / empty → byte-identical to today (DEFAULT-OFF). Present → validated then
+    # hashed (bound to the evidence; the warn-mode gate just surfaces it, never blocks).
+    if closeout_obligations:
+        payload["closeout_obligations"] = _validate_closeout(closeout_obligations)
     payload["evidence_hash"] = compute_evidence_hash(payload)
     return payload
 
@@ -734,6 +825,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--lesson-disposition no_novel_lesson_attested:routine feature, nothing novel",
     )
     ap.add_argument(
+        "--closeout-status",
+        action="append",
+        default=[],
+        dest="closeout_status",
+        help="closeout_obligations (warn-mode, third vector): repeatable; key=status[:reason] "
+        f"where key ∈ {list(CLOSEOUT_KEYS)} and status ∈ {sorted(PHASE_STATUS_VALID)}. ✅ needs "
+        "no reason; ⚠️/❌/skip require one ('skip' encodes an N/A item → give why it does not "
+        "apply), e.g. --closeout-status release=skip:no user-visible change this hop",
+    )
+    ap.add_argument(
         "--no-lock",
         action="store_true",
         help="skip precheck.lock acquisition (advanced; for forensic batch only)",
@@ -805,6 +906,17 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"ERR-FATAL lesson-disposition-invalid: {e}\n")
             return 1
 
+    # closeout_obligations (third vector / warn-mode): parse with the SAME key=status[:reason]
+    # grammar the phase flags use, then validate now so a malformed value is a clean nonzero
+    # exit BEFORE the lock / any artifact is written (mirrors the backref / lesson pre-check).
+    closeout_raw = _parse_phase_kv(args.closeout_status) or None
+    if closeout_raw:
+        try:
+            _validate_closeout(closeout_raw)
+        except ValueError as e:
+            sys.stderr.write(f"ERR-FATAL closeout-status-invalid: {e}\n")
+            return 1
+
     output = (
         Path(args.output)
         if args.output
@@ -822,6 +934,7 @@ def main(argv: list[str] | None = None) -> int:
             phase1=p1,
             predecessor_lesson_backref=backref_raw,
             lesson_disposition=lesson_disp_raw,
+            closeout_obligations=closeout_raw,
         )
         write_evidence(payload, output)
         sys.stdout.write(f"OK precheck-written: {output}\n")

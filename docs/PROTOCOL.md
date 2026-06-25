@@ -376,6 +376,25 @@ Activation triggers (`dump.py`): an explicit `--retro-evidence FILE`, `HANDOFF_R
 
 `HANDOFF_RETRO_BYPASS=1` requires an `ack/<task>.retro.override.json` carrying a `follow_up_retro_task_id` + ISO-8601 `follow_up_deadline`, else `ERR-BYPASS` (exit 6). Bypass is *deferred* retro, not *skipped* retro: an overdue follow-up is caught at the next dump.
 
+### 13.5 The `closeout_obligations` status-vector (warn-mode · DEFAULT-OFF)
+
+A **third** optional status-vector on the retro evidence (after `phase0` / `phase1`). It turns the soft text rule ⑬「交棒前先复盘」 — which conflated two different things — into a machine-checkable **scope-by-delivery** closeout contract:
+
+* `sedimentation_always` — lesson + retro-evidence, done on **every** coordinator handoff (should be `✅`).
+* `audit` — only when there were code changes.
+* `doc_mapping` — only when instructions / architecture / config changed.
+* `release` — only on user-visible delivery.
+* `sync_pipeline` — only when artifacts changed.
+* `postmortem` — only when this hop had an incident / regression.
+
+Each item is either an artifact-pass (`✅`) or an explicit N/A. **The status vocabulary is reused from phase0/phase1** (`✅` / `⚠️` / `❌` / `skip`); because `skip` is in `STATUS_REQUIRING_REASON`, an N/A item (`skip`) **naturally requires a reason** — i.e. "N/A + why" is enforced for free. Authority: `handoff_precheck.CLOSEOUT_KEYS` + `_validate_closeout` (the single structural-validation point) + the `--closeout-status <key>=<status>[:reason]` CLI flag.
+
+**Conditional-fold (the zero-regression basis).** Unlike phase0/phase1 (which are *always present* via `merge_phase_status`), `closeout_obligations` is **OPTIONAL** and uses the same conditional-fold pattern as `predecessor_lesson_backref` / `lesson_disposition`: when **not** supplied the key does not appear in the payload and the evidence (and its `evidence_hash`) is **byte-for-byte identical** to a pre-closeout payload. When supplied it is validated (malformed → `ValueError`, garbage never enters the hashed payload; an unknown key is rejected — stricter than `merge_phase_status`'s drop-unknown leniency, because the keys are an enum) then folded into the hashed payload. `_attempt_realign` preserves a present vector verbatim across a sibling-HEAD refresh (same guarantee `codex_audit` / backref have); `dump._write_old_ready` surfaces a present vector into `old_ready` so the next session's §0 audit can read it.
+
+**Warn-mode gate (never blocks).** `dump._run_closeout_obligations_gate` is **WARN-ONLY**: it ALWAYS returns `None` and NEVER returns a blocking exit code — it only prints a non-blocking stderr advisory (clearly marked `warn-mode advisory, non-blocking`) when a coordinator handoff is missing the vector, or when `sedimentation_always` is not `✅`. It is **DEFAULT-OFF** (empty `config.json:closeout_obligations_warn_projects` = no project warned fleet-wide; owner flips a project or `"*"` in). One-key rollback = an off-switch sentinel `$HANDOFF_HOME/<project>/.closeout-obligations-warn-off` (per-project) or `$HANDOFF_HOME/.closeout-obligations-warn-off` (fleet-wide). Fail-SAFE-OFF: an unreadable / malformed evidence, a non-dict payload, or any unexpected error → silent `None` (a warn-only gate must never crash the dump and thereby block a handoff). Crucially the vector is **NOT** added to `retro_gate._validate_phase_status` (the hard-blocking phase0/phase1 check) — its only structural validation is in `build_evidence` (precheck-side, fail-fast); the dump side carries warn-mode advisory only.
+
+**🔴 Q3 — "who verifies the honesty of an N/A (`release:skip`)?" — chosen design (owner-ratified).** Warn-mode v1 does **NOT** verify N/A honesty. An independent consumer that scrutinizes a suspicious `release:skip` is **DEFERRED to enforce-mode**, where it will mirror retrieval-pull: the next coordinator's §0 audit reads the predecessor's closeout vector (surfaced into `old_ready`) and can challenge it. The warn-mode v1 signal is simply that the vector becomes a **visible artifact** (folded into the hashed evidence + surfaced into `old_ready` + an advisory when absent). This is the intentional "right size" (freeze Case B + owner-chosen warn-first + simplicity-first: do not build an independent consumer in v1).
+
 ## 14. The codex audit gate
 
 > Source-of-truth for the in-code refs `codex_audit.py` / `templates.py` §-1.5 (formerly cited as `codex-audit-gate-spec-draft.md` / `codex-audit-gate-design.md`).

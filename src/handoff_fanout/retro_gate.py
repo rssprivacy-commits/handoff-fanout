@@ -1279,6 +1279,12 @@ def _attempt_realign(
         # not receive it, so copy it from the original — same rationale as backref).
         if "lesson_disposition" in payload:
             new_payload["lesson_disposition"] = payload["lesson_disposition"]
+        # Likewise preserve the third-vector closeout_obligations verbatim — re-align refreshes
+        # the HEAD binding only; the recorded scope-by-delivery closeout vector must not be
+        # erased by a sibling-HEAD move (build_evidence above did not receive it — the gate has
+        # no CLI to re-supply it — so copy it from the original, same rationale as backref).
+        if "closeout_obligations" in payload:
+            new_payload["closeout_obligations"] = payload["closeout_obligations"]
         # The in-process builder must have observed the same HEAD we validated;
         # if not (e.g. its rev-parse failed → "(unknown)"), abort this attempt.
         if new_payload.get("head_at_precheck") != head_now:

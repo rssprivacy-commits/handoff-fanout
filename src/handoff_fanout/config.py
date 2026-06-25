@@ -215,6 +215,22 @@ class Config:
     # ``dump._retrieval_pull_enforce_enabled``), so a fleet-wide misfire is disabled WITHOUT
     # a config edit. Fail-SAFE-OFF: a corrupt config / unreadable evidence never blocks.
     retrieval_pull_enforce_projects: list[str] = field(default_factory=list)
+    # ── closeout_obligations status-vector WARN-mode roll-out (DEFAULT-OFF) ──────
+    # The third retro-evidence status-vector (after phase0 / phase1): a scope-by-delivery
+    # closeout contract (sedimentation_always / audit / doc_mapping / release / sync_pipeline
+    # / postmortem; each ✅ artifact-pass or skip+reason N/A). Unlike B1's retrieval-pull,
+    # this vector's dump-side gate is WARN-ONLY — it prints a non-blocking advisory and NEVER
+    # returns a blocking exit code. DEFAULT-OFF (empty list = no project warned fleet-wide,
+    # like the Step 4 anchor lists / retrieval_pull — NOT ``mandate_projects``: an accidental
+    # empty must never flip behaviour). Owner flips a project (or ``"*"``) in to start the
+    # advisory. Emergency one-key rollback = a sentinel file (see
+    # ``dump._closeout_obligations_warn_enabled``:
+    # ``$HANDOFF_HOME/<project>/.closeout-obligations-warn-off`` per-project or
+    # ``$HANDOFF_HOME/.closeout-obligations-warn-off`` fleet-wide), so a fleet-wide misfire is
+    # silenced WITHOUT a config edit. Fail-SAFE-OFF: a corrupt config / unreadable evidence /
+    # any OSError never blocks a handoff (the gate is warn-only anyway). Conditional-fold (the
+    # vector is OPTIONAL on evidence): an absent vector → byte-identical payload + a no-op gate.
+    closeout_obligations_warn_projects: list[str] = field(default_factory=list)
     # ``True`` when this Config was parsed from a trusted source (absent file = clean defaults,
     # or a present file that read + parsed). A present-but-untrustworthy config (unreadable /
     # corrupt JSON) sets this ``False`` via ``_fail_closed_config`` so the Step 4 anchor decision
@@ -461,6 +477,11 @@ def _from_dict(data: dict, home: Path) -> Config:
         # absent/typo/non-list → [] = no project enforced = warn/no-op, the safe default).
         retrieval_pull_enforce_projects=_anchor_slug_list(
             data, "retrieval_pull_enforce_projects"
+        ),
+        # closeout_obligations WARN-mode roll-out list (reuses the slug-list parser; absent/typo/
+        # non-list → [] = no project warned = no-op, the safe DEFAULT-OFF). Warn-only gate.
+        closeout_obligations_warn_projects=_anchor_slug_list(
+            data, "closeout_obligations_warn_projects"
         ),
         **_parse_worktree(data),
         **_parse_reclaim(data),

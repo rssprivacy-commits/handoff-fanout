@@ -960,6 +960,104 @@ def _run_retrieval_pull_gate(
     return retro_gate.EXIT_RETRY
 
 
+def _closeout_obligations_warn_enabled(cfg: _config.Config, project: str) -> bool:
+    """Is the ``closeout_obligations`` WARN-mode advisory ON for ``project``? DEFAULT-OFF +
+    fail-SAFE-OFF. (Byte-for-byte the same enable shape as
+    :func:`_retrieval_pull_enforce_enabled`, only the config field + sentinel name differ — and
+    "ON" here means "print an advisory", never "block".)
+
+    ON iff the project (or ``"*"``) is in ``cfg.closeout_obligations_warn_projects`` AND no
+    off-switch sentinel is present. The off-switch —
+    ``$HANDOFF_HOME/<project>/.closeout-obligations-warn-off`` (per-project) or
+    ``$HANDOFF_HOME/.closeout-obligations-warn-off`` (fleet-wide) — is the one-key rollback: a
+    fleet-wide noisy advisory is silenced WITHOUT a config edit. Any filesystem error → OFF."""
+    projects = getattr(cfg, "closeout_obligations_warn_projects", [])
+    if project not in projects and "*" not in projects:
+        return False
+    try:
+        if (cfg.home / project / ".closeout-obligations-warn-off").exists():
+            return False
+        if (cfg.home / ".closeout-obligations-warn-off").exists():
+            return False
+    except OSError:
+        return False
+    return True
+
+
+def _run_closeout_obligations_gate(
+    args: argparse.Namespace, project: str, cfg: _config.Config
+) -> None:
+    """closeout_obligations WARN-mode advisory (the third status-vector). WARN-ONLY: this
+    function ALWAYS returns ``None`` and NEVER returns a blocking exit code — it only prints a
+    non-blocking stderr advisory. The caller therefore does NOT check its return value (unlike
+    the B1 retrieval-pull gate, which can block).
+
+    A coordinator ACTIVE handoff whose retro evidence is MISSING the closeout vector gets an
+    advisory to add ``--closeout-status``; one whose ``sedimentation_always`` is not ✅ gets an
+    advisory that sedimentation should be done on every hop. Everything else (worker spawn /
+    non-coordinator / no evidence / vector present + sedimentation ✅ / gate disabled) is silent.
+
+    🔴 Q3 — "who verifies the honesty of an N/A (skip+reason)?" — is a CHOSEN design decision
+    (owner-ratified, written here + in PROTOCOL §13.5): warn-mode v1 does NOT verify N/A
+    honesty. An independent consumer that scrutinizes a suspicious ``release:skip`` is DEFERRED
+    to enforce-mode (where it will mirror retrieval-pull: the next coordinator's §0 audit reads
+    the predecessor's closeout vector surfaced into ``old_ready`` and can challenge it). The
+    warn-mode v1 signal is simply that the vector becomes a VISIBLE artifact (folded into the
+    hashed evidence + surfaced into old_ready + an advisory when absent). This is the
+    intentional "right size" (freeze Case B + owner-chosen warn-first + simplicity-first: do
+    NOT build an independent consumer in v1).
+
+    DEFAULT-OFF (empty ``closeout_obligations_warn_projects``) → silent no-op, byte-identical to
+    the pre-closeout path. Fail-SAFE-OFF: an unreadable / malformed evidence, a non-dict
+    payload, or ANY unexpected error during the advisory logic → return ``None`` silently
+    (a warn-only gate must NEVER crash the dump and thereby block a handoff)."""
+    # Only a coordinator ACTIVE handoff has a closeout to advise on — a worker spawn / a
+    # terminal done|blocked close is out of scope (mirrors the retrieval-pull gate's trigger).
+    if args.status != "active" or not getattr(args, "coordinator", False):
+        return None
+    evidence_path = (
+        Path(args.retro_evidence) if getattr(args, "retro_evidence", None) else None
+    )
+    if evidence_path is None:
+        return None
+    if not _closeout_obligations_warn_enabled(cfg, project):
+        return None
+    # Everything below is best-effort advisory: wrap it so NOTHING (a read error, a surprising
+    # payload shape, a broken stderr) can raise out of a warn-only gate and block the handoff.
+    try:
+        try:
+            payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None  # fail-SAFE-OFF: an unreadable evidence is never a blocker (or noisy)
+        if not isinstance(payload, dict):
+            return None
+        closeout = payload.get("closeout_obligations")
+        if not isinstance(closeout, dict) or not closeout:
+            print(
+                "⚠️ [dump] closeout-obligations-advisory (warn-mode advisory, non-blocking): "
+                "this coordinator handoff's retro evidence carries no closeout_obligations "
+                "vector. Consider recording one with --closeout-status "
+                "<key>=<✅|skip:reason> (keys: sedimentation_always / audit / doc_mapping / "
+                "release / sync_pipeline / postmortem; ✅ = done, skip:reason = N/A). "
+                f"Silence: touch {cfg.home}/{project}/.closeout-obligations-warn-off",
+                file=sys.stderr,
+            )
+            return None
+        sed = closeout.get("sedimentation_always")
+        sed_status = sed.get("status") if isinstance(sed, dict) else None
+        if sed_status != "✅":
+            print(
+                "⚠️ [dump] closeout-obligations-advisory (warn-mode advisory, non-blocking): "
+                f"sedimentation_always is {sed_status!r}, not ✅ — lesson + retro-evidence "
+                "should be sedimented on EVERY coordinator handoff. "
+                f"Silence: touch {cfg.home}/{project}/.closeout-obligations-warn-off",
+                file=sys.stderr,
+            )
+        return None
+    except Exception:  # noqa: BLE001 — a warn-only gate must never block a handoff by raising
+        return None
+
+
 def _spawner_focus_line(
     decision: _spawner_focus.AnchorDecision,
     *,
@@ -1382,6 +1480,15 @@ def _write_old_ready(
     lesson_disposition = payload.get("lesson_disposition")
     if isinstance(lesson_disposition, dict) and lesson_disposition:
         old_ready["lesson_disposition"] = lesson_disposition
+
+    # closeout_obligations (third vector): surface the closing session's closeout vector so the
+    # §0 new-session audit (and a future enforce-mode independent consumer — Q3, PROTOCOL §13.5)
+    # can read it without re-parsing the evidence. Additive-when-present: a non-dict / absent /
+    # empty value is ignored → old_ready stays byte-stable for the common case. old_ready is
+    # unhashed; the value is copied from the already-hashed evidence, not recomputed.
+    closeout_obligations = payload.get("closeout_obligations")
+    if isinstance(closeout_obligations, dict) and closeout_obligations:
+        old_ready["closeout_obligations"] = closeout_obligations
 
     ack_dir.mkdir(parents=True, exist_ok=True)
     out = ack_dir / f"{task}.old_ready"
@@ -2247,6 +2354,13 @@ def main(argv: list[str] | None = None, *, suppress_spawn_artifacts: bool = Fals
     rp_rc = _run_retrieval_pull_gate(args, project, cfg)
     if rp_rc is not None:
         return rp_rc
+
+    # closeout_obligations (third vector / WARN-mode): emit a non-blocking advisory if a
+    # coordinator handoff is missing the closeout vector (or sedimentation_always != ✅). It
+    # ALWAYS returns None and NEVER blocks — so we call it for its side effect and intentionally
+    # do NOT check a return value (contrast the rp gate above). DEFAULT-OFF → silent no-op,
+    # byte-identical to the pre-closeout path.
+    _run_closeout_obligations_gate(args, project, cfg)
 
     if args.open_batch:
         # spawn-unification Step 4: the fan-out sub-task .uris carry the coordinator anchor → resolve
