@@ -78,6 +78,12 @@ def main(argv: list[str] | None = None) -> int:
         "retro-gated, and the sole issuer of the one-time succession authority token",
     )
     sub.add_parser(
+        "audit-discharge",
+        help="req3: write the non-forgeable audited-to-terminal signal "
+        "(ack/<task>.audit_discharged) for a worker the coordinator merged + audited GREEN; "
+        "the autoclose driver corroborates it (git ancestry + spawn anchors) before closing",
+    )
+    sub.add_parser(
         "audit-check",
         help="Delivery-audit machine gate: verify dual-brain evidence exists for a "
         "repo+range (used by pre-push / post-merge / post-commit hooks)",
@@ -176,6 +182,10 @@ def main(argv: list[str] | None = None) -> int:
         from handoff_fanout import codex_audit
 
         return codex_audit.main_audit_close(rest)
+    if args.subcommand == "audit-discharge":
+        from handoff_fanout import codex_audit
+
+        return codex_audit.main_audit_discharge(rest)
     if args.subcommand == "audit-check":
         from handoff_fanout import audit_evidence
 

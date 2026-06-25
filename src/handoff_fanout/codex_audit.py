@@ -61,6 +61,10 @@ CANONICAL_DESC = "sorted-keys,utf-8,no-bom,lf"
 _SHA256_REF_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _GIT_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 _VERDICT_VALID = ("pass", "fail")
+# req3 audit-discharge spawn nonce (16-hex, either case — title nonces are lowercase
+# but stay lenient on input; the autoclose driver reads the authoritative nonce from
+# the sidecar, this is cross-check metadata only).
+_NONCE16_RE = re.compile(r"^[0-9a-fA-F]{16}$")
 
 
 def _validate_ids(project: str, task: str) -> None:
@@ -357,6 +361,76 @@ def write_bypass_override(
             "failure_count": len(codex_failure_attempts),
         },
     )
+    return artifact
+
+
+# ─── audit-discharge: non-forgeable "audited-to-terminal" signal (req3 §2.A) ──
+# The COORDINATOR calls this after it audits a worker window to GREEN-terminal
+# (merged to the integration branch). It writes ``ack/<task>.audit_discharged`` —
+# the STRONG signal the autoclose driver (``autoclose_gate``) corroborates at CONSUME
+# time against git ancestry + the spawn-time ``.worktree`` base anchor + the live
+# worktree HEAD (req3 P0-1/P0-2/P0-3).
+#
+# TRUST MODEL (mirrors reclaim.py codex-M3 + the owner_ack note above): worker and
+# coordinator are the SAME UNIX user and ``ack/`` is worker-writable, so a bare
+# sentinel is FORGEABLE. This writer is therefore a PURE PRODUCER with NO authority of
+# its own — its mere existence grants NOTHING. ALL anti-forge verification (verdict ==
+# GREEN ∩ merge_sha a non-trivial real ancestor of origin/main ∩ no head drift ∩
+# worktree terminal) is the CONSUMER's job in ``autoclose_gate.corroborate_discharge``.
+# The writer only validates shape so a malformed signal never lands (a non-GREEN
+# verdict or a malformed SHA is rejected here, not silently written).
+
+AUDIT_DISCHARGED_SCHEMA_VERSION = "1.0"
+
+
+def audit_discharged_path(project: str, task: str) -> Path:
+    """``$HANDOFF_HOME/<project>/ack/<task>.audit_discharged`` — the signal file."""
+    _validate_ids(project, task)
+    return _config.home_dir() / project / "ack" / f"{task}.audit_discharged"
+
+
+def write_audit_discharged(
+    project: str,
+    task: str,
+    *,
+    verdict: str,
+    merge_sha: str,
+    worktree_head: str | None,
+    nonce: str | None,
+    discharged_at: str,
+) -> dict:
+    """Write the ``audit_discharged`` signal artifact. Returns the artifact dict.
+
+    Shape-only validation (the consumer does the real corroboration): ``verdict`` MUST
+    be ``GREEN`` (a window is discharged only on a clean audit), ``merge_sha`` and
+    ``worktree_head`` MUST be git SHAs, ``nonce`` (if given) MUST be 16 hex. Raises
+    ``ValueError`` on any violation so a malformed signal never reaches disk.
+    ``worktree_head`` defaults to ``merge_sha`` (a fast-forward merge leaves the worker
+    branch HEAD == the merged commit — the common going-forward case).
+    """
+    _validate_ids(project, task)
+    if verdict != "GREEN":
+        raise ValueError(f"verdict must be GREEN to discharge a window; got {verdict!r}")
+    if not isinstance(merge_sha, str) or not _GIT_SHA_RE.match(merge_sha):
+        raise ValueError(f"merge_sha must be a git SHA (7-40 lowercase hex); got {merge_sha!r}")
+    wt_head = worktree_head if worktree_head else merge_sha
+    if not isinstance(wt_head, str) or not _GIT_SHA_RE.match(wt_head):
+        raise ValueError(f"worktree_head must be a git SHA (7-40 lowercase hex); got {wt_head!r}")
+    if nonce is not None and (not isinstance(nonce, str) or not _NONCE16_RE.match(nonce)):
+        raise ValueError(f"nonce must be 16 hex chars; got {nonce!r}")
+    artifact = {
+        "schema_version": AUDIT_DISCHARGED_SCHEMA_VERSION,
+        "kind": "audit_discharged",
+        "task": task,
+        "verdict": verdict,
+        "merge_sha": merge_sha,
+        "worktree_head": wt_head,
+        "nonce": nonce,
+        "discharged_at": discharged_at,
+    }
+    path = audit_discharged_path(project, task)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic.atomic_replace(path, json.dumps(artifact, ensure_ascii=False, sort_keys=True) + "\n")
     return artifact
 
 
@@ -2788,3 +2862,52 @@ def main_audit_close(argv: list[str] | None = None) -> int:
     except atomic.LockAcquisitionError:
         sys.stderr.write(f"ERR-LOCKED audit-close-lock-held: {locks_root}\n")
         return 3
+
+
+def main_audit_discharge(argv: list[str] | None = None) -> int:
+    """req3 §2.A — write the non-forgeable audited-to-terminal signal for a worker.
+
+    The COORDINATOR runs this after auditing a worker window to GREEN-terminal (its
+    branch merged to the integration branch). It writes ``ack/<task>.audit_discharged``
+    which the autoclose driver later corroborates against git + spawn anchors before it
+    will close the window. Pure producer — no existing path changes; all anti-forge
+    verification is the consumer's job (``autoclose_gate``)."""
+    ap = argparse.ArgumentParser(prog="handoff audit-discharge")
+    ap.add_argument("task", help="kebab-case worker task id whose window is audited-to-terminal")
+    ap.add_argument("--project", default=None, help="project slug; defaults to basename(workspace)")
+    ap.add_argument("--workspace", default=None, help="abs path to project root; defaults to cwd")
+    ap.add_argument("--verdict", required=True, help="audit verdict; MUST be GREEN to discharge")
+    ap.add_argument(
+        "--merge-sha", required=True, help="the worker head SHA merged to the integration branch"
+    )
+    ap.add_argument(
+        "--worktree-head", default=None, help="worker worktree HEAD (defaults to --merge-sha)"
+    )
+    ap.add_argument(
+        "--nonce", default=None, help="spawn nonce (16-hex); optional cross-check metadata"
+    )
+    args = ap.parse_args(argv)
+
+    if not _pc.TASK_ID_RE.match(args.task):
+        sys.stderr.write(f"ERR-FATAL invalid-task-id: {args.task!r}\n")
+        return 1
+    workspace = Path(args.workspace).resolve() if args.workspace else Path.cwd().resolve()
+    project = args.project or workspace.name
+    if not _pc.TASK_ID_RE.match(project):
+        sys.stderr.write(f"ERR-FATAL invalid-project-slug: {project!r}\n")
+        return 1
+    try:
+        record = write_audit_discharged(
+            project,
+            args.task,
+            verdict=args.verdict,
+            merge_sha=args.merge_sha,
+            worktree_head=args.worktree_head,
+            nonce=args.nonce,
+            discharged_at=datetime.now(UTC).isoformat(),
+        )
+    except ValueError as e:
+        sys.stderr.write(f"ERR-FATAL audit-discharge-invalid: {e}\n")
+        return 1
+    sys.stdout.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    return 0
