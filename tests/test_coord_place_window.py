@@ -65,7 +65,7 @@ cpw = _load()
 # Holder for the per-test isolated lock path (set by the `_isolate_placement_lock` autouse fixture).
 # A 1-element list so `_load_staging` (module function) can read the CURRENT value by reference and
 # redirect freshly-loaded staging modules to the same tmp path.
-_ACTIVE_LOCKFILE = [None]
+_ACTIVE_LOCKFILE: "list[str | None]" = [None]
 
 
 @pytest.fixture(autouse=True)
@@ -438,9 +438,9 @@ def _load_staging():
     # run), so it starts with the REAL PLACE_LOCK_FILE. Redirect it to the per-test isolated path
     # set by `_isolate_placement_lock` so a freshly-loaded `spw` never touches the real lock either.
     if _ACTIVE_LOCKFILE[0] is not None and hasattr(mod, "PLACE_LOCK_FILE"):
-        mod.PLACE_LOCK_FILE = _ACTIVE_LOCKFILE[0]
+        setattr(mod, "PLACE_LOCK_FILE", _ACTIVE_LOCKFILE[0])
         if hasattr(mod, "PLACE_LOCK_WAIT"):
-            mod.PLACE_LOCK_WAIT = 1.0
+            setattr(mod, "PLACE_LOCK_WAIT", 1.0)
     return mod
 
 
