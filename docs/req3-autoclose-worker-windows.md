@@ -12,7 +12,7 @@ auto-close on discharge + janitor backlog sweep).
 
 | Piece | What | Location |
 |---|---|---|
-| **A** signal writer | `handoff audit-discharge` → writes the non-forgeable `ack/<task>.audit_discharged` | `src/handoff_fanout/codex_audit.py` (git, editable) |
+| **A** signal writer | `handoff audit-discharge` → writes the strong, git-corroborated `ack/<task>.audit_discharged` (forgeable only by the same-UID worker — see "single-user authorization residual" below) | `src/handoff_fanout/codex_audit.py` (git, editable) |
 | **gate** | the 5-predicate fail-safe safety gate (pure, unit-tested) | `src/handoff_fanout/autoclose_gate.py` (git, editable) |
 | **B** close-by-WID | `coord-close-windows.py --close-wid` (AI-title + §6(a) TOCTOU root-fix) + §6(b) stats fix | `~/.claude-handoff/supervisor-monitor/coord-close-windows.py` (non-git, deploy-audited) |
 | **C** driver/sweep | `autoclose-audited-workers.py` (thin glue: gate → bind WID → invoke the close tool) | `~/.claude-handoff/supervisor-monitor/autoclose-audited-workers.py` (non-git, deploy-audited) |
@@ -52,6 +52,27 @@ path). Such windows are **NOT auto-closed**; the driver logs them as `unbindable
 This is a deliberate fail-safe, not a silent drop. Most worker windows DO retain the structured
 nonce title and close normally.
 
+### Known boundary — single-user authorization residual (owner-ACCEPTED, reclaim parity)
+
+The discharge signal and the pinned record (`ack/<task>.audit_discharged`, `ack/<task>.old_ready`,
+`ack/<task>.head.json`) all live under the **worker-writable** `ack/` dir, and the worker runs as the
+**same Unix user** as the coordinator. So a worker CAN forge both sides of the `merge_sha ==
+_pinned_sha` equality — point both at some already-merged commit `Q`, reset its own worktree to `Q`,
+keep it clean — and self-authorize a close. The equality therefore proves *consistency*, **not**
+*coordinator authorship*. This is an **authorization-purity** gap, and on a single-user same-UID
+system it **cannot be cryptographically closed** without a coordinator-held secret (HMAC-signed
+discharge) — explicitly deferred to a multi-user deployment, exactly mirroring the `owner_ack_token`
+precedent (防篡改 + 摩擦, 非加密, 单用户接受). **owner ACCEPTED this at the ENABLE gate (Option 1 =
+reclaim parity).**
+
+🔴 **The SAFETY property holds regardless** (绝不误关 · 无未审丢失): to close, the gate requires the
+**live worktree HEAD == merge_sha == a real ancestor of `origin/<int>` (merged)** AND the worktree
+**clean**. So in EVERY forge path the window that closes has a worktree sitting at a clean, merged
+commit — there is **no un-reviewed/un-merged work to lose**. (Un-reviewed work at a non-merged HEAD →
+`worktree-live-head-drift` REFUSE; uncommitted changes → `dirty` REFUSE; reset-to-merged-Q →
+the work is already overwritten.) The residual is purely "a worker can self-authorize *its own*
+close", never "an un-reviewed delivery is destroyed".
+
 ## D — the opt-in switch (DEFAULT-OFF) + kill-switch
 
 `worker-autoclose.enabled` is **SEPARATE** from the v4 coordinator-autoclose switch
@@ -77,20 +98,55 @@ Durable decision log (every close / refuse+reason / unbindable): `$HANDOFF_HOME/
 
 The least-invasive wiring (chosen over engine-editing audit-close, which would breach
 coordinator-no-self-edit and enlarge the blast radius) is a **coordinator SOP step**: after a
-coordinator audits a worker to GREEN-terminal and merges its branch, it runs two commands:
+coordinator audits a worker to GREEN-terminal and merges its branch, it runs the four commands
+below **in order**.
+
+🔴 **Why `record-head` is step 0 (do NOT skip — without it the gate REFUSES every legit close).**
+Predicate 2 is reclaim-parity: it honors `.audit_discharged` only when `merge_sha` **EQUALS the
+task's pinned closing commit** (`reclaim._pinned_sha` = `ack/<task>.old_ready` `commit_hash` >
+`ack/<task>.head.json` `head_sha`), not merely descends from the shared spawn base (that base-only
+lower bound is the FORGE-D hole). If the worker never dumped an `old_ready` (e.g. it only
+`touch`-ed `worker_reported`), **nothing populates the pinned record** → `_pinned_sha` returns
+`None` → the gate fails closed and the window never auto-closes (fail-safe, but the feature is
+INERT). `handoff worktree record-head` is the evidence channel that fills `head.json`.
+
+🔴 **Independence (keep the FORGE-D defense intact).** `record-head` reads the **worktree/branch
+HEAD at audit time** — an *independent* capture of the worker's actual delivery. The `merge_sha`
+then equals the pinned SHA **by construction of the ff-only merge** (ff = no new commit, so
+`main` advances to exactly the worker's branch tip), NOT by echoing the discharge input into the
+pinned record. Never set `pinned = merge_sha` from the discharge — that would re-open FORGE D
+(a worker could pin any commit it points `--merge-sha` at). Run `record-head` **before** the merge.
 
 ```bash
-# 1) write the non-forgeable signal (the COORDINATOR does this — it has the merge SHA):
+# 0) record the worker's HONEST closing commit (reads the worktree/branch HEAD → head.json).
+#    Independence: this is captured from the worker's delivery, BEFORE the merge, not from the
+#    coordinator's --merge-sha input.
+handoff worktree record-head <task> --project <project>
+
+# 1) merge the worker's branch fast-forward-only → main advances to EXACTLY the worker's tip,
+#    so the resulting merge SHA == the pinned head recorded in step 0. PUSH it: the gate
+#    proves "merged" by fetching origin/main and checking merge_sha is its ancestor — an
+#    un-pushed local merge fails the gate ("not-merged", fail-safe). Push first.
+git merge --ff-only handoff/<task>          # merged SHA = worker HEAD = recorded pinned
+git push origin main                        # gate checks ancestry against origin/main
+
+# 2) write the strong git-corroborated signal (the COORDINATOR does this — it has the merge SHA):
 handoff audit-discharge <task> --project <project> --verdict GREEN --merge-sha <merged-sha>
 #    optional: --worktree-head <sha>  --nonce <spawn-nonce>   (worktree-head defaults to merge-sha)
 
-# 2) gate + (if worker-autoclose.enabled) close that one worker window — dry-run unless --execute:
+# 3) gate + (if worker-autoclose.enabled) close that one worker window — dry-run unless --execute:
 ~/.claude-handoff/supervisor-monitor/autoclose-audited-workers.py \
     --project <project> --task <task> [--execute]
 ```
 
-Step 2 is safe to run unconditionally: it is dry-run unless BOTH `--execute` is passed AND the
+Step 3 is safe to run unconditionally: it is dry-run unless BOTH `--execute` is passed AND the
 opt-in switch is ON, and the gate refuses anything not provably audited-to-terminal + idle + clean.
+
+> **Note — workers that dump a handoff already carry the pinned record.** A worker that ran
+> `handoff dump`/`audit-close` at its own handoff writes `old_ready.commit_hash` (the retro-gated
+> recorder, which `_pinned_sha` prefers); for those, step 0 is redundant but harmless (it only
+> writes the `head.json` fallback channel). Run step 0 unconditionally so the flow is correct for
+> both worker shapes (dumped vs. report-only).
 
 ## Janitor backlog sweep (manual or scheduled)
 
