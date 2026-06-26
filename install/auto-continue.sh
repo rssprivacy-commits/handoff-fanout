@@ -86,6 +86,27 @@ CODE_BIN="${HANDOFF_CODE_BIN:-/usr/local/bin/code}"
 # fallback: which code
 [ ! -x "$CODE_BIN" ] && CODE_BIN=$(command -v code 2>/dev/null)
 
+# ── req2 window auto-placement (sw-place-at-spawn / opt-in, default-OFF) ──────────────────────
+# After a CONFIRMED submit the watchdog best-effort tiles the just-spawned window via the shared
+# coord-place-window.py (Rectangle). STRICTLY opt-in: runs ONLY when a sentinel exists (global
+# $HANDOFF_ROOT/.window-placement.enabled or per-project <project>/window-placement.enabled), so a
+# default deploy is a zero-behavior-change no-op. Every dep is env-overridable; a missing tool
+# degrades to a logged skip, a missing `timeout` binary degrades to unbounded (the tool self-bounds
+# via its own subprocess timeouts + placement-lock wait).
+HANDOFF_PLACE_PYTHON="${HANDOFF_PLACE_PYTHON:-/opt/homebrew/bin/python3}"
+HANDOFF_PLACE_TOOL="${HANDOFF_PLACE_TOOL:-$HANDOFF_ROOT/supervisor-monitor/coord-place-window.py}"
+HANDOFF_PLACE_WAIT="${HANDOFF_PLACE_WAIT:-8}"
+HANDOFF_PLACE_TIMEOUT="${HANDOFF_PLACE_TIMEOUT:-30}"
+# Absolute `timeout`/`gtimeout` (launchd PATH is minimal → try known prefixes, then PATH). Empty ⇒
+# run the tool unbounded (it self-bounds). Overridable via HANDOFF_TIMEOUT_CMD.
+if [ -z "${HANDOFF_TIMEOUT_CMD:-}" ]; then
+    HANDOFF_TIMEOUT_CMD=""
+    for _t in /opt/homebrew/bin/timeout /usr/local/bin/timeout /opt/homebrew/bin/gtimeout /usr/local/bin/gtimeout; do
+        [ -x "$_t" ] && { HANDOFF_TIMEOUT_CMD="$_t"; break; }
+    done
+    [ -z "$HANDOFF_TIMEOUT_CMD" ] && HANDOFF_TIMEOUT_CMD=$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)
+fi
+
 log() {
     mkdir -p "$HANDOFF_ROOT" 2>/dev/null
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"
@@ -217,6 +238,55 @@ write_ack() {
     local ack_dir="$proj_dir/ack"
     mkdir -p "$ack_dir" 2>/dev/null
     printf '%s\n%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$detail" > "$ack_dir/$task.$state"
+}
+
+# req2 (sw-place-at-spawn): after a CONFIRMED submit, best-effort tile the just-spawned window via
+# the shared coord-place-window.py (Rectangle). STRICTLY opt-in (default-OFF sentinel) so a default
+# deploy is a zero-behavior-change no-op; bounded + fully swallowed (|| true) so a placement
+# hang/error can NEVER affect the spawn outcome (the `.submitted` ack is already written by the
+# time this runs). The watchdog is the only FLEET-WIDE trigger — every project + every coordinator
+# (new or pre-existing) — because it does NOT depend on a coordinator's onboarding brief (§0.8
+# misses already-running coordinators / fires late). Role: a coordinator succession carries
+# role=supervisor_succession in the singlepane sidecar (→ coord → right-half); a worktree worker /
+# no sidecar / role=worker → worker → free-quadrant (the tool maps role→slot). Always returns 0.
+maybe_place_window() {
+    local project="$1" task="$2" proj_dir="$3" queue="$4"
+    # opt-in gate (mirror autoclose.enabled): global OR per-project sentinel; neither ⇒ skip silently.
+    [ -f "$HANDOFF_ROOT/.window-placement.enabled" ] || [ -f "$proj_dir/window-placement.enabled" ] || return 0
+    if [ ! -f "$HANDOFF_PLACE_TOOL" ]; then
+        log "PLACE[$task]: SKIP — placement tool not found ($HANDOFF_PLACE_TOOL)"
+        return 0
+    fi
+    # Role from the singlepane sidecar's `role` field (singlepane is per-project, so it alone can't
+    # tell coord from worker). A coordinator succession = supervisor_succession; everything else
+    # (worktree worker / no sidecar / role=worker) defaults to worker.
+    local role="worker" sc="$queue/$task.singlepane" sc_role=""
+    if [ -f "$sc" ]; then
+        sc_role=$("$HANDOFF_PYTHON_CMD" - "$sc" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.loads(open(sys.argv[1], encoding="utf-8").read())
+    print(d.get("role", "") if isinstance(d, dict) else "")
+except Exception:
+    print("")
+PY
+)
+        case "$sc_role" in supervisor_succession|*coord*|*supervisor*) role="coord" ;; esac
+    fi
+    log "PLACE[$task]: tiling just-spawned window (role=$role project=$project) — opt-in best-effort bounded≤${HANDOFF_PLACE_TIMEOUT}s"
+    # Bounded (timeout if available) + non-fatal (|| true): the spawn outcome is already ack'd, so a
+    # placement hang/error is swallowed and never propagates. Tool output → the launcher log.
+    if [ -n "${HANDOFF_TIMEOUT_CMD:-}" ]; then
+        "$HANDOFF_TIMEOUT_CMD" "$HANDOFF_PLACE_TIMEOUT" \
+            "$HANDOFF_PLACE_PYTHON" "$HANDOFF_PLACE_TOOL" \
+            --project "$project" --task "$task" --role "$role" \
+            --wait "$HANDOFF_PLACE_WAIT" --execute >>"$LOG" 2>&1 || true
+    else
+        "$HANDOFF_PLACE_PYTHON" "$HANDOFF_PLACE_TOOL" \
+            --project "$project" --task "$task" --role "$role" \
+            --wait "$HANDOFF_PLACE_WAIT" --execute >>"$LOG" 2>&1 || true
+    fi
+    return 0
 }
 
 # 2026-05-28 codex audit blind-spot #4 修复:
@@ -2379,6 +2449,12 @@ EOF
                 _return_token="$TASK"   # in title always (rootName + custom); nonce lands in kCGWindowName too late
                 _return_unique=1        # task id is per-spawn-unique → unique-mode title-substring (handle-reuse-immune)
             fi
+            # req2 (sw-place-at-spawn): tile the just-spawned window NOW — right after the CONFIRMED
+            # submit and BEFORE the return jump, while the focus-jumped window is still on the active
+            # spawn desktop (so the common case needs no goto). Gated on _RETURN_DISPATCHED (a real
+            # submit, ack `submitted`) + the opt-in sentinel; bounded by HANDOFF_PLACE_TIMEOUT and
+            # fully swallowed, so it can never affect the spawn outcome (already ack'd). Snap-back next.
+            [ "$_RETURN_DISPATCHED" = "1" ] && maybe_place_window "$PROJECT" "$TASK" "$PROJ_DIR" "$QUEUE"
             [ "$_RETURN_DISPATCHED" = "1" ] && _return_jump_back "${_return_token:-}" "${_return_unique:-0}"
             sleep 0.5  # 防同次 launchd run 内连续 spawn 让主人晕
         else
