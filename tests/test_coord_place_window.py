@@ -512,3 +512,53 @@ def test_run_place_fires_when_lock_held(monkeypatch):
     assert gotos[-1] == 9               # restored the owner's active desktop LAST
     assert raised and raised[0] == win["title"]
     assert fired == ["top-left"]
+
+
+@_staging_skip
+def test_run_self_skips_when_lock_unavailable(monkeypatch):
+    # --self now serializes too: the frontmost window + Rectangle's "act on frontmost" target are
+    # GLOBAL shared state, so a concurrent placement could steal focus between validate and fire.
+    # placement_lock yields False → run_self SKIPs (SystemExit) and NEVER fires Rectangle.
+    spw = _load_staging()
+    import contextlib as _cl
+    monkeypatch.setattr(spw, "read_frontmost_title", lambda: COORD)   # a valid 🧭 handoff-fanout coord
+    monkeypatch.setattr(spw, "rectangle_running", lambda: True)
+    monkeypatch.setattr(spw, "raise_window", lambda t: None)
+    monkeypatch.setattr(spw, "frontmost_is", lambda t: True)
+    fired = []
+    monkeypatch.setattr(spw, "fire_rectangle", lambda s: fired.append(s))
+
+    @_cl.contextmanager
+    def _no_lock():
+        yield False                     # never acquired
+    monkeypatch.setattr(spw, "placement_lock", _no_lock)
+    monkeypatch.setattr(spw.time, "sleep", lambda *a: None)
+    with pytest.raises(SystemExit):
+        spw.run_self("handoff-fanout", "right-half", execute=True)
+    assert fired == []                  # skipped → no wrong-window fire
+
+
+@_staging_skip
+def test_run_self_fires_when_lock_held(monkeypatch):
+    # Happy path on the STAGING build: lock acquired (yields True) → re-validate under lock →
+    # raise → frontmost_is → fire.
+    spw = _load_staging()
+    import contextlib as _cl
+    monkeypatch.setattr(spw, "read_frontmost_title", lambda: COORD)   # valid 🧭 handoff-fanout coord
+    monkeypatch.setattr(spw, "rectangle_running", lambda: True)
+    raised = []
+    monkeypatch.setattr(spw, "raise_window", lambda t: raised.append(t))
+    monkeypatch.setattr(spw, "frontmost_is", lambda t: True)
+    bounds = iter(["0,0,100,100", "1028,39,1028,1290"])
+    monkeypatch.setattr(spw, "capture_front_bounds", lambda: next(bounds))
+    fired = []
+    monkeypatch.setattr(spw, "fire_rectangle", lambda s: fired.append(s))
+
+    @_cl.contextmanager
+    def _held_lock():
+        yield True                      # acquired
+    monkeypatch.setattr(spw, "placement_lock", _held_lock)
+    monkeypatch.setattr(spw.time, "sleep", lambda *a: None)
+    spw.run_self("handoff-fanout", "right-half", execute=True)
+    assert raised and raised[0] == COORD
+    assert fired == ["right-half"]
