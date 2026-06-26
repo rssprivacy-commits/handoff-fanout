@@ -406,68 +406,55 @@ _staging_skip = pytest.mark.skipif(
 
 @_staging_skip
 def test_placement_lock_acquires_and_releases(tmp_path, monkeypatch):
+    # flock-based: an anchor FILE persists; acquire/release is the flock state, not the file's
+    # existence. Re-acquiring after the first `with` exits proves the lock was truly released.
     spw = _load_staging()
-    lockdir = tmp_path / ".place-window.lock"
-    monkeypatch.setattr(spw, "PLACE_LOCK_DIR", str(lockdir))
-    assert not lockdir.exists()
+    lockfile = tmp_path / ".place-window.lock"
+    monkeypatch.setattr(spw, "PLACE_LOCK_FILE", str(lockfile))
     with spw.placement_lock() as got:
         assert got is True
-        assert lockdir.is_dir()        # mkdir created the lockdir while held
-    assert not lockdir.exists()        # released in finally → dir gone
+        assert lockfile.is_file()       # anchor file created
+    assert lockfile.is_file()           # anchor file PERSISTS (not unlinked — that would break mutex)
+    with spw.placement_lock() as got2:  # a second acquire succeeds → the first truly released
+        assert got2 is True
 
 
 @_staging_skip
 def test_placement_lock_contention_skips(tmp_path, monkeypatch):
+    # Hold the SAME anchor file's flock via an independent fd (a separate open-file-description),
+    # so placement_lock contends and must fail-safe SKIP (yield False) within the short wait.
+    import fcntl as _fcntl
+    import os as _os
     spw = _load_staging()
-    lockdir = tmp_path / ".place-window.lock"
-    monkeypatch.setattr(spw, "PLACE_LOCK_DIR", str(lockdir))
-    monkeypatch.setattr(spw, "PLACE_LOCK_WAIT", 0.05)   # tiny wait → fast fail-safe
+    lockfile = tmp_path / ".place-window.lock"
+    monkeypatch.setattr(spw, "PLACE_LOCK_FILE", str(lockfile))
+    monkeypatch.setattr(spw, "PLACE_LOCK_WAIT", 0.5)    # tiny wait → fast fail-safe
     monkeypatch.setattr(spw.time, "sleep", lambda *a: None)
-    lockdir.parent.mkdir(parents=True, exist_ok=True)
-    lockdir.mkdir()                     # a FRESH holder already owns the lock
-    with spw.placement_lock() as got:
-        assert got is False             # contention → could not acquire → caller must SKIP
-    assert lockdir.is_dir()             # we did NOT steal/break the live holder's lock
+    holder_fd = _os.open(str(lockfile), _os.O_CREAT | _os.O_RDWR, 0o644)
+    _fcntl.flock(holder_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)   # we hold it exclusively
+    try:
+        with spw.placement_lock() as got:
+            assert got is False         # contention → could not acquire → caller must SKIP
+    finally:
+        _fcntl.flock(holder_fd, _fcntl.LOCK_UN)
+        _os.close(holder_fd)
+    # After we release, placement_lock can acquire cleanly (proves it never stole/broke our lock).
+    with spw.placement_lock() as got2:
+        assert got2 is True
 
 
 @_staging_skip
-def test_placement_lock_breaks_stale(tmp_path, monkeypatch):
+def test_placement_lock_recovers_leftover_directory(tmp_path, monkeypatch):
+    # Defensive path: an earlier mkdir-based build may have left a DIRECTORY at the lock path;
+    # the flock lock removes an empty stale dir then opens the anchor file and acquires.
     spw = _load_staging()
-    import os as _os
-    lockdir = tmp_path / ".place-window.lock"
-    monkeypatch.setattr(spw, "PLACE_LOCK_DIR", str(lockdir))
-    monkeypatch.setattr(spw.time, "sleep", lambda *a: None)
-    lockdir.parent.mkdir(parents=True, exist_ok=True)
-    lockdir.mkdir()                     # a holder dir...
-    # ...older than PLACE_LOCK_TTL (now 180s) → dead holder. Reclaim is ownership-safe: the
-    # stale dir is atomically RENAMEd to a unique temp name and then removed, NOT blind-rmdir'd.
-    stale = spw._now() - (spw.PLACE_LOCK_TTL + 60.0)
-    _os.utime(str(lockdir), (stale, stale))
+    lockfile = tmp_path / ".place-window.lock"
+    monkeypatch.setattr(spw, "PLACE_LOCK_FILE", str(lockfile))
+    lockfile.mkdir()                    # leftover directory from the old scheme
+    assert lockfile.is_dir()
     with spw.placement_lock() as got:
-        assert got is True              # stale lock reclaimed (via rename) → we acquired it
-        assert lockdir.is_dir()
-    assert not lockdir.exists()         # and released it cleanly
-
-
-@_staging_skip
-def test_placement_lock_stale_break_leaves_no_temp_dirs(tmp_path, monkeypatch):
-    # FIX 1: the ownership-safe break renames the stale lock to a unique `.stale.<pid>.<ms>` dir
-    # then rmdir's it — verify acquire leaves NO leftover `.stale.*` temp dirs behind.
-    spw = _load_staging()
-    import os as _os
-    lockdir = tmp_path / ".place-window.lock"
-    monkeypatch.setattr(spw, "PLACE_LOCK_DIR", str(lockdir))
-    monkeypatch.setattr(spw.time, "sleep", lambda *a: None)
-    lockdir.parent.mkdir(parents=True, exist_ok=True)
-    lockdir.mkdir()
-    stale = spw._now() - (spw.PLACE_LOCK_TTL + 60.0)
-    _os.utime(str(lockdir), (stale, stale))
-    with spw.placement_lock() as got:
-        assert got is True
-    # after release: only the released (now-gone) lockdir — no stale temp residue.
-    leftovers = [p.name for p in tmp_path.iterdir() if ".stale." in p.name]
-    assert leftovers == [], f"stale-break left temp dirs behind: {leftovers}"
-    assert not lockdir.exists()
+        assert got is True              # recovered: dir removed, file anchor opened, flock held
+        assert lockfile.is_file()
 
 
 @_staging_skip
