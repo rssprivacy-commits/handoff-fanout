@@ -612,3 +612,159 @@ def test_run_self_fires_when_lock_held(monkeypatch):
     spw.run_self("handoff-fanout", "right-half", execute=True)
     assert raised and raised[0] == COORD
     assert fired == ["right-half"]
+
+
+# ── worker free-quadrant auto-alternation (sw-place-at-spawn) ─────────────────
+# `--role worker` WITHOUT `--worker-index` picks the FIRST FREE of {top-left, bottom-left} on the
+# target desktop, so auto-spawned workers fill/alternate instead of stacking. The feature lives in
+# the STAGING copy first (the deployed supervisor-monitor/ copy is the pre-feature build until the
+# coordinator deploy-audits it); these tests therefore load the STAGING file EXPLICITLY (the SOT
+# for the new code), pinned by a skip that requires the new symbol — exactly like the lock tests.
+
+_staging_freequad_skip = pytest.mark.skipif(
+    not _STAGING_CPW.exists()
+    or "def free_worker_slot" not in _STAGING_CPW.read_text(),
+    reason="staging coord-place-window.py with worker free-quadrant selection not present",
+)
+
+
+@_staging_freequad_skip
+def test_resolve_slot_worker_no_index_defers_to_free_quadrant():
+    # resolve_slot defers a worker-without-index to the FREE_QUADRANT sentinel (decided at place
+    # time), WHILE slot_for_role keeps its strict contract (still raises if called directly).
+    spw = _load_staging()
+    assert spw.resolve_slot(None, "worker", None) == spw.FREE_QUADRANT
+    assert spw.FREE_QUADRANT not in spw.VALID_SLOTS          # never a real Rectangle action
+    assert spw.resolve_slot(None, "worker", 0) == "top-left"   # index path EXACTLY unchanged
+    assert spw.resolve_slot(None, "worker", 1) == "bottom-left"
+    with pytest.raises(ValueError):
+        spw.slot_for_role("worker", None)                    # strict contract preserved
+
+
+@_staging_freequad_skip
+def test_free_worker_slot_rule():
+    spw = _load_staging()
+    assert spw.free_worker_slot(set()) == "top-left"                    # both free → top-left
+    assert spw.free_worker_slot({"bottom-left"}) == "top-left"          # only bottom occ → top-left
+    assert spw.free_worker_slot({"top-left"}) == "bottom-left"          # top occ → bottom-left
+    assert spw.free_worker_slot({"top-left", "bottom-left"}) == "top-left"  # both occ → fallback TL
+    # accepts any iterable; extraneous members are ignored
+    assert spw.free_worker_slot(["top-left", "right-half"]) == "bottom-left"
+
+
+@_staging_freequad_skip
+def test_quadrant_of_classification():
+    spw = _load_staging()
+    F = (0, 0, 2056, 1329)
+    assert spw.quadrant_of((0, 39, 1028, 645), F) == "top-left"       # left half, upper
+    assert spw.quadrant_of((0, 684, 1028, 645), F) == "bottom-left"   # left half, lower
+    assert spw.quadrant_of((1028, 39, 1028, 1290), F) is None         # right half → not a left quad
+    assert spw.quadrant_of(None, F) is None                          # unreadable bounds
+    assert spw.quadrant_of((0, 0, 100, 100), None) is None           # unknown frame
+    assert spw.quadrant_of((0, 0, 100, 100), (0, 0, 0, 0)) is None   # degenerate frame
+
+
+@_staging_freequad_skip
+def test_screen_visible_frame_parses_and_guards(monkeypatch):
+    spw = _load_staging()
+
+    class _R:
+        def __init__(self, rc, out):
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+
+    monkeypatch.setattr(spw, "_run", lambda *a, **k: _R(0, "0, 0, 2056, 1329"))
+    assert spw.screen_visible_frame() == (0, 0, 2056, 1329)          # left,top,right,bottom → x,y,w,h
+    monkeypatch.setattr(spw, "_run", lambda *a, **k: _R(1, ""))
+    assert spw.screen_visible_frame() is None                       # osascript failed
+    monkeypatch.setattr(spw, "_run", lambda *a, **k: _R(0, "0,0,0,0"))
+    assert spw.screen_visible_frame() is None                       # degenerate rect
+    monkeypatch.setattr(spw, "_run", lambda *a, **k: _R(0, "garbage"))
+    assert spw.screen_visible_frame() is None                       # unparseable
+
+
+@_staging_freequad_skip
+def test_probe_left_quadrant_occupancy_classifies_excludes_and_filters(monkeypatch):
+    # The probe: only the target desktop, excluding the target window itself; right-half windows
+    # don't count; other-desktop windows are ignored.
+    spw = _load_staging()
+    monkeypatch.setattr(spw, "screen_visible_frame", lambda: (0, 0, 2056, 1329))
+    wins = [
+        _win("target", 100, desktop=5),    # the target itself → excluded by wid
+        _win("worker-A", 101, desktop=5),  # top-left tile → occupies top-left
+        _win("coord-R", 102, desktop=5),   # right-half → NOT a left quadrant
+        _win("worker-B", 103, desktop=9),  # other desktop → filtered out
+    ]
+    bounds = {"worker-A": "0,39,1028,645", "coord-R": "1028,39,1028,1290"}
+    monkeypatch.setattr(spw, "capture_bounds_by_title", lambda t: bounds.get(t))
+    assert spw.probe_left_quadrant_occupancy(wins, 5, 100) == {"top-left"}
+
+
+@_staging_freequad_skip
+def test_probe_left_quadrant_occupancy_no_frame_is_empty(monkeypatch):
+    # No screen frame (best-effort failure) ⇒ occupancy unknown ⇒ empty (→ default top-left).
+    spw = _load_staging()
+    monkeypatch.setattr(spw, "screen_visible_frame", lambda: None)
+    assert spw.probe_left_quadrant_occupancy([_win("x", 1, desktop=5)], 5, 99) == set()
+
+
+def _free_quad_run_place(monkeypatch, occupied):
+    """Drive run_place on the STAGING build with slot=FREE_QUADRANT and a MOCKED occupancy probe
+    (returning ``occupied``); return the list of slots actually fired."""
+    import contextlib as _cl
+    spw = _load_staging()
+    win = _win("handoff-fanout · sw-foo · worker · " + "a" * 16 + " [worktree] — x", 100, desktop=5)
+    monkeypatch.setattr(spw, "probe_windows", lambda: [win])
+    monkeypatch.setattr(spw, "detect_active_desktop", lambda w: 9)
+    monkeypatch.setattr(spw, "rectangle_running", lambda: True)
+    monkeypatch.setattr(spw, "goto", lambda n: True)
+    monkeypatch.setattr(spw, "raise_window", lambda t: None)
+    monkeypatch.setattr(spw, "frontmost_is", lambda t: True)
+    bounds = iter(["0,0,100,100", "0,39,1028,645"])
+    monkeypatch.setattr(spw, "capture_bounds_by_title", lambda t: next(bounds))
+    # the occupancy probe is MOCKED (the GUI screen/bounds osascript is never touched here)
+    monkeypatch.setattr(spw, "probe_left_quadrant_occupancy", lambda w, d, x: set(occupied))
+    fired = []
+    monkeypatch.setattr(spw, "fire_rectangle", lambda s: fired.append(s))
+
+    @_cl.contextmanager
+    def _held_lock():
+        yield True
+    monkeypatch.setattr(spw, "placement_lock", _held_lock)
+    monkeypatch.setattr(spw.time, "sleep", lambda *a: None)
+    spw.run_place("handoff-fanout", "sw-foo", None, spw.FREE_QUADRANT, 0.0, execute=True)
+    return fired
+
+
+@_staging_freequad_skip
+def test_run_place_free_quadrant_both_free_fires_top_left(monkeypatch):
+    assert _free_quad_run_place(monkeypatch, set()) == ["top-left"]
+
+
+@_staging_freequad_skip
+def test_run_place_free_quadrant_top_left_occupied_fires_bottom_left(monkeypatch):
+    assert _free_quad_run_place(monkeypatch, {"top-left"}) == ["bottom-left"]
+
+
+@_staging_freequad_skip
+def test_run_place_free_quadrant_both_occupied_fires_top_left(monkeypatch):
+    # best-effort fallback when both left quadrants are already occupied
+    assert _free_quad_run_place(monkeypatch, {"top-left", "bottom-left"}) == ["top-left"]
+
+
+@_staging_freequad_skip
+def test_run_place_free_quadrant_dryrun_never_fires(monkeypatch, capsys):
+    # A FREE_QUADRANT dry-run resolves NOTHING + fires NOTHING (and never calls the occupancy probe).
+    spw = _load_staging()
+    win = _win("handoff-fanout · sw-foo · worker · " + "b" * 16 + " [worktree] — x", 100, desktop=5)
+    monkeypatch.setattr(spw, "probe_windows", lambda: [win])
+    monkeypatch.setattr(spw, "detect_active_desktop", lambda w: 9)
+    probed = []
+    monkeypatch.setattr(spw, "probe_left_quadrant_occupancy",
+                        lambda w, d, x: (probed.append(1), set())[1])
+    fired = []
+    monkeypatch.setattr(spw, "fire_rectangle", lambda s: fired.append(s))
+    spw.run_place("handoff-fanout", "sw-foo", None, spw.FREE_QUADRANT, 0.0, execute=False)
+    out = capsys.readouterr().out
+    assert "DRY-RUN" in out
+    assert "free-left-quadrant" in out   # preview names the auto behavior
+    assert fired == [] and probed == []  # dry-run touches nothing
