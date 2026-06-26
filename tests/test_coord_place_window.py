@@ -439,12 +439,35 @@ def test_placement_lock_breaks_stale(tmp_path, monkeypatch):
     monkeypatch.setattr(spw.time, "sleep", lambda *a: None)
     lockdir.parent.mkdir(parents=True, exist_ok=True)
     lockdir.mkdir()                     # a holder dir...
-    stale = spw._now() - 100.0          # ...older than PLACE_LOCK_TTL (45s) → dead holder
+    # ...older than PLACE_LOCK_TTL (now 180s) → dead holder. Reclaim is ownership-safe: the
+    # stale dir is atomically RENAMEd to a unique temp name and then removed, NOT blind-rmdir'd.
+    stale = spw._now() - (spw.PLACE_LOCK_TTL + 60.0)
     _os.utime(str(lockdir), (stale, stale))
     with spw.placement_lock() as got:
-        assert got is True              # stale lock reclaimed → we acquired it
+        assert got is True              # stale lock reclaimed (via rename) → we acquired it
         assert lockdir.is_dir()
     assert not lockdir.exists()         # and released it cleanly
+
+
+@_staging_skip
+def test_placement_lock_stale_break_leaves_no_temp_dirs(tmp_path, monkeypatch):
+    # FIX 1: the ownership-safe break renames the stale lock to a unique `.stale.<pid>.<ms>` dir
+    # then rmdir's it — verify acquire leaves NO leftover `.stale.*` temp dirs behind.
+    spw = _load_staging()
+    import os as _os
+    lockdir = tmp_path / ".place-window.lock"
+    monkeypatch.setattr(spw, "PLACE_LOCK_DIR", str(lockdir))
+    monkeypatch.setattr(spw.time, "sleep", lambda *a: None)
+    lockdir.parent.mkdir(parents=True, exist_ok=True)
+    lockdir.mkdir()
+    stale = spw._now() - (spw.PLACE_LOCK_TTL + 60.0)
+    _os.utime(str(lockdir), (stale, stale))
+    with spw.placement_lock() as got:
+        assert got is True
+    # after release: only the released (now-gone) lockdir — no stale temp residue.
+    leftovers = [p.name for p in tmp_path.iterdir() if ".stale." in p.name]
+    assert leftovers == [], f"stale-break left temp dirs behind: {leftovers}"
+    assert not lockdir.exists()
 
 
 @_staging_skip
