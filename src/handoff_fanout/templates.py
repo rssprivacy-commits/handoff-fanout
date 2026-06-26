@@ -224,6 +224,19 @@ handoff audit-close ... \\
 ```
 3. **warn-mode 非阻断**：缺向量**永不 block** —— 仅当项目在 `closeout_obligations_warn_projects` 内（DEFAULT-OFF）才出一条 advisory 提醒补 `--closeout-status`，handoff 照常推进。一键静默：`touch $HANDOFF_HOME/{project}/.closeout-obligations-warn-off`。
 
+## §0.7 parked-backlog scan — 开张扫 owner backlog, 防衰减失忆 (anti-decay / 软规则机器化)
+
+> **触发**: 中枢接棒开张 — §0.5/§0.6 之后, 本步强制扫一遍 owner 的 parked backlog, 防 owner-req 衰减出当前摘要、靠 owner 记起才浮回。
+> **为什么**: "每棒开张必扫 backlog" 是软规则、靠自律, 实证仍漏 (中枢声称"无活了", owner 敲打"查你账本不是还有一堆")。把"扫 backlog"前移成开张硬动作。
+
+1. **扫 open-loops backlog 块**: 读中枢 memory `open-loops.md` 的「当前有效摘要」+「排期 BACKLOG」段, 逐项核当前状态 (别凭记忆)。
+```bash
+OL="$HOME/.claude/projects/-Users-chenmingzhong-Projects-{project}/memory/open-loops.md"
+grep -nE "BACKLOG|DONE|dx territory|owner-gated|parked|待 owner|RESURFACED" "$OL" | head -25
+```
+2. **逐项判定**: 每个 parked / owner-gated 项 → 仍有效 (still valid·本棒可推) / 已闭环 (done) / 已交别链 (dx-handed)。**禁**让 owner-gated 项静默滑出摘要。
+3. **诚实出口**: 本棒确无自主切片时 → **禁报 "nothing left / 没活了"**; 须显式列 owner-gated 清单交 owner (它们是"此刻无自主切片"非"不存在")。让 owner 一眼看全 backlog、不靠记忆浮回。
+
 ## 第一步: 启动 heartbeat (v5.1+ / 529 风暴防御 / v4.1 单 task 模式)
 
 > **触发**: 主人 5/29 'API Error 会话裸跑' 根因 — v4.1 单 task spawn 后若卡死 / 529 overloaded 没人接手。

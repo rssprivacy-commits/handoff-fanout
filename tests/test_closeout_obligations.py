@@ -724,3 +724,24 @@ def test_template_renders_closeout_guidance():
     # §-1.5 audit-close example carries a --closeout-status demonstration line
     i = md.find("full_codex_audit --run-record")
     assert "--closeout-status sedimentation_always=✅" in md[i:i + 260]
+
+
+def test_template_renders_backlog_scan_guidance():
+    """§0.7 anti-decay block: every engine-spawned coordinator's onboarding brief must tell it to
+    scan the owner backlog at开张 (machine-izing the soft 'scan backlog every hop' rule). The
+    {project} placeholder must be substituted with the real slug, and §0.5/§0.6 must still render."""
+    from pathlib import Path
+
+    md = templates.build_handoff_md(
+        task=TASK, project=PROJECT, workspace=Path("/tmp/ws"),
+        next_brief="x", status="active", tests=None, baseline={},
+        roadmap_excerpt="r", inject_blocks=[], handoff_home=Path("/tmp/hh"),
+        handoff_md_path=Path("/tmp/h.md"),
+    )
+    assert "§0.7 parked-backlog scan" in md
+    # {project} placeholder is substituted with the real slug in the OL= line, not left literal
+    assert f"-Users-chenmingzhong-Projects-{PROJECT}/memory/open-loops.md" in md
+    assert "-Projects-{project}/memory/open-loops.md" not in md
+    # sanity: the adjacent §0.5 + §0.6 blocks still render (no regression)
+    assert "§0.5 retrieval-pull" in md
+    assert "§0.6 closeout obligations" in md
