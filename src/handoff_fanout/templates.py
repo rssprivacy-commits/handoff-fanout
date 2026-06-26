@@ -237,6 +237,21 @@ grep -nE "BACKLOG|DONE|dx territory|owner-gated|parked|待 owner|RESURFACED" "$O
 2. **逐项判定**: 每个 parked / owner-gated 项 → 仍有效 (still valid·本棒可推) / 已闭环 (done) / 已交别链 (dx-handed)。**禁**让 owner-gated 项静默滑出摘要。
 3. **诚实出口**: 本棒确无自主切片时 → **禁报 "nothing left / 没活了"**; 须显式列 owner-gated 清单交 owner (它们是"此刻无自主切片"非"不存在")。让 owner 一眼看全 backlog、不靠记忆浮回。
 
+## §0.8 window placement — 开张自摆 + 派 worker 自动入位 (Rectangle within-desktop / 软规则机器化)
+
+> **触发**: 中枢接棒开张 (self-place) + 每派出一个 worker 之后 (place worker) — 用已装的 **Rectangle** 把窗口在**本桌面内**摆位, owner 一眼看全队形。
+> **为什么**: owner p71 立法「中枢窗 → 右半 / worker 窗 → 左上·左下交替」。手动摆窗靠自律必漂; 把"摆位"前移成开张 + 派后的硬动作。桌面*分配*仍归 dharmaxis vscode-spaces (RED LINE #4 — 本工具只读消费 winlist/goto); 这里只在桌面内平铺、用 Rectangle URL scheme (非自写 set position/size)、可逆 (Rectangle "Restore")。
+
+1. **开张自摆右半** (onboarding 之后, 一次; `--self` = 当前 frontmost 窗, 无 goto/无 restore):
+```bash
+~/.claude-handoff/supervisor-monitor/coord-place-window.py --project {project} --self --slot right-half --execute
+```
+2. **每派一个 worker 后自动入位** (worker 窗异步出现 → `--wait` 轮询; 计数 n 从 0 起、本棒每派一个 +1, 偶数→top-left 奇数→bottom-left):
+```bash
+~/.claude-handoff/supervisor-monitor/coord-place-window.py --project {project} --task <worker-task> --role worker --worker-index <n> --wait 45 --execute
+```
+3. **说明**: DRY-RUN 默认 (去掉 `--execute` 只打印 plan、不动窗); 身份 fail-closed (stable WID → 唯一 title, 非本链窗 HARD REFUSE); Rectangle 没起会显式报错不静默 no-op; 成功与否按 bounds delta 诚实判定。
+
 ## 第一步: 启动 heartbeat (v5.1+ / 529 风暴防御 / v4.1 单 task 模式)
 
 > **触发**: 主人 5/29 'API Error 会话裸跑' 根因 — v4.1 单 task spawn 后若卡死 / 529 overloaded 没人接手。

@@ -745,3 +745,29 @@ def test_template_renders_backlog_scan_guidance():
     # sanity: the adjacent §0.5 + §0.6 blocks still render (no regression)
     assert "§0.5 retrieval-pull" in md
     assert "§0.6 closeout obligations" in md
+
+
+def test_template_renders_window_placement_guidance():
+    """§0.8 window-placement block (req2): every engine-spawned coordinator's onboarding brief must
+    tell it to self-place (right-half) at开张 and place each spawned worker (top-left/bottom-left
+    alternating) via coord-place-window.py + the already-installed Rectangle. The {project}
+    placeholder is substituted in BOTH emitted commands, and §0.5/§0.6/§0.7 must still render."""
+    from pathlib import Path
+
+    md = templates.build_handoff_md(
+        task=TASK, project=PROJECT, workspace=Path("/tmp/ws"),
+        next_brief="x", status="active", tests=None, baseline={},
+        roadmap_excerpt="r", inject_blocks=[], handoff_home=Path("/tmp/hh"),
+        handoff_md_path=Path("/tmp/h.md"),
+    )
+    assert "§0.8 window placement" in md
+    # coordinator self-place command, {project} substituted with the real slug (not literal)
+    assert f"--project {PROJECT} --self --slot right-half --execute" in md
+    assert "--project {project}" not in md
+    # worker-place command keeps the runtime placeholders (<worker-task> / <n>) the coordinator fills
+    assert "--role worker --worker-index <n> --wait 45 --execute" in md
+    assert "supervisor-monitor/coord-place-window.py" in md
+    # no regression: the adjacent §0.5/§0.6/§0.7 blocks all still render
+    assert "§0.5 retrieval-pull" in md
+    assert "§0.6 closeout obligations" in md
+    assert "§0.7 parked-backlog scan" in md
