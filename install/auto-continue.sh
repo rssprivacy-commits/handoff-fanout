@@ -267,7 +267,12 @@ maybe_place_window() {
     local role="worker" sc="$queue/$task.singlepane" sc_role=""
     if [ -f "$sc" ]; then
         sc_role=$("$HANDOFF_PYTHON_CMD" - "$sc" <<'PY' 2>/dev/null
-import json, sys
+import json, sys, signal
+# hard self-bound (default-ON contract: never an unbounded subprocess in the pre-return-jump path).
+# A hung read/parse → SIGALRM → handler raises → except → print "" (role defaults to worker). The
+# 5s cap is generous for a tiny local sidecar read yet guarantees the watchdog strand can't pin.
+signal.signal(signal.SIGALRM, lambda *_a: (_ for _ in ()).throw(TimeoutError()))
+signal.alarm(5)
 try:
     d = json.loads(open(sys.argv[1], encoding="utf-8").read())
     print(d.get("role", "") if isinstance(d, dict) else "")
