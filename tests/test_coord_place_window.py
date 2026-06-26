@@ -134,6 +134,15 @@ def test_is_self_placeable():
     assert cpw.is_self_placeable("plain title — no fields", "handoff-fanout") is False
 
 
+def test_frontmost_is(monkeypatch):
+    # frontmost_is delegates to frontmost_window_title and demands EXACT equality.
+    monkeypatch.setattr(cpw, "frontmost_window_title", lambda: COORD)
+    assert cpw.frontmost_is(COORD) is True             # matching title → True
+    assert cpw.frontmost_is(WORKER) is False           # different title → False
+    monkeypatch.setattr(cpw, "frontmost_window_title", lambda: None)
+    assert cpw.frontmost_is(COORD) is False            # None (another app frontmost) → never True
+
+
 # ── pure helpers: bounds delta (honest success reporting) ────────────────────
 
 
@@ -155,7 +164,18 @@ def test_bounds_changed():
 # ── osacompile: EVERY AppleScript actuator must COMPILE (close-windows p70 bug class) ──
 
 
-@pytest.mark.parametrize("const_name", ["RAISE_OSA", "BOUNDS_BY_TITLE_OSA", "SELF_TITLE_OSA", "BOUNDS_FRONT_OSA"])
+# EVERY module-level AppleScript constant (attr ending in _OSA) is enumerated DYNAMICALLY so
+# any new actuator (e.g. FRONTMOST_OSA) is auto-covered without editing a hardcoded list.
+_OSA_CONSTS = sorted(n for n in dir(cpw) if n.endswith("_OSA") and isinstance(getattr(cpw, n), str))
+
+
+def test_osa_consts_enumerated():
+    # Guard: the dynamic scan actually found the actuators (a typo'd suffix would silently skip).
+    assert "FRONTMOST_OSA" in _OSA_CONSTS
+    assert "RAISE_OSA" in _OSA_CONSTS
+
+
+@pytest.mark.parametrize("const_name", _OSA_CONSTS)
 def test_applescript_constant_compiles(const_name):
     osacompile = shutil.which("osacompile")
     if osacompile is None:
@@ -225,6 +245,7 @@ def test_run_place_execute_gotos_raises_fires_restores(monkeypatch):
     monkeypatch.setattr(cpw, "goto", lambda n: (gotos.append(n), True)[1])
     raised = []
     monkeypatch.setattr(cpw, "raise_window", lambda t: raised.append(t))
+    monkeypatch.setattr(cpw, "frontmost_is", lambda t: True)   # raise made the target the global frontmost
     fired = []
     monkeypatch.setattr(cpw, "fire_rectangle", lambda s: fired.append(s))
     bounds = iter(["0,0,100,100", "1028,39,1028,1290"])
@@ -249,6 +270,24 @@ def test_run_place_failed_goto_never_fires(monkeypatch):
     with pytest.raises(SystemExit):
         cpw.run_place("handoff-fanout", "sw-foo", None, "top-left", 0.0, execute=True)
     assert fired == []   # fail-closed: never fired on the wrong Space
+
+
+def test_run_place_active_unknown_fail_closed(monkeypatch):
+    # Target is on a DIFFERENT desktop but the owner's active desktop is UNKNOWN (None) →
+    # a cross-desktop goto could never be restored → fail-closed BEFORE any goto/fire.
+    win = _win("handoff-fanout · sw-foo · worker · " + "f" * 16 + " [worktree] — x", 100, desktop=7)
+    monkeypatch.setattr(cpw, "probe_windows", lambda: [win])
+    monkeypatch.setattr(cpw, "detect_active_desktop", lambda w: None)   # active desktop undetectable
+    monkeypatch.setattr(cpw, "rectangle_running", lambda: True)
+    gotos = []
+    monkeypatch.setattr(cpw, "goto", lambda n: (gotos.append(n), True)[1])
+    fired = []
+    monkeypatch.setattr(cpw, "fire_rectangle", lambda s: fired.append(s))
+    monkeypatch.setattr(cpw.time, "sleep", lambda *a: None)
+    with pytest.raises(SystemExit):
+        cpw.run_place("handoff-fanout", None, 100, "top-left", 0.0, execute=True)
+    assert gotos == []   # never switched Space (can't restore it)
+    assert fired == []   # fail-closed: nothing fired
 
 
 def test_run_place_refuses_other_chain(monkeypatch):
@@ -303,6 +342,8 @@ def test_run_self_refuses_other_chain_coord(monkeypatch):
 def test_run_self_coord_fires(monkeypatch):
     monkeypatch.setattr(cpw, "read_frontmost_title", lambda: COORD)
     monkeypatch.setattr(cpw, "rectangle_running", lambda: True)
+    monkeypatch.setattr(cpw, "raise_window", lambda t: None)
+    monkeypatch.setattr(cpw, "frontmost_is", lambda t: True)   # raise made it the global frontmost
     bounds = iter(["0,0,100,100", "1028,39,1028,1290"])
     monkeypatch.setattr(cpw, "capture_front_bounds", lambda: next(bounds))
     fired = []
@@ -310,6 +351,21 @@ def test_run_self_coord_fires(monkeypatch):
     monkeypatch.setattr(cpw.time, "sleep", lambda *a: None)
     cpw.run_self("handoff-fanout", "right-half", execute=True)
     assert fired == ["right-half"]
+
+
+def test_run_self_fail_closed_when_not_frontmost_after_raise(monkeypatch):
+    # The validated 🧭 window is correct, but another app/window holds focus after raise →
+    # fail-closed, never fire Rectangle on the wrong (global frontmost) window.
+    monkeypatch.setattr(cpw, "read_frontmost_title", lambda: COORD)   # valid coord title
+    monkeypatch.setattr(cpw, "rectangle_running", lambda: True)
+    monkeypatch.setattr(cpw, "raise_window", lambda t: None)
+    monkeypatch.setattr(cpw, "frontmost_is", lambda t: False)         # raise did NOT win focus
+    fired = []
+    monkeypatch.setattr(cpw, "fire_rectangle", lambda s: fired.append(s))
+    monkeypatch.setattr(cpw.time, "sleep", lambda *a: None)
+    with pytest.raises(SystemExit):
+        cpw.run_self("handoff-fanout", "right-half", execute=True)
+    assert fired == []   # fail-closed: never fired on the wrong frontmost window
 
 
 def test_run_self_dryrun_never_fires(monkeypatch, capsys):
