@@ -30,9 +30,26 @@ _CANDIDATES = [
     Path.home() / ".claude-handoff" / "supervisor-monitor" / "coord-place-window.py",  # deployed
     Path.home() / ".claude-handoff" / "staging-place" / "coord-place-window.py",       # pre-deploy
 ]
-CPW_PATH = next((p for p in _CANDIDATES if p.exists()), None)
-if CPW_PATH is None:
+_EXISTING = [p for p in _CANDIDATES if p.exists()]
+if not _EXISTING:
     pytest.skip("coord-place-window.py not deployed/staged on this machine", allow_module_level=True)
+
+
+def _pick_path():
+    """Deterministically prefer the LOCK-CAPABLE build: the first candidate whose SOURCE defines
+    ``placement_lock`` (the final flock build). This way the suite always exercises the lock build
+    when one is present, regardless of which copy (deployed vs staging) `next-existing` would pick.
+    Fall back to the first existing candidate if none define it (an older pre-lock build)."""
+    for p in _EXISTING:
+        try:
+            if "def placement_lock" in p.read_text():
+                return p
+        except OSError:
+            continue
+    return _EXISTING[0]
+
+
+CPW_PATH = _pick_path()
 
 
 def _load():
@@ -44,6 +61,29 @@ def _load():
 
 
 cpw = _load()
+
+# Holder for the per-test isolated lock path (set by the `_isolate_placement_lock` autouse fixture).
+# A 1-element list so `_load_staging` (module function) can read the CURRENT value by reference and
+# redirect freshly-loaded staging modules to the same tmp path.
+_ACTIVE_LOCKFILE = [None]
+
+
+@pytest.fixture(autouse=True)
+def _isolate_placement_lock(tmp_path, monkeypatch):
+    """Never touch the real machine-wide ~/.claude-handoff/.place-window.lock during tests:
+    redirect every loaded module's PLACE_LOCK_FILE to a per-test tmp file (so the real flock —
+    and any concurrent live placement — is never contended) + keep the wait short. `cpw` is the
+    module-level build (deployed copy now carries the real flock lock); staging modules loaded
+    per-test via `_load_staging` pick up the same tmp path through `_ACTIVE_LOCKFILE`."""
+    lockfile = str(tmp_path / "place-window.lock")
+    _ACTIVE_LOCKFILE[0] = lockfile
+    for _mod in {id(m): m for m in (cpw,) if m is not None}.values():
+        if hasattr(_mod, "PLACE_LOCK_FILE"):
+            monkeypatch.setattr(_mod, "PLACE_LOCK_FILE", lockfile, raising=False)
+        if hasattr(_mod, "PLACE_LOCK_WAIT"):
+            monkeypatch.setattr(_mod, "PLACE_LOCK_WAIT", 1.0, raising=False)
+    yield
+    _ACTIVE_LOCKFILE[0] = None
 
 
 def _win(title, wid, desktop=1):
@@ -394,6 +434,13 @@ def _load_staging():
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    # A staging module is loaded FRESH inside each test (after the autouse isolation fixture has
+    # run), so it starts with the REAL PLACE_LOCK_FILE. Redirect it to the per-test isolated path
+    # set by `_isolate_placement_lock` so a freshly-loaded `spw` never touches the real lock either.
+    if _ACTIVE_LOCKFILE[0] is not None and hasattr(mod, "PLACE_LOCK_FILE"):
+        mod.PLACE_LOCK_FILE = _ACTIVE_LOCKFILE[0]
+        if hasattr(mod, "PLACE_LOCK_WAIT"):
+            mod.PLACE_LOCK_WAIT = 1.0
     return mod
 
 
@@ -430,7 +477,10 @@ def test_placement_lock_contention_skips(tmp_path, monkeypatch):
     monkeypatch.setattr(spw, "PLACE_LOCK_FILE", str(lockfile))
     monkeypatch.setattr(spw, "PLACE_LOCK_WAIT", 0.5)    # tiny wait → fast fail-safe
     monkeypatch.setattr(spw.time, "sleep", lambda *a: None)
-    holder_fd = _os.open(str(lockfile), _os.O_CREAT | _os.O_RDWR, 0o644)
+    # Contend on the EXACT path the code-under-test uses (read it back from the module, never a
+    # hardcoded ~/.claude-handoff path) so the holder fd and placement_lock share the same file.
+    held_path = spw.PLACE_LOCK_FILE
+    holder_fd = _os.open(held_path, _os.O_CREAT | _os.O_RDWR, 0o644)
     _fcntl.flock(holder_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)   # we hold it exclusively
     try:
         with spw.placement_lock() as got:
