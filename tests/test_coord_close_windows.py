@@ -10,6 +10,9 @@ deployed on this machine the module is skipped (environmental, like the DX_SPAWN
 from __future__ import annotations
 
 import importlib.util
+import shutil
+import subprocess
+import tempfile
 import types
 from pathlib import Path
 
@@ -83,6 +86,34 @@ def test_close_by_wid_osa_uses_exact_equality_and_indices():
     # WID close matches by EXACT equality (not `contains`) and returns ARGV indices.
     assert "is equal to (item idx of argv)" in ccw.CLOSE_BY_WID_OSA
     assert 'text item delimiters to ","' in ccw.CLOSE_BY_WID_OSA
+
+
+# ─── req3 close-windows asfix: both AppleScript actuators must COMPILE ────────
+# The bug (sw-coord-p70 behavior-verify): both constants used the one-liner
+# `tell application "System Events" to tell process "Code"` form, which opens a
+# single (or zero) block, but the body closed with TWO `end tell` lines → the
+# second `end tell` had no matching `tell` → `osascript rc=1 syntax error` →
+# closed 0. The unit tests above only string-matched the source, so the SYNTAX
+# error slipped through. This regression test compiles each constant with the
+# real AppleScript compiler so a future structural break fails CI on a Mac.
+
+
+@pytest.mark.parametrize("const_name", ["CLOSE_OSA", "CLOSE_BY_WID_OSA"])
+def test_applescript_constant_compiles(const_name):
+    osacompile = shutil.which("osacompile")
+    if osacompile is None:
+        pytest.skip("osacompile unavailable (non-mac CI) — syntax check skipped")
+    source = getattr(ccw, const_name)
+    with tempfile.TemporaryDirectory() as d:
+        src = Path(d) / f"{const_name}.applescript"
+        src.write_text(source)
+        out = Path(d) / f"{const_name}.scpt"
+        r = subprocess.run(
+            [osacompile, "-o", str(out), str(src)],
+            capture_output=True,
+            text=True,
+        )
+    assert r.returncode == 0, f"{const_name} failed to compile: {r.stderr.strip()}"
 
 
 def test_close_by_titles_maps_indices_to_titles(monkeypatch):
