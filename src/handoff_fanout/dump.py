@@ -343,6 +343,9 @@ def _run_retro_gate(
         mandate_enabled=mandate,
         audit_mandate_enabled=audit_mandate,
         audit_mandate_expected=audit_mandate_expected,
+        # ship-live closure gate (DEFAULT-ON / §13.6): additive + narrow (fires only on a
+        # structured closeout_obligations.release=✅), with env / config / sentinel off-switches.
+        closure_mandate_enabled=_closure_attestation_mandate_enabled(cfg, project),
         nonce=args.nonce,
         session_id=sid,
     )
@@ -984,6 +987,40 @@ def _closeout_obligations_warn_enabled(cfg: _config.Config, project: str) -> boo
     return True
 
 
+def _closure_attestation_mandate_enabled(cfg: _config.Config, project: str) -> bool:
+    """Is the ship-live closure_attestation gate ON for ``project``? DEFAULT-**ON** (ship-live is
+    owner law, NOT opt-in — the opposite default from the warn/anchor lists above) + fail-SAFE.
+
+    OFF iff ANY of (so a fleet-wide misfire has multiple one-key rollbacks):
+      * env ``HANDOFF_CLOSURE_OFF=1``                              (fleet kill, no config edit)
+      * ``config.json: closure_attestation_mandate: false``       (durable owner kill)
+      * sentinel ``$HANDOFF_HOME/<project>/.closure-gate-off``     (per-project rollback)
+      * sentinel ``$HANDOFF_HOME/.closure-gate-off``               (fleet-wide rollback)
+      * the config was present-but-untrustworthy (``config_trusted=False``) — a BLOCKING gate must
+        never run off an unparseable config (禁止 a corrupt config silently blocking handoffs).
+
+    The gate itself is additive + narrow (rides the existing evidence path; fires only on a
+    structured release=✅), so even ON it is a no-op for coordination / no-evidence dumps. Any
+    unexpected error → OFF (fail-open: a blocking gate must never brick a handoff on its own bug).
+    """
+    try:
+        if os.environ.get("HANDOFF_CLOSURE_OFF") == "1":
+            return False
+        if getattr(cfg, "closure_attestation_mandate", True) is False:
+            return False
+        if getattr(cfg, "config_trusted", True) is False:
+            return False
+        if (cfg.home / project / ".closure-gate-off").exists():
+            return False
+        if (cfg.home / ".closure-gate-off").exists():
+            return False
+    except OSError:
+        return False
+    except Exception:
+        return False
+    return True
+
+
 def _run_closeout_obligations_gate(
     args: argparse.Namespace, project: str, cfg: _config.Config
 ) -> None:
@@ -1489,6 +1526,14 @@ def _write_old_ready(
     closeout_obligations = payload.get("closeout_obligations")
     if isinstance(closeout_obligations, dict) and closeout_obligations:
         old_ready["closeout_obligations"] = closeout_obligations
+
+    # closure_attestation (the「闭环证书」): surface the closing session's binding(s) so the next
+    # §0 audit can challenge a suspicious release=skip (the same successor-challenge posture
+    # closeout has — 同信任域 visibility, PROTOCOL §13.6). Additive-when-present: a non-list /
+    # absent / empty value is ignored → old_ready stays byte-stable for the common case.
+    closure_attestation = payload.get("closure_attestation")
+    if isinstance(closure_attestation, list) and closure_attestation:
+        old_ready["closure_attestation"] = closure_attestation
 
     ack_dir.mkdir(parents=True, exist_ok=True)
     out = ack_dir / f"{task}.old_ready"

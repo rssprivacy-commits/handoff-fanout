@@ -252,6 +252,22 @@ grep -nE "BACKLOG|DONE|dx territory|owner-gated|parked|待 owner|RESURFACED" "$O
 ```
 3. **说明**: DRY-RUN 默认 (去掉 `--execute` 只打印 plan、不动窗); 身份 fail-closed (stable WID → 唯一 title, 非本链窗 HARD REFUSE); Rectangle 没起会显式报错不静默 no-op; 成功与否按 bounds delta 诚实判定。
 
+## §0.9 closure attestation — 声称用户可见交付必绑 live 证据 (ship-live 硬闸 / DEFAULT-ON)
+
+> **触发**: 你这一棒**真做出了用户可见交付 / 功能上线**、且要在交棒里声明它 (`--closeout-status release=✅`) 时。
+> **为什么**: 「彻底闭环」过去是唯一纯靠自觉的核心立法 → 系统性拿"建了 / 提交了 / 记一笔"顶替"真 live 生效"。这条把它机器化：**声明了 release=✅ 就必须给出「闭环证书」**——把每个交付绑到具体 live 证据 (部署位置 + behavior-verify)，否则 dump 被拒 (retry→block)。它**只**读你自己填的结构化字段、**绝不**去解析你的散文判断真假 (这正是 field-verify 闸 p67 死于"不可判定"的坑——本闸绕开它)。
+
+1. **每个交付一条证书** (在你自己交棒的 `audit-close` 上加 flag，折进同一份 retro evidence)：
+```bash
+handoff audit-close ... \\
+  --closeout-status release=✅ \\
+  --closure-evidence '<交付名>=shipped:<deployed: SHA|部署路径|合 main commit>::<verified: 跑了什么命令 → 观察到什么效果>'
+```
+2. **N/A 出口** (本棒确无用户可见交付)：把 `release` 标 `skip` 即可，**无需**证书：`--closeout-status release=skip:<为何本棒无用户可见交付>`。
+3. **shipped 须双绑**：`deployed`=去了哪 (哪个 live 位置)、`verified`=behavior-verify (命令 → 效果，非"我觉得好了")；只 `skip` 不算 (声明了 release=✅ 却全 skip / 缺证书 → 闸拦)。
+4. **同信任域定位**：闸=**防默认漂移 + 抬地板 + 留痕**，非围堵铁心说谎——你大可标 `release=skip` 蒙混，但那是一次**显式、可审、被下一棒 §0 挑战**的谎 (证书 surface 进 `old_ready`)。
+5. **DEFAULT-ON / 纯 additive**：只在**已有 retro evidence 的交棒**上生效 (legacy 无证据 dump 不受影响)、只在 release=✅ 触发 (协调 / 内部重构棒不碰=零 FP)。一键回滚：`touch $HANDOFF_HOME/{project}/.closure-gate-off` (本项目) 或 `$HANDOFF_HOME/.closure-gate-off` (全域) 或 `HANDOFF_CLOSURE_OFF=1`。
+
 ## 第一步: 启动 heartbeat (v5.1+ / 529 风暴防御 / v4.1 单 task 模式)
 
 > **触发**: 主人 5/29 'API Error 会话裸跑' 根因 — v4.1 单 task spawn 后若卡死 / 529 overloaded 没人接手。

@@ -2532,6 +2532,26 @@ def main_audit_close(argv: list[str] | None = None) -> int:
         "needs no reason; ⚠️/❌/skip require one ('skip' encodes an N/A item → give why it does "
         "not apply), e.g. --closeout-status release=skip:no user-visible change this hop",
     )
+    # closure_attestation (ship-live closure gate / DEFAULT-ON / §13.6): the closing session's
+    # 「闭环证书」binding a claimed delivery to LIVE evidence (folded into the SAME retro evidence
+    # the inner dump consumes — the path a real 中枢交棒 uses). Mirrors the handoff precheck CLI.
+    # REQUIRED when --closeout-status release=✅; the dump-side gate BLOCKS without it.
+    ap.add_argument(
+        "--closure-evidence",
+        action="append",
+        default=[],
+        dest="closure_evidence",
+        help="closure_attestation (ship-live gate): repeatable; "
+        "<deliverable>=shipped:<deployed>::<verified> (deployed=SHA/path/merged-commit; "
+        "verified=cmd→observed effect) OR <deliverable>=skip:<reason>. Required when "
+        "--closeout-status release=✅",
+    )
+    ap.add_argument(
+        "--closure-evidence-file",
+        default=None,
+        dest="closure_evidence_file",
+        help="path to a JSON array of closure_attestation objects (REPLACES the flags — file wins)",
+    )
     args = ap.parse_args(argv)
 
     if not _pc.TASK_ID_RE.match(args.task):
@@ -2665,6 +2685,28 @@ def main_audit_close(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"ERR-FATAL closeout-status-invalid: {e}\n")
             return 1
 
+    # closure_attestation (ship-live gate / §13.6): the file REPLACES the flags (file wins).
+    # Parse + validate now so a malformed value is a clean nonzero exit BEFORE the lock / any
+    # artifact (mirrors the backref / lesson / closeout pre-check — validation is pre-lock).
+    closure_file = _pc._load_closure_file(
+        Path(args.closure_evidence_file) if args.closure_evidence_file else None
+    )
+    if closure_file is not None:
+        if args.closure_evidence:
+            sys.stderr.write(
+                "WARN closure-file-wins: both --closure-evidence and --closure-evidence-file "
+                "given; the file replaces the flags\n"
+            )
+        closure_raw: list[dict] | None = closure_file
+    else:
+        closure_raw = _pc.parse_closure_kv(args.closure_evidence) or None
+    if closure_raw:
+        try:
+            _pc._validate_closure_attestation(closure_raw)
+        except ValueError as e:
+            sys.stderr.write(f"ERR-FATAL closure-evidence-invalid: {e}\n")
+            return 1
+
     # R2 P1: the entire audit snapshot — validate run records, read dispositions,
     # build the block, write evidence, dump — must run under ONE held critical
     # section so a concurrent audit-run / audit-disposition can't mutate the
@@ -2765,6 +2807,7 @@ def main_audit_close(argv: list[str] | None = None) -> int:
                 predecessor_lesson_backref=backref_raw,
                 lesson_disposition=lesson_disp_raw,
                 closeout_obligations=closeout_raw,
+                closure_attestation=closure_raw,
             )
             out = _pc.precheck_dir(project) / f"{args.task}.retro.evidence.json"
             _pc.write_evidence(evidence, out)
