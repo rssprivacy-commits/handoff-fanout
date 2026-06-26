@@ -376,3 +376,129 @@ def test_run_self_dryrun_never_fires(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "DRY-RUN" in out
     assert fired == []
+
+
+# ── fleet placement lock (machine-wide active-Space mutex) ───────────────────
+# IMPORTANT: the lock lives in the STAGING copy first; the deployed supervisor-monitor/
+# copy is the OLD version until the coordinator re-deploys. _CANDIDATES above PREFERS the
+# deployed copy, so `cpw` may be the pre-lock build. These tests therefore load the STAGING
+# file EXPLICITLY (the SOT for the new code), independent of which copy `cpw` resolved to.
+# Once the coordinator deploy-audits the staging file → supervisor-monitor/, both copies
+# carry the lock and these tests would pass against either; until then they pin the new code.
+
+_STAGING_CPW = Path.home() / ".claude-handoff" / "staging-place" / "coord-place-window.py"
+
+
+def _load_staging():
+    spec = importlib.util.spec_from_file_location("coord_place_window_staging", _STAGING_CPW)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_staging_skip = pytest.mark.skipif(
+    not _STAGING_CPW.exists()
+    or "placement_lock" not in _STAGING_CPW.read_text(),
+    reason="staging coord-place-window.py with placement_lock not present",
+)
+
+
+@_staging_skip
+def test_placement_lock_acquires_and_releases(tmp_path, monkeypatch):
+    spw = _load_staging()
+    lockdir = tmp_path / ".place-window.lock"
+    monkeypatch.setattr(spw, "PLACE_LOCK_DIR", str(lockdir))
+    assert not lockdir.exists()
+    with spw.placement_lock() as got:
+        assert got is True
+        assert lockdir.is_dir()        # mkdir created the lockdir while held
+    assert not lockdir.exists()        # released in finally → dir gone
+
+
+@_staging_skip
+def test_placement_lock_contention_skips(tmp_path, monkeypatch):
+    spw = _load_staging()
+    lockdir = tmp_path / ".place-window.lock"
+    monkeypatch.setattr(spw, "PLACE_LOCK_DIR", str(lockdir))
+    monkeypatch.setattr(spw, "PLACE_LOCK_WAIT", 0.05)   # tiny wait → fast fail-safe
+    monkeypatch.setattr(spw.time, "sleep", lambda *a: None)
+    lockdir.parent.mkdir(parents=True, exist_ok=True)
+    lockdir.mkdir()                     # a FRESH holder already owns the lock
+    with spw.placement_lock() as got:
+        assert got is False             # contention → could not acquire → caller must SKIP
+    assert lockdir.is_dir()             # we did NOT steal/break the live holder's lock
+
+
+@_staging_skip
+def test_placement_lock_breaks_stale(tmp_path, monkeypatch):
+    spw = _load_staging()
+    import os as _os
+    lockdir = tmp_path / ".place-window.lock"
+    monkeypatch.setattr(spw, "PLACE_LOCK_DIR", str(lockdir))
+    monkeypatch.setattr(spw.time, "sleep", lambda *a: None)
+    lockdir.parent.mkdir(parents=True, exist_ok=True)
+    lockdir.mkdir()                     # a holder dir...
+    stale = spw._now() - 100.0          # ...older than PLACE_LOCK_TTL (45s) → dead holder
+    _os.utime(str(lockdir), (stale, stale))
+    with spw.placement_lock() as got:
+        assert got is True              # stale lock reclaimed → we acquired it
+        assert lockdir.is_dir()
+    assert not lockdir.exists()         # and released it cleanly
+
+
+@_staging_skip
+def test_run_place_skips_when_lock_unavailable(monkeypatch):
+    # placement_lock yields False (could not acquire) → run_place SKIPs (SystemExit) and NEVER
+    # fires Rectangle — that is the whole point: never place without the lock (= the race).
+    spw = _load_staging()
+    import contextlib as _cl
+    win = _win("handoff-fanout · sw-foo · worker · " + "a" * 16 + " [worktree] — x", 100, desktop=5)
+    monkeypatch.setattr(spw, "probe_windows", lambda: [win])
+    monkeypatch.setattr(spw, "detect_active_desktop", lambda w: 9)
+    monkeypatch.setattr(spw, "rectangle_running", lambda: True)
+    fired = []
+    monkeypatch.setattr(spw, "fire_rectangle", lambda s: fired.append(s))
+    gotos = []
+    monkeypatch.setattr(spw, "goto", lambda n: (gotos.append(n), True)[1])
+
+    @_cl.contextmanager
+    def _no_lock():
+        yield False                     # never acquired
+    monkeypatch.setattr(spw, "placement_lock", _no_lock)
+    monkeypatch.setattr(spw.time, "sleep", lambda *a: None)
+    with pytest.raises(SystemExit):
+        spw.run_place("handoff-fanout", "sw-foo", None, "top-left", 0.0, execute=True)
+    assert fired == []                  # skipped → no race
+    assert gotos == []                  # never switched Space
+
+
+@_staging_skip
+def test_run_place_fires_when_lock_held(monkeypatch):
+    # Happy path on the STAGING build: lock acquired (yields True) → full goto/raise/fire/restore.
+    spw = _load_staging()
+    import contextlib as _cl
+    win = _win("handoff-fanout · sw-foo · worker · " + "c" * 16 + " [worktree] — x", 100, desktop=5)
+    monkeypatch.setattr(spw, "probe_windows", lambda: [win])
+    monkeypatch.setattr(spw, "detect_active_desktop", lambda w: 9)
+    monkeypatch.setattr(spw, "rectangle_running", lambda: True)
+    gotos = []
+    monkeypatch.setattr(spw, "goto", lambda n: (gotos.append(n), True)[1])
+    raised = []
+    monkeypatch.setattr(spw, "raise_window", lambda t: raised.append(t))
+    monkeypatch.setattr(spw, "frontmost_is", lambda t: True)
+    fired = []
+    monkeypatch.setattr(spw, "fire_rectangle", lambda s: fired.append(s))
+    bounds = iter(["0,0,100,100", "1028,39,1028,1290"])
+    monkeypatch.setattr(spw, "capture_bounds_by_title", lambda t: next(bounds))
+
+    @_cl.contextmanager
+    def _held_lock():
+        yield True                      # acquired
+    monkeypatch.setattr(spw, "placement_lock", _held_lock)
+    monkeypatch.setattr(spw.time, "sleep", lambda *a: None)
+    spw.run_place("handoff-fanout", "sw-foo", None, "top-left", 0.0, execute=True)
+    assert 5 in gotos                   # switched to the target's desktop (inside the lock)
+    assert gotos[-1] == 9               # restored the owner's active desktop LAST
+    assert raised and raised[0] == win["title"]
+    assert fired == ["top-left"]
