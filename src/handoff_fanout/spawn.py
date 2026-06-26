@@ -92,12 +92,14 @@ def _err(msg: str) -> None:
 # ─── prompt / uri ─────────────────────────────────────────────────────────────
 
 
-# req1 (machine-enforced 大白话 purpose-echo): ``大白话`` is the distinctive cue marking a prompt
-# that ALREADY carries a plain-language purpose statement (a coord_dispatch brief, or a deliberate
-# purpose-bearing literal --prompt) — such a prompt is NOT re-injected. NB the live dx-spawn prompt
-# carries only a bare "echo your 🆔" cue (回显本窗口标识), NOT this cue — it has no purpose, which is
-# exactly the gap req1 closes, so it DOES get the injection.
-_PURPOSE_ECHO_CUE = "大白话"
+# req1 (machine-enforced 大白话 purpose-echo): the cue is the DISTINCTIVE phrase the injection itself
+# emits — not the bare noun ``大白话`` (which a literal --prompt may mention incidentally, e.g. "把架构
+# 用大白话写给主人", and which must NOT false-skip the injection — the Codex-flagged FIX D bug). A
+# prompt that ALREADY carries this exact phrase (a re-dispatch of an injected prompt, or a deliberate
+# purpose-bearing literal) is left verbatim (no double-inject). NB the live dx-spawn prompt carries
+# only a bare "echo your 🆔" cue (回显本窗口标识), NOT this phrase — it has no purpose, which is exactly
+# the gap req1 closes, so it DOES get the injection.
+_PURPOSE_ECHO_CUE = "用一句大白话说明你这个会话要做什么"
 
 
 def _purpose_echo_instruction(task: str, *, brief: str | None) -> str:

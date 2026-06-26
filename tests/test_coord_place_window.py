@@ -707,6 +707,48 @@ def test_probe_left_quadrant_occupancy_no_frame_is_empty(monkeypatch):
     assert spw.probe_left_quadrant_occupancy([_win("x", 1, desktop=5)], 5, 99) == set()
 
 
+_staging_multidisplay_skip = pytest.mark.skipif(
+    not _STAGING_CPW.exists()
+    or "def all_display_frames" not in _STAGING_CPW.read_text(),
+    reason="staging coord-place-window.py with multi-display (FIX B) free-quadrant probe not present",
+)
+
+
+@_staging_multidisplay_skip
+def test_probe_left_quadrant_occupancy_filters_by_target_display(monkeypatch):
+    # FIX B (dual-brain): with ≥2 displays the probe pins to the display CONTAINING the target window
+    # and counts ONLY same-display windows, so a worker on a secondary display alternates against ITS
+    # screen's quadrants instead of being misjudged against the main-display frame.
+    spw = _load_staging()
+    # main display + a secondary display abutting on the right (top-left-origin global coords)
+    monkeypatch.setattr(spw, "all_display_frames",
+                        lambda: [(0, 0, 2000, 1300), (2000, 0, 2000, 1300)])
+    bounds = {
+        "target":   "2000,0,1000,650",   # the just-spawned worker — on the SECONDARY display
+        "sec-wkr":  "2000,0,1000,650",    # secondary display, top-left → counts
+        "main-wkr": "0,0,1000,650",       # MAIN display top-left → must NOT count (other display)
+    }
+    monkeypatch.setattr(spw, "capture_bounds_by_title", lambda t: bounds.get(t))
+    wins = [_win("target", 100, desktop=5), _win("sec-wkr", 101, desktop=5),
+            _win("main-wkr", 102, desktop=5)]
+    # only the secondary-display worker is counted; the main-display worker is filtered out by display
+    assert spw.probe_left_quadrant_occupancy(wins, 5, 100) == {"top-left"}
+
+
+@_staging_multidisplay_skip
+def test_probe_left_quadrant_occupancy_single_display_unchanged(monkeypatch):
+    # FIX B degrade contract: with a single display (or Quartz unavailable → all_display_frames []),
+    # behavior is byte-unchanged — classify every same-desktop window against the main-display frame.
+    spw = _load_staging()
+    monkeypatch.setattr(spw, "all_display_frames", lambda: [])    # Quartz unavailable / 1 display
+    monkeypatch.setattr(spw, "screen_visible_frame", lambda: (0, 0, 2056, 1329))
+    bounds = {"worker-A": "0,39,1028,645", "coord-R": "1028,39,1028,1290"}
+    monkeypatch.setattr(spw, "capture_bounds_by_title", lambda t: bounds.get(t))
+    wins = [_win("target", 100, desktop=5), _win("worker-A", 101, desktop=5),
+            _win("coord-R", 102, desktop=5), _win("worker-B", 103, desktop=9)]
+    assert spw.probe_left_quadrant_occupancy(wins, 5, 100) == {"top-left"}
+
+
 def _free_quad_run_place(monkeypatch, occupied):
     """Drive run_place on the STAGING build with slot=FREE_QUADRANT and a MOCKED occupancy probe
     (returning ``occupied``); return the list of slots actually fired."""

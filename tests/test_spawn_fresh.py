@@ -440,15 +440,32 @@ def test_prompt_live_dxspawn_shape_injected_without_id_duplication(tmp_path, mon
 
 
 def test_prompt_with_existing_cue_left_verbatim(tmp_path, monkeypatch):
-    """A literal --prompt that ALREADY carries the 大白话 purpose cue is used verbatim — no
-    double-injection of the instruction."""
+    """A literal --prompt that ALREADY carries the PRECISE 大白话 purpose marker (the distinctive
+    injected phrase, not the bare noun) is used verbatim — no double-injection of the instruction."""
     home = _home(tmp_path, monkeypatch)
     repo = _plain_repo(tmp_path)
-    crafted = f"🆔{TASK} 我用大白话说：本会话给 X 加缓存。open `/tmp/b.md` and execute."
+    crafted = (
+        f"🆔{TASK} 用一句大白话说明你这个会话要做什么：本会话给 X 加缓存。"
+        f"open `/tmp/b.md` and execute."
+    )
     assert spawn.main(_argv(isolation="singlepane", workspace=repo, prompt=crafted)) == 0
     prompt = _decoded_prompt(home)
-    assert prompt == crafted  # verbatim, prefix already present
-    assert "用一句大白话说明你这个会话要做什么" not in prompt  # the injected instruction is absent
+    assert prompt == crafted  # verbatim, prefix + cue already present
+    assert prompt.count("用一句大白话说明你这个会话要做什么") == 1  # not double-injected
+
+
+def test_prompt_bare_noun_dabaihua_still_injected(tmp_path, monkeypatch):
+    """FIX D (Codex): a literal --prompt that merely MENTIONS the noun '大白话' (e.g. asks the worker
+    to write something 用大白话) but does NOT carry the precise injected marker is STILL injected — an
+    incidental mention of the noun no longer false-skips the purpose echo (the bare-substring bug)."""
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    crafted = f"🆔{TASK} 把架构用大白话写给主人。open `/tmp/b.md` and execute."
+    assert spawn.main(_argv(isolation="singlepane", workspace=repo, prompt=crafted)) == 0
+    prompt = _decoded_prompt(home)
+    assert prompt.startswith(f"🆔{TASK} 🔴开张第一句先回显")          # injected, leads with id + echo
+    assert "用一句大白话说明你这个会话要做什么" in prompt            # the instruction WAS injected
+    assert "把架构用大白话写给主人" in prompt                        # original literal preserved
 
 
 def test_build_prompt_succession_role_not_injected():
