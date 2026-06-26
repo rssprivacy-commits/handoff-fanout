@@ -17,15 +17,24 @@ hold (spec req3 §1):
   1. **worker, NOT coordinator** — the ``queue/<task>.singlepane`` sidecar's ``role``
      is ``worker``. A coordinator window is NEVER auto-closed (the close tool also
      hard-protects 🧭 / sw-coord — defense in depth).
-  2. **STRONG audited-to-terminal signal, NON-FORGEABLE (P0-1 + P0-2)** — a
-     coordinator-written ``ack/<task>.audit_discharged`` (verdict GREEN) is honored ONLY
-     when corroborated by git: ``merge_sha`` is a NON-TRIVIAL real ancestor of the
-     integration branch (in-section ``git fetch`` then ``merge-base --is-ancestor``),
-     ``merge_sha != spawn_base`` (kills the vacuous-ancestor hole P0-2), the recorded
-     ``worktree_head == merge_sha`` (no drift), and the LIVE worktree HEAD == ``merge_sha``
-     (the worker-writable signal is EVIDENCE, never authority — mirrors
-     ``reclaim.py`` codex-M2/M3). A worktree already reclaimed must carry a
-     ``reclaim_done`` (the §6c machinery already proved it merged + removed it).
+  2. **STRONG audited-to-terminal signal, NON-FORGEABLE (P0-1 + P0-2 + pinned parity)** —
+     a coordinator-written ``ack/<task>.audit_discharged`` (verdict GREEN) is honored ONLY
+     when corroborated by git AND bound to THIS task's own delivery: ``merge_sha`` must
+     EQUAL the task's PINNED closing commit (``reclaim._pinned_sha`` — ``old_ready``
+     ``commit_hash`` > ``head.json`` ``head_sha``), NOT merely descend from the shared
+     spawn base. A base-only lower bound let ANY commit between base and the integration
+     head through — FORGE D: a worker that did no work points ``merge_sha`` at *another
+     task's* already-merged commit (on main, descends from the shared base) and closes a
+     never-audited window. The pinned commit must resolve (unresolvable ⇒ REFUSE, NEVER
+     fall back to the base), must be a real ancestor of the integration branch (in-section
+     ``git fetch`` then ``merge-base --is-ancestor`` = merged — re-verified against git
+     even on the worktree-gone/``reclaim_done`` path: a marker is NEVER terminal proof
+     alone, FORGE E), the recorded ``worktree_head == merge_sha`` (no drift), and the LIVE
+     worktree HEAD == ``merge_sha`` (the worker-writable signal is EVIDENCE, never
+     authority — mirrors ``reclaim.py`` codex-M2/M3 + ``_evaluate_merged``). ``merge_sha
+     != spawn_base`` is kept as defense-in-depth. A worktree already reclaimed must carry a
+     ``reclaim_done`` AND still pass the merged re-verification (the §6c machinery proved
+     it merged + removed it; the gate re-proves merged against git, never on the marker).
      ⛔ Worker self-report (``.worker_reported``/``.submitted``/``.done``) is NEVER a
      trigger; bare ``merge-base --is-ancestor`` is NEVER a standalone signal.
   3. **not in-flight (P0-3)** — the newest transcript's last *conversation* entry kind is
@@ -111,6 +120,7 @@ class _LocalOK:
     merge_sha: str
     base_sha: str
     nonce: str
+    pinned: str  # this task's own recorded closing commit (== merge_sha; reclaim parity)
 
 
 def _corroborate_local(cfg: _config.Config, project: str, task: str) -> GateDecision | _LocalOK:
@@ -173,7 +183,29 @@ def _corroborate_local(cfg: _config.Config, project: str, task: str) -> GateDeci
             "vacuous-no-advance",
             f"merge_sha == spawn base {base_sha[:8]} — branch never advanced (vacuous-ancestor)",
         )
-    return _LocalOK(merge_sha=merge_sha, base_sha=base_sha, nonce=nonce)
+
+    # PRIMARY lower bound (reclaim parity): bind merge_sha to THIS task's OWN recorded
+    # closing commit, NOT the shared spawn base. The base-only bound let any commit between
+    # base and the integration head through (FORGE D: point merge_sha at another task's
+    # already-merged commit). Mirror reclaim._pinned_sha (old_ready.commit_hash >
+    # head.json.head_sha — the worker's own delivery record, never the abandon marker /
+    # never a live branch read) and require strict equality. Unresolvable ⇒ REFUSE (no
+    # independent delivery record) — NEVER fall back to the shared base (the FORGE D root).
+    pinned, pinned_src = _reclaim._pinned_sha(cfg, project, task)
+    if not _is_sha(pinned):
+        return _refuse(
+            "pinned-unresolvable",
+            "no recorded closing head SHA for this task (ack/<task>.old_ready commit_hash "
+            "or ack/<task>.head.json head_sha) — can't prove merge_sha is THIS task's own "
+            "delivery; REFUSE rather than fall back to the shared spawn base",
+        )
+    if merge_sha != pinned:
+        return _refuse(
+            "merge-sha-not-pinned",
+            f"merge_sha {merge_sha[:8]} != this task's pinned closing commit "
+            f"{pinned[:8]} ({pinned_src}) — not this task's own delivery (FORGE D)",
+        )
+    return _LocalOK(merge_sha=merge_sha, base_sha=base_sha, nonce=nonce, pinned=pinned)
 
 
 # ─── predicate 2 (git half) + 4: ancestry + live-head drift + dirty ──────────
@@ -222,7 +254,11 @@ def _corroborate_git(cfg: _config.Config, project: str, task: str, local: _Local
             f"spawn base {base_sha[:8]} is not an ancestor of merge_sha {merge_sha[:8]} "
             "(not a real advance)",
         )
-    # P0-1(ii): merge_sha must be a real ancestor of the integration branch (= merged).
+    # P0-1(ii) + FORGE E: merge_sha (== this task's pinned closing commit, bound in
+    # _corroborate_local) must be a real ancestor of the integration branch (= merged).
+    # This runs UNCONDITIONALLY, BEFORE the worktree-existence branch below — so the
+    # worktree-gone/``reclaim_done`` path can NEVER skip the merged re-verification (the
+    # marker is never terminal proof alone; git re-proves merged — mirrors reclaim).
     if not _worktree.is_ancestor(repo, merge_sha, canon):
         return _refuse(
             "not-merged",
@@ -246,7 +282,10 @@ def _corroborate_git(cfg: _config.Config, project: str, task: str, local: _Local
             return _refuse("dirty", "worktree has uncommitted/untracked changes — NEVER close")
     else:
         # Worktree GONE → require the §6c reclaim to have already VERIFIED merged + removed
-        # it (the terminal proof). No reclaim_done ⇒ anomalous removal ⇒ fail-safe.
+        # it (the terminal proof). No reclaim_done ⇒ anomalous removal ⇒ fail-safe. The
+        # reclaim_done marker is NOT itself terminal authority (FORGE E: forge it to skip
+        # the live-head check) — the merged re-verification above (pinned ancestor of the
+        # integration head) already ran unconditionally and refuses an unmerged commit.
         if not (ack / f"{task}.reclaim_done").exists():
             return _refuse(
                 "worktree-gone-no-reclaim-proof",
@@ -257,7 +296,12 @@ def _corroborate_git(cfg: _config.Config, project: str, task: str, local: _Local
         close_ok=True,
         reason=CLOSE_OK,
         nonce=local.nonce,
-        evidence={"merge_sha": merge_sha, "base_sha": base_sha, "canonical_int_sha": canon},
+        evidence={
+            "merge_sha": merge_sha,
+            "pinned_sha": local.pinned,
+            "base_sha": base_sha,
+            "canonical_int_sha": canon,
+        },
     )
 
 

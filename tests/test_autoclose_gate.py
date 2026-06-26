@@ -98,6 +98,9 @@ def world(tmp_path, monkeypatch):
     )
     # the GREEN discharge signal (worktree_head == merge_sha == C1).
     _write_signal(ack, TASK, verdict="GREEN", merge_sha=c1, worktree_head=c1, nonce=NONCE)
+    # this task's OWN recorded closing commit (reclaim._pinned_sha source): pinned == C1.
+    # The gate binds merge_sha to THIS (FORGE D fix), not the shared spawn base.
+    _write_pinned(ack, TASK, c1)
     # a settled, long-idle transcript (assistant_turn).
     _write_transcript(projects_root, wt, kind="assistant_turn", ts=ISO)
 
@@ -122,6 +125,13 @@ def _write_signal(ack: Path, task: str, *, verdict, merge_sha, worktree_head, no
             }
         )
     )
+
+
+def _write_pinned(ack: Path, task: str, sha: str):
+    """This task's OWN recorded closing head — the ``reclaim._pinned_sha`` source the gate
+    binds ``merge_sha`` to (``ack/<task>.old_ready`` ``commit_hash``). Distinct from the
+    shared spawn base: it is THIS task's delivery, not "any commit between base and main"."""
+    (ack / f"{task}.old_ready").write_text(json.dumps({"task": task, "commit_hash": sha}))
 
 
 def _write_transcript(projects_root: Path, wt: Path, *, kind: str, ts: str):
@@ -214,10 +224,13 @@ def test_vacuous_ancestor_refused(world):
 
 
 def test_forged_unmerged_sha_refused(world):
-    # A fabricated merge_sha that is not in the repo at all → no ancestry backing.
+    # A fabricated merge_sha that is not in the repo at all → no ancestry backing. Forge
+    # the recorded pinned to MATCH (the stronger attacker who also forges old_ready), so the
+    # local pinned-equality check passes and the GIT ancestry half is the defense that bites.
     bogus = "f" * 40
     _write_signal(world["ack"], TASK, verdict="GREEN", merge_sha=bogus,
                   worktree_head=bogus, nonce=NONCE)
+    _write_pinned(world["ack"], TASK, bogus)
     d = _gate(world)
     assert d.close_ok is False
     # base is not an ancestor of a non-existent commit → caught in the git half.
@@ -234,7 +247,10 @@ def test_unmerged_branch_commit_refused(world):
     _git(wt, "config", "commit.gpgsign", "false")
     _git(wt, "commit", "-q", "-m", "C2 unmerged")
     c2 = _git(wt, "rev-parse", "HEAD")
+    # pinned == merge_sha == C2 (the worker really delivered C2): isolates the GIT
+    # not-merged check — C2 is a real advance from base but never reached origin/main.
     _write_signal(world["ack"], TASK, verdict="GREEN", merge_sha=c2, worktree_head=c2, nonce=NONCE)
+    _write_pinned(world["ack"], TASK, c2)
     d = _gate(world)
     assert d.close_ok is False
     assert d.reason == "not-merged"
@@ -374,6 +390,95 @@ def test_worktree_gone_without_reclaim_done_refused(world):
     d = _gate(world)
     assert d.close_ok is False
     assert d.reason == "worktree-gone-no-reclaim-proof"
+
+
+# ─── pinned parity (FORGE D / FORGE E) — the req3-fixer P0 ───────────────────
+# The discharge signal's merge_sha must be bound to THIS task's OWN recorded delivery
+# (reclaim._pinned_sha), NOT merely "any commit between the shared spawn base and main".
+
+
+def test_forge_d_other_task_merged_commit_refused(world):
+    """FORGE D: a worker that did NO work points merge_sha at ANOTHER task's already-merged
+    commit Q (on origin/main, descends from the shared spawn base). The OLD base-only lower
+    bound PASSES Q (it descends from base AND is merged); the pinned binding REFUSES because
+    Q is not THIS task's recorded delivery (old_ready commit_hash stays C1)."""
+    origin, wt = world["origin"], world["wt"]
+    # Q: another task's merged commit, advanced on origin/main beyond C1 (descends from base).
+    (origin / "g.txt").write_text("another task's merged work\n")
+    _git(origin, "add", "g.txt")
+    _git(origin, "commit", "-q", "-m", "Q another task merged")
+    q = _git(origin, "rev-parse", "HEAD")
+    assert q != world["c1"]
+    # The worker resets its OWN worktree HEAD to Q (brief §1 FORGE D) so the live-head-drift
+    # check PASSES — on the pre-fix base-only gate this closes (Q descends from base + merged
+    # + live HEAD == merge_sha); ONLY the pinned binding catches that Q is not this task's
+    # delivery. this task's pinned delivery stays C1 (old_ready commit_hash unchanged).
+    _git(wt, "fetch", "origin")
+    _git(wt, "reset", "--hard", q)
+    _write_signal(world["ack"], TASK, verdict="GREEN", merge_sha=q, worktree_head=q, nonce=NONCE)
+    d = _gate(world)
+    assert d.close_ok is False, "FORGE D must be refused, got close_ok"
+    assert d.reason == "merge-sha-not-pinned", f"got {d.reason}: {d.detail}"
+    assert world["c1"][:8] in d.detail  # detail names this task's real pinned commit
+
+
+def test_forge_e_reclaim_done_over_unmerged_pinned_refused(world):
+    """FORGE E: worker advances to an UNMERGED commit C2, removes its worktree, and forges
+    ack/<task>.reclaim_done to skip the live-head drift check. The reclaim_done marker is NOT
+    terminal proof alone — the gate RE-VERIFIES the pinned commit is merged (runs before the
+    worktree-existence branch) and refuses an unmerged commit (mirror reclaim never trusting
+    a marker)."""
+    wt = world["wt"]
+    (wt / "f.txt").write_text("unmerged work\n")
+    _git(wt, "add", "f.txt")
+    _git(wt, "config", "user.email", "t@t.test")
+    _git(wt, "config", "user.name", "t")
+    _git(wt, "config", "commit.gpgsign", "false")
+    _git(wt, "commit", "-q", "-m", "C2 unmerged")
+    c2 = _git(wt, "rev-parse", "HEAD")
+    # pinned == merge_sha == C2 (passes the local pinned-equality binding), but C2 was NEVER
+    # merged to origin/main.
+    _write_pinned(world["ack"], TASK, c2)
+    _write_signal(world["ack"], TASK, verdict="GREEN", merge_sha=c2, worktree_head=c2, nonce=NONCE)
+    # remove the worktree + FORGE the §6c terminal marker.
+    _git(world["main_repo"], "worktree", "remove", "--force", str(wt))
+    (world["ack"] / f"{TASK}.reclaim_done").write_text(json.dumps({"task": TASK}))
+    d = _gate(world)
+    assert d.close_ok is False, "FORGE E must be refused — reclaim_done must not bypass merged"
+    assert d.reason == "not-merged", f"got {d.reason}: {d.detail}"
+
+
+def test_pinned_unresolvable_refused(world):
+    """No recorded closing head (no old_ready, no head.json) → REFUSE rather than fall back
+    to the shared spawn base (the FORGE D root). A discharge for a window with no independent
+    delivery record can never be trusted."""
+    (world["ack"] / f"{TASK}.old_ready").unlink()
+    hj = world["ack"] / f"{TASK}.head.json"
+    if hj.exists():
+        hj.unlink()
+    d = _gate(world)
+    assert d.close_ok is False
+    assert d.reason == "pinned-unresolvable", f"got {d.reason}: {d.detail}"
+
+
+def test_pinned_from_head_json_fallback_closes(world):
+    """reclaim parity: _pinned_sha falls back to ack/<task>.head.json head_sha when
+    old_ready is absent — still binds merge_sha to THIS task's delivery → close_ok."""
+    (world["ack"] / f"{TASK}.old_ready").unlink()
+    (world["ack"] / f"{TASK}.head.json").write_text(json.dumps({"head_sha": world["c1"]}))
+    d = _gate(world)
+    assert d.close_ok is True, f"{d.reason}: {d.detail}"
+    assert d.evidence["pinned_sha"] == world["c1"]
+
+
+def test_pinned_equals_merge_sha_true_positive_closes(world):
+    """True-positive parity (the genuine case the binding must NOT block): pinned ==
+    merge_sha == merged C1, live HEAD == merge_sha, idle + clean + worker → close_ok, and
+    the evidence records the bound pinned commit."""
+    d = _gate(world)
+    assert d.close_ok is True, f"{d.reason}: {d.detail}"
+    assert d.evidence["merge_sha"] == world["c1"]
+    assert d.evidence["pinned_sha"] == world["c1"]
 
 
 # ─── discovery helper ────────────────────────────────────────────────────────
