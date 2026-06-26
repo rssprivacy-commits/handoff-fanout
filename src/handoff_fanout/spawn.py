@@ -92,14 +92,57 @@ def _err(msg: str) -> None:
 # ─── prompt / uri ─────────────────────────────────────────────────────────────
 
 
-def _build_prompt(task: str, *, brief: str | None, prompt: str | None) -> str:
+# req1 (machine-enforced 大白话 purpose-echo): ``大白话`` is the distinctive cue marking a prompt
+# that ALREADY carries a plain-language purpose statement (a coord_dispatch brief, or a deliberate
+# purpose-bearing literal --prompt) — such a prompt is NOT re-injected. NB the live dx-spawn prompt
+# carries only a bare "echo your 🆔" cue (回显本窗口标识), NOT this cue — it has no purpose, which is
+# exactly the gap req1 closes, so it DOES get the injection.
+_PURPOSE_ECHO_CUE = "大白话"
+
+
+def _purpose_echo_instruction(task: str, *, brief: str | None) -> str:
+    """The 大白话 purpose-echo instruction prepended to a worker prompt (req1). ``brief`` present ⇒
+    tell the worker to read it before stating its purpose; absent (a literal --prompt) ⇒ just state
+    it. Ends with ``然后 `` so the original body reads on naturally after the prefix logic runs."""
+    read = f"读 `{brief}` 后用人话讲清" if brief is not None else "用人话讲清"
+    return (
+        f"🔴开张第一句先回显：🆔{task} ＋ 用一句大白话说明你这个会话要做什么"
+        f"（{read}，别只回显 🆔）。然后 "
+    )
+
+
+def _build_prompt(task: str, *, role: str, brief: str | None, prompt: str | None) -> str:
     """The session prompt, prefixed with the 🆔 window-identity token (CLAUDE.md 派会话窗口标识).
 
     ``--prompt`` is used verbatim; ``--brief`` becomes a short instruction to read that file. The
     🆔``<task>`` prefix is prepended unless the caller already led with it, so the spawned session's
-    first message carries the exact id the owner uses to find the window."""
-    body = prompt if prompt is not None else f"open `{brief}` and execute per its instructions."
+    first message carries the exact id the owner uses to find the window.
+
+    req1 (machine-enforced, 2026-06-27): a ``worker`` dispatch ALSO gets the 大白话 purpose-echo
+    instruction injected, so EVERY dispatched worker self-announces its task in plain language — not
+    just the 🆔. Applied to BOTH the ``--brief`` AND the ``--prompt`` path, because the LIVE dispatch
+    (``dx-spawn`` → ``handoff spawn``) always converts a brief into ``--prompt`` (a --brief-only
+    injection would never reach a real worker). A literal --prompt already carrying ``_PURPOSE_ECHO_CUE``
+    is left verbatim (no double-inject). Non-worker roles (``supervisor_succession`` — a coordinator
+    relay with its own deliberate continuation prompt) are NEVER injected: req1 is scoped to workers,
+    and this keeps the succession prompt byte-identical."""
     prefix = f"🆔{task}"
+    inject = role == ROLE_WORKER
+    if prompt is not None:
+        if inject and _PURPOSE_ECHO_CUE not in prompt:
+            instr = _purpose_echo_instruction(task, brief=None)
+            if prompt.startswith(prefix):
+                # insert right after the leading 🆔{task} (+ its separator) so the id is never
+                # duplicated — the live dx-spawn prompt leads with "🆔{task} · …".
+                rest = prompt[len(prefix) :].lstrip(" ·")
+                body = f"{prefix} {instr}{rest}"
+            else:
+                body = f"{instr}{prompt}"
+        else:
+            body = prompt  # verbatim — non-worker role, or the cue is already present
+    else:
+        open_line = f"open `{brief}` and execute per its instructions."
+        body = (_purpose_echo_instruction(task, brief=brief) + open_line) if inject else open_line
     return body if body.startswith(prefix) else f"{prefix} {body}"
 
 
@@ -616,7 +659,7 @@ def run_spawn(
             return EXIT_FAIL_CLOSED
 
     nonce = _spawn_nonce.new_nonce()
-    prompt_text = _build_prompt(task, brief=brief, prompt=prompt)
+    prompt_text = _build_prompt(task, role=role, brief=brief, prompt=prompt)
     queue_dir = cfg.queue_dir(project)
 
     # direct-jump-spawn (2026-06-13): validate the optional spawner focus path — the ACTIVE

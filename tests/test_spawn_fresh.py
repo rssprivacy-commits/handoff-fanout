@@ -385,6 +385,88 @@ def test_brief_path_referenced_in_prompt(tmp_path, monkeypatch):
     assert str(brief) in prompt
 
 
+# ─── req1: machine-enforced 大白话 purpose-echo (2026-06-27) ─────────────────
+# Every WORKER prompt instructs the worker to FIRST state its plain-language purpose, so the owner
+# sees a real task statement — not just a 🆔 echo. Applied to BOTH the --brief and --prompt paths
+# (the live dx-spawn → handoff spawn dispatch always converts a brief into --prompt). Non-worker
+# (supervisor_succession) prompts stay byte-identical.
+
+
+def test_brief_path_worker_injects_purpose_echo(tmp_path, monkeypatch):
+    """--brief worker: the prompt becomes the exact 大白话 purpose-echo form (brief §0/req1)."""
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    brief = tmp_path / "mybrief.md"
+    brief.write_text("# brief\n")
+    assert spawn.main(_argv(isolation="singlepane", workspace=repo, prompt=None, brief=brief)) == 0
+    prompt = _decoded_prompt(home)
+    assert prompt == (
+        f"🆔{TASK} 🔴开张第一句先回显：🆔{TASK} ＋ 用一句大白话说明你这个会话要做什么"
+        f"（读 `{brief}` 后用人话讲清，别只回显 🆔）。然后 "
+        f"open `{brief}` and execute per its instructions."
+    )
+
+
+def test_prompt_path_worker_injects_purpose_echo(tmp_path, monkeypatch):
+    """A bare literal --prompt (no purpose cue) gets the 大白话 instruction prepended, still leads
+    with 🆔{task}, and the original literal is preserved."""
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    assert spawn.main(_argv(isolation="singlepane", workspace=repo, prompt="do the thing")) == 0
+    prompt = _decoded_prompt(home)
+    assert prompt.startswith(f"🆔{TASK} 🔴开张第一句先回显")
+    assert "用一句大白话说明你这个会话要做什么" in prompt
+    assert prompt.endswith("然后 do the thing")
+
+
+def test_prompt_live_dxspawn_shape_injected_without_id_duplication(tmp_path, monkeypatch):
+    """The ACTUAL live path: dx-spawn builds '🆔{task} · …（开张先回显本窗口标识「🆔{task}」…）' and
+    calls `handoff spawn --prompt`. That bare-🆔-echo prompt (no 大白话) MUST get the purpose-echo
+    injected — this is the gap req1 closes — without duplicating the leading 🆔 identity token."""
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    live = (
+        f"🆔{TASK} · 你被跨项目派来，现在在 wilde-hexe 项目。读 /tmp/b.md 全文，再执行其中任务。"
+        f"（开张第一句先回显本窗口标识「🆔{TASK}」，方便主人对窗口）"
+    )
+    assert spawn.main(_argv(isolation="singlepane", workspace=repo, prompt=live)) == 0
+    prompt = _decoded_prompt(home)
+    # leading id is NOT duplicated — it's immediately followed by the instruction, not another 🆔
+    assert prompt.startswith(f"🆔{TASK} 🔴开张第一句先回显")
+    assert not prompt.startswith(f"🆔{TASK} 🆔{TASK}")
+    assert "用一句大白话说明你这个会话要做什么" in prompt
+    # original literal body preserved (the separator is folded away, the task description stays)
+    assert "你被跨项目派来" in prompt
+
+
+def test_prompt_with_existing_cue_left_verbatim(tmp_path, monkeypatch):
+    """A literal --prompt that ALREADY carries the 大白话 purpose cue is used verbatim — no
+    double-injection of the instruction."""
+    home = _home(tmp_path, monkeypatch)
+    repo = _plain_repo(tmp_path)
+    crafted = f"🆔{TASK} 我用大白话说：本会话给 X 加缓存。open `/tmp/b.md` and execute."
+    assert spawn.main(_argv(isolation="singlepane", workspace=repo, prompt=crafted)) == 0
+    prompt = _decoded_prompt(home)
+    assert prompt == crafted  # verbatim, prefix already present
+    assert "用一句大白话说明你这个会话要做什么" not in prompt  # the injected instruction is absent
+
+
+def test_build_prompt_succession_role_not_injected():
+    """Non-worker (supervisor_succession) prompts/briefs are NEVER injected — req1 is scoped to
+    workers, and this keeps the succession continuation prompt byte-identical (the warmgap-C
+    golden asserts the exact succession .uri)."""
+    succ_prompt = spawn._build_prompt(
+        "wh-succ", role=spawn.ROLE_SUCCESSION, brief=None, prompt="自动接续 / continue per baseline"
+    )
+    assert succ_prompt == "🆔wh-succ 自动接续 / continue per baseline"
+    assert "大白话" not in succ_prompt
+    succ_brief = spawn._build_prompt(
+        "wh-succ", role=spawn.ROLE_SUCCESSION, brief="/tmp/b.md", prompt=None
+    )
+    assert succ_brief == "🆔wh-succ open `/tmp/b.md` and execute per its instructions."
+    assert "大白话" not in succ_brief
+
+
 # ─── singlepane concurrency hard-REJECT (design §5.4 / p6a-fix1 MUST 3) ─────
 
 
