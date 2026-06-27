@@ -1,11 +1,12 @@
 """req2 — coord-place-window.py: the placement twin of coord-close-windows.py.
 
 The tool lives at ``~/.claude-handoff/supervisor-monitor/coord-place-window.py`` once the
-coordinator has deploy-audited it (build worker writes it to ``staging-place/`` first).
-These tests load it by path — preferring the deployed location, falling back to staging so
-the build worker can self-verify before deploy — and mock the GUI side (winlist / osascript /
-goto / Rectangle) so nothing real ever moves. If the tool is on neither path the module is
-skipped (environmental, like the DX_SPAWN_SH / coord-close-windows tests).
+coordinator has deploy-audited it (the fixer worker stages it at ``placement-staged/`` inside the
+worktree first). These tests load it by path — preferring the worktree staged copy (so the fixer
+can self-verify before deploy), falling back to the deployed / legacy staging locations — and mock
+the GUI side (winlist / osascript / goto / Rectangle) so nothing real ever moves. If the tool is on
+none of the paths the module is skipped (environmental, like the DX_SPAWN_SH / coord-close-windows
+tests).
 
 Coverage:
   • pure helpers — slot mapping, slot resolution, identity (find/unique/self), bounds delta
@@ -22,13 +23,18 @@ import importlib.util
 import shutil
 import subprocess
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 import pytest
 
+# This fix (sw-place-fix2) stages the fixed tool inside the worktree at placement-staged/; prefer it
+# so the suite always exercises THIS fix's SOT, falling back to the deployed / legacy staging copies.
+_WORKTREE_STAGED = Path(__file__).resolve().parents[1] / "placement-staged" / "coord-place-window.py"
 _CANDIDATES = [
+    _WORKTREE_STAGED,                                                                   # worktree staged (this fix's SOT)
     Path.home() / ".claude-handoff" / "supervisor-monitor" / "coord-place-window.py",  # deployed
-    Path.home() / ".claude-handoff" / "staging-place" / "coord-place-window.py",       # pre-deploy
+    Path.home() / ".claude-handoff" / "staging-place" / "coord-place-window.py",       # legacy pre-deploy
 ]
 _EXISTING = [p for p in _CANDIDATES if p.exists()]
 if not _EXISTING:
@@ -419,14 +425,13 @@ def test_run_self_dryrun_never_fires(monkeypatch, capsys):
 
 
 # ── fleet placement lock (machine-wide active-Space mutex) ───────────────────
-# IMPORTANT: the lock lives in the STAGING copy first; the deployed supervisor-monitor/
-# copy is the OLD version until the coordinator re-deploys. _CANDIDATES above PREFERS the
-# deployed copy, so `cpw` may be the pre-lock build. These tests therefore load the STAGING
-# file EXPLICITLY (the SOT for the new code), independent of which copy `cpw` resolved to.
-# Once the coordinator deploy-audits the staging file → supervisor-monitor/, both copies
-# carry the lock and these tests would pass against either; until then they pin the new code.
+# The SOT for the code under test is the WORKTREE staged copy (placement-staged/, this fix);
+# _STAGING_CPW points there and these staging-gated tests load it EXPLICITLY via _load_staging so
+# they always pin THIS fix's code, independent of which copy `cpw` resolved to. Once the coordinator
+# deploy-audits the staged file → supervisor-monitor/, the deployed copy carries the same code and
+# these tests pass against it too.
 
-_STAGING_CPW = Path.home() / ".claude-handoff" / "staging-place" / "coord-place-window.py"
+_STAGING_CPW = _WORKTREE_STAGED
 
 
 def _load_staging():
@@ -623,8 +628,8 @@ def test_run_self_fires_when_lock_held(monkeypatch):
 
 _staging_freequad_skip = pytest.mark.skipif(
     not _STAGING_CPW.exists()
-    or "def free_worker_slot" not in _STAGING_CPW.read_text(),
-    reason="staging coord-place-window.py with worker free-quadrant selection not present",
+    or "def least_loaded_slot" not in _STAGING_CPW.read_text(),
+    reason="staging coord-place-window.py with count-based least-loaded selection not present",
 )
 
 
@@ -642,14 +647,17 @@ def test_resolve_slot_worker_no_index_defers_to_free_quadrant():
 
 
 @_staging_freequad_skip
-def test_free_worker_slot_rule():
+def test_least_loaded_slot_rule():
+    # Count-based load-balance (owner correction #1): place to the LEFT quadrant with FEWER windows;
+    # ties (incl. both-empty) → top-left. (Per the authoritative spec's least_loaded_slot: n_tl < n_bl
+    # → top-left, i.e. the side with fewer wins — NOT the flipped wording in the brief's parenthetical.)
     spw = _load_staging()
-    assert spw.free_worker_slot(set()) == "top-left"                    # both free → top-left
-    assert spw.free_worker_slot({"bottom-left"}) == "top-left"          # only bottom occ → top-left
-    assert spw.free_worker_slot({"top-left"}) == "bottom-left"          # top occ → bottom-left
-    assert spw.free_worker_slot({"top-left", "bottom-left"}) == "top-left"  # both occ → fallback TL
-    # accepts any iterable; extraneous members are ignored
-    assert spw.free_worker_slot(["top-left", "right-half"]) == "bottom-left"
+    assert spw.least_loaded_slot(0, 0) == "top-left"     # both empty (tie) → top-left
+    assert spw.least_loaded_slot(0, 1) == "top-left"     # top-left fewer → top-left
+    assert spw.least_loaded_slot(1, 0) == "bottom-left"  # bottom-left fewer → bottom-left
+    assert spw.least_loaded_slot(2, 2) == "top-left"     # tie at 2 → top-left
+    assert spw.least_loaded_slot(1, 3) == "top-left"     # multi-window: top-left fewer → top-left
+    assert spw.least_loaded_slot(3, 1) == "bottom-left"  # multi-window: bottom-left fewer → bottom-left
 
 
 @_staging_freequad_skip
@@ -684,27 +692,28 @@ def test_screen_visible_frame_parses_and_guards(monkeypatch):
 
 @_staging_freequad_skip
 def test_probe_left_quadrant_occupancy_classifies_excludes_and_filters(monkeypatch):
-    # The probe: only the target desktop, excluding the target window itself; right-half windows
-    # don't count; other-desktop windows are ignored.
+    # The probe returns a per-quadrant COUNT (Counter): only the target desktop, excluding the target
+    # window itself; right-half windows don't count; other-desktop windows are ignored.
     spw = _load_staging()
     monkeypatch.setattr(spw, "screen_visible_frame", lambda: (0, 0, 2056, 1329))
     wins = [
         _win("target", 100, desktop=5),    # the target itself → excluded by wid
-        _win("worker-A", 101, desktop=5),  # top-left tile → occupies top-left
+        _win("worker-A", 101, desktop=5),  # top-left tile → +1 top-left
         _win("coord-R", 102, desktop=5),   # right-half → NOT a left quadrant
         _win("worker-B", 103, desktop=9),  # other desktop → filtered out
     ]
     bounds = {"worker-A": "0,39,1028,645", "coord-R": "1028,39,1028,1290"}
     monkeypatch.setattr(spw, "capture_bounds_by_title", lambda t: bounds.get(t))
-    assert spw.probe_left_quadrant_occupancy(wins, 5, 100) == {"top-left"}
+    # Counter compares equal to a plain dict with the same counts.
+    assert spw.probe_left_quadrant_occupancy(wins, 5, 100) == {"top-left": 1}
 
 
 @_staging_freequad_skip
 def test_probe_left_quadrant_occupancy_no_frame_is_empty(monkeypatch):
-    # No screen frame (best-effort failure) ⇒ occupancy unknown ⇒ empty (→ default top-left).
+    # No screen frame (best-effort failure) ⇒ counts unknown ⇒ empty Counter (→ tie → default top-left).
     spw = _load_staging()
     monkeypatch.setattr(spw, "screen_visible_frame", lambda: None)
-    assert spw.probe_left_quadrant_occupancy([_win("x", 1, desktop=5)], 5, 99) == set()
+    assert spw.probe_left_quadrant_occupancy([_win("x", 1, desktop=5)], 5, 99) == {}
 
 
 _staging_multidisplay_skip = pytest.mark.skipif(
@@ -732,13 +741,14 @@ def test_probe_left_quadrant_occupancy_filters_by_target_display(monkeypatch):
     wins = [_win("target", 100, desktop=5), _win("sec-wkr", 101, desktop=5),
             _win("main-wkr", 102, desktop=5)]
     # only the secondary-display worker is counted; the main-display worker is filtered out by display
-    assert spw.probe_left_quadrant_occupancy(wins, 5, 100) == {"top-left"}
+    assert spw.probe_left_quadrant_occupancy(wins, 5, 100) == {"top-left": 1}
 
 
 @_staging_multidisplay_skip
 def test_probe_left_quadrant_occupancy_single_display_unchanged(monkeypatch):
     # FIX B degrade contract: with a single display (or Quartz unavailable → all_display_frames []),
-    # behavior is byte-unchanged — classify every same-desktop window against the main-display frame.
+    # the classification is unchanged — every same-desktop window is classified against the
+    # main-display frame and counted into the returned Counter.
     spw = _load_staging()
     monkeypatch.setattr(spw, "all_display_frames", lambda: [])    # Quartz unavailable / 1 display
     monkeypatch.setattr(spw, "screen_visible_frame", lambda: (0, 0, 2056, 1329))
@@ -746,12 +756,12 @@ def test_probe_left_quadrant_occupancy_single_display_unchanged(monkeypatch):
     monkeypatch.setattr(spw, "capture_bounds_by_title", lambda t: bounds.get(t))
     wins = [_win("target", 100, desktop=5), _win("worker-A", 101, desktop=5),
             _win("coord-R", 102, desktop=5), _win("worker-B", 103, desktop=9)]
-    assert spw.probe_left_quadrant_occupancy(wins, 5, 100) == {"top-left"}
+    assert spw.probe_left_quadrant_occupancy(wins, 5, 100) == {"top-left": 1}
 
 
-def _free_quad_run_place(monkeypatch, occupied):
+def _free_quad_run_place(monkeypatch, counts):
     """Drive run_place on the STAGING build with slot=FREE_QUADRANT and a MOCKED occupancy probe
-    (returning ``occupied``); return the list of slots actually fired."""
+    (returning the given per-quadrant ``counts`` as a Counter); return the list of slots fired."""
     import contextlib as _cl
     spw = _load_staging()
     win = _win("handoff-fanout · sw-foo · worker · " + "a" * 16 + " [worktree] — x", 100, desktop=5)
@@ -764,7 +774,7 @@ def _free_quad_run_place(monkeypatch, occupied):
     bounds = iter(["0,0,100,100", "0,39,1028,645"])
     monkeypatch.setattr(spw, "capture_bounds_by_title", lambda t: next(bounds))
     # the occupancy probe is MOCKED (the GUI screen/bounds osascript is never touched here)
-    monkeypatch.setattr(spw, "probe_left_quadrant_occupancy", lambda w, d, x: set(occupied))
+    monkeypatch.setattr(spw, "probe_left_quadrant_occupancy", lambda w, d, x: Counter(counts))
     fired = []
     monkeypatch.setattr(spw, "fire_rectangle", lambda s: fired.append(s))
 
@@ -778,19 +788,27 @@ def _free_quad_run_place(monkeypatch, occupied):
 
 
 @_staging_freequad_skip
-def test_run_place_free_quadrant_both_free_fires_top_left(monkeypatch):
-    assert _free_quad_run_place(monkeypatch, set()) == ["top-left"]
+def test_run_place_free_quadrant_both_empty_fires_top_left(monkeypatch):
+    # both quadrants empty (tie) → top-left
+    assert _free_quad_run_place(monkeypatch, {}) == ["top-left"]
 
 
 @_staging_freequad_skip
-def test_run_place_free_quadrant_top_left_occupied_fires_bottom_left(monkeypatch):
-    assert _free_quad_run_place(monkeypatch, {"top-left"}) == ["bottom-left"]
+def test_run_place_free_quadrant_top_left_busier_fires_bottom_left(monkeypatch):
+    # top-left has more windows → load-balance to the FEWER side (bottom-left)
+    assert _free_quad_run_place(monkeypatch, {"top-left": 1}) == ["bottom-left"]
 
 
 @_staging_freequad_skip
-def test_run_place_free_quadrant_both_occupied_fires_top_left(monkeypatch):
-    # best-effort fallback when both left quadrants are already occupied
-    assert _free_quad_run_place(monkeypatch, {"top-left", "bottom-left"}) == ["top-left"]
+def test_run_place_free_quadrant_equal_counts_fires_top_left(monkeypatch):
+    # equal counts (tie) → top-left
+    assert _free_quad_run_place(monkeypatch, {"top-left": 1, "bottom-left": 1}) == ["top-left"]
+
+
+@_staging_freequad_skip
+def test_run_place_free_quadrant_multi_window_bottom_left_busier_fires_top_left(monkeypatch):
+    # multi-window: bottom-left has more → load-balance to the FEWER side (top-left)
+    assert _free_quad_run_place(monkeypatch, {"top-left": 1, "bottom-left": 3}) == ["top-left"]
 
 
 @_staging_freequad_skip
@@ -802,7 +820,7 @@ def test_run_place_free_quadrant_dryrun_never_fires(monkeypatch, capsys):
     monkeypatch.setattr(spw, "detect_active_desktop", lambda w: 9)
     probed = []
     monkeypatch.setattr(spw, "probe_left_quadrant_occupancy",
-                        lambda w, d, x: (probed.append(1), set())[1])
+                        lambda w, d, x: (probed.append(1), Counter())[1])
     fired = []
     monkeypatch.setattr(spw, "fire_rectangle", lambda s: fired.append(s))
     spw.run_place("handoff-fanout", "sw-foo", None, spw.FREE_QUADRANT, 0.0, execute=False)

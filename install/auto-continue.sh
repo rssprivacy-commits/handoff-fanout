@@ -2178,6 +2178,25 @@ EOF
             log "WARN: WORKSPACE empty/invalid ($WORKSPACE), falling back to frontmost"
         fi
 
+        # req2 (sw-place-fix2 / 2026-06-28 owner correction #2): tile the just-spawned window NOW —
+        # right after it is open + frontmost (+ titled — the focus block above either matched our
+        # per-spawn token on the happy path or POSITIVELY confirmed it in the discriminator; every
+        # fail-closed path `continue`d before here) and BEFORE the open-URI inject / cold-submit and
+        # the spawn-return jump. WHY HERE (not after submit, as before): the worker window is the
+        # global frontmost on its OWN spawn desktop with NO competing focus/Space change in flight, so
+        # Rectangle (which acts on the active-Space frontmost) tiles THIS window. The old post-submit
+        # ordering raced the cold-submit Enter + the return-jump Space change → Rectangle tiled nothing
+        # (`bounds UNCHANGED`, auto-continue.log 03:13:25). Tiling leaves the SAME window frontmost on
+        # the SAME desktop (Rectangle only resizes/moves it), so the open-URI inject below still lands
+        # in it. DELIBERATELY synchronous, NOT backgrounded: a background `&` placement would run its
+        # own goto/restore and race the NEXT spawn's focus-jump for the global active-desktop (flock
+        # only serializes placement-vs-placement, not placement-vs-spawn-focusjump). Hard-bounded
+        # (≤ HANDOFF_PLACE_TIMEOUT) + fully swallowed (|| true inside maybe_place_window) so it can
+        # NEVER affect the spawn outcome; default-ON unless a `.window-placement-off` sentinel. The
+        # tool resolves the target by its UNIQUE structured title and polls --wait for it (the short
+        # title-confirm) — best-effort SKIP if the title isn't ready yet, never extends this strand.
+        maybe_place_window "$PROJECT" "$TASK" "$PROJ_DIR" "$QUEUE"
+
         # SP-SUBMIT baseline (sw-sp-enter-retry): the singlepane confirm signal is a NEW
         # transcript *.jsonl (∉ this set) carrying 🆔<task>. Captured BEFORE the URI dispatch
         # so ANY session file born after it counts as new; the set (not mtime) is the
@@ -2470,18 +2489,11 @@ EOF
                 _return_token="$TASK"   # in title always (rootName + custom); nonce lands in kCGWindowName too late
                 _return_unique=1        # task id is per-spawn-unique → unique-mode title-substring (handle-reuse-immune)
             fi
-            # req2 (sw-place-at-spawn): tile the just-spawned window NOW — right after the CONFIRMED
-            # submit and BEFORE the return jump, while the focus-jumped window is the frontmost on the
-            # active spawn desktop (no goto needed). DELIBERATELY synchronous, NOT backgrounded: a
-            # background `&` placement would run its own goto/restore and race the NEXT spawn's
-            # focus-jump for the global active-desktop (the very class of race p71's flock fixed — and
-            # flock only serializes placement-vs-placement, not placement-vs-spawn-focusjump). Kept
-            # short + hard-bounded (≤ wait+place via HANDOFF_PLACE_TIMEOUT) so the owner's snap-back is
-            # never stalled; a not-yet-ready window title is a best-effort skip inside the tool (it
-            # never extends this strand). Gated on _RETURN_DISPATCHED (a real submit, ack `submitted`)
-            # + default-ON (unless a `.window-placement-off` sentinel); fully swallowed, so it can
-            # never affect the spawn outcome (already ack'd). Snap-back jump runs next.
-            [ "$_RETURN_DISPATCHED" = "1" ] && maybe_place_window "$PROJECT" "$TASK" "$PROJ_DIR" "$QUEUE"
+            # req2 window placement was MOVED EARLIER (sw-place-fix2 / owner correction #2): it now
+            # runs right after the window is frontmost+titled and BEFORE the open-URI inject (see
+            # maybe_place_window above), so Rectangle tiles the window while it is the sole frontmost
+            # on its own desktop instead of racing THIS return-jump's Space change (the old
+            # post-submit ordering → `bounds UNCHANGED`). Snap-back jump runs now.
             [ "$_RETURN_DISPATCHED" = "1" ] && _return_jump_back "${_return_token:-}" "${_return_unique:-0}"
             sleep 0.5  # 防同次 launchd run 内连续 spawn 让主人晕
         else
