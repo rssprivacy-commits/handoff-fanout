@@ -54,9 +54,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub.add_parser(
         "coord-dispatch",
-        help="Low-friction coordinator fan-out: draft worker briefs from a tasks-json and run "
-        "the HARD machine-judged concurrency-conflict gate (dry-run by default; --execute fans "
-        "out via dx-spawn-session.sh only when the batch is SAFE-PARALLEL)",
+        help="Low-friction coordinator fan-out: draft worker briefs from a tasks-json, run the "
+        "HARD machine-judged concurrency-conflict gate, and CONCURRENTLY dispatch the proven-"
+        "disjoint wave (dry-run by default; --execute fans the wave out via dx-spawn-session.sh "
+        "in parallel, load-/width-capped + failure-isolated, deferring conflicting tasks to a "
+        "later wave)",
     )
     sub.add_parser(
         "gc-singlepane",

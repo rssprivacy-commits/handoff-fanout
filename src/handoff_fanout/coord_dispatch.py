@@ -12,10 +12,32 @@ fan it out* (feedback-supervisor-center-duty §六) — into a deterministic gat
 
 Design posture (owner law §六)
 ------------------------------
-* **Default serial.** Parallel is the *optimization exception a coordinator must
-  EARN by proving "safe to parallelize"*, never the default. So the gate is
-  fail-closed: a batch is declared ``SAFE-PARALLEL`` only when *every* pair is
-  provably disjoint; any doubt → ``MUST-SERIAL``.
+* **Earned parallel, fail-closed.** Parallel is the *optimization exception a
+  coordinator must EARN by proving "safe to parallelize"*, never an unchecked
+  default. The gate is fail-closed: a pair is ``SAFE-PARALLEL`` only when it is
+  *provably* disjoint; any doubt → ``MUST-SERIAL``. ``--execute`` then dispatches
+  ONLY the provably-disjoint subset (see "concurrent wave" below) — it never fans
+  out a pair it could not prove safe.
+* **Concurrent wave + partition (the live default).** ``--execute`` does NOT
+  serial-loop the batch (the disease this command cures: coordinators that always
+  dispatch one-at-a-time). It partitions the batch into a **wave** — a maximum set
+  of tasks that are *pairwise* ``SAFE-PARALLEL`` — and fans the wave out
+  CONCURRENTLY (one thread per ``dx-spawn-session.sh`` call, failure-isolated).
+  Tasks left out of the wave are **deferred** (reported, NOT dispatched) for the
+  coordinator to send in a LATER wave. This is the only safe handling of a
+  conflicting task — see "serial dispatch ≠ serial execution" below.
+* **serial dispatch ≠ serial execution.** Dispatch is fire-and-forget intent
+  production; every dispatched worker then runs ~concurrently regardless of the
+  order we dispatched them. So serial-dispatching two conflicting workers does
+  NOT serialize their execution — they would still collide. The ONLY safe action
+  for a conflicting task is to keep it OUT of the current concurrent wave; "serial"
+  therefore means "a later wave" (a separate coordinator action after the current
+  wave's workers merge), never "serial-dispatch now". The set actually dispatched
+  in one ``--execute`` is one wave and is ALWAYS pairwise-disjoint.
+* **Resource-bounded width (N ≤ loadavg).** The concurrent wave width is capped by
+  the machine's load headroom (``cpu_count − loadavg``, ≥1) or an explicit
+  ``--max-width``. Tasks beyond the cap are load-deferred (kept for a later wave),
+  so a saturated box degrades to width 1 (serial) instead of piling on workers.
 * **Machine-judge declared fields ONLY.** The conflict verdict reads the task's
   *declared* schema fields (``predicted_files`` / ``repo_branch`` / ``will_push``
   / ``worktree_isolation`` / ``shared_writes`` / ``credential_scopes`` /
@@ -24,9 +46,13 @@ Design posture (owner law §六)
   into an opaque one). The soft dimensions (logical independence, resource
   bounds) are surfaced for the human/owner to eyeball in the dry-run table.
 * **dry-run by default.** It prints the batch plan + the full pairwise conflict
-  table + each generated brief; it writes no ``.uri`` and spawns nothing.
-  ``--execute`` is the only path that actually dispatches, and it REFUSES a batch
-  that is not ``SAFE-PARALLEL`` (the gate would be theatre otherwise).
+  table + the concurrent wave plan + each generated brief; it writes no ``.uri``
+  and spawns nothing. ``--execute`` is the only path that actually dispatches.
+* **Failure isolation (sound because the wave is proven-disjoint).** Each spawn in
+  the wave is isolated: one ``dx-spawn`` failing neither aborts nor corrupts its
+  peers — they were proven file/resource-disjoint, so a failed spawn is an
+  operational hiccup for that one task only. ``--execute`` attempts every wave
+  task and reports per-task success/failure (exit 2 if any spawn failed).
 * **Reuse, never re-implement spawn.** The actual spawn is a thin adapter that
   shells out to the existing ``dx-spawn-session.sh`` (``$DX_SPAWN_SH``); this
   module never re-implements the spawn engine, never touches the watchdog /
@@ -36,6 +62,7 @@ Design posture (owner law §六)
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import fnmatch
 import glob
 import json
@@ -64,6 +91,15 @@ EXIT_FAIL = 2  # fail-closed: invalid input / refused unsafe --execute / dispatc
 # Verdicts.
 SAFE_PARALLEL = "SAFE-PARALLEL"
 MUST_SERIAL = "MUST-SERIAL"
+
+# Sentinel for ``ConflictProfile.isolation`` when the registry routing is IN FORCE but
+# could not yield a clean ``worktree``/``singlepane`` mode (an explicit
+# ``DX_PROJECT_REGISTRY`` that is missing/unreadable/corrupt, or a project found in the
+# registry with a missing/illegal ``worker_isolation``). It is NOT a routable mode — it
+# means "fail-closed: treat a same-project pair as MUST-SERIAL" (宁可多串行别漏). Distinct
+# from a real mode so the conflict table can say *why* (unresolved registry) rather than
+# mislabel it "singlepane".
+ISOLATION_UNKNOWN = "registry-unresolved"
 
 # The three opaque-token "shared resource" dimensions, compared by set-intersection.
 _SHARED_DIMS = ("shared_writes", "credential_scopes", "runtime_targets")
@@ -172,6 +208,22 @@ class ConflictProfile:
     worktree_isolation: bool | None = None
     shared: dict[str, set[str] | None] = field(default_factory=dict)  # dim → set, or None=missing/unknown
     field_issues: list[str] = field(default_factory=list)
+    # EFFECTIVE worker isolation mode the actuator routes on. PRIMARY source = the
+    # project-registry.json that ``dx-spawn-session.sh`` actually reads (NOT handoff
+    # config — the live config's global ``worker_isolation={"default":"worktree"}`` would
+    # mask every project's true mode; the actuator ignores config). config / the declared
+    # ``worktree_isolation`` field are only a fallback when the registry is silent for this
+    # project. ``"singlepane"`` → the project may hold only ONE active worker (spawn-side
+    # hard REJECT of a concurrent 2nd); ``"worktree"`` → concurrent same-project workers
+    # queue safely on the shared spawn lock; ``ISOLATION_UNKNOWN`` → registry in force but
+    # unresolved (fail-closed → serialize); ``None`` → unresolvable (no registry/config,
+    # declared field missing → already a field_issue). Drives the same-project axis.
+    isolation: str | None = None
+    # realpath of the project's git common-dir (``git rev-parse --git-common-dir``), or
+    # ``None`` when the project is genuinely NOT a git repo (no shared object store to
+    # race). A probe that could not RUN (git missing / unexpected error) instead adds a
+    # ``field_issue`` (fail-closed). Drives the cross-slug shared-object-store axis.
+    git_common_dir: str | None = None
 
 
 def _has_glob(entry: str) -> bool:
@@ -365,9 +417,192 @@ def _normalize_repo_branch(rb: str) -> tuple[str, str]:
     return canonical, branch
 
 
-def build_conflict_profile(task: Task) -> ConflictProfile:
-    """Extract the declared-field conflict surface for one task. Pure (no spawn,
-    no mutation) except read-only filesystem glob expansion against the project."""
+def _load_config() -> _config.Config:
+    """Load the live handoff config, never raising — the gate must stay up even if the
+    config is absent/degenerate (``_config.load`` already fails closed to defaults).
+    Returns an empty default ``Config`` on any unexpected error (isolation then falls
+    back to the per-task declared ``worktree_isolation`` field)."""
+    try:
+        return _config.load(_config.home_dir())
+    except Exception:  # never let a config read crash the conflict gate
+        return _config.Config()
+
+
+def _registry_path() -> tuple[Path | None, bool]:
+    """``(path, explicit)`` for the project-registry.json the ACTUATOR (dx-spawn) reads.
+
+    Mirrors ``dx-spawn-session.sh``: honour ``$DX_PROJECT_REGISTRY`` first, else derive
+    ``$(dirname SCRIPT_DIR)/project-registry.json`` from the spawn-engine location
+    (``SCRIPT_DIR`` = the dir holding ``dx-spawn-session.sh`` = ``$DX_SPAWN_SH``'s parent).
+
+    ``explicit`` = whether ``$DX_PROJECT_REGISTRY`` was set. It is ``True`` only for an
+    operator-pinned registry — that path is treated STRICTLY (a miss = fail-closed). A
+    DERIVED path (``explicit=False``) is best-effort: a project the derived registry does
+    not list falls back to config rather than serializing every unrelated project (the
+    test suite runs with ``$DX_SPAWN_SH`` pointing at the live engine, so the derived
+    registry is the live one and would otherwise serialize every tmp_path fixture)."""
+    env = os.environ.get("DX_PROJECT_REGISTRY", "")
+    if env.strip():
+        return Path(os.path.expanduser(env.strip())), True
+    dx = _resolve_dx_spawn()
+    if dx is None:
+        return None, False
+    # dx-spawn: SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"; REGISTRY="$(dirname "$SCRIPT_DIR")/...".
+    # abspath (NOT realpath) matches ``cd dirname && pwd`` (it makes the path absolute
+    # without resolving a symlinked script file — dx-spawn doesn't resolve $0's symlink).
+    script_dir = Path(os.path.abspath(os.path.expanduser(str(dx)))).parent
+    return script_dir.parent / "project-registry.json", False
+
+
+def _registry_isolation(project_root: str) -> str | None:
+    """Worker-isolation mode the ACTUATOR routes ``project_root`` on, read from the
+    project-registry.json — dx-spawn's TRUE source (NOT handoff config).
+
+    Byte-mirrors ``dx-spawn-session.sh:157-204``: load ``projects`` (dict) → realpath-match
+    each entry's ``paths.root`` against ``project_root`` → take its ``worker_isolation``.
+
+    Returns:
+      ``"worktree"`` / ``"singlepane"`` — the registry's explicit, valid mode (the actuator
+        will route on exactly this);
+      ``ISOLATION_UNKNOWN`` — the registry could not yield a clean mode and the project may
+        be singlepane → fail-closed (serialize). Fires when: the registry path is NOT
+        locatable at all (no ``$DX_PROJECT_REGISTRY`` AND ``$DX_SPAWN_SH`` unset → can't even
+        derive a path — the COMMON 中枢-shell case, p74 bug-1 三修); an EXPLICIT
+        ``$DX_PROJECT_REGISTRY`` that is missing/unreadable/corrupt; a registry (explicit or
+        derived) that is readable-but-corrupt; a malformed ``projects`` map; a project found
+        with a missing/illegal mode; or a project absent from an EXPLICIT registry (drift);
+      ``None`` — registry routing is locatable but simply silent for THIS project: a DERIVED
+        registry path that doesn't exist on disk, or that exists but does not list this
+        project. Only here does the caller fall back to config (don't over-serialize an
+        unrelated project the live derived registry happens not to route)."""
+    reg, explicit = _registry_path()
+    if reg is None:
+        # Registry path is NOT locatable AT ALL (no ``$DX_PROJECT_REGISTRY`` AND
+        # ``$DX_SPAWN_SH`` unset → we can't even derive a path to read). The actuator's
+        # true isolation source is therefore unverifiable — the project MAY be singlepane.
+        # Fail-CLOSED (``ISOLATION_UNKNOWN``), NOT ``None``: returning ``None`` here would
+        # fall back to handoff config whose global ``{"default":"worktree"}`` masks every
+        # project's true mode → a singlepane project mislabeled SAFE-PARALLEL in the
+        # dry-run preview table (p74 bug-1 三修). 中枢 live shell defaults to DX_SPAWN_SH
+        # UNSET, so this is the COMMON path, not an edge case.
+        return ISOLATION_UNKNOWN
+    try:
+        with open(reg, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        # An explicit pinned registry that's missing is a misconfig → fail-closed; a derived
+        # one that doesn't exist just means registry routing isn't wired here → config fallback.
+        return ISOLATION_UNKNOWN if explicit else None
+    except (OSError, ValueError):
+        # readable-but-corrupt / unreadable: the actuator would fail to parse it too → fail-closed.
+        return ISOLATION_UNKNOWN
+    if not isinstance(data, dict):
+        # readable but not a JSON object (top-level list/scalar/null) = corrupt
+        # registry → fail-closed (same class as the OSError/ValueError branch).
+        return ISOLATION_UNKNOWN
+    projects = data.get("projects")
+    if not isinstance(projects, dict):
+        return ISOLATION_UNKNOWN
+    target = os.path.realpath(project_root)
+    for entry in projects.values():
+        if not isinstance(entry, dict):
+            continue
+        paths = entry.get("paths")
+        root = paths.get("root") if isinstance(paths, dict) else None
+        if not isinstance(root, str) or not root:
+            continue
+        if os.path.realpath(os.path.expanduser(root)) == target:
+            iso = entry.get("worker_isolation")
+            if iso in ("worktree", "singlepane"):
+                return iso
+            return ISOLATION_UNKNOWN  # found but mode missing/illegal → fail-closed (mirrors dx-spawn)
+    # project not listed: drift in an explicit registry → fail-closed; a derived registry
+    # that doesn't route this project → config fallback (don't over-serialize the unrelated).
+    return ISOLATION_UNKNOWN if explicit else None
+
+
+def _effective_isolation(
+    cfg: _config.Config, project_root: str, declared_worktree_isolation: bool | None
+) -> str | None:
+    """The EFFECTIVE worker-isolation mode the actuator would route ``project_root`` on.
+
+    PRIMARY source = the project-registry.json the actuator (dx-spawn) actually reads
+    (``_registry_isolation``) — NOT handoff config. The live config carries a global
+    ``worker_isolation={"default":"worktree"}`` that masks every project's true mode, and
+    dx-spawn ignores config entirely, so resolving from config would read a registry-
+    ``singlepane`` project as ``worktree`` → false SAFE-PARALLEL → the actuator rejects the
+    concurrent 2nd worker → the whole wave exits 2 (p74 bug 1).
+
+    Resolution:
+      1. registry yields a concrete mode (``worktree``/``singlepane``) → use it (the actuator
+         will route on exactly this);
+      2. registry unresolved / not locatable (``ISOLATION_UNKNOWN``) → return it so the same-
+         project axis serializes (宁可多串行别漏). NOTE: a registry that can't even be located
+         (DX_SPAWN_SH unset + no DX_PROJECT_REGISTRY) lands HERE now (p74 bug-1 三修), NOT in
+         the config-fallback branch below — an unverifiable isolation must never silently
+         resolve to config's masking ``worktree`` default;
+      3. registry locatable but silent for this project (``None``) → legacy fallback to
+         ``config.resolve_isolation(slug)``, then the declared ``worktree_isolation`` field
+         (preserves pre-registry behavior for projects a DERIVED registry doesn't route):
+         ``True`` → ``"worktree"``, ``False`` → ``"singlepane"``, missing → ``None`` (the
+         missing field already taints the pair via ``field_issues``)."""
+    reg = _registry_isolation(project_root)
+    if reg is not None:
+        return reg  # "worktree" / "singlepane" / ISOLATION_UNKNOWN
+    mode = cfg.resolve_isolation(os.path.basename(project_root))
+    if mode is not None:
+        return mode
+    if declared_worktree_isolation is True:
+        return "worktree"
+    if declared_worktree_isolation is False:
+        return "singlepane"
+    return None
+
+
+def _resolve_git_common_dir(project_root: str) -> tuple[str | None, str | None]:
+    """``(common_dir, issue)`` for a project's git object store.
+
+    ``common_dir`` = realpath of ``git -C <root> rev-parse --git-common-dir`` when the
+    root is inside a git repo, else ``None``. Two projects that share ONE object store
+    (a linked git-worktree / two checkouts of one bare repo / a symlinked source tree)
+    resolve to the SAME ``common_dir`` even with different slugs — the signal the slug-
+    keyed spawn lock is blind to.
+
+    ``issue`` is a fail-closed field-issue string ONLY when the probe could not RUN
+    (git binary missing / unexpected error / timeout). A clean "not a git repository"
+    (non-zero exit) is NOT an issue: a non-git directory has no object store to race →
+    ``(None, None)``. The subprocess is hard-bounded (``timeout``) so a hung git can
+    never wedge the gate."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", project_root, "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        # could not even run the probe (git missing / timeout / …) → fail closed
+        return None, f"git common-dir probe could not run ({e}) — fail-closed serialize"
+    if proc.returncode != 0:
+        # "not a git repository" (or a repo-level error): no resolvable shared object
+        # store on this axis → no taint (a genuine non-git project shares nothing).
+        return None, None
+    out = proc.stdout.strip()
+    if not out:
+        return None, None
+    # git prints the path relative to <root> (we ran with -C <root>), or absolute.
+    raw = out if os.path.isabs(out) else os.path.join(project_root, out)
+    return os.path.realpath(raw), None
+
+
+def build_conflict_profile(task: Task, *, cfg: _config.Config | None = None) -> ConflictProfile:
+    """Extract the declared-field conflict surface for one task. Side-effect-free
+    except read-only filesystem glob expansion + a read-only ``git rev-parse`` probe
+    (shared-object-store detection) + a read-only config read (isolation resolution).
+    ``cfg`` is loaded once per batch by ``analyze_batch`` and threaded in; a direct
+    caller may omit it (loaded on demand)."""
+    if cfg is None:
+        cfg = _load_config()
     project_root = os.path.realpath(task.project)
     prof = ConflictProfile(task_id=task.task_id, project_root=project_root)
     prof.case_insensitive = _fs_case_insensitive(project_root)
@@ -392,86 +627,98 @@ def build_conflict_profile(task: Task) -> ConflictProfile:
                 prof.files_indeterminate = True
                 prof.file_notes.append('predicted_files entry "unknown" → file set unknown')
                 continue
-            # A trailing separator declares a *directory* — capture it before
-            # _anchor (realpath strips it).
-            declared_dir = entry.endswith("/") or entry.endswith(os.sep)
-            # Anchor globs with a glob-AWARE canonicalizer: realpath ONLY the static
-            # prefix before the first wildcard segment, never the wildcard segments
-            # themselves. A whole-path realpath would dissolve a symlink whose own
-            # NAME is a metachar (``l*`` / ``l*.py``), ERASING the pattern into a
-            # concrete file → false SAFE-PARALLEL (codex R3/R4/R5). Exact-file entries
-            # still get full realpath (resolves symlink aliases to one canonical path).
-            is_glob = _has_glob(entry)
-            anchored = _anchor_glob(project_root, entry) if is_glob else _anchor(project_root, entry)
-            if is_glob:
-                prof.glob_patterns.add(anchored)
-                # A wildcard in a NON-FINAL (directory) segment makes the glob's
-                # future expansion unbounded — it can match a symlink dir or a
-                # not-yet-created subdir at runtime that no static expansion (nor the
-                # leaf-realpath check below, which sees only TODAY's matches) can
-                # predict (the codex case ``l*`` matching a plain dir today but a
-                # symlink dir tomorrow). Fail closed → indeterminate.
-                #
-                # Key this check on the RAW DECLARED string, NOT on ``anchored``:
-                # ``_anchor``'s realpath can dissolve a symlink whose own NAME contains
-                # a metachar — a literal dir named ``l*`` → ``src`` collapses to ``src``,
-                # ERASING the ``*`` that should have tripped this guard → false
-                # SAFE-PARALLEL (two workers then clobber a runtime-shared file). The
-                # raw string is a pure-syntactic anchor the filesystem can't rewrite,
-                # so it's immune to every symlink/alias trick. Precision is unchanged:
-                # a guarded directory segment (``src``, static-symlink ``link``) carries
-                # no metachar in raw OR anchored form, so keying on raw adds zero false
-                # serialization — it only plugs the metachar-named-symlink hole.
-                # Declarations use ``/`` (POSIX); normalize ``\`` too before splitting.
-                raw_segs = entry.replace("\\", "/").split("/")
-                if any(_has_glob(seg) for seg in raw_segs[:-1]):
-                    prof.files_indeterminate = True
-                    prof.file_notes.append(
-                        f"glob has a directory-segment wildcard — future expansion "
-                        f"unbounded (may cross symlinks / new subdirs): {entry}"
-                    )
-                    continue
-                matches = glob.glob(anchored, recursive=True)
-                if matches:
-                    # canonicalize each match too: glob traverses INTO symlinks and
-                    # yields them unresolved, so two globs reaching one real file
-                    # would otherwise look disjoint.
-                    prof.files_concrete.update(os.path.realpath(m) for m in matches)
-                    # A glob whose SYMLINK lives in a glob *segment* (``l*/*.py``,
-                    # not a static prefix) can't be statically resolved by _anchor,
-                    # so the stored pattern keeps the unresolved ``l*`` — a future
-                    # file created under the symlinked real dir WOULD collide at
-                    # runtime but the unresolved pattern won't ``fnmatch`` it
-                    # (false SAFE). Detect it: a match whose realpath differs from
-                    # its literal (normpath) form crossed a symlink the pattern
-                    # can't predict → fail-closed indeterminate.
-                    if any(os.path.realpath(m) != os.path.normpath(m) for m in matches):
+            # A malformed entry (embedded NUL, undecodable path, …) makes the
+            # ``os.path.realpath`` calls below raise — fail-closed for THIS entry
+            # (taint → MUST-SERIAL), never crash. Same class as an unexpandable glob.
+            try:
+                # A trailing separator declares a *directory* — capture it before
+                # _anchor (realpath strips it).
+                declared_dir = entry.endswith("/") or entry.endswith(os.sep)
+                # Anchor globs with a glob-AWARE canonicalizer: realpath ONLY the static
+                # prefix before the first wildcard segment, never the wildcard segments
+                # themselves. A whole-path realpath would dissolve a symlink whose own
+                # NAME is a metachar (``l*`` / ``l*.py``), ERASING the pattern into a
+                # concrete file → false SAFE-PARALLEL (codex R3/R4/R5). Exact-file entries
+                # still get full realpath (resolves symlink aliases to one canonical path).
+                is_glob = _has_glob(entry)
+                anchored = _anchor_glob(project_root, entry) if is_glob else _anchor(project_root, entry)
+                if is_glob:
+                    prof.glob_patterns.add(anchored)
+                    # A wildcard in a NON-FINAL (directory) segment makes the glob's
+                    # future expansion unbounded — it can match a symlink dir or a
+                    # not-yet-created subdir at runtime that no static expansion (nor the
+                    # leaf-realpath check below, which sees only TODAY's matches) can
+                    # predict (the codex case ``l*`` matching a plain dir today but a
+                    # symlink dir tomorrow). Fail closed → indeterminate.
+                    #
+                    # Key this check on the RAW DECLARED string, NOT on ``anchored``:
+                    # ``_anchor``'s realpath can dissolve a symlink whose own NAME contains
+                    # a metachar — a literal dir named ``l*`` → ``src`` collapses to ``src``,
+                    # ERASING the ``*`` that should have tripped this guard → false
+                    # SAFE-PARALLEL (two workers then clobber a runtime-shared file). The
+                    # raw string is a pure-syntactic anchor the filesystem can't rewrite,
+                    # so it's immune to every symlink/alias trick. Precision is unchanged:
+                    # a guarded directory segment (``src``, static-symlink ``link``) carries
+                    # no metachar in raw OR anchored form, so keying on raw adds zero false
+                    # serialization — it only plugs the metachar-named-symlink hole.
+                    # Declarations use ``/`` (POSIX); normalize ``\`` too before splitting.
+                    raw_segs = entry.replace("\\", "/").split("/")
+                    if any(_has_glob(seg) for seg in raw_segs[:-1]):
                         prof.files_indeterminate = True
                         prof.file_notes.append(
-                            f"glob expands through a symlink — future matches "
-                            f"unpredictable: {entry}"
+                            f"glob has a directory-segment wildcard — future expansion "
+                            f"unbounded (may cross symlinks / new subdirs): {entry}"
                         )
-                else:
-                    # "无法展开的 glob 不得当空集" — a glob that matches nothing on disk
-                    # (incl. one whose prefix dir is missing / an unresolvable symlink)
-                    # cannot be proven to touch any specific (or no) file → indeterminate.
+                        continue
+                    matches = glob.glob(anchored, recursive=True)
+                    if matches:
+                        # canonicalize each match too: glob traverses INTO symlinks and
+                        # yields them unresolved, so two globs reaching one real file
+                        # would otherwise look disjoint.
+                        prof.files_concrete.update(os.path.realpath(m) for m in matches)
+                        # A glob whose SYMLINK lives in a glob *segment* (``l*/*.py``,
+                        # not a static prefix) can't be statically resolved by _anchor,
+                        # so the stored pattern keeps the unresolved ``l*`` — a future
+                        # file created under the symlinked real dir WOULD collide at
+                        # runtime but the unresolved pattern won't ``fnmatch`` it
+                        # (false SAFE). Detect it: a match whose realpath differs from
+                        # its literal (normpath) form crossed a symlink the pattern
+                        # can't predict → fail-closed indeterminate.
+                        if any(os.path.realpath(m) != os.path.normpath(m) for m in matches):
+                            prof.files_indeterminate = True
+                            prof.file_notes.append(
+                                f"glob expands through a symlink — future matches "
+                                f"unpredictable: {entry}"
+                            )
+                    else:
+                        # "无法展开的 glob 不得当空集" — a glob that matches nothing on disk
+                        # (incl. one whose prefix dir is missing / an unresolvable symlink)
+                        # cannot be proven to touch any specific (or no) file → indeterminate.
+                        prof.files_indeterminate = True
+                        prof.file_notes.append(f"unexpandable glob (0 matches): {entry}")
+                elif os.path.isdir(anchored):
+                    # A directory entry claims the WHOLE subtree, including files not
+                    # created yet — a recursive listing of today's files can't prove
+                    # what it will touch tomorrow → fail-closed indeterminate.
                     prof.files_indeterminate = True
-                    prof.file_notes.append(f"unexpandable glob (0 matches): {entry}")
-            elif os.path.isdir(anchored):
-                # A directory entry claims the WHOLE subtree, including files not
-                # created yet — a recursive listing of today's files can't prove
-                # what it will touch tomorrow → fail-closed indeterminate.
+                    prof.file_notes.append(f"directory entry (claims whole subtree): {entry}")
+                elif declared_dir:
+                    # A trailing-slash entry that doesn't exist is a directory claim we
+                    # can't even enumerate → fail-closed.
+                    prof.files_indeterminate = True
+                    prof.file_notes.append(f"non-existent directory entry: {entry}")
+                else:
+                    # literal file — a new file need not exist yet; keep it as a
+                    # realpath-canonical concrete path.
+                    prof.files_concrete.add(anchored)
+            except (OSError, ValueError) as e:
+                # malformed path entry (embedded NUL / undecodable / OS-rejected) →
+                # can't anchor it, so can't prove it disjoint from anything → taint
+                # (fail-closed → MUST-SERIAL), no crash.
                 prof.files_indeterminate = True
-                prof.file_notes.append(f"directory entry (claims whole subtree): {entry}")
-            elif declared_dir:
-                # A trailing-slash entry that doesn't exist is a directory claim we
-                # can't even enumerate → fail-closed.
-                prof.files_indeterminate = True
-                prof.file_notes.append(f"non-existent directory entry: {entry}")
-            else:
-                # literal file — a new file need not exist yet; keep it as a
-                # realpath-canonical concrete path.
-                prof.files_concrete.add(anchored)
+                prof.field_issues.append(f"predicted_files entry unprocessable ({entry!r}): {e}")
+                prof.file_notes.append(f"unprocessable predicted_files entry ({entry!r}): {e}")
+                continue
 
     # ── repo / branch / push / isolation ──
     rb = task.raw.get("repo_branch")
@@ -502,6 +749,19 @@ def build_conflict_profile(task: Task) -> ConflictProfile:
         prof.shared[dim] = parsed
         if parsed is None:
             prof.field_issues.append(f"{dim} missing / unknown / malformed (need a list or \"none\")")
+
+    # ── effective worker isolation (singlepane-blind axis) ──
+    # PRIMARY source = the project-registry.json the actuator (dx-spawn) reads — its TRUE
+    # routing source (NOT handoff config, whose default-worktree masks real singlepane
+    # projects). config / the declared worktree_isolation field are only the registry-silent
+    # fallback. Pass the full project_root so the registry realpath-match (on paths.root) works.
+    prof.isolation = _effective_isolation(cfg, project_root, prof.worktree_isolation)
+
+    # ── shared git object-store (cross-slug-collision axis) ──
+    # A probe that could not RUN taints the task (fail-closed); a clean non-git dir does not.
+    prof.git_common_dir, git_issue = _resolve_git_common_dir(project_root)
+    if git_issue:
+        prof.field_issues.append(git_issue)
 
     return prof
 
@@ -671,6 +931,51 @@ def analyze_pair(a: ConflictProfile, b: ConflictProfile) -> tuple[str, list[str]
             if inter:
                 reasons.append(f"shared {dim}: {sorted(inter)}")
 
+    slug_a, slug_b = os.path.basename(a.project_root), os.path.basename(b.project_root)
+
+    # same singlepane project (bug 1 — singlepane-blind axis). A singlepane project may
+    # hold only ONE active worker: spawn-side ``_active_singlepane_worker`` hard-REJECTs a
+    # concurrent 2nd (design §5.4), so co-dispatching two same-(slug)project singlepane
+    # tasks makes the actuator reject one → the whole wave exits 2. The gate must instead
+    # judge them MUST-SERIAL so ``compute_wave`` DEFERS the 2nd to a later wave. Keyed on
+    # SLUG (the actuator's queue/lock are slug-keyed); worktree projects are exempt
+    # (worktree isolation + the wait=120 spawn-lock queue serialize them safely). The
+    # isolation values come from the registry (dx-spawn's real source); an unresolved
+    # registry (``ISOLATION_UNKNOWN``) is treated as possibly-singlepane → fail-closed.
+    if slug_a == slug_b:
+        sp = a.isolation == "singlepane" or b.isolation == "singlepane"
+        unk = a.isolation == ISOLATION_UNKNOWN or b.isolation == ISOLATION_UNKNOWN
+        if sp:
+            reasons.append(
+                f"same singlepane project {slug_a!r} — only one active worker allowed at a "
+                "time (actuator hard-rejects a concurrent 2nd) → serialize"
+            )
+        elif unk:
+            reasons.append(
+                f"same project {slug_a!r} with unresolved registry isolation "
+                "(registry missing/corrupt/illegal mode) — fail-closed, may be singlepane "
+                "→ serialize"
+            )
+
+    # cross-slug shared git object store (bug 2). Two DIFFERENT slugs (→ two distinct
+    # spawn lockdirs ``home/<slug>/.spawn.lock`` → NO serialization) that share ONE git
+    # common-dir (a linked worktree / two checkouts of one bare repo / a symlinked source
+    # tree) would run concurrent ``git fetch`` / ``worktree add`` against the SAME object
+    # store and race index.lock / packed-refs — exactly what the worktree spawn lock is
+    # meant to prevent but can't here because the lock is slug-keyed. The per-project
+    # realpath file axis can't see it (declared files anchor under each project root).
+    if (
+        a.git_common_dir is not None
+        and b.git_common_dir is not None
+        and a.git_common_dir == b.git_common_dir
+        and slug_a != slug_b
+    ):
+        reasons.append(
+            f"shared git object store ({a.git_common_dir}) across distinct projects "
+            f"{slug_a!r}/{slug_b!r} — concurrent git writes race (the slug-keyed spawn "
+            "lock can't serialize them) → serialize"
+        )
+
     return (MUST_SERIAL if reasons else SAFE_PARALLEL, reasons)
 
 
@@ -694,8 +999,12 @@ class BatchAnalysis:
         return all(p.verdict == SAFE_PARALLEL for p in self.pairs)
 
 
-def analyze_batch(tasks: list[Task]) -> BatchAnalysis:
-    profiles = [build_conflict_profile(t) for t in tasks]
+def analyze_batch(tasks: list[Task], *, cfg: _config.Config | None = None) -> BatchAnalysis:
+    # Load the config ONCE for the whole batch (isolation resolution) and thread it into
+    # every profile — avoids a per-task config read. A caller may inject ``cfg`` (tests).
+    if cfg is None:
+        cfg = _load_config()
+    profiles = [build_conflict_profile(t, cfg=cfg) for t in tasks]
     pairs: list[PairVerdict] = []
     for i in range(len(profiles)):
         for j in range(i + 1, len(profiles)):
@@ -706,6 +1015,134 @@ def analyze_batch(tasks: list[Task]) -> BatchAnalysis:
                 )
             )
     return BatchAnalysis(profiles=profiles, pairs=pairs)
+
+
+# ─── concurrent wave planning (partition + resource bound) ──────────────────────
+
+# Above this many tasks, the exact maximum-independent-set search (2^N subsets) is
+# skipped for a deterministic greedy maximal set. A coordinator fanning out >16
+# workers in a single wave is not a real scenario (load headroom caps it far lower),
+# so the exact path always runs in practice; the greedy fallback is a runaway guard.
+_MIS_EXACT_MAX = 16
+
+# Conservative wave width when the load probe is unavailable (no os.getloadavg on
+# the platform / probe error). Small on purpose — fail toward fewer concurrent
+# spawns, never toward piling workers onto an unknown box.
+_WIDTH_FALLBACK = 4
+
+
+@dataclass
+class WavePlan:
+    """How a batch is partitioned for one ``--execute`` invocation.
+
+    ``wave`` — the task_ids dispatched CONCURRENTLY this invocation. ALWAYS
+    pairwise ``SAFE-PARALLEL`` (a subset of a maximum independent set in the
+    conflict graph) AND ``len(wave) ≤ max_width`` (resource bound). Never empty
+    for a non-empty batch.
+
+    ``conflict_deferred`` — task_ids left out because they conflict with a wave
+    member (or with each other); the coordinator dispatches them in a LATER wave
+    after the current wave merges. ``load_deferred`` — task_ids that ARE wave-
+    eligible (disjoint) but exceeded the load/width cap; dispatch them next wave
+    when headroom frees up. Both deferred lists are in declared order."""
+
+    wave: list[str]
+    conflict_deferred: list[str]
+    load_deferred: list[str]
+
+
+def _conflict_adjacency(analysis: BatchAnalysis) -> tuple[list[str], list[list[bool]]]:
+    """Build the undirected conflict graph: nodes = tasks (declared order), an edge
+    iff the pair is ``MUST-SERIAL`` (cannot run concurrently). Returns
+    ``(ids, adj)`` where ``adj[i][j]`` is True when tasks i,j conflict."""
+    ids = [p.task_id for p in analysis.profiles]
+    idx = {tid: i for i, tid in enumerate(ids)}
+    n = len(ids)
+    adj = [[False] * n for _ in range(n)]
+    for pv in analysis.pairs:
+        if pv.verdict == MUST_SERIAL:
+            i, j = idx[pv.a], idx[pv.b]
+            adj[i][j] = adj[j][i] = True
+    return ids, adj
+
+
+def _is_independent(sel: tuple[int, ...], adj: list[list[bool]]) -> bool:
+    for x in range(len(sel)):
+        for y in range(x + 1, len(sel)):
+            if adj[sel[x]][sel[y]]:
+                return False
+    return True
+
+
+def _max_independent_set(adj: list[list[bool]]) -> list[int]:
+    """The largest set of pairwise-non-conflicting task indices (a maximum
+    independent set in the conflict graph). Ties broken toward the lexicographically
+    smallest index tuple → prefers earlier-declared tasks, fully deterministic.
+
+    A node that conflicts with EVERY other (e.g. a task with incomplete/unknown
+    declared fields → ``analyze_pair`` taints all its pairs) has edges to all, so it
+    can only sit in a size-1 set; the maximum set therefore naturally EXCLUDES it in
+    favour of the larger clean group — the under-declared task is the one deferred,
+    not the good batch. Exact over all 2^N subsets for N ≤ ``_MIS_EXACT_MAX``;
+    deterministic greedy (declared order) above it (a runaway guard, never hit in
+    practice). Always returns ≥1 index for a non-empty graph."""
+    n = len(adj)
+    if n == 0:
+        return []
+    if n > _MIS_EXACT_MAX:
+        # greedy maximal set in declared order (guard path only)
+        chosen: list[int] = []
+        for i in range(n):
+            if all(not adj[i][c] for c in chosen):
+                chosen.append(i)
+        return chosen
+    best: tuple[int, ...] | None = None
+    for mask in range(1, 1 << n):
+        sel = tuple(i for i in range(n) if mask >> i & 1)
+        if not _is_independent(sel, adj):
+            continue
+        if best is None or len(sel) > len(best) or (len(sel) == len(best) and sel < best):
+            best = sel
+    return list(best) if best is not None else [0]
+
+
+def compute_wave(analysis: BatchAnalysis, *, max_width: int) -> WavePlan:
+    """Partition the batch into the concurrent wave + the two deferred buckets.
+
+    1. Maximum independent set of the conflict graph = the largest pairwise-disjoint
+       group (everything NOT in it is ``conflict_deferred``).
+    2. Cap the wave to ``max_width`` (resource bound, N ≤ loadavg). The independent
+       set's first ``max_width`` tasks (declared order) form the wave; the rest are
+       ``load_deferred``. A prefix of an independent set is still independent, so the
+       capped wave stays provably pairwise-disjoint."""
+    ids, adj = _conflict_adjacency(analysis)
+    if not ids:
+        return WavePlan(wave=[], conflict_deferred=[], load_deferred=[])
+    width = max(1, max_width)
+    mis = _max_independent_set(adj)            # indices, ascending = declared order
+    mis_set = set(mis)
+    kept = mis[:width]
+    load_idx = mis[width:]
+    conflict_idx = [i for i in range(len(ids)) if i not in mis_set]
+    return WavePlan(
+        wave=[ids[i] for i in kept],
+        conflict_deferred=[ids[i] for i in conflict_idx],
+        load_deferred=[ids[i] for i in load_idx],
+    )
+
+
+def _load_headroom() -> int:
+    """Best-effort concurrent-wave width ceiling from system load: ``cpu_count −
+    1-min loadavg``, floored at 1 (always dispatch at least one). A busy box yields a
+    small headroom → fewer concurrent spawns; a saturated box → width 1 (serial),
+    satisfying owner law §六 "资源有界". Falls back to ``_WIDTH_FALLBACK`` whenever
+    the load/cpu probe is unavailable (fail toward fewer, never more)."""
+    try:
+        load1 = os.getloadavg()[0]
+    except (OSError, AttributeError):  # no getloadavg on this platform
+        return _WIDTH_FALLBACK
+    cpu = os.cpu_count() or _WIDTH_FALLBACK
+    return max(1, int(cpu - load1))
 
 
 # ─── brief skeleton generation ─────────────────────────────────────────────────
@@ -832,6 +1269,35 @@ def dispatch_one(task: Task, *, dx_spawn: Path, home: Path) -> tuple[bool, str]:
     return True, out.strip()
 
 
+def dispatch_wave(
+    wave_tasks: list[Task], *, dx_spawn: Path, home: Path, width: int
+) -> dict[str, tuple[bool, str]]:
+    """Fan the wave out CONCURRENTLY, one thread per ``dispatch_one`` call, and
+    return ``{task_id: (ok, msg)}`` for EVERY wave task. Concurrency is bounded by
+    ``width`` (already ≤ the load/width cap from ``compute_wave``).
+
+    Failure-isolated: a task whose spawn fails — or unexpectedly raises — is recorded
+    as ``(False, msg)`` and never aborts its peers (sound because the wave is proven
+    pairwise-disjoint, so a failed spawn cannot corrupt another's files/state). The
+    spawn itself (``subprocess.run``) is I/O-bound and releases the GIL, so a thread
+    pool is the right primitive (no re-implementation of the spawn engine)."""
+    results: dict[str, tuple[bool, str]] = {}
+    if not wave_tasks:
+        return results
+    max_workers = max(1, min(width, len(wave_tasks)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {
+            ex.submit(dispatch_one, t, dx_spawn=dx_spawn, home=home): t for t in wave_tasks
+        }
+        for fut in concurrent.futures.as_completed(futs):
+            t = futs[fut]
+            try:
+                results[t.task_id] = fut.result()
+            except Exception as e:  # dispatch_one already catches its own; this is belt-and-braces
+                results[t.task_id] = (False, f"dispatch raised for {t.task_id}: {e!r}")
+    return results
+
+
 # ─── rendering ─────────────────────────────────────────────────────────────────
 
 
@@ -864,15 +1330,40 @@ def _render_verdict(analysis: BatchAnalysis) -> str:
     n = sum(1 for p in analysis.pairs if p.verdict == MUST_SERIAL)
     return (
         "═══ 批次裁定 ═══\n"
-        f"  🔴 NOT PARALLEL-SAFE — {n} 个任务对判 MUST-SERIAL（见上表原因）。\n"
-        "  → 建议：串行逐个派 / 拆小到无冲突子批 / 交 owner 决策。--execute 将拒绝并发本批。"
+        f"  🔴 NOT FULLY PARALLEL — {n} 个任务对判 MUST-SERIAL（见上表原因）。\n"
+        "  → --execute 仍会并发派【可证明 disjoint 的最大子集】(wave)，冲突的 defer 到下一波。"
     )
+
+
+def _render_wave_plan(plan: WavePlan, *, width: int, width_src: str) -> str:
+    """Render the concurrent wave partition — exactly what ``--execute`` will do."""
+    lines = ["═══ 并发波次计划（concurrent wave plan） ═══"]
+    lines.append(f"  并发宽度上界 N≤{width}  （来源：{width_src}）")
+    if plan.wave:
+        lines.append(
+            f"  ✅ 本波并发派 (wave, {len(plan.wave)} 个 — 两两 disjoint): {plan.wave}"
+        )
+    else:
+        lines.append("  ✅ 本波并发派 (wave): (空 — 无可派任务)")
+    if plan.load_deferred:
+        lines.append(
+            f"  ⏳ 负载 deferred ({len(plan.load_deferred)} 个 — 宽度上界已满，下一波派): "
+            f"{plan.load_deferred}"
+        )
+    if plan.conflict_deferred:
+        lines.append(
+            f"  ⏭️  冲突 deferred ({len(plan.conflict_deferred)} 个 — 与本波/彼此冲突，"
+            f"待本波合并后再派，见冲突表): {plan.conflict_deferred}"
+        )
+    if not plan.load_deferred and not plan.conflict_deferred:
+        lines.append("  （无 deferred — 全批一波并发派）")
+    return "\n".join(lines)
 
 
 # ─── CLI ───────────────────────────────────────────────────────────────────────
 
 
-def run(tasks_json: Path, *, execute: bool) -> int:
+def run(tasks_json: Path, *, execute: bool, max_width: int | None = None) -> int:
     # parse + validate identity/brief-required fields (hard, fail-closed)
     try:
         raw_tasks = _load_tasks(tasks_json)
@@ -887,7 +1378,25 @@ def run(tasks_json: Path, *, execute: bool) -> int:
         _err(f"duplicate task_id(s) in batch: {dupes}")
         return EXIT_FAIL
 
-    analysis = analyze_batch(tasks)
+    # Catch-all backstop (mirrors the actuator dx-spawn's bash FATAL wrapper): the
+    # per-task fail-closes in build_conflict_profile (FIX 1/2) are the primary graceful
+    # path; this is the last-resort net so NO analysis crash ever escapes as a raw
+    # traceback — refuse to dispatch (fail-closed) instead.
+    try:
+        analysis = analyze_batch(tasks)
+    except Exception as e:
+        _err(f"conflict analysis failed (fail-closed, refusing to dispatch): {e}")
+        return EXIT_FAIL
+
+    # resolve the concurrent-wave width ceiling (explicit --max-width wins; else the
+    # live load headroom). Computed up front so the dry-run preview shows EXACTLY
+    # what --execute would do this moment.
+    if max_width is not None:
+        width, width_src = max(1, max_width), "--max-width"
+    else:
+        width, width_src = _load_headroom(), "loadavg headroom (cpu−load1, ≥1)"
+    plan = compute_wave(analysis, max_width=width)
+    by_id = {t.task_id: t for t in tasks}
 
     # dry-run / preview output (always printed — the gate's visual record)
     print(_render_plan(tasks))
@@ -896,6 +1405,8 @@ def run(tasks_json: Path, *, execute: bool) -> int:
     print()
     print(_render_verdict(analysis))
     print()
+    print(_render_wave_plan(plan, width=width, width_src=width_src))
+    print()
     print("═══ 每任务 brief 预览（brief preview） ═══")
     for t in tasks:
         print(f"\n───── 🆔{t.task_id} ─────")
@@ -903,18 +1414,12 @@ def run(tasks_json: Path, *, execute: bool) -> int:
 
     if not execute:
         print(
-            "\n[coord-dispatch] dry-run（默认）—— 未写 .uri、未真派。确认无误后加 --execute 真派。"
+            "\n[coord-dispatch] dry-run（默认）—— 未写 .uri、未真派。确认无误后加 --execute 真派"
+            "（将并发派上面 wave 列出的任务，deferred 的留待下一波）。"
         )
         return EXIT_OK
 
-    # ── --execute: real dispatch ──
-    if not analysis.parallel_safe:
-        _err(
-            "REFUSED: 本批非 SAFE-PARALLEL（见冲突表）。并发派被 fail-closed 拒绝 —— "
-            "请串行逐个派、拆小到无冲突子批、或交 owner 决策。"
-        )
-        return EXIT_FAIL
-
+    # ── --execute: real CONCURRENT dispatch of the proven-disjoint wave ──
     dx_spawn = _resolve_dx_spawn()
     if dx_spawn is None:
         _err(
@@ -924,22 +1429,47 @@ def run(tasks_json: Path, *, execute: bool) -> int:
         return EXIT_FAIL
 
     home = _config.home_dir()
-    print(f"\n[coord-dispatch] SAFE-PARALLEL — 经 {dx_spawn} 逐个派 {len(tasks)} 个 worker intent…")
-    dispatched: list[str] = []
-    for t in tasks:
-        ok, msg = dispatch_one(t, dx_spawn=dx_spawn, home=home)
-        if not ok:
-            _err(msg)
-            _err(
-                f"dispatch 在 {t.task_id} 处失败 —— 已派 {dispatched or '(none)'}；停止本批"
-                "（fail-closed，不在失败后继续派）。请人工核查后处理剩余任务。"
-            )
-            return EXIT_FAIL
-        dispatched.append(t.task_id)
-        print(f"  ✅ 已派 🆔{t.task_id}")
-        if msg:
-            print(f"     {msg.splitlines()[-1] if msg.splitlines() else ''}")
-    print(f"[coord-dispatch] ✅ 全部 {len(dispatched)} 个 worker intent 已产出：{dispatched}")
+    wave_tasks = [by_id[tid] for tid in plan.wave]
+    print(
+        f"\n[coord-dispatch] 并发派 wave（{len(wave_tasks)} 个，宽度上界 N≤{width}）"
+        f"经 {dx_spawn} …"
+    )
+    results = dispatch_wave(wave_tasks, dx_spawn=dx_spawn, home=home, width=width)
+
+    ok_ids = [tid for tid in plan.wave if results.get(tid, (False, ""))[0]]
+    failed_ids = [tid for tid in plan.wave if not results.get(tid, (False, ""))[0]]
+    for tid in plan.wave:
+        ok, msg = results.get(tid, (False, "(no result)"))
+        if ok:
+            tail = msg.splitlines()[-1] if msg.splitlines() else ""
+            print(f"  ✅ 已派 🆔{tid}" + (f"  {tail}" if tail else ""))
+        else:
+            print(f"  ❌ 派失败 🆔{tid}: {msg.splitlines()[0] if msg.splitlines() else msg}")
+
+    if plan.load_deferred:
+        print(
+            f"  ⏳ 负载 deferred（未派，宽度上界已满，下一波派）：{plan.load_deferred}"
+        )
+    if plan.conflict_deferred:
+        print(
+            f"  ⏭️  冲突 deferred（未派，与本波/彼此冲突，待本波合并后再派）："
+            f"{plan.conflict_deferred}"
+        )
+
+    if failed_ids:
+        _err(
+            f"{len(failed_ids)} 个 worker intent 派发失败：{failed_ids}（已隔离，未影响其余 "
+            f"{ok_ids or '(none)'}）。请人工核查失败原因后重派失败项。"
+        )
+        return EXIT_FAIL
+    print(
+        f"[coord-dispatch] ✅ 本波 {len(ok_ids)} 个 worker intent 已并发产出：{ok_ids}"
+        + (
+            f"；下一波待派：{plan.conflict_deferred + plan.load_deferred}"
+            if (plan.conflict_deferred or plan.load_deferred)
+            else "（全批一波派完）"
+        )
+    )
     return EXIT_OK
 
 
@@ -949,8 +1479,9 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Low-friction coordinator fan-out with a HARD machine-judged "
             "concurrency-conflict gate. Default dry-run (prints batch plan + "
-            "conflict table + brief previews, spawns nothing); --execute fans out "
-            "via dx-spawn-session.sh ONLY when the batch is SAFE-PARALLEL."
+            "conflict table + concurrent wave plan + brief previews, spawns "
+            "nothing); --execute CONCURRENTLY fans out the proven-disjoint wave "
+            "(load-/width-capped, failure-isolated) and defers the rest to a later wave."
         ),
     )
     p.add_argument(
@@ -961,14 +1492,25 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--execute",
         action="store_true",
-        help="actually dispatch (default: dry-run). Refused unless the batch is SAFE-PARALLEL.",
+        help="actually dispatch (default: dry-run). Concurrently fans out the proven-"
+        "disjoint wave; conflicting / over-width tasks are deferred to a later wave.",
+    )
+    p.add_argument(
+        "--max-width",
+        type=int,
+        default=None,
+        metavar="N",
+        help="explicit concurrent-wave width ceiling (overrides the loadavg headroom). "
+        "N≤0 is clamped to 1. Use to force serial (--max-width 1) or a known-idle box's full width.",
     )
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    return run(Path(args.tasks_json).expanduser(), execute=args.execute)
+    return run(
+        Path(args.tasks_json).expanduser(), execute=args.execute, max_width=args.max_width
+    )
 
 
 if __name__ == "__main__":

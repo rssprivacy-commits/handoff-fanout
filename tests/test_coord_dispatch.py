@@ -10,10 +10,13 @@ use a FAKE ``DX_SPAWN_SH`` that records its argv — never a real worker window.
 from __future__ import annotations
 
 import json
+import subprocess
+import threading
 from pathlib import Path
 
 import pytest
 
+from handoff_fanout import config as _config
 from handoff_fanout import coord_dispatch as cd
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
@@ -508,10 +511,10 @@ def test_execute_safe_batch_invokes_fake_dx_spawn(tmp_path: Path, monkeypatch: p
         _task(pa, "t-a", repo_branch="a@main"),
         _task(pb, "t-b", repo_branch="b@main"),
     ])
-    rc = cd.run(p, execute=True)
+    rc = cd.run(p, execute=True, max_width=2)  # explicit width → deterministic vs machine load
     assert rc == cd.EXIT_OK
     log = fake_log.read_text()
-    # both tasks dispatched, each with --project / --brief / --task-id
+    # both disjoint tasks dispatched in one concurrent wave, each with --project / --brief / --task-id
     assert "--task-id t-a" in log and "--task-id t-b" in log
     assert "--project " + str(pa) in log
     assert "--brief " in log
@@ -520,7 +523,12 @@ def test_execute_safe_batch_invokes_fake_dx_spawn(tmp_path: Path, monkeypatch: p
     assert (home / "_dispatch_briefs" / "t-b.md").is_file()
 
 
-def test_execute_refuses_unsafe_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_execute_unsafe_pair_dispatches_one_defers_other(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two tasks editing the same file are MUST-SERIAL: --execute dispatches the
+    proven-safe wave (exactly one of them) and DEFERS the conflicting peer — it
+    NEVER co-dispatches a conflicting pair into the same concurrent wave."""
     pa = _mkproject(tmp_path, "proj-a")
     fake_log = tmp_path / "spawn.log"
     fake = _write_fake_dx_spawn(tmp_path, fake_log, rc=0)
@@ -531,9 +539,12 @@ def test_execute_refuses_unsafe_batch(tmp_path: Path, monkeypatch: pytest.Monkey
         _task(pa, "t-one", predicted_files=["src/x.py"]),
         _task(pa, "t-two", predicted_files=["src/x.py"]),
     ])
-    rc = cd.run(p, execute=True)
-    assert rc == cd.EXIT_FAIL
-    assert not fake_log.exists(), "an unsafe batch must never reach the spawn engine"
+    rc = cd.run(p, execute=True, max_width=4)
+    assert rc == cd.EXIT_OK  # the wave dispatched cleanly; the conflict is deferred, not an error
+    log = fake_log.read_text()
+    # exactly ONE dispatched (the earlier-declared t-one), the conflicting peer deferred
+    assert "--task-id t-one" in log
+    assert "--task-id t-two" not in log, "a conflicting pair must never both reach one wave"
 
 
 def test_execute_without_dx_spawn_env_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -544,8 +555,11 @@ def test_execute_without_dx_spawn_env_fails(tmp_path: Path, monkeypatch: pytest.
     assert cd.run(p, execute=True) == cd.EXIT_FAIL
 
 
-def test_execute_stops_on_first_dispatch_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A failing dx-spawn (rc!=0) → fail-closed: report + stop, exit 2."""
+def test_execute_failure_isolation_attempts_all_wave_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing dx-spawn (rc!=0) is ISOLATED: every wave task is still attempted
+    (no stop-on-first), and the batch exits FAIL because a spawn failed."""
     pa = _mkproject(tmp_path, "proj-a")
     pb = _mkproject(tmp_path, "proj-b")
     home = tmp_path / "home"
@@ -557,7 +571,170 @@ def test_execute_stops_on_first_dispatch_failure(tmp_path: Path, monkeypatch: py
         _task(pa, "t-a", repo_branch="a@main"),
         _task(pb, "t-b", repo_branch="b@main"),
     ])
-    assert cd.run(p, execute=True) == cd.EXIT_FAIL
+    assert cd.run(p, execute=True, max_width=2) == cd.EXIT_FAIL
+    log = fake_log.read_text()
+    # failure isolation: BOTH wave tasks were attempted, not just the first
+    assert "--task-id t-a" in log and "--task-id t-b" in log
+
+
+# ─── concurrent wave planning: partition (compute_wave) ──────────────────────
+
+
+def _analysis(tasks: list[dict]) -> cd.BatchAnalysis:
+    parsed = [cd._parse_identity(t, i) for i, t in enumerate(tasks)]
+    return cd.analyze_batch(parsed)
+
+
+def test_compute_wave_all_disjoint_is_single_wave(tmp_path: Path) -> None:
+    """Three mutually-disjoint tasks under a generous width → one full wave, nothing deferred."""
+    pa, pb, pc = (_mkproject(tmp_path, n) for n in ("a", "b", "c"))
+    analysis = _analysis([
+        _task(pa, "t-a", repo_branch="a@main"),
+        _task(pb, "t-b", repo_branch="b@main"),
+        _task(pc, "t-c", repo_branch="c@main"),
+    ])
+    plan = cd.compute_wave(analysis, max_width=8)
+    assert plan.wave == ["t-a", "t-b", "t-c"]
+    assert plan.conflict_deferred == [] and plan.load_deferred == []
+
+
+def test_compute_wave_conflict_defers_minimum(tmp_path: Path) -> None:
+    """A-B share a file (conflict); C disjoint. The maximum independent set is
+    {one of A/B, C}; the conflicting peer is the only task deferred."""
+    pa = _mkproject(tmp_path, "a")
+    pc = _mkproject(tmp_path, "c")
+    analysis = _analysis([
+        _task(pa, "t-a", predicted_files=["src/shared.py"]),
+        _task(pa, "t-b", predicted_files=["src/shared.py"]),
+        _task(pc, "t-c", repo_branch="c@main"),
+    ])
+    plan = cd.compute_wave(analysis, max_width=8)
+    # t-a (earlier of the conflicting pair) + t-c go; t-b deferred. Wave is pairwise-disjoint.
+    assert set(plan.wave) == {"t-a", "t-c"}
+    assert plan.conflict_deferred == ["t-b"]
+    assert plan.load_deferred == []
+
+
+def test_compute_wave_underdeclared_task_deferred_not_good_batch(tmp_path: Path) -> None:
+    """An under-declared task (missing predicted_files → fail-closed, conflicts with
+    EVERYTHING) must be the one deferred — the maximum independent set keeps the
+    larger clean batch, never letting a position-0 hub poison the wave."""
+    pa, pb, pc = (_mkproject(tmp_path, n) for n in ("a", "b", "c"))
+    analysis = _analysis([
+        _task(pa, "t-bad", drop={"predicted_files"}),   # declared first, conflicts with all
+        _task(pb, "t-b", repo_branch="b@main"),
+        _task(pc, "t-c", repo_branch="c@main"),
+    ])
+    plan = cd.compute_wave(analysis, max_width=8)
+    assert set(plan.wave) == {"t-b", "t-c"}
+    assert plan.conflict_deferred == ["t-bad"]
+
+
+def test_compute_wave_load_cap_truncates_and_load_defers(tmp_path: Path) -> None:
+    """Disjoint tasks beyond the width cap are load-deferred (declared order kept),
+    and the capped wave stays pairwise-disjoint."""
+    pa, pb, pc = (_mkproject(tmp_path, n) for n in ("a", "b", "c"))
+    analysis = _analysis([
+        _task(pa, "t-a", repo_branch="a@main"),
+        _task(pb, "t-b", repo_branch="b@main"),
+        _task(pc, "t-c", repo_branch="c@main"),
+    ])
+    plan = cd.compute_wave(analysis, max_width=2)
+    assert plan.wave == ["t-a", "t-b"]
+    assert plan.load_deferred == ["t-c"]
+    assert plan.conflict_deferred == []
+
+
+def test_compute_wave_width_clamped_to_at_least_one(tmp_path: Path) -> None:
+    pa = _mkproject(tmp_path, "a")
+    analysis = _analysis([_task(pa, "solo")])
+    plan = cd.compute_wave(analysis, max_width=0)  # clamped to 1
+    assert plan.wave == ["solo"]
+
+
+def test_load_headroom_at_least_one() -> None:
+    """The auto width ceiling is always a positive int (never 0 / negative)."""
+    h = cd._load_headroom()
+    assert isinstance(h, int) and h >= 1
+
+
+# ─── concurrent wave dispatch: parallelism + failure isolation + render ────────
+
+
+def test_dispatch_wave_runs_concurrently(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deterministic concurrency proof: a 2-party barrier inside a patched
+    dispatch_one only clears if BOTH wave tasks run at the same time. A serial loop
+    would block the first party until the 5s timeout → broken barrier → test fails."""
+    pa, pb = _mkproject(tmp_path, "a"), _mkproject(tmp_path, "b")
+    home = tmp_path / "home"
+    monkeypatch.setenv("HANDOFF_HOME", str(home))
+    fake = _write_fake_dx_spawn(tmp_path, tmp_path / "spawn.log", rc=0)
+    monkeypatch.setenv("DX_SPAWN_SH", str(fake))
+
+    barrier = threading.Barrier(2, timeout=5)
+    seen: list[str] = []
+    lock = threading.Lock()
+
+    def fake_dispatch_one(task: cd.Task, *, dx_spawn: Path, home: Path) -> tuple[bool, str]:
+        del dx_spawn, home  # mock matches the real keyword interface; values unused here
+        barrier.wait()  # serial dispatch ⇒ deadlock here ⇒ BrokenBarrierError ⇒ failure
+        with lock:
+            seen.append(task.task_id)
+        return True, "ok"
+
+    monkeypatch.setattr(cd, "dispatch_one", fake_dispatch_one)
+    p = _write_json(tmp_path, [
+        _task(pa, "t-a", repo_branch="a@main"),
+        _task(pb, "t-b", repo_branch="b@main"),
+    ])
+    rc = cd.run(p, execute=True, max_width=2)
+    assert rc == cd.EXIT_OK
+    assert sorted(seen) == ["t-a", "t-b"], "both wave tasks must run concurrently"
+
+
+def test_max_width_one_forces_serial_single_task_wave(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--max-width 1 collapses even a disjoint batch to a width-1 wave (the rest
+    load-deferred) — the explicit serial escape hatch."""
+    pa, pb = _mkproject(tmp_path, "a"), _mkproject(tmp_path, "b")
+    home = tmp_path / "home"
+    monkeypatch.setenv("HANDOFF_HOME", str(home))
+    fake_log = tmp_path / "spawn.log"
+    fake = _write_fake_dx_spawn(tmp_path, fake_log, rc=0)
+    monkeypatch.setenv("DX_SPAWN_SH", str(fake))
+    p = _write_json(tmp_path, [
+        _task(pa, "t-a", repo_branch="a@main"),
+        _task(pb, "t-b", repo_branch="b@main"),
+    ])
+    rc = cd.run(p, execute=True, max_width=1)
+    assert rc == cd.EXIT_OK
+    log = fake_log.read_text()
+    assert "--task-id t-a" in log
+    assert "--task-id t-b" not in log, "width-1 wave must defer the second disjoint task"
+
+
+def test_dry_run_shows_wave_plan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                 capsys: pytest.CaptureFixture[str]) -> None:
+    pa, pb = _mkproject(tmp_path, "a"), _mkproject(tmp_path, "b")
+    monkeypatch.setenv("HANDOFF_HOME", str(tmp_path / "home"))
+    p = _write_json(tmp_path, [
+        _task(pa, "t-a", repo_branch="a@main"),
+        _task(pb, "t-b", repo_branch="b@main"),
+    ])
+    assert cd.run(p, execute=False, max_width=4) == cd.EXIT_OK
+    out = capsys.readouterr().out
+    assert "并发波次计划" in out          # wave plan section rendered
+    assert "wave" in out and "并发宽度上界" in out
+
+
+def test_cli_routing_accepts_max_width(tmp_path: Path) -> None:
+    """`handoff coord-dispatch --max-width N` parses + routes through the unified CLI."""
+    from handoff_fanout import cli
+
+    pa = _mkproject(tmp_path, "proj-a")
+    p = _write_json(tmp_path, [_task(pa, "solo")])
+    assert cli.main(["coord-dispatch", "--tasks-json", str(p), "--max-width", "3"]) == 0
 
 
 # ─── input validation ────────────────────────────────────────────────────────
@@ -1112,3 +1289,461 @@ def _write_fake_dx_spawn(tmp_path: Path, log: Path, *, rc: int) -> Path:
     )
     f.chmod(0o755)
     return f
+
+
+def _git(root: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, text=True)
+
+
+def _mkgitrepo(tmp_path: Path, name: str, files: list[str] | None = None) -> Path:
+    """A project dir that IS a git repo (≥1 commit, so a worktree can be added)."""
+    root = _mkproject(tmp_path, name, files)
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "t@t")
+    _git(root, "config", "user.name", "t")
+    _git(root, "commit", "-q", "--allow-empty", "-m", "init")
+    return root
+
+
+# ─── bug 1: singlepane same-project — actuator allows only ONE active worker ───
+
+
+def test_same_singlepane_project_two_tasks_are_must_serial(tmp_path: Path) -> None:
+    """🔴 bug 1 (p74 RED — singlepane blind): two tasks in the SAME project that
+    resolves to ``singlepane`` isolation must be MUST-SERIAL even when their declared
+    files are disjoint and they declare ``worktree_isolation=True``. A singlepane
+    project may hold only ONE active worker (``spawn._active_singlepane_worker`` hard-
+    REJECTs a concurrent 2nd → the whole wave exits 2); the gate must defer the 2nd,
+    not fan it out to be rejected. Config is the authoritative isolation source (it
+    overrides the per-task declared field)."""
+    pa = _mkproject(tmp_path, "proj-a")
+    cfg = _config.Config(worker_isolation={"proj-a": "singlepane"})
+    tasks = [
+        cd._parse_identity(_task(pa, "t-one", predicted_files=["src/one.py"],
+                                 worktree_isolation=True), 0),
+        cd._parse_identity(_task(pa, "t-two", predicted_files=["src/two.py"],
+                                 worktree_isolation=True), 1),
+    ]
+    analysis = cd.analyze_batch(tasks, cfg=cfg)
+    assert _verdict_for(analysis, "t-one", "t-two") == cd.MUST_SERIAL
+    assert any("singlepane" in r for r in analysis.pairs[0].reasons)
+
+
+def test_singlepane_same_project_second_task_deferred_not_codispatched(tmp_path: Path) -> None:
+    """🔴 bug 1: the singlepane MUST-SERIAL edge must make ``compute_wave`` DEFER the
+    second same-project task (keep it out of the wave) rather than co-dispatch it —
+    co-dispatch is exactly what makes the actuator reject the 2nd and exit 2."""
+    pa = _mkproject(tmp_path, "proj-a")
+    cfg = _config.Config(worker_isolation={"proj-a": "singlepane"})
+    tasks = [
+        cd._parse_identity(_task(pa, "t-one", predicted_files=["src/one.py"]), 0),
+        cd._parse_identity(_task(pa, "t-two", predicted_files=["src/two.py"]), 1),
+    ]
+    plan = cd.compute_wave(cd.analyze_batch(tasks, cfg=cfg), max_width=8)
+    assert plan.wave == ["t-one"]
+    assert plan.conflict_deferred == ["t-two"]
+
+
+def test_worktree_project_same_two_tasks_stay_safe_parallel(tmp_path: Path) -> None:
+    """Precision guard for bug 1 (no over-serialization): two same-project tasks in a
+    ``worktree``-isolated project with disjoint files + no push stay SAFE-PARALLEL —
+    worktree isolation + the wait=120 spawn-lock queue serialize their shared-repo git
+    writes safely. The fix must key on *singlepane*, never blanket 'same project'."""
+    pa = _mkproject(tmp_path, "proj-a")
+    cfg = _config.Config(worker_isolation={"proj-a": "worktree"})
+    tasks = [
+        cd._parse_identity(_task(pa, "t-one", predicted_files=["src/one.py"],
+                                 repo_branch="proj-a@main", will_push=False,
+                                 worktree_isolation=True), 0),
+        cd._parse_identity(_task(pa, "t-two", predicted_files=["src/two.py"],
+                                 repo_branch="proj-a@main", will_push=False,
+                                 worktree_isolation=True), 1),
+    ]
+    assert cd.analyze_batch(tasks, cfg=cfg).parallel_safe
+
+
+def test_singlepane_fallback_from_declared_worktree_isolation_false(tmp_path: Path) -> None:
+    """🔴 bug 1 fail-closed fallback: when config does NOT pin the project's isolation
+    (``resolve_isolation`` → None), a declared ``worktree_isolation=False`` means the
+    worker runs in the REAL repo (not worktree-isolated) → only one at a time → two
+    same-project tasks are MUST-SERIAL. ``will_push=False`` so the same-repo-push rule
+    can't fire — the verdict is owed to the singlepane fallback axis alone."""
+    pa = _mkproject(tmp_path, "proj-a")
+    cfg = _config.Config()  # empty → resolve_isolation returns None → declared-field fallback
+    tasks = [
+        cd._parse_identity(_task(pa, "t-one", predicted_files=["src/one.py"],
+                                 repo_branch="proj-a@main", will_push=False,
+                                 worktree_isolation=False), 0),
+        cd._parse_identity(_task(pa, "t-two", predicted_files=["src/two.py"],
+                                 repo_branch="proj-a@main", will_push=False,
+                                 worktree_isolation=False), 1),
+    ]
+    analysis = cd.analyze_batch(tasks, cfg=cfg)
+    assert _verdict_for(analysis, "t-one", "t-two") == cd.MUST_SERIAL
+    assert any("singlepane" in r for r in analysis.pairs[0].reasons)
+
+
+# ─── bug 1 (二修): registry is the isolation source the actuator routes on ─────
+#
+# The actuator (dx-spawn-session.sh) reads project-registry.json, NOT handoff config.
+# Live config carries ``worker_isolation={"default":"worktree"}`` which would mask every
+# project's true mode; the gate must resolve isolation from the registry (via an explicit
+# ``DX_PROJECT_REGISTRY``) so its verdict matches what the actuator actually does.
+
+
+def _write_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entries: dict[Path, str | None],
+    *,
+    name: str = "project-registry.json",
+) -> Path:
+    """Write a mock project-registry.json ({key: {paths:{root}, worker_isolation}}) and
+    pin ``DX_PROJECT_REGISTRY`` at it (an EXPLICIT registry → strict / fail-closed on miss).
+    A ``None`` isolation value omits the ``worker_isolation`` key (illegal/missing mode)."""
+    projects: dict = {}
+    for i, (root, iso) in enumerate(entries.items()):
+        entry: dict = {"paths": {"root": str(root)}}
+        if iso is not None:
+            entry["worker_isolation"] = iso
+        projects[f"key{i}"] = entry
+    reg = tmp_path / name
+    reg.write_text(json.dumps({"projects": projects}), encoding="utf-8")
+    monkeypatch.setenv("DX_PROJECT_REGISTRY", str(reg))
+    return reg
+
+
+def test_registry_singlepane_overrides_config_default_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """🔴 bug 1 二修 (live-shape regression): the LIVE shape is config
+    ``worker_isolation={"default":"worktree"}`` (which ``resolve_isolation`` returns for
+    every project) while the registry marks the project ``singlepane``. The actuator routes
+    on the registry, so the gate must too: two same-project tasks → MUST-SERIAL even though
+    config-default says worktree. (The previous fix read config and so missed this — it only
+    passed because its test injected a matching cfg the live config never has.)"""
+    pa = _mkproject(tmp_path, "proj-a")
+    _write_registry(tmp_path, monkeypatch, {pa: "singlepane"})
+    cfg = _config.Config(worker_isolation={"default": "worktree"})  # live shape: masks the truth
+    tasks = [
+        cd._parse_identity(_task(pa, "t-one", predicted_files=["src/one.py"],
+                                 worktree_isolation=True), 0),
+        cd._parse_identity(_task(pa, "t-two", predicted_files=["src/two.py"],
+                                 worktree_isolation=True), 1),
+    ]
+    analysis = cd.analyze_batch(tasks, cfg=cfg)
+    assert _verdict_for(analysis, "t-one", "t-two") == cd.MUST_SERIAL
+    assert any("singlepane" in r for r in analysis.pairs[0].reasons)
+
+
+def test_registry_worktree_same_project_stays_safe_parallel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Precision guard (no over-serialization): the registry explicitly marks the project
+    ``worktree`` → two same-project tasks with disjoint files + no push stay SAFE-PARALLEL
+    (worktree isolation + the wait=120 spawn-lock queue serialize them safely). config-default
+    is worktree too, but the registry is the one that must clear them."""
+    pa = _mkproject(tmp_path, "proj-a")
+    _write_registry(tmp_path, monkeypatch, {pa: "worktree"})
+    cfg = _config.Config(worker_isolation={"default": "worktree"})
+    tasks = [
+        cd._parse_identity(_task(pa, "t-one", predicted_files=["src/one.py"],
+                                 repo_branch="proj-a@main", will_push=False,
+                                 worktree_isolation=True), 0),
+        cd._parse_identity(_task(pa, "t-two", predicted_files=["src/two.py"],
+                                 repo_branch="proj-a@main", will_push=False,
+                                 worktree_isolation=True), 1),
+    ]
+    assert cd.analyze_batch(tasks, cfg=cfg).parallel_safe
+
+
+def test_explicit_registry_missing_file_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """🔴 fail-closed: an EXPLICIT ``DX_PROJECT_REGISTRY`` pointing at a missing file is a
+    misconfig the gate must not silently treat as 'no singlepane' — two same-project tasks
+    are MUST-SERIAL (may-be-singlepane → 宁可多串行别漏)."""
+    pa = _mkproject(tmp_path, "proj-a")
+    monkeypatch.setenv("DX_PROJECT_REGISTRY", str(tmp_path / "does-not-exist.json"))
+    cfg = _config.Config(worker_isolation={"default": "worktree"})
+    tasks = [
+        cd._parse_identity(_task(pa, "t-one", predicted_files=["src/one.py"],
+                                 worktree_isolation=True), 0),
+        cd._parse_identity(_task(pa, "t-two", predicted_files=["src/two.py"],
+                                 worktree_isolation=True), 1),
+    ]
+    analysis = cd.analyze_batch(tasks, cfg=cfg)
+    assert _verdict_for(analysis, "t-one", "t-two") == cd.MUST_SERIAL
+    assert any("registry" in r for r in analysis.pairs[0].reasons)
+
+
+def test_project_not_in_explicit_registry_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """🔴 fail-closed: an EXPLICIT registry that exists but does NOT list the project
+    (drift / unregistered) → MUST-SERIAL. The actuator would reject such a spawn outright;
+    the gate must not read the absence as a clearance to co-dispatch."""
+    pa = _mkproject(tmp_path, "proj-a")
+    other = _mkproject(tmp_path, "other-proj")
+    _write_registry(tmp_path, monkeypatch, {other: "worktree"})  # registry lists 'other', not proj-a
+    cfg = _config.Config(worker_isolation={"default": "worktree"})
+    tasks = [
+        cd._parse_identity(_task(pa, "t-one", predicted_files=["src/one.py"],
+                                 worktree_isolation=True), 0),
+        cd._parse_identity(_task(pa, "t-two", predicted_files=["src/two.py"],
+                                 worktree_isolation=True), 1),
+    ]
+    assert _verdict_for(cd.analyze_batch(tasks, cfg=cfg), "t-one", "t-two") == cd.MUST_SERIAL
+
+
+def test_registry_illegal_isolation_mode_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """🔴 fail-closed: a project found in the registry with a missing/illegal
+    ``worker_isolation`` (here a typo'd mode) → MUST-SERIAL (mirrors dx-spawn, which errors
+    out on an unrecognized mode rather than guessing)."""
+    pa = _mkproject(tmp_path, "proj-a")
+    _write_registry(tmp_path, monkeypatch, {pa: "worktre"})  # typo → illegal mode
+    cfg = _config.Config(worker_isolation={"default": "worktree"})
+    tasks = [
+        cd._parse_identity(_task(pa, "t-one", predicted_files=["src/one.py"],
+                                 worktree_isolation=True), 0),
+        cd._parse_identity(_task(pa, "t-two", predicted_files=["src/two.py"],
+                                 worktree_isolation=True), 1),
+    ]
+    assert _verdict_for(cd.analyze_batch(tasks, cfg=cfg), "t-one", "t-two") == cd.MUST_SERIAL
+
+
+def test_derived_registry_miss_falls_back_to_config_not_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The explicit/derived asymmetry that keeps the suite green: a registry DERIVED from
+    ``$DX_SPAWN_SH`` (no explicit ``DX_PROJECT_REGISTRY``) that does NOT list the project
+    falls back to config — NOT fail-closed. The suite runs with ``$DX_SPAWN_SH`` pointing at
+    the live engine, so every tmp_path fixture would otherwise serialize. Here config marks
+    the project worktree → the same-project pair stays SAFE-PARALLEL."""
+    monkeypatch.delenv("DX_PROJECT_REGISTRY", raising=False)
+    dharm = tmp_path / "dharmaxis"
+    scripts = dharm / "scripts"
+    scripts.mkdir(parents=True)
+    fake = scripts / "dx-spawn-session.sh"
+    fake.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setenv("DX_SPAWN_SH", str(fake))
+    # derived registry = <dharm>/project-registry.json (sibling of scripts); exists, lists 'other'
+    (dharm / "project-registry.json").write_text(
+        json.dumps({"projects": {
+            "other": {"paths": {"root": str(tmp_path / "elsewhere")}, "worker_isolation": "singlepane"}
+        }}),
+        encoding="utf-8",
+    )
+    pa = _mkproject(tmp_path, "proj-a")
+    cfg = _config.Config(worker_isolation={"proj-a": "worktree"})  # config clears it
+    tasks = [
+        cd._parse_identity(_task(pa, "t-one", predicted_files=["src/one.py"],
+                                 repo_branch="proj-a@main", will_push=False,
+                                 worktree_isolation=True), 0),
+        cd._parse_identity(_task(pa, "t-two", predicted_files=["src/two.py"],
+                                 repo_branch="proj-a@main", will_push=False,
+                                 worktree_isolation=True), 1),
+    ]
+    assert cd.analyze_batch(tasks, cfg=cfg).parallel_safe
+
+
+# ─── bug 1 (三修): registry NOT locatable at all → fail-close, never config ────
+#
+# 二修 made registry the PRIMARY isolation source, but the registry was only located
+# when ``$DX_SPAWN_SH`` was set (to DERIVE the path) or ``$DX_PROJECT_REGISTRY`` was
+# pinned. The 中枢's LIVE shell defaults to DX_SPAWN_SH UNSET → ``_registry_path`` returned
+# ``(None, _)`` → ``_registry_isolation`` returned ``None`` → ``_effective_isolation`` fell
+# back to config (live ``{"default":"worktree"}``) → a singlepane project mislabeled
+# SAFE-PARALLEL in the dry-run preview table the owner reads. 三修: registry not locatable
+# AT ALL = unverifiable isolation = fail-close (``ISOLATION_UNKNOWN``), NOT config fallback.
+
+
+def test_registry_isolation_unlocatable_is_unknown_not_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """🔴 bug 1 三修 (unit / mirrors the brief's 实测): with BOTH ``DX_SPAWN_SH`` and
+    ``DX_PROJECT_REGISTRY`` unset, the registry path can't even be DERIVED, so
+    ``_registry_isolation`` must return ``ISOLATION_UNKNOWN`` (not ``None``) and
+    ``_effective_isolation`` must propagate it (not fall back to config's masking
+    ``worktree`` default). Pre-fix this returned ``None`` → ``"worktree"`` — the bug."""
+    monkeypatch.delenv("DX_SPAWN_SH", raising=False)
+    monkeypatch.delenv("DX_PROJECT_REGISTRY", raising=False)
+    pa = _mkproject(tmp_path, "proj-a")
+    assert cd._registry_isolation(str(pa)) == cd.ISOLATION_UNKNOWN
+    # config defaults every project to worktree; the fix must NOT let that mask the
+    # unverifiable isolation — _effective_isolation returns ISOLATION_UNKNOWN, not "worktree".
+    cfg = _config.Config(worker_isolation={"default": "worktree"})
+    assert cd._effective_isolation(cfg, str(pa), True) == cd.ISOLATION_UNKNOWN
+
+
+def test_unlocatable_registry_same_project_pair_is_must_serial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """🔴 bug 1 三修 (integration / DoD #1): when the registry is NOT locatable (中枢's
+    default DX_SPAWN_SH-unset shell), two same-slug tasks in a project that is REALLY
+    singlepane (but unreadable because no registry can be found) → MUST-SERIAL via
+    ``ISOLATION_UNKNOWN``. This proves the dry-run preview table no longer mislabels a
+    singlepane same-project pair SAFE-PARALLEL. The pair is otherwise fully clean (disjoint
+    files, no push, all shared dims "none") so the verdict is owed to the fail-close axis
+    ALONE — pre-fix (config fallback → worktree) it read SAFE-PARALLEL."""
+    monkeypatch.delenv("DX_SPAWN_SH", raising=False)
+    monkeypatch.delenv("DX_PROJECT_REGISTRY", raising=False)
+    pa = _mkproject(tmp_path, "proj-a")
+    # The project's TRUE mode is singlepane, but the gate can't locate any registry to read
+    # it; live config masks it to worktree. The fix must serialize on the unverifiability.
+    cfg = _config.Config(worker_isolation={"default": "worktree"})
+    tasks = [
+        cd._parse_identity(_task(pa, "t-one", predicted_files=["src/one.py"],
+                                 repo_branch="proj-a@main", will_push=False,
+                                 worktree_isolation=True), 0),
+        cd._parse_identity(_task(pa, "t-two", predicted_files=["src/two.py"],
+                                 repo_branch="proj-a@main", will_push=False,
+                                 worktree_isolation=True), 1),
+    ]
+    analysis = cd.analyze_batch(tasks, cfg=cfg)
+    assert _verdict_for(analysis, "t-one", "t-two") == cd.MUST_SERIAL
+    assert any("unresolved registry" in r for r in analysis.pairs[0].reasons)
+
+
+# ─── bug 2: cross-slug shared git object store ────────────────────────────────
+
+
+def test_shared_git_object_store_cross_slug_is_must_serial(tmp_path: Path) -> None:
+    """🔴 bug 2 (p74 RED — cross-slug shared git object store): two DIFFERENT projects
+    (distinct slugs) that share ONE underlying ``.git`` — here a main repo and a linked
+    git-worktree of it — must be MUST-SERIAL. Their declared files are disjoint (anchored
+    to different roots) and their ``repo_branch`` strings differ, so the existing axes
+    read SAFE-PARALLEL; but the slug-keyed spawn lock takes two distinct lockdirs → no
+    serialization → concurrent ``git fetch`` / ``worktree add`` race the shared object
+    store (index.lock / packed-refs). Resolving the git common-dir catches it."""
+    main_repo = _mkgitrepo(tmp_path, "main-repo", files=["src/one.py"])
+    linked = tmp_path / "linked"
+    _git(main_repo, "worktree", "add", "-q", str(linked))
+    cfg = _config.Config(worker_isolation={"default": "worktree"})
+    tasks = [
+        cd._parse_identity(_task(main_repo, "t-main", predicted_files=["src/one.py"],
+                                 repo_branch="main-repo@main", will_push=False), 0),
+        cd._parse_identity(_task(linked, "t-link", predicted_files=["src/two.py"],
+                                 repo_branch="linked@feature", will_push=False), 1),
+    ]
+    analysis = cd.analyze_batch(tasks, cfg=cfg)
+    assert _verdict_for(analysis, "t-main", "t-link") == cd.MUST_SERIAL
+    assert any("object store" in r for r in analysis.pairs[0].reasons)
+
+
+def test_independent_git_repos_stay_safe_parallel(tmp_path: Path) -> None:
+    """Precision guard for bug 2 (no over-serialization): two INDEPENDENT git repos
+    (separate ``git init`` → distinct object stores) with disjoint files and distinct
+    repo_branches stay SAFE-PARALLEL. The fix must key on a SHARED common-dir, never on
+    'both are git repos'."""
+    ra = _mkgitrepo(tmp_path, "repo-a", files=["src/a.py"])
+    rb = _mkgitrepo(tmp_path, "repo-b", files=["src/b.py"])
+    cfg = _config.Config(worker_isolation={"default": "worktree"})
+    tasks = [
+        cd._parse_identity(_task(ra, "t-a", predicted_files=["src/a.py"],
+                                 repo_branch="repo-a@main", will_push=False), 0),
+        cd._parse_identity(_task(rb, "t-b", predicted_files=["src/b.py"],
+                                 repo_branch="repo-b@main", will_push=False), 1),
+    ]
+    assert cd.analyze_batch(tasks, cfg=cfg).parallel_safe
+
+
+def test_git_common_dir_probe_failure_is_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """🔴 bug 2 fail-closed: if the git common-dir probe cannot RUN (git binary missing
+    / unexpected error — as opposed to a clean 'not a git repository') the task is
+    tainted so its pairs are MUST-SERIAL — never silently treated as 'no shared store'."""
+    pa = _mkproject(tmp_path, "proj-a")
+    pb = _mkproject(tmp_path, "proj-b")
+
+    def _boom(*_a: object, **_k: object) -> None:
+        raise OSError("git not found")
+
+    monkeypatch.setattr(cd.subprocess, "run", _boom)
+    cfg = _config.Config(worker_isolation={"default": "worktree"})
+    tasks = [
+        cd._parse_identity(_task(pa, "t-a", repo_branch="a@main"), 0),
+        cd._parse_identity(_task(pb, "t-b", repo_branch="b@main"), 1),
+    ]
+    assert _verdict_for(cd.analyze_batch(tasks, cfg=cfg), "t-a", "t-b") == cd.MUST_SERIAL
+
+
+# ─── malformed-input hardening (fail-closed, no raw traceback) ───────────────
+
+
+@pytest.mark.parametrize("contents", ["[]", '"x"', "42", "null"])
+def test_non_dict_registry_json_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, contents: str
+) -> None:
+    """🔴 fail-closed (no crash): a registry that is valid JSON but NOT a top-level object
+    (list/scalar/null) makes ``data.get`` raise ``AttributeError``. The guard treats a
+    readable-but-not-an-object registry as corrupt → ``ISOLATION_UNKNOWN`` (same class as
+    the OSError/ValueError branch), never an uncaught exception."""
+    pa = _mkproject(tmp_path, "proj-a")
+    reg = tmp_path / "project-registry.json"
+    reg.write_text(contents, encoding="utf-8")
+    monkeypatch.setenv("DX_PROJECT_REGISTRY", str(reg))
+    # does NOT raise + fails closed to the unresolved sentinel
+    assert cd._registry_isolation(str(pa)) == cd.ISOLATION_UNKNOWN
+
+
+def test_run_with_non_dict_registry_returns_exit_fail_not_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """🔴 a full ``cd.run`` over a valid 2-task batch with an EXPLICIT ``[]`` (non-object)
+    registry must NOT raise. With FIX 1 the gate fail-closes gracefully (the same-project
+    pair → MUST-SERIAL, the dry-run still completes), so ``run`` returns an int — the KEY
+    invariant is that no raw traceback escapes."""
+    pa = _mkproject(tmp_path, "proj-a")
+    reg = tmp_path / "project-registry.json"
+    reg.write_text("[]", encoding="utf-8")
+    monkeypatch.setenv("DX_PROJECT_REGISTRY", str(reg))
+    tasks = [
+        _task(pa, "t-one", predicted_files=["src/one.py"], repo_branch="proj-a@main"),
+        _task(pa, "t-two", predicted_files=["src/two.py"], repo_branch="proj-a@main"),
+    ]
+    p = _write_json(tmp_path, tasks)
+    rc = cd.run(p, execute=False)  # must NOT raise
+    assert isinstance(rc, int)
+    # and the gate fail-closed on the unresolvable registry
+    assert cd._registry_isolation(str(pa)) == cd.ISOLATION_UNKNOWN
+
+
+def test_nul_byte_predicted_files_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """🔴 fail-closed (no crash): a ``predicted_files`` entry with an embedded NUL makes
+    ``os.path.realpath`` raise ``ValueError('embedded null byte')``. The per-entry guard
+    taints the task (``files_indeterminate`` + a ``field_issue``) so its pairs are
+    MUST-SERIAL, and ``cd.run`` over such a batch returns an int rather than crashing."""
+    pa = _mkproject(tmp_path, "proj-a")
+    pb = _mkproject(tmp_path, "proj-b")
+    bad = cd.build_conflict_profile(
+        cd._parse_identity(
+            _task(pa, "t-bad", predicted_files=["src/\x00bad.py"], repo_branch="proj-a@main"), 0
+        )
+    )
+    # the bad entry tainted the profile (no raise)
+    assert bad.files_indeterminate
+    assert bad.field_issues
+
+    # a 2-task batch including it is MUST-SERIAL (the indeterminate file set taints the pair)
+    tasks = [
+        cd._parse_identity(
+            _task(pa, "t-bad", predicted_files=["src/\x00bad.py"], repo_branch="proj-a@main"), 0
+        ),
+        cd._parse_identity(_task(pb, "t-ok", predicted_files=["src/ok.py"], repo_branch="proj-b@main"), 1),
+    ]
+    assert _verdict_for(cd.analyze_batch(tasks), "t-bad", "t-ok") == cd.MUST_SERIAL
+
+    # and ``cd.run`` over a tasks-json with the NUL entry does NOT raise
+    p = _write_json(
+        tmp_path,
+        [
+            _task(pa, "t-bad", predicted_files=["src/\x00bad.py"], repo_branch="proj-a@main"),
+            _task(pb, "t-ok", predicted_files=["src/ok.py"], repo_branch="proj-b@main"),
+        ],
+    )
+    rc = cd.run(p, execute=False)  # must NOT raise
+    assert isinstance(rc, int)
