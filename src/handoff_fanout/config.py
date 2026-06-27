@@ -231,6 +231,23 @@ class Config:
     # any OSError never blocks a handoff (the gate is warn-only anyway). Conditional-fold (the
     # vector is OPTIONAL on evidence): an absent vector → byte-identical payload + a no-op gate.
     closeout_obligations_warn_projects: list[str] = field(default_factory=list)
+    # ── closure_attestation gate (ship-live · DEFAULT-ON / owner law) ────────────
+    # The BLOCKING「闭环证书」gate (PROTOCOL §13.6): when a closing session's structured
+    # ``closeout_obligations.release`` is ``✅`` (it declared a user-visible delivery) the retro
+    # evidence must carry a ``closure_attestation`` binding that delivery to LIVE evidence
+    # (deployed + behavior-verified), else the dump is REFUSED (retry→block, like the phase
+    # status / G0-G9 ladder). UNLIKE every roll-out list above, this DEFAULTS **ON** (ship-live is
+    # owner law, not opt-in) — but it is purely ADDITIVE: it rides the existing evidence-bearing
+    # gate path (a legacy no-evidence dump is untouched) and fires ONLY on the structured release=✅
+    # declaration (a coordination / internal-refactor hop that declares release=skip / omits it is
+    # never touched — narrow trigger = no FP). Owner kills it via ``closure_attestation_mandate:
+    # false`` here, env ``HANDOFF_CLOSURE_OFF=1`` (fleet), or a sentinel
+    # ``$HANDOFF_HOME/<project>/.closure-gate-off`` / ``$HANDOFF_HOME/.closure-gate-off`` — see
+    # ``dump._closure_attestation_mandate_enabled``. Parsed with the kill-switch-safe bool reader
+    # (a JSON string ``"false"`` actually disables it — no ``bool("false")==True`` footgun). A
+    # present-but-corrupt config (``config_trusted=False``) disables the gate at the dump helper
+    # (a blocking gate must never run off an unparseable config).
+    closure_attestation_mandate: bool = True
     # ``True`` when this Config was parsed from a trusted source (absent file = clean defaults,
     # or a present file that read + parsed). A present-but-untrustworthy config (unreadable /
     # corrupt JSON) sets this ``False`` via ``_fail_closed_config`` so the Step 4 anchor decision
@@ -483,6 +500,9 @@ def _from_dict(data: dict, home: Path) -> Config:
         closeout_obligations_warn_projects=_anchor_slug_list(
             data, "closeout_obligations_warn_projects"
         ),
+        # closure_attestation gate kill-switch — DEFAULT-ON (ship-live owner law), parsed with the
+        # kill-switch-safe bool reader so a JSON string "false" genuinely disables it.
+        closure_attestation_mandate=_parse_closure_mandate(data),
         **_parse_worktree(data),
         **_parse_reclaim(data),
     )
@@ -551,6 +571,36 @@ def _parse_unified_spawn_enabled(data: dict) -> bool:
             return True
     print(
         f"⚠️  unified_spawn_enabled: unrecognized value {raw!r}; defaulting to enabled "
+        "(True). Use a JSON boolean (true/false).",
+        file=sys.stderr,
+    )
+    return True
+
+
+def _parse_closure_mandate(data: dict) -> bool:
+    """Parse ``closure_attestation_mandate`` (DEFAULT-ON) without the ``bool()`` footgun.
+
+    Same kill-switch-safe reader as :func:`_parse_unified_spawn_enabled` (a JSON string
+    ``"false"`` MUST disable it — ``bool("false")`` is ``True``): key absent / JSON ``null`` →
+    default (ON); a real bool / number / recognised string → honoured; anything unrecognised →
+    default (ON) + a loud warn (never a silent mis-parse of a safety switch)."""
+    if "closure_attestation_mandate" not in data:
+        return True
+    raw = data.get("closure_attestation_mandate")
+    if raw is None:
+        return True
+    if isinstance(raw, bool):  # MUST precede int — bool is a subclass of int
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in _FALSEY_STR:
+            return False
+        if s in _TRUTHY_STR:
+            return True
+    print(
+        f"⚠️  closure_attestation_mandate: unrecognized value {raw!r}; defaulting to enabled "
         "(True). Use a JSON boolean (true/false).",
         file=sys.stderr,
     )

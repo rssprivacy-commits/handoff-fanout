@@ -34,6 +34,7 @@ from pathlib import Path
 from handoff_fanout import atomic
 from handoff_fanout import config as _config
 from handoff_fanout.handoff_precheck import (
+    CLOSURE_TRIGGER_CLOSEOUT_KEY,
     EVIDENCE_KIND_RETRO,
     MODE_FORENSIC_RETRO,
     MODE_VALID,
@@ -42,6 +43,7 @@ from handoff_fanout.handoff_precheck import (
     PHASE_STATUS_VALID,
     STATUS_REQUIRING_REASON,
     SUPPORTED_EVIDENCE_SCHEMA_VERSIONS,
+    _validate_closure_attestation,
     build_evidence,
     compute_evidence_hash,
 )
@@ -558,6 +560,83 @@ def _validate_phase_status(payload: dict) -> GateResult | None:
                     f"{section}-status-missing-reason",
                     f"{section}.{k} status={status} requires a non-empty reason (only ✅ may omit it)",
                 )
+    return None
+
+
+# ─── closure_attestation gate (ship-live / DEFAULT-ON / §13.6) ──────────────
+
+
+def _closeout_release_status(payload: dict) -> str | None:
+    """The session's STRUCTURED ``closeout_obligations.release`` status, or ``None``.
+
+    This is the ONLY signal the closure gate keys off — a machine-readable field the closing
+    session itself supplied, NEVER prose. ``✅`` = "a user-visible delivery happened this hop"
+    (the structured「声称有用户可见交付」). Anything else (skip / ⚠️ / ❌ / absent / malformed)
+    → the closure binding is not required (those cases are self-justified via the closeout
+    warn-mode vector). Keeping the trigger here, off ONE structured field, is exactly how we
+    avoid the undecidability wall that killed field-verify (p67): we never ask "is this prose a
+    closure claim", we read a field the session set."""
+    closeout = payload.get("closeout_obligations")
+    if not isinstance(closeout, dict):
+        return None
+    rel = closeout.get(CLOSURE_TRIGGER_CLOSEOUT_KEY)
+    if isinstance(rel, dict):
+        return rel.get("status")
+    if isinstance(rel, str):  # bare-string status form (mirrors merge_phase_status leniency)
+        return rel
+    return None
+
+
+def _validate_closure_gate(payload: dict) -> GateResult | None:
+    """BLOCK-class (retry→exhaust→block) closure-attestation gate. Returns ``None`` when the
+    closure dimension is satisfied (or not triggered), else a retry ``GateResult``.
+
+    Two independent checks, both DECIDABLE (existence + structural completeness + binding — never
+    the truth of any assertion, the design invariant that sidesteps field-verify's death):
+
+      (a) **Structural re-validation (defence in depth).** If ``closure_attestation`` is present
+          it must be well-formed (delegated to the SINGLE validator
+          :func:`handoff_precheck._validate_closure_attestation`). A builder-produced evidence
+          already passed this + is hash-bound, so this only bites a hand-crafted hash-consistent
+          payload — still cheap insurance.
+
+      (b) **Release-coupled requirement (the ship-live floor).** When the session's own
+          ``closeout_obligations.release`` is ``✅`` (it declared a user-visible delivery), it
+          MUST carry a ``closure_attestation`` with ≥1 ``shipped`` entry bound to live. Declaring
+          a release then binding nothing (absent / all-skip) is the exact「记一笔当完成」this gate
+          treats. The honest escape is to set ``release=skip:<reason>`` instead (an explicit,
+          auditable statement — 同信任域 floor-raising, not liar-proofing).
+    """
+    attestation = payload.get("closure_attestation")
+    # (a) structural re-validation when present
+    if attestation is not None:
+        try:
+            _validate_closure_attestation(attestation)
+        except ValueError as e:
+            return _retry("closure-attestation-malformed", str(e))
+
+    # (b) release-coupled requirement — fires ONLY on the structured release=✅ declaration
+    if _closeout_release_status(payload) != "✅":
+        return None
+    if not isinstance(attestation, list) or not attestation:
+        return _retry(
+            "closure-attestation-missing",
+            "closeout_obligations.release=✅ (you declared a user-visible delivery) but the "
+            "evidence carries no closure_attestation. Bind each delivery to LIVE evidence with "
+            "--closure-evidence '<deliverable>=shipped:<deployed-sha|path|merged-commit>::"
+            "<cmd → observed effect>'  — or, if nothing actually shipped, set "
+            "--closeout-status release=skip:<reason> instead",
+        )
+    shipped = [
+        e for e in attestation if isinstance(e, dict) and e.get("kind") == "shipped"
+    ]
+    if not shipped:
+        return _retry(
+            "closure-attestation-all-skip",
+            "closeout_obligations.release=✅ but every closure_attestation entry is 'skip' — a "
+            "declared user-visible delivery needs ≥1 'shipped' entry bound to live "
+            "(deployed + verified). If nothing actually shipped, set release=skip:<reason> instead",
+        )
     return None
 
 
@@ -1285,6 +1364,12 @@ def _attempt_realign(
         # no CLI to re-supply it — so copy it from the original, same rationale as backref).
         if "closeout_obligations" in payload:
             new_payload["closeout_obligations"] = payload["closeout_obligations"]
+        # Likewise preserve the closure_attestation verbatim — re-align refreshes the HEAD binding
+        # only; the「闭环证书」(deployed/verified bindings) must not be erased by a sibling-HEAD move
+        # (build_evidence above did not receive it — the gate has no CLI to re-supply it — so copy
+        # it from the original, same rationale as backref / closeout).
+        if "closure_attestation" in payload:
+            new_payload["closure_attestation"] = payload["closure_attestation"]
         # The in-process builder must have observed the same HEAD we validated;
         # if not (e.g. its rev-parse failed → "(unknown)"), abort this attempt.
         if new_payload.get("head_at_precheck") != head_now:
@@ -1316,6 +1401,7 @@ def check_retro_gate(
     mandate_enabled: bool,
     audit_mandate_enabled: bool = False,
     audit_mandate_expected: bool = False,
+    closure_mandate_enabled: bool = True,
     nonce: str | None = None,
     config: dict | None = None,
     session_id: str = "",
@@ -1461,6 +1547,28 @@ def check_retro_gate(
                         session_id=sid,
                         head=payload.get("head_at_precheck", ""),
                     )
+
+                # closure_attestation gate (ship-live / DEFAULT-ON / §13.6). Additive: rides the
+                # existing evidence path (never forces evidence where there was none — a legacy
+                # no-evidence dump still short-circuits above). Fires ONLY on the structured
+                # closeout_obligations.release=✅ declaration (never prose → no undecidability /
+                # field-verify repeat). Off-switch resolved by the caller → closure_mandate_enabled.
+                # Wrapped fail-open: a bug in the gate must never block a handoff.
+                if closure_mandate_enabled:
+                    try:
+                        closure_err = _validate_closure_gate(payload)
+                    except Exception:  # fail-open: the gate's own bug must not brick a handoff
+                        closure_err = None
+                    if closure_err is not None:
+                        return _handle_validation_failure(
+                            project=project,
+                            task=task,
+                            failure=closure_err,
+                            payload=payload,
+                            evidence_path=evidence_path,
+                            session_id=sid,
+                            head=payload.get("head_at_precheck", ""),
+                        )
 
                 head_err, warnings = _check_head_freshness(
                     payload, workspace, config, project, task

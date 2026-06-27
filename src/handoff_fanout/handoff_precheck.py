@@ -142,6 +142,36 @@ CLOSEOUT_KEYS = (
     "postmortem",
 )
 
+# ─── closure_attestation vocabulary (the ship-live closure gate / DEFAULT-ON) ───
+# The optional structured「闭环证书」: a list of per-deliverable attestations that BIND a
+# claimed "completed / user-visible delivery" to specific LIVE evidence. This is the
+# machine-checkable substitute for the soft「彻底闭环」rule — and it is deliberately built
+# to AVOID the undecidability wall that killed ``field-verify-guard`` (lesson-sw-coord-p67):
+# the gate NEVER parses prose to decide "is this really shipped". Instead each entry is a
+# STRUCTURED record the closing session supplies; the gate only checks existence + structural
+# completeness + binding (decidable — like ``retro_gate`` checks phase status, like
+# ``deploy-audited`` checks byte binding), never the TRUTH of the assertion.
+#
+# Each entry has a ``deliverable`` (non-empty str) + a ``kind``:
+#   * ``shipped`` — REQUIRES ``deployed`` (SHA / deploy path / merged-main commit — WHERE it
+#     went live) AND ``verified`` (cmd → observed effect — behavior-verify, NOT "我觉得好了").
+#   * ``skip``    — REQUIRES ``reason`` (this deliverable is N/A / nothing to ship). Mirrors the
+#     phase-status「skip 须带理由」anti-hollow invariant: an N/A must justify itself, so a false
+#     all-skip is an EXPLICIT, auditable lie (同信任域: the gate raises the floor + makes hiding
+#     visible — it cannot stop a determined liar in the same trust domain, p58).
+#
+# OPTIONAL + CONDITIONAL-FOLD (same invariant as closeout / backref / lesson_disposition): when
+# omitted / empty the key does not appear and the payload (+ ``evidence_hash``) is byte-for-byte
+# identical to a pre-closure payload (so existing flows / tests are byte-unaffected). When
+# supplied it is validated (malformed → ``ValueError``; garbage never enters the hashed payload)
+# then folded into the hashed payload (binding it — tampering invalidates ``evidence_hash``).
+# The BLOCKING dump-side gate that reads it lives in ``retro_gate._validate_closure_gate``.
+# Spec: ``docs/PROTOCOL.md`` Part II §13.6.
+CLOSURE_KINDS = ("shipped", "skip")
+# The closeout key whose ``✅`` is the structured "user-visible delivery happened this hop"
+# signal that the closure gate keys off (NEVER parsed from prose — see retro_gate).
+CLOSURE_TRIGGER_CLOSEOUT_KEY = "release"
+
 MODE_NORMAL = "normal"
 MODE_FORENSIC_RETRO = "forensic_retro"
 MODE_VALID = {MODE_NORMAL, MODE_FORENSIC_RETRO}
@@ -499,6 +529,72 @@ def _validate_closeout(value: object) -> dict:
     return out
 
 
+def _validate_closure_attestation(value: object) -> list[dict]:
+    """Normalize + validate the ``closure_attestation`` list (the「闭环证书」).
+
+    Mirrors the other conditional-fold validators (:func:`_validate_backref` /
+    :func:`_validate_closeout`): a fail-fast validator whose ONLY job is to guarantee garbage
+    can NEVER be folded into the hashed payload. It is purely STRUCTURAL — it asserts the
+    presence + shape of the binding fields, NEVER the truth of any assertion (the whole point
+    of the design: validate existence + completeness + binding, decidable; do not try to decide
+    "is this really live" — that is the undecidable question that killed field-verify, p67).
+
+    ``value`` must be a non-empty list of dicts. Each entry must carry a non-empty
+    ``deliverable`` (str) and a ``kind`` in :data:`CLOSURE_KINDS`:
+      * ``kind == "shipped"`` → REQUIRES non-empty ``deployed`` (str) AND non-empty ``verified``
+        (str). ``deployed`` = WHERE it went live (SHA / deploy path / merged-main commit);
+        ``verified`` = the behavior-verify (cmd → observed effect).
+      * ``kind == "skip"``    → REQUIRES a non-empty ``reason`` (str): why this deliverable is
+        N/A / nothing to ship (the anti-hollow invariant — an N/A must justify itself).
+
+    Raises :class:`ValueError` on any malformed entry. Returns a fresh list normalized to
+    exactly the canonical keys per ``kind`` (extra keys dropped, same as the other validators).
+    """
+    if not isinstance(value, list):
+        raise ValueError(
+            f"closure_attestation must be a list of dicts; got {type(value).__name__}"
+        )
+    if not value:
+        raise ValueError("closure_attestation must be a non-empty list (omit it entirely if N/A)")
+    out: list[dict] = []
+    for i, entry in enumerate(value):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"closure_attestation[{i}] must be a dict; got {type(entry).__name__}"
+            )
+        deliverable = entry.get("deliverable")
+        if not isinstance(deliverable, str) or not deliverable.strip():
+            raise ValueError(
+                f"closure_attestation[{i}].deliverable must be a non-empty str"
+            )
+        kind = entry.get("kind")
+        if kind not in CLOSURE_KINDS:
+            raise ValueError(
+                f"closure_attestation[{i}].kind must be one of {list(CLOSURE_KINDS)}; got {kind!r}"
+            )
+        norm: dict = {"deliverable": deliverable.strip(), "kind": kind}
+        if kind == "shipped":
+            for fld in ("deployed", "verified"):
+                raw = entry.get(fld)
+                if not isinstance(raw, str) or not raw.strip():
+                    raise ValueError(
+                        f"closure_attestation[{i}].{fld} is required (non-empty) when "
+                        f"kind='shipped' (deployed=WHERE it went live: SHA/path/merged-commit; "
+                        "verified=behavior-verify: cmd → observed effect)"
+                    )
+                norm[fld] = raw.strip()
+        else:  # skip
+            reason = entry.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError(
+                    f"closure_attestation[{i}].reason is required (non-empty) when kind='skip' "
+                    "(an N/A deliverable must say WHY there was nothing to ship)"
+                )
+            norm["reason"] = reason.strip()
+        out.append(norm)
+    return out
+
+
 # ─── evidence builder ───────────────────────────────────────────────────────
 
 
@@ -515,6 +611,7 @@ def build_evidence(
     predecessor_lesson_backref: list[dict] | None = None,
     lesson_disposition: dict | None = None,
     closeout_obligations: dict | None = None,
+    closure_attestation: list[dict] | None = None,
 ) -> dict:
     """Assemble + hash a retro-evidence payload.
 
@@ -552,6 +649,14 @@ def build_evidence(
     empty → the payload is byte-for-byte identical to today's (DEFAULT-OFF = zero behavior
     change); supplied → validated then folded into the hashed payload. The dump-side gate that
     reads it is WARN-ONLY (advisory, never blocking).
+
+    ``closure_attestation`` (the「闭环证书」/ ship-live closure gate) is the optional list of
+    per-deliverable attestations binding a claimed delivery to LIVE evidence (each ``shipped`` →
+    deployed + verified, or ``skip`` → reason — see :func:`_validate_closure_attestation`). SAME
+    conditional-fold invariant: omitted / empty → byte-identical; supplied → validated then folded
+    into the hashed payload (bound to the evidence). UNLIKE closeout, the dump-side gate that reads
+    it (:func:`retro_gate._validate_closure_gate`) is BLOCKING (DEFAULT-ON / ship-live) — but it
+    only fires on a structured ``closeout_obligations.release == ✅`` declaration, never on prose.
     """
     if mode not in MODE_VALID:
         raise ValueError(f"mode must be one of {sorted(MODE_VALID)}; got {mode!r}")
@@ -598,6 +703,11 @@ def build_evidence(
     # hashed (bound to the evidence; the warn-mode gate just surfaces it, never blocks).
     if closeout_obligations:
         payload["closeout_obligations"] = _validate_closeout(closeout_obligations)
+    # closure_attestation (the「闭环证书」/ ship-live gate): fold in ONLY when supplied & non-empty
+    # — same conditional-fold pattern. Absent / empty → byte-identical to today (additive). Present
+    # → validated then hashed (bound to the evidence). The BLOCKING gate is in retro_gate.
+    if closure_attestation:
+        payload["closure_attestation"] = _validate_closure_attestation(closure_attestation)
     payload["evidence_hash"] = compute_evidence_hash(payload)
     return payload
 
@@ -759,6 +869,78 @@ def parse_lesson_disposition(value: str | None) -> dict | None:
     return entry
 
 
+def parse_closure_kv(values: list[str] | None) -> list[dict]:
+    """Parse ``--closure-evidence`` flags into raw closure-attestation entry dicts.
+
+    Grammar (unambiguous; the builder's :func:`_validate_closure_attestation` is the single
+    validation point — this only shapes, never validates beyond the split):
+
+      * ``<deliverable>=skip:<reason>``                    → ``{deliverable, kind:"skip", reason}``
+      * ``<deliverable>=shipped:<deployed>::<verified>``   → ``{deliverable, kind:"shipped",
+        deployed, verified}``
+
+    Split on the FIRST ``=`` (deliverable | rest), then the FIRST ``:`` (kind | payload). For
+    ``shipped`` the payload splits on the FIRST ``::`` (``deployed`` | ``verified`` — verbatim,
+    so ``verified`` may contain ``:``, ``→``, or further ``::``; ``deployed`` is a simple
+    SHA/path/commit so the first ``::`` is the boundary). A grammar error (missing ``=`` / ``:`` /
+    the ``shipped`` ``::``) raises :class:`SystemExit` so the caller surfaces a clean message, not
+    a traceback. For arbitrarily complex entries use ``--closure-evidence-file`` (a JSON array).
+    """
+    out: list[dict] = []
+    if not values:
+        return out
+    for raw in values:
+        if "=" not in raw:
+            raise SystemExit(
+                f"❌ --closure-evidence must be <deliverable>=skip:<reason> or "
+                f"<deliverable>=shipped:<deployed>::<verified>: {raw!r}"
+            )
+        deliverable, rest = raw.split("=", 1)
+        deliverable = deliverable.strip()
+        rest = rest.strip()
+        if ":" not in rest:
+            raise SystemExit(
+                f"❌ --closure-evidence value must be kind:payload (kind ∈ "
+                f"{list(CLOSURE_KINDS)}): {raw!r}"
+            )
+        kind, payload = rest.split(":", 1)
+        kind = kind.strip()
+        if kind == "shipped":
+            if "::" not in payload:
+                raise SystemExit(
+                    f"❌ --closure-evidence shipped needs <deployed>::<verified>: {raw!r}"
+                )
+            deployed, verified = payload.split("::", 1)
+            out.append(
+                {
+                    "deliverable": deliverable,
+                    "kind": "shipped",
+                    "deployed": deployed.strip(),
+                    "verified": verified.strip(),
+                }
+            )
+        else:
+            out.append({"deliverable": deliverable, "kind": kind, "reason": payload.strip()})
+    return out
+
+
+def _load_closure_file(path: Path | None) -> list[dict] | None:
+    """Load a JSON-array closure-attestation file. ``None`` when no path; raises SystemExit on a
+    missing file or non-array / invalid JSON (clean CLI error). Contents are NOT validated here —
+    the builder validates (mirrors :func:`_load_backref_file`)."""
+    if not path:
+        return None
+    if not path.exists():
+        raise SystemExit(f"❌ --closure-evidence-file not found: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"❌ --closure-evidence-file invalid JSON: {e}") from e
+    if not isinstance(data, list):
+        raise SystemExit("❌ --closure-evidence-file must be a JSON array of objects")
+    return data
+
+
 def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="handoff-precheck",
@@ -833,6 +1015,25 @@ def _build_parser() -> argparse.ArgumentParser:
         f"where key ∈ {list(CLOSEOUT_KEYS)} and status ∈ {sorted(PHASE_STATUS_VALID)}. ✅ needs "
         "no reason; ⚠️/❌/skip require one ('skip' encodes an N/A item → give why it does not "
         "apply), e.g. --closeout-status release=skip:no user-visible change this hop",
+    )
+    ap.add_argument(
+        "--closure-evidence",
+        action="append",
+        default=[],
+        dest="closure_evidence",
+        help="closure_attestation (ship-live closure gate / DEFAULT-ON): repeatable; bind a "
+        "claimed delivery to LIVE evidence. <deliverable>=shipped:<deployed>::<verified> "
+        "(deployed=SHA/path/merged-commit; verified=cmd→observed effect) OR "
+        "<deliverable>=skip:<reason> (N/A — nothing shipped). Required when "
+        "--closeout-status release=✅, e.g. "
+        "--closure-evidence 'login flow=shipped:abc123::curl /login → 200 + session cookie set'",
+    )
+    ap.add_argument(
+        "--closure-evidence-file",
+        default=None,
+        dest="closure_evidence_file",
+        help="path to a JSON array of closure_attestation objects; when given it REPLACES the "
+        "--closure-evidence flags (file wins)",
     )
     ap.add_argument(
         "--no-lock",
@@ -917,6 +1118,28 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"ERR-FATAL closeout-status-invalid: {e}\n")
             return 1
 
+    # closure_attestation (ship-live gate): the file REPLACES the flags (file wins) — warn if both.
+    # Parse + validate now so a malformed value is a clean nonzero exit BEFORE the lock / any
+    # artifact is written (mirrors the backref / lesson / closeout pre-check).
+    closure_file = _load_closure_file(
+        Path(args.closure_evidence_file) if args.closure_evidence_file else None
+    )
+    if closure_file is not None:
+        if args.closure_evidence:
+            sys.stderr.write(
+                "WARN closure-file-wins: both --closure-evidence and --closure-evidence-file "
+                "given; the file replaces the flags\n"
+            )
+        closure_raw: list[dict] | None = closure_file
+    else:
+        closure_raw = parse_closure_kv(args.closure_evidence) or None
+    if closure_raw:
+        try:
+            _validate_closure_attestation(closure_raw)
+        except ValueError as e:
+            sys.stderr.write(f"ERR-FATAL closure-evidence-invalid: {e}\n")
+            return 1
+
     output = (
         Path(args.output)
         if args.output
@@ -935,6 +1158,7 @@ def main(argv: list[str] | None = None) -> int:
             predecessor_lesson_backref=backref_raw,
             lesson_disposition=lesson_disp_raw,
             closeout_obligations=closeout_raw,
+            closure_attestation=closure_raw,
         )
         write_evidence(payload, output)
         sys.stdout.write(f"OK precheck-written: {output}\n")
