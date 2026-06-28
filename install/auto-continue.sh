@@ -98,6 +98,13 @@ HANDOFF_PLACE_PYTHON="${HANDOFF_PLACE_PYTHON:-/opt/homebrew/bin/python3}"
 HANDOFF_PLACE_TOOL="${HANDOFF_PLACE_TOOL:-$HANDOFF_ROOT/supervisor-monitor/coord-place-window.py}"
 HANDOFF_PLACE_WAIT="${HANDOFF_PLACE_WAIT:-3}"
 HANDOFF_PLACE_TIMEOUT="${HANDOFF_PLACE_TIMEOUT:-12}"
+# winlist (vscode-spaces) — prints a JSON array of {"title":…, "window_number":N} for every Code
+# window, the instant the OS window exists (title-INDEPENDENT). Used for winlist-diff WID capture so
+# placement can resolve the just-spawned window by its Quartz window_number (--wid) instead of its
+# late-binding structured title (a heavy workspace — erp — applies window.title only ~4s after the
+# window exists, so a title-match misses it; the WID is available immediately). Env-overridable;
+# a missing/failing tool degrades gracefully to the title (--task) path in maybe_place_window.
+HANDOFF_WINLIST="${HANDOFF_WINLIST:-$HOME/Projects/dharmaxis/scripts/vscode-spaces/winlist}"
 # Absolute `timeout`/`gtimeout` (launchd PATH is minimal → try known prefixes, then PATH). Empty ⇒
 # fall back to the python-level bounded wrapper in maybe_place_window (still hard-bounded, never
 # unbounded). Overridable via HANDOFF_TIMEOUT_CMD.
@@ -252,7 +259,7 @@ write_ack() {
 # role=supervisor_succession in the singlepane sidecar (→ coord → right-half); a worktree worker /
 # no sidecar / role=worker → worker → free-quadrant (the tool maps role→slot). Always returns 0.
 maybe_place_window() {
-    local project="$1" task="$2" proj_dir="$3" queue="$4"
+    local project="$1" task="$2" proj_dir="$3" queue="$4" wid="${5:-}"
     # default-ON gate (mirror worker-autoclose `.worker-autoclose-off`): global OR per-project OFF
     # sentinel ⇒ skip silently; otherwise placement runs by default.
     [ -f "$HANDOFF_ROOT/.window-placement-off" ] && return 0
@@ -261,6 +268,17 @@ maybe_place_window() {
         log "PLACE[$task]: SKIP — placement tool not found ($HANDOFF_PLACE_TOOL)"
         return 0
     fi
+    # Target selector (sw-place-wid-fix / 2026-06-28): resolve the just-spawned window by its Quartz
+    # WID when the winlist-diff capture at the call site found exactly one new window (`--wid`,
+    # available the instant the OS window exists — title-INDEPENDENT, so a heavy-workspace window
+    # whose structured window.title binds ~4s late is still resolved instantly). `--wid` and `--task`
+    # are mutually exclusive in coord-place-window.py; FALL BACK to the title path (`--task`) whenever
+    # no WID was captured (winlist unavailable / 0 or >1 new windows / parse error) so placement never
+    # regresses below today's behavior. A non-numeric wid is rejected defensively (treated as absent).
+    case "$wid" in ''|*[!0-9]*) wid="" ;; esac
+    # Reject a non-positive WID (0 / 00) defensively — a real Quartz window_number is always > 0
+    # (codex r2 advisory). An out-of-range value would otherwise resolve to no window.
+    [ -n "$wid" ] && { [ "$wid" -gt 0 ] 2>/dev/null || wid=""; }
     # Role from the singlepane sidecar's `role` field (singlepane is per-project, so it alone can't
     # tell coord from worker). A coordinator succession = supervisor_succession; everything else
     # (worktree worker / no sidecar / role=worker) defaults to worker.
@@ -282,32 +300,99 @@ PY
 )
         case "$sc_role" in supervisor_succession|*coord*|*supervisor*) role="coord" ;; esac
     fi
-    log "PLACE[$task]: tiling just-spawned window (role=$role project=$project) — best-effort hard-bounded≤${HANDOFF_PLACE_TIMEOUT}s"
+    # Mutually-exclusive selector: --wid when captured, else the title path --task (fallback).
+    local _sel_flag _sel_val _sel_kind
+    if [ -n "$wid" ]; then _sel_flag="--wid"; _sel_val="$wid"; _sel_kind="wid=$wid"; else _sel_flag="--task"; _sel_val="$task"; _sel_kind="task (title)"; fi
+    log "PLACE[$task]: tiling just-spawned window (role=$role project=$project select=$_sel_kind) — best-effort hard-bounded≤${HANDOFF_PLACE_TIMEOUT}s"
     # HARD-bounded on BOTH paths + non-fatal (|| true): the spawn outcome is already ack'd, so a
     # placement hang/error is swallowed and never propagates. Tool output → the launcher log.
     if [ -n "${HANDOFF_TIMEOUT_CMD:-}" ]; then
         "$HANDOFF_TIMEOUT_CMD" "$HANDOFF_PLACE_TIMEOUT" \
             "$HANDOFF_PLACE_PYTHON" "$HANDOFF_PLACE_TOOL" \
-            --project "$project" --task "$task" --role "$role" \
+            --project "$project" "$_sel_flag" "$_sel_val" --role "$role" \
             --wait "$HANDOFF_PLACE_WAIT" --execute >>"$LOG" 2>&1 || true
     else
         # No `timeout`/`gtimeout` binary → bound via a python-level subprocess.run(timeout=N) so
         # there is NEVER an unbounded path (a placement hang would otherwise pin this watchdog
         # strand). The wrapper kills the child on timeout and always exits 0 (swallowed). Args are
-        # passed positionally (heredoc is unexpanded) → no shell-injection surface.
+        # passed positionally (heredoc is unexpanded) → no shell-injection surface. The selector
+        # flag/value pair is passed positionally too (--wid <wid> OR --task <task>).
         "$HANDOFF_PLACE_PYTHON" - "$HANDOFF_PLACE_TIMEOUT" "$HANDOFF_PLACE_PYTHON" "$HANDOFF_PLACE_TOOL" \
-            "$project" "$task" "$role" "$HANDOFF_PLACE_WAIT" >>"$LOG" 2>&1 <<'PY' || true
+            "$project" "$_sel_flag" "$_sel_val" "$role" "$HANDOFF_PLACE_WAIT" >>"$LOG" 2>&1 <<'PY' || true
 import subprocess, sys
-timeout, py, tool, project, task, role, wait = (
-    float(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7])
+timeout, py, tool, project, sel_flag, sel_val, role, wait = (
+    float(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8])
 try:
-    subprocess.run([py, tool, "--project", project, "--task", task, "--role", role,
+    subprocess.run([py, tool, "--project", project, sel_flag, sel_val, "--role", role,
                     "--wait", wait, "--execute"], timeout=timeout)
 except Exception:   # TimeoutExpired (child already killed by run) OR any launch error → swallow
     pass
 PY
     fi
     return 0
+}
+
+# winlist-diff WID capture (sw-place-wid-fix / 2026-06-28) ───────────────────────────────────────
+# Print the SET of VS Code window_numbers (one Quartz WID per line, unsorted) by running the winlist
+# tool and extracting the integer `window_number` from each {"title":…, "window_number":N} entry.
+# Title-INDEPENDENT and available the instant the OS window exists — so a heavy-workspace window
+# (erp: window.title binds ~4s late) is already enumerable here even though a title-match would miss
+# it. Parsed via $HANDOFF_PYTHON_CMD (the script's python; no jq dependency), matching the existing
+# sidecar-parse pattern. Hard self-bound (SIGALRM, default-ON contract: never an unbounded subprocess
+# in the pre-return-jump path). On ANY failure (tool missing/non-exec, non-zero exit, non-JSON, parse
+# error, timeout) prints NOTHING + returns non-zero → the caller's diff yields no WID → graceful
+# fallback to the title (--task) placement path. Whitespace-only stdout = empty set (legal: 0 windows).
+winlist_wids() {
+    [ -x "$HANDOFF_WINLIST" ] || return 1
+    "$HANDOFF_PYTHON_CMD" - "$HANDOFF_WINLIST" <<'PY' 2>/dev/null
+import json, subprocess, sys, signal
+# hard self-bound: a hung winlist (its CGWindowList enumeration is normally instant, but a wedged
+# WindowServer could stall) → SIGALRM → handler raises → except → exit 1 (no output → fallback).
+signal.signal(signal.SIGALRM, lambda *_a: (_ for _ in ()).throw(TimeoutError()))
+signal.alarm(5)
+try:
+    r = subprocess.run([sys.argv[1]], capture_output=True, timeout=4)
+    if r.returncode != 0:
+        raise SystemExit(1)
+    out = r.stdout.decode("utf-8", "replace")
+    data = json.loads(out)
+    if not isinstance(data, list):
+        raise SystemExit(1)
+    wids = []
+    for e in data:
+        if isinstance(e, dict):
+            n = e.get("window_number")
+            if isinstance(n, int):
+                wids.append(n)
+    print("\n".join(str(n) for n in wids))
+except SystemExit:
+    raise
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+# Given a BEFORE snapshot (newline-joined WIDs in $1) and a fresh winlist read, print the SINGLE WID
+# present now but NOT before — the just-spawned window. The launcher drains spawns serially (one
+# `code -n` per iteration), so the diff is exactly one new WID on the happy path. Prints nothing (and
+# returns non-zero) when the new-WID count is 0 (window not yet enumerable / WID reuse) or >1 (a
+# concurrent foreign spawn landed a window between the two snapshots — ambiguous, must NOT guess) or
+# when either winlist read failed → the caller falls back to the title (--task) path. The before-set
+# membership test uses whole-line `grep -Fxq` (exact integer, never a substring).
+winlist_new_wid() {  # <before_wids_newline_joined>
+    local before="$1" now new=""
+    now=$(winlist_wids) || return 1
+    local n count=0
+    while IFS= read -r n; do
+        [ -n "$n" ] || continue
+        if ! printf '%s\n' "$before" | /usr/bin/grep -Fxq -- "$n"; then
+            new="$n"; count=$((count + 1))
+        fi
+    done <<EOF
+$now
+EOF
+    [ "$count" -eq 1 ] || return 1
+    printf '%s\n' "$new"
 }
 
 # 2026-05-28 codex audit blind-spot #4 修复:
@@ -1864,6 +1949,19 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
         log "TRIGGER: project=$PROJECT task=$TASK workspace=$WORKSPACE"
         _perf_reset   # start the per-segment spawn clock (PERF[...] lines from here to COLD-SUBMIT)
 
+        # winlist-diff WID capture — BEFORE snapshot (sw-place-wid-fix / 2026-06-28). Snapshot the
+        # current set of Code window_numbers BEFORE this iteration opens its window (`code -n` / `code`
+        # in Step 1 below, on EVERY path: cold / singlepane / warm). After the window is confirmed
+        # frontmost (just before maybe_place_window) we re-read winlist and diff: the WID present then
+        # but not now = the just-spawned window, resolved title-independently. Best-effort: a failed
+        # capture leaves the set empty → the diff finds no unique WID → placement falls back to the
+        # title (--task) path (no regression). Cheap (one bounded winlist read) and never gates a spawn.
+        # Track BEFORE-capture success separately: a FAILED capture must force the title (--task)
+        # fallback, NOT be conflated with a genuinely-empty set (0 windows). Conflating them risks
+        # mistargeting a pre-existing window when the AFTER snapshot happens to show exactly one
+        # window (codex RED fix, sw-coord-p76 / 2026-06-28).
+        if _PLACE_WIDS_BEFORE=$(winlist_wids 2>/dev/null); then _PLACE_WIDS_OK=1; else _PLACE_WIDS_OK=0; _PLACE_WIDS_BEFORE=""; fi
+
         # Step 1: activate the project window (跨项目 routing 核心)
         # worktree spawn-UX fix (2026-06-03): ONLY a per-session worktree spawn (workspace under
         # */worktrees/*) is a fresh cold window needing the engine-injected .code-workspace open-target
@@ -2192,10 +2290,41 @@ EOF
         # own goto/restore and race the NEXT spawn's focus-jump for the global active-desktop (flock
         # only serializes placement-vs-placement, not placement-vs-spawn-focusjump). Hard-bounded
         # (≤ HANDOFF_PLACE_TIMEOUT) + fully swallowed (|| true inside maybe_place_window) so it can
-        # NEVER affect the spawn outcome; default-ON unless a `.window-placement-off` sentinel. The
-        # tool resolves the target by its UNIQUE structured title and polls --wait for it (the short
-        # title-confirm) — best-effort SKIP if the title isn't ready yet, never extends this strand.
-        maybe_place_window "$PROJECT" "$TASK" "$PROJ_DIR" "$QUEUE"
+        # NEVER affect the spawn outcome; default-ON unless a `.window-placement-off` sentinel.
+        # WID-first target resolution (sw-place-wid-fix / 2026-06-28): diff the winlist AFTER snapshot
+        # against the pre-open _PLACE_WIDS_BEFORE to recover the just-spawned window's Quartz WID, then
+        # pass it to maybe_place_window as `--wid` (resolved title-INDEPENDENTLY — fixes heavy projects
+        # like erp whose structured window.title binds ~4s late, so the tool's strict title parse used
+        # to miss the window: 13/13 erp placements failed `cannot resolve target`). winlist_new_wid
+        # returns the unique new WID only when the diff yields EXACTLY one (the serial spawn drain
+        # guarantees this on the happy path); 0 or >1 (window not yet enumerable / WID reuse / a
+        # concurrent foreign spawn) → empty → maybe_place_window falls back to today's title (--task)
+        # path. Strictly additive: WID when we have it, the existing title path otherwise (no regression).
+        # WID identity-binding (codex r2 RED closure, sw-coord-p76 / 2026-06-28): the winlist BEFORE/
+        # AFTER diff only reliably identifies the just-spawned window when this iteration opened a
+        # GENUINELY-NEW window — a worktree cold spawn (COLD_WINDOW=1) or a singlepane `code -n`
+        # (SINGLEPANE_WINDOW=1). There the target is fresh + already confirmed frontmost → necessarily
+        # in the AFTER set, so a diff of EXACTLY one new WID is provably the target (a co-occurring
+        # foreign window makes the count 2 → fallback). On the WARM reuse path the target is a
+        # PRE-EXISTING window (NOT in the diff) and WID gives no benefit (a warm window's title is
+        # already bound), so a lone foreign window in the gap could be mis-resolved — gate WID to
+        # new-window spawns; warm reuse always takes the title (--task) path. Also still requires the
+        # BEFORE snapshot to have been captured successfully (_PLACE_WIDS_OK=1; the r2 fix).
+        # r4 (sw-coord-p76): the COLD/SINGLEPANE flag is only a PROXY for "opened a new window THIS
+        # iteration" — on a focus-contended RETRY tick that reuses a window opened in a PRIOR tick
+        # (_skip_code_n=1 → `code -n` skipped, lines ~2080/2098/2112) the target is already in the
+        # BEFORE snapshot, so a foreign window in the gap would be the unique "new" WID → mistarget.
+        # Also require `_skip_code_n != 1` so WID is used ONLY when `code -n` actually ran this tick
+        # (target genuinely new → in AFTER, not in BEFORE). `_skip_code_n` is reset to 0 every
+        # cold/singlepane iteration (line ~2065) before this gate; on the warm path the COLD/SINGLEPANE
+        # term is already false so a stale value is irrelevant. The retry-reuse window's title has long
+        # bound (opened a prior tick) → the --task fallback resolves it fine (no regression).
+        if [ "${_PLACE_WIDS_OK:-0}" = 1 ] && [ "${_skip_code_n:-0}" != "1" ] && { [ "${COLD_WINDOW:-0}" = 1 ] || [ "${SINGLEPANE_WINDOW:-0}" = 1 ]; }; then
+            _place_wid=$(winlist_new_wid "$_PLACE_WIDS_BEFORE" 2>/dev/null || true)
+        else
+            _place_wid=""
+        fi
+        maybe_place_window "$PROJECT" "$TASK" "$PROJ_DIR" "$QUEUE" "$_place_wid"
 
         # SP-SUBMIT baseline (sw-sp-enter-retry): the singlepane confirm signal is a NEW
         # transcript *.jsonl (∉ this set) carrying 🆔<task>. Captured BEFORE the URI dispatch
