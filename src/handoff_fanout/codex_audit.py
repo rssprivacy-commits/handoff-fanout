@@ -2929,6 +2929,18 @@ def main_audit_discharge(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--nonce", default=None, help="spawn nonce (16-hex); optional cross-check metadata"
     )
+    ap.add_argument(
+        "--and-close",
+        action="store_true",
+        help="after writing the signal, immediately gate+close this worker's window via the "
+        "autoclose --task driver (else pure producer, default)",
+    )
+    ap.add_argument(
+        "--autoclose-driver",
+        default=None,
+        help="path to autoclose-audited-workers.py (default: $HANDOFF_AUTOCLOSE_DRIVER or "
+        "~/.claude-handoff/supervisor-monitor/autoclose-audited-workers.py)",
+    )
     args = ap.parse_args(argv)
 
     if not _pc.TASK_ID_RE.match(args.task):
@@ -2953,4 +2965,52 @@ def main_audit_discharge(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"ERR-FATAL audit-discharge-invalid: {e}\n")
         return 1
     sys.stdout.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+    # The signal is now written and reported. Default (no --and-close) stops here =
+    # byte-identical pure producer (backward compatible). With --and-close, best-effort +
+    # hard-bounded: immediately invoke the autoclose --task driver to gate+close THIS one
+    # window. A close failure must NEVER fail the discharge — the signal persists on disk,
+    # so the hourly janitor sweep backstops any immediate close that can't run.
+    if args.and_close:
+        driver = Path(
+            args.autoclose_driver
+            or os.environ.get("HANDOFF_AUTOCLOSE_DRIVER")
+            or (Path.home() / ".claude-handoff" / "supervisor-monitor" / "autoclose-audited-workers.py")
+        )
+        if not (driver.is_file() and os.access(driver, os.R_OK)):
+            sys.stderr.write(
+                f"WARN audit-discharge-and-close: driver not found at {driver} — signal "
+                "written, window NOT closed (run the sweep or pass --autoclose-driver)\n"
+            )
+            return 0
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(driver), "--project", project, "--task", args.task, "--execute"],
+                timeout=60,
+                capture_output=True,
+                text=True,
+            )
+            if proc.returncode == 0:
+                summary = (proc.stdout or "").strip().splitlines()
+                sys.stderr.write(
+                    "OK audit-discharge-and-close: "
+                    + (summary[-1] if summary else "(driver produced no output)")
+                    + "\n"
+                )
+            else:
+                sys.stderr.write(
+                    f"WARN audit-discharge-and-close: driver exited rc={proc.returncode} — "
+                    f"signal written, window NOT closed (sweep will backstop). "
+                    f"stderr={(proc.stderr or '').strip()[:500]!r}\n"
+                )
+        except subprocess.TimeoutExpired:
+            sys.stderr.write(
+                "WARN audit-discharge-and-close: driver timed out (>60s) — signal written, "
+                "window NOT closed (sweep will backstop)\n"
+            )
+        except OSError as e:
+            sys.stderr.write(
+                f"WARN audit-discharge-and-close: driver failed to launch ({e}) — signal "
+                "written, window NOT closed (sweep will backstop)\n"
+            )
     return 0

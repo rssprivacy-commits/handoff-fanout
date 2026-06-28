@@ -166,3 +166,122 @@ def test_cli_dispatches_through_handoff(handoff_home, capsys):
     )
     assert rc == 0
     assert codex_audit.audit_discharged_path(PROJECT, TASK).exists()
+
+
+# ─── --and-close: immediate gate+close via the autoclose --task driver ────────
+#
+# These assert the additive --and-close path: the signal write is unchanged, and the
+# close is best-effort + hard-bounded (timeout=60, all failures swallowed to a WARN with
+# rc 0 — a close failure must NEVER fail the discharge, the signal persists for the sweep).
+
+
+def test_no_and_close_is_pure_producer(handoff_home, monkeypatch, capsys):
+    """Backward-compat: WITHOUT --and-close, the signal is written and NO close fires."""
+    called = []
+    monkeypatch.setattr(
+        codex_audit.subprocess, "run", lambda *a, **k: called.append((a, k))
+    )
+    rc = codex_audit.main_audit_discharge(
+        [TASK, "--project", PROJECT, "--verdict", "GREEN", "--merge-sha", SHA]
+    )
+    assert rc == 0
+    assert called == []  # the close driver was NEVER invoked
+    path = codex_audit.audit_discharged_path(PROJECT, TASK)
+    assert path.exists()
+    on_disk = json.loads(path.read_text())
+    assert on_disk["verdict"] == "GREEN"
+    assert on_disk["merge_sha"] == SHA
+
+
+def test_and_close_invokes_driver(handoff_home, tmp_path, monkeypatch, capsys):
+    """WITH --and-close, the driver is invoked with the exact argv + timeout=60."""
+    fake_driver = tmp_path / "autoclose-audited-workers.py"
+    fake_driver.write_text("# fake driver\n")
+    recorded = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = "closed window for wk-discharge-1\n"
+        stderr = ""
+
+    def _fake_run(argv, **kwargs):
+        recorded["argv"] = argv
+        recorded["kwargs"] = kwargs
+        return _Proc()
+
+    monkeypatch.setattr(codex_audit.subprocess, "run", _fake_run)
+    rc = codex_audit.main_audit_discharge(
+        [TASK, "--project", PROJECT, "--verdict", "GREEN", "--merge-sha", SHA,
+         "--and-close", "--autoclose-driver", str(fake_driver)]
+    )
+    assert rc == 0
+    argv = recorded["argv"]
+    # [sys.executable, <driver>, "--project", <p>, "--task", <task>, "--execute"]
+    assert argv[1] == str(fake_driver)
+    assert argv[-5:] == ["--project", PROJECT, "--task", TASK, "--execute"]
+    assert recorded["kwargs"]["timeout"] == 60
+    # signal still written
+    assert codex_audit.audit_discharged_path(PROJECT, TASK).exists()
+
+
+def test_and_close_driver_missing_warns_rc0(handoff_home, monkeypatch, capsys):
+    """--and-close with a missing driver → WARN, rc 0, signal still written, no subprocess."""
+    called = []
+    monkeypatch.setattr(
+        codex_audit.subprocess, "run", lambda *a, **k: called.append((a, k))
+    )
+    rc = codex_audit.main_audit_discharge(
+        [TASK, "--project", PROJECT, "--verdict", "GREEN", "--merge-sha", SHA,
+         "--and-close", "--autoclose-driver", "/nonexistent/autoclose-audited-workers.py"]
+    )
+    assert rc == 0
+    assert called == []  # never even tried to launch a missing driver
+    err = capsys.readouterr().err
+    assert "WARN audit-discharge-and-close" in err
+    assert "driver not found" in err
+    assert codex_audit.audit_discharged_path(PROJECT, TASK).exists()
+
+
+def test_and_close_driver_timeout_warns_rc0(handoff_home, tmp_path, monkeypatch, capsys):
+    """--and-close where the driver times out → WARN, rc 0, signal persists."""
+    import subprocess as _sp
+
+    fake_driver = tmp_path / "autoclose-audited-workers.py"
+    fake_driver.write_text("# fake driver\n")
+
+    def _raise_timeout(argv, **kwargs):
+        raise _sp.TimeoutExpired(cmd=argv, timeout=60)
+
+    monkeypatch.setattr(codex_audit.subprocess, "run", _raise_timeout)
+    rc = codex_audit.main_audit_discharge(
+        [TASK, "--project", PROJECT, "--verdict", "GREEN", "--merge-sha", SHA,
+         "--and-close", "--autoclose-driver", str(fake_driver)]
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "WARN audit-discharge-and-close" in err
+    assert "timed out" in err
+    # signal persists even though the close failed
+    assert codex_audit.audit_discharged_path(PROJECT, TASK).exists()
+
+
+def test_and_close_driver_nonzero_warns_rc0(handoff_home, tmp_path, monkeypatch, capsys):
+    """--and-close where the driver exits non-zero → WARN, rc 0, signal persists."""
+    fake_driver = tmp_path / "autoclose-audited-workers.py"
+    fake_driver.write_text("# fake driver\n")
+
+    class _Proc:
+        returncode = 1
+        stdout = ""
+        stderr = "gate refused: spawn anchor missing\n"
+
+    monkeypatch.setattr(codex_audit.subprocess, "run", lambda *a, **k: _Proc())
+    rc = codex_audit.main_audit_discharge(
+        [TASK, "--project", PROJECT, "--verdict", "GREEN", "--merge-sha", SHA,
+         "--and-close", "--autoclose-driver", str(fake_driver)]
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "WARN audit-discharge-and-close" in err
+    assert "rc=1" in err
+    assert codex_audit.audit_discharged_path(PROJECT, TASK).exists()
