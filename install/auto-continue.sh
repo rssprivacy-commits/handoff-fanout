@@ -2321,8 +2321,30 @@ EOF
         # bound (opened a prior tick) → the --task fallback resolves it fine (no regression).
         if [ "${_PLACE_WIDS_OK:-0}" = 1 ] && [ "${_skip_code_n:-0}" != "1" ] && { [ "${COLD_WINDOW:-0}" = 1 ] || [ "${SINGLEPANE_WINDOW:-0}" = 1 ]; }; then
             _place_wid=$(winlist_new_wid "$_PLACE_WIDS_BEFORE" 2>/dev/null || true)
+            # PLACE-WID-DIAG (sw-coord-p76 follow-up / diagnostic-only, ADDITIVE — no behavior change):
+            # when the gate passed but no unique WID came back, record WHY so a placement failure's
+            # root cause is visible. new=0 ⇒ the just-spawned window was not yet enumerable by winlist
+            # at AFTER-snapshot time (heavy-workspace render lag — the leading hypothesis); new>1 ⇒ a
+            # concurrent foreign window landed in the gap (WID safely declines). One extra bounded
+            # winlist read; best-effort, never gates a spawn.
+            if [ -z "$_place_wid" ]; then
+                _d_now=$(winlist_wids 2>/dev/null || true)
+                _d_bn=$(printf '%s\n' "$_PLACE_WIDS_BEFORE" | /usr/bin/grep -c '[0-9]' 2>/dev/null || echo 0)
+                _d_nn=$(printf '%s\n' "$_d_now" | /usr/bin/grep -c '[0-9]' 2>/dev/null || echo 0)
+                _d_new=0
+                while IFS= read -r _d_n; do
+                    [ -n "$_d_n" ] || continue
+                    printf '%s\n' "$_PLACE_WIDS_BEFORE" | /usr/bin/grep -Fxq -- "$_d_n" || _d_new=$((_d_new + 1))
+                done <<EOF
+$_d_now
+EOF
+                log "PLACE-WID-DIAG[$TASK]: gate-passed but no unique WID → new=$_d_new before=$_d_bn now=$_d_nn (new=0⇒window-not-enumerable / new>1⇒concurrent-foreign) → title fallback"
+            else
+                log "PLACE-WID-DIAG[$TASK]: WID=$_place_wid"
+            fi
         else
             _place_wid=""
+            log "PLACE-WID-DIAG[$TASK]: gate-declined (_PLACE_WIDS_OK=${_PLACE_WIDS_OK:-0} _skip_code_n=${_skip_code_n:-0} COLD=${COLD_WINDOW:-0} SP=${SINGLEPANE_WINDOW:-0}) → title"
         fi
         maybe_place_window "$PROJECT" "$TASK" "$PROJ_DIR" "$QUEUE" "$_place_wid"
 
