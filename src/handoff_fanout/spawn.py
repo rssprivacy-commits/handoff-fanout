@@ -305,6 +305,63 @@ def _remove_worktree_best_effort(
         )
 
 
+# ─── spawn-time base-anchor (autoclose gate P0-2) ──────────────────────────────
+
+
+def _worktree_anchor_dict(result: _worktree.WorktreeResult, source_workspace: Path) -> dict:
+    """The ``ack/<task>.worktree`` base-anchor payload. MIRRORS
+    ``dump._worktree_info_dict(result, MODE_ON)`` KEY-FOR-KEY (the autoclose gate's P0-2
+    corroboration reads ``base_sha`` from it to prove a non-trivial advance; prune/gc + the
+    §0 trace read the rest) plus the ``source_workspace`` field ``dump`` appends at write time.
+    Authored here, NOT imported from ``dump`` — design §13 forbids ``spawn`` importing ``dump``;
+    the duplication is deliberate (see the module docstring's dump-mirror note)."""
+    return {
+        "mode": _worktree.MODE_ON,
+        "status": result.status,
+        "path": str(result.spawn_workspace),
+        "branch": result.branch,
+        "base_sha": result.base_sha,
+        "integration_branch": result.integration_branch,
+        "linked": result.linked,
+        "degraded": result.status == _worktree.ST_DEGRADED,
+        "reason": result.reason,
+        "warnings": result.warnings,
+        "planned_cmd": result.planned_cmd,
+        "source_workspace": str(source_workspace),
+    }
+
+
+def _write_worktree_anchor(
+    cfg: _config.Config, src: Path, project: str, task: str, result: _worktree.WorktreeResult
+) -> None:
+    """Write ``ack/<task>.worktree`` (the spawn-time base-anchor) for a CREATED worktree —
+    the gap unified spawn left open: ``dump`` writes this anchor but a unified ``spawn`` never
+    called ``dump``, so EVERY unified-spawn worktree worker had no anchor → the autoclose gate
+    REFUSEd them all ``base-anchor-missing``. Mirrors ``dump``'s write (dump.py:1308-1330):
+    crash-atomic via ``atomic.atomic_replace`` (temp + ``os.replace``, NOT ``write_with_fsync``'s
+    in-place ``O_TRUNC`` which can leave partial JSON the GC mis-parses), and NON-FATAL on OSError
+    (a worker that loses its anchor just degrades to a manual close — never fail the spawn over it).
+    Called inside the project spawn lock, BEFORE the ``.uri`` publish (dump's same ordering rule)."""
+    try:
+        ack_dir = cfg.ack_dir(project)
+        ack_dir.mkdir(parents=True, exist_ok=True)
+        atomic.atomic_replace(
+            ack_dir / f"{task}.worktree",
+            json.dumps(_worktree_anchor_dict(result, src), ensure_ascii=False, indent=2) + "\n",
+        )
+    except OSError as e:
+        _err(f"(non-fatal) could not write .worktree base-anchor: {e}")
+
+
+def _remove_worktree_anchor_best_effort(cfg: _config.Config, project: str, task: str) -> None:
+    """Delete ``ack/<task>.worktree`` on a publish-failure rollback. Called ONLY when WE created
+    the worktree this call (``not result.reused``) — a reused worktree's anchor may belong to
+    another live session, so it is left intact (parity with NOT removing the reused worktree).
+    Best-effort: a missing/locked anchor never raises over the original publish failure."""
+    with contextlib.suppress(OSError):
+        (cfg.ack_dir(project) / f"{task}.worktree").unlink(missing_ok=True)
+
+
 # ─── per-isolation orchestration ───────────────────────────────────────────────
 
 
@@ -523,6 +580,12 @@ def _produce_worktree(
             _remove_worktree_best_effort(cfg, src, project, task, result)
         return EXIT_FAIL_CLOSED
     uri = _build_uri(cfg, prompt_text)
+    # Spawn-time base-anchor (ack/<task>.worktree) — mirror dump so EVERY unified-spawn
+    # worktree worker self-carries the base_sha the autoclose gate's P0-2 corroboration needs
+    # (without it the gate REFUSEs every unified-spawn worker base-anchor-missing). Written
+    # here inside the spawn lock and BEFORE the .uri publish (dump's .worktree-before-.uri
+    # ordering); reused worktrees re-stamp the same fork-point base_sha (idempotent).
+    _write_worktree_anchor(cfg, src, project, task, result)
     try:
         _write_sidecar(
             queue_dir,
@@ -548,8 +611,11 @@ def _produce_worktree(
         # MUST 2 (p6a-fix1): only remove a worktree THIS call created. A reused one
         # (create_worktree's idempotent-adoption branch) may belong to another live
         # session / the previous relay leg — removing it would be data loss; we roll
-        # back only our own sidecar/.uri above and leave the worktree untouched.
+        # back only our own sidecar/.uri above and leave the worktree untouched. The
+        # base-anchor follows the worktree: drop it iff WE made the worktree (else a
+        # reused worktree would be orphaned of its anchor / lose another session's).
         if not result.reused:
+            _remove_worktree_anchor_best_effort(cfg, project, task)
             _remove_worktree_best_effort(cfg, src, project, task, result)
         return EXIT_FAIL_CLOSED
     print(f"[spawn] ✅ worktree intent for {project}/{task} on {result.branch} (nonce {nonce})")

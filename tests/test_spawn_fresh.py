@@ -27,10 +27,14 @@ from pathlib import Path
 
 import pytest
 
+from handoff_fanout import autoclose_gate
+from handoff_fanout import dump
+from handoff_fanout import reclaim
 from handoff_fanout import spawn
 from handoff_fanout import spawn_nonce as _spawn_nonce
 from handoff_fanout import spawner_focus as _spawner_focus
 from handoff_fanout import succession_authority as _authority
+from handoff_fanout import worktree as _worktree
 
 PROJECT = "wilde-hexe"
 TASK = "wh-frobnicate"
@@ -983,6 +987,90 @@ def test_worktree_reuse_publish_failure_does_not_remove_worktree(tmp_path, monke
     assert not (qd / f"{TASK}.singlepane").exists()
     # … but the REUSED worktree (not ours to destroy) survives.
     assert wt_dir.is_dir()
+
+
+# ─── spawn-time base-anchor (autoclose gate P0-2) ───────────────────────────
+
+
+def test_worktree_writes_base_anchor_mirroring_dump(tmp_path, monkeypatch):
+    """A unified-spawn worktree worker MUST self-carry the spawn-time base-anchor
+    ``ack/<task>.worktree`` — without it ``autoclose_gate``'s P0-2 corroboration REFUSEs
+    EVERY unified-spawn worker ``base-anchor-missing`` and auto-close never fires (the gap
+    this fix closes). ``spawn`` must NOT import ``dump``, so the hand-written mirror's key set
+    is locked here to dump's authoritative ``_worktree_info_dict`` shape (drift = test fail)."""
+    home = _home(tmp_path, monkeypatch)
+    _, ws = _bare_and_clone(tmp_path)
+
+    assert spawn.main(_argv(isolation="worktree", workspace=ws)) == 0
+
+    anchor = home / PROJECT / "ack" / f"{TASK}.worktree"
+    assert anchor.exists()
+
+    # the gate reads it EXACTLY this way (reclaim._read_json + _is_sha on base_sha), so this
+    # asserts the corroboration no longer trips base-anchor-missing for this worker.
+    info = reclaim._read_json(anchor)
+    assert isinstance(info, dict)
+    assert autoclose_gate._is_sha(info.get("base_sha"))
+
+    # base_sha == the worktree's actual fork point (its HEAD off origin/main at creation).
+    wt_workspace = Path(_uri_lines(home)["WORKSPACE"])
+    head = subprocess.run(
+        ["git", "-C", str(wt_workspace), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert info["base_sha"] == head
+
+    # key-for-key identical to dump's authoritative shape (+ the source_workspace dump appends
+    # at write time) — locks the no-import mirror against silent drift.
+    canonical = _worktree.WorktreeResult(
+        status=_worktree.ST_CREATED, spawn_workspace=Path("/x")
+    )
+    assert set(info) == set(dump._worktree_info_dict(canonical, _worktree.MODE_ON)) | {
+        "source_workspace"
+    }
+    assert info["source_workspace"] == str(ws)
+    assert info["mode"] == _worktree.MODE_ON
+    assert info["status"] == _worktree.ST_CREATED
+
+
+def test_worktree_partial_failure_removes_base_anchor(tmp_path, monkeypatch):
+    """Publish failure on a freshly-CREATED (not reused) worktree rolls back the base-anchor
+    too — no orphan ``ack/<task>.worktree`` left pointing at a worktree we just destroyed."""
+    home = _home(tmp_path, monkeypatch)
+    _, ws = _bare_and_clone(tmp_path)
+
+    def boom(*a, **k):
+        raise RuntimeError("simulated publish failure")
+
+    monkeypatch.setattr(spawn, "_write_uri", boom)
+    rc = spawn.main(_argv(isolation="worktree", workspace=ws))
+    assert rc == 2
+    # the worktree is gone (existing contract) AND its anchor with it (no orphan).
+    assert not (home / PROJECT / "worktrees" / TASK).exists()
+    assert not (home / PROJECT / "ack" / f"{TASK}.worktree").exists()
+
+
+def test_worktree_reuse_publish_failure_keeps_base_anchor(tmp_path, monkeypatch):
+    """A publish failure on a REUSED worktree must NOT delete the base-anchor: the worktree
+    survives (it may belong to another live session / the previous relay leg), so its anchor
+    survives with it — parity with NOT removing the reused worktree itself (data-loss class)."""
+    home = _home(tmp_path, monkeypatch)
+    _, ws = _bare_and_clone(tmp_path)
+
+    # 1st spawn creates the worktree + anchor + publishes fine.
+    assert spawn.main(_argv(isolation="worktree", workspace=ws)) == 0
+    anchor = home / PROJECT / "ack" / f"{TASK}.worktree"
+    assert anchor.exists()
+
+    # 2nd spawn for the SAME task REUSES the worktree; its publish fails → roll back only this
+    # spawn's sidecar/.uri, never the reused worktree NOR its anchor.
+    def boom(*a, **k):
+        raise RuntimeError("simulated publish failure")
+
+    monkeypatch.setattr(spawn, "_write_uri", boom)
+    assert spawn.main(_argv(isolation="worktree", workspace=ws)) == 2
+    assert (home / PROJECT / "worktrees" / TASK).is_dir()
+    assert anchor.exists()  # the reused worktree's anchor survives
 
 
 # ─── arg validation ─────────────────────────────────────────────────────────
