@@ -14,6 +14,7 @@
 #   4. ROLE= absent + sidecar role=solo                  -> --role worker (fallback, non-coord sidecar)
 #   5. ROLE= absent + NO sidecar                         -> --role worker (safe default)
 #   6. ROLE= absent + sidecar role=worker                -> --role worker
+#   7. explicit PRESENT-BUT-UNRECOGNIZED ROLE= (+ coord sidecar) -> --role worker (sidecar IGNORED)
 # Plus a structural guard: the launcher must NOT sniff UI appearance for the placement role.
 #
 # Exit 0 on full pass, non-zero on any failure. Run: bash tests/test_place_role_contract.sh
@@ -154,6 +155,19 @@ assert_role "worker" "CASE5: ROLE= absent + no sidecar (safe default)"
 Q="$(new_queue)"; write_sidecar "$Q" "worker"
 run_case "$Q" ""
 assert_role "worker" "CASE6: ROLE= absent + sidecar worker (fallback)"
+
+# ================================================================================
+# CASE 7: explicit PRESENT-BUT-UNRECOGNIZED ROLE= (nonempty, neither coord nor
+#         worker) -> worker, IGNORING a coord-driving sidecar. Once the ROLE=
+#         contract is present it is authoritative: an unknown value must fail-safe
+#         to worker directly, NOT revert to the legacy sidecar fallback (which
+#         would mis-resolve to coord here). We deliberately plant a coord sidecar
+#         (role=supervisor_succession) in the SAME queue to prove the function does
+#         NOT consult it for a nonempty-unknown ROLE=.
+# ================================================================================
+Q="$(new_queue)"; write_sidecar "$Q" "supervisor_succession"
+run_case "$Q" "supervisor_succession"
+assert_role "worker" "CASE7: nonempty-unknown ROLE=supervisor_succession + coord sidecar -> --role worker (sidecar ignored)"
 
 # ================================================================================
 # STRUCTURAL GUARD: the launcher's placement role must NOT be derived from UI

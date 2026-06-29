@@ -291,16 +291,20 @@ maybe_place_window() {
     [ -n "$wid" ] && { [ "$wid" -gt 0 ] 2>/dev/null || wid=""; }
     # Role resolution (place-role-explicit-contract / 2026-06-29). AUTHORITATIVE = the engine-stamped
     # ROLE= from the .uri ($uri_role): the engine knows coord-vs-worker at spawn time and emits it on
-    # every path → no UI-sniffing, mode-agnostic. Only "coord" maps to coord; "worker" (and any other
-    # explicit value) → worker. FALLBACK (ROLE= absent — a legacy / in-flight .uri): read the
-    # per-project singlepane sidecar `role` (the transitional pre-contract signal), else default to
-    # worker. A coordinator succession carries role=supervisor_succession in that sidecar.
+    # every path → no UI-sniffing, mode-agnostic. Only "coord" maps to coord; "worker" → worker. A
+    # PRESENT-BUT-UNRECOGNIZED ROLE= value (nonempty, neither coord nor worker) is treated as an
+    # authoritative-but-unknown contract → fail-safe to worker directly (do NOT consult the legacy
+    # sidecar — once the contract is present it is the sole signal; guessing via the sidecar would
+    # mis-resolve to coord). The transitional sidecar FALLBACK is reserved for the EMPTY case only:
+    # ROLE= absent (a legacy / in-flight .uri written before this contract) → read the per-project
+    # singlepane sidecar `role` (the pre-contract signal), else default to worker. A coordinator
+    # succession carries role=supervisor_succession in that sidecar.
     local role="worker"
     case "$uri_role" in
         coord) role="coord" ;;
         worker) role="worker" ;;
-        *)
-            # No explicit ROLE= → transitional singlepane-sidecar fallback (then worker default).
+        "")
+            # No explicit ROLE= (empty) → transitional singlepane-sidecar fallback (then worker default).
             local sc="$queue/$task.singlepane" sc_role=""
             if [ -f "$sc" ]; then
                 sc_role=$("$HANDOFF_PYTHON_CMD" - "$sc" <<'PY' 2>/dev/null
@@ -320,6 +324,8 @@ PY
                 case "$sc_role" in supervisor_succession|*coord*|*supervisor*) role="coord" ;; esac
             fi
             ;;
+        *)  # present-but-unrecognized ROLE= → fail-safe to worker (do NOT consult the legacy sidecar).
+            role="worker" ;;
     esac
     # Mutually-exclusive selector: --wid when captured, else the title path --task (fallback).
     local _sel_flag _sel_val _sel_kind
