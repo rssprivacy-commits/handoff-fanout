@@ -98,6 +98,46 @@ else
 fi
 
 # ================================================================================
+# OBJECT shape (sw-place-wid-spaces / 2026-06-29): winlist --spaces-of-windows emits
+# {"windows":[…],"ok":true} (cross-Space). winlist_wids must unwrap .windows and
+# print the window_numbers. The fake ignores args, so the --spaces-of-windows flag
+# the function now passes is harmless.
+# ================================================================================
+export HANDOFF_WINLIST="$(make_winlist 0 '{"windows":[{"window_number":1},{"window_number":2}],"ok":true}')"
+out="$(winlist_wids)"; rc=$?
+got="$(printf '%s\n' "$out" | tr '\n' ' ' | sed 's/ *$//')"
+if [ "$rc" -eq 0 ] && [ "$got" = "1 2" ]; then
+    pass "obj-shape: {\"windows\":[…]} -> prints '1' and '2', rc 0"
+else
+    fyi  "obj-shape: expected rc0 out='1 2'; got rc=$rc out=[$got]"
+fi
+
+# ================================================================================
+# OBJECT shape with no .windows key -> data.get('windows') is None -> not a list
+# -> fail-closed (empty + non-zero), so the caller falls back to the title path.
+# ================================================================================
+export HANDOFF_WINLIST="$(make_winlist 0 '{"ok":true}')"
+out="$(winlist_wids)"; rc=$?
+if [ "$rc" -ne 0 ] && [ -z "$out" ]; then
+    pass "obj-shape: {} without .windows -> fail-closed (empty + non-zero, rc=$rc)"
+else
+    fyi  "obj-shape: missing .windows must fail-closed; got rc=$rc out=[$out]"
+fi
+
+# ================================================================================
+# BACKWARD-COMPAT: a bare array (the old plain-winlist shape) is still parsed.
+# (restores the two-window exit-0 fake for the winlist_new_wid cases below.)
+# ================================================================================
+export HANDOFF_WINLIST="$(make_winlist 0 '[{"window_number":1},{"window_number":2}]')"
+out="$(winlist_wids)"; rc=$?
+got="$(printf '%s\n' "$out" | tr '\n' ' ' | sed 's/ *$//')"
+if [ "$rc" -eq 0 ] && [ "$got" = "1 2" ]; then
+    pass "bare-array: [{…},{…}] still parsed -> prints '1' and '2', rc 0 (backward-compat)"
+else
+    fyi  "bare-array: expected rc0 out='1 2'; got rc=$rc out=[$got]"
+fi
+
+# ================================================================================
 # winlist_new_wid: BEFORE={1}, now={1,2} -> exactly one new -> prints 2, rc 0
 # (now is read via the live winlist_wids over the exit-0 two-window fake above)
 # ================================================================================

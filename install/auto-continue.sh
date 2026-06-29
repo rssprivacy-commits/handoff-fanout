@@ -98,12 +98,15 @@ HANDOFF_PLACE_PYTHON="${HANDOFF_PLACE_PYTHON:-/opt/homebrew/bin/python3}"
 HANDOFF_PLACE_TOOL="${HANDOFF_PLACE_TOOL:-$HANDOFF_ROOT/supervisor-monitor/coord-place-window.py}"
 HANDOFF_PLACE_WAIT="${HANDOFF_PLACE_WAIT:-3}"
 HANDOFF_PLACE_TIMEOUT="${HANDOFF_PLACE_TIMEOUT:-12}"
-# winlist (vscode-spaces) — prints a JSON array of {"title":…, "window_number":N} for every Code
-# window, the instant the OS window exists (title-INDEPENDENT). Used for winlist-diff WID capture so
-# placement can resolve the just-spawned window by its Quartz window_number (--wid) instead of its
-# late-binding structured title (a heavy workspace — erp — applies window.title only ~4s after the
-# window exists, so a title-match misses it; the WID is available immediately). Env-overridable;
-# a missing/failing tool degrades gracefully to the title (--task) path in maybe_place_window.
+# winlist (vscode-spaces) — invoked with --spaces-of-windows so it enumerates EVERY macOS Space (not
+# just the current one), returning {"windows":[{"title":…,"window_number":N,"desktop":D},…]} for every
+# Code window, the instant the OS window exists (title-INDEPENDENT). All-Spaces enumeration keeps the
+# winlist-diff Space-INDEPENDENT: the spawn switches Spaces (focus-jump/goto), so a current-Space-only
+# snapshot would see another Space's windows as spurious "new" ones (new>1 → decline). Used for
+# winlist-diff WID capture so placement can resolve the just-spawned window by its Quartz window_number
+# (--wid) instead of its late-binding structured title (a heavy workspace — erp — applies window.title
+# only ~4s after the window exists, so a title-match misses it; the WID is available immediately).
+# Env-overridable; a missing/failing tool degrades gracefully to the title (--task) path in maybe_place_window.
 HANDOFF_WINLIST="${HANDOFF_WINLIST:-$HOME/Projects/dharmaxis/scripts/vscode-spaces/winlist}"
 # Absolute `timeout`/`gtimeout` (launchd PATH is minimal → try known prefixes, then PATH). Empty ⇒
 # fall back to the python-level bounded wrapper in maybe_place_window (still hard-bounded, never
@@ -332,9 +335,15 @@ PY
     return 0
 }
 
-# winlist-diff WID capture (sw-place-wid-fix / 2026-06-28) ───────────────────────────────────────
+# winlist-diff WID capture (sw-place-wid-fix / 2026-06-28; ALL-Spaces fix sw-place-wid-spaces / 2026-06-29)
 # Print the SET of VS Code window_numbers (one Quartz WID per line, unsorted) by running the winlist
-# tool and extracting the integer `window_number` from each {"title":…, "window_number":N} entry.
+# tool with --spaces-of-windows and extracting the integer `window_number` from each window entry.
+# --spaces-of-windows enumerates EVERY macOS Space (plain winlist returns only the CURRENT Space's
+# windows): the spawn flow switches Spaces (focus-jump/goto), so a current-Space-only BEFORE/AFTER
+# snapshot lands the two reads on different Spaces → every AFTER window looks "new" → winlist_new_wid
+# declines (new>1). Enumerating all Spaces makes the diff Space-INDEPENDENT. The cross-Space tool
+# emits the OBJECT shape {"windows":[{"title":…,"window_number":N,"desktop":D},…],"ok":true}; the
+# parse below unwraps `.windows` (a bare array is still accepted for backward-compat).
 # Title-INDEPENDENT and available the instant the OS window exists — so a heavy-workspace window
 # (erp: window.title binds ~4s late) is already enumerable here even though a title-match would miss
 # it. Parsed via $HANDOFF_PYTHON_CMD (the script's python; no jq dependency), matching the existing
@@ -351,11 +360,13 @@ import json, subprocess, sys, signal
 signal.signal(signal.SIGALRM, lambda *_a: (_ for _ in ()).throw(TimeoutError()))
 signal.alarm(5)
 try:
-    r = subprocess.run([sys.argv[1]], capture_output=True, timeout=4)
+    r = subprocess.run([sys.argv[1], "--spaces-of-windows"], capture_output=True, timeout=4)
     if r.returncode != 0:
         raise SystemExit(1)
     out = r.stdout.decode("utf-8", "replace")
     data = json.loads(out)
+    if isinstance(data, dict):
+        data = data.get("windows")
     if not isinstance(data, list):
         raise SystemExit(1)
     wids = []
