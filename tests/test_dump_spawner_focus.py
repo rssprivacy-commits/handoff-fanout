@@ -157,19 +157,26 @@ def test_active_dump_writes_spawner_focus_from_self_id(tmp_path, monkeypatch):
 # ─── place-role-explicit-contract: the engine-stamped ROLE= line ─────────────
 
 
-def test_active_dump_cold_start_coordinator_writes_role_coord(tmp_path, monkeypatch):
+def test_active_dump_cold_start_coordinator_writes_role_coord(
+    tmp_path, isolated_handoff_home, monkeypatch
+):
     """DEFECT#1 (the cold-start singlepane coordinator): an ``is_coordinator`` dump records
     role="worker" in its singlepane SIDECAR (the watchdog red-top contract), so the .uri's explicit
     ROLE= is the ONLY signal carrying the true coordinator identity to the launcher's placement. It
     MUST be ROLE=coord (→ right-half), not worker."""
-    home = tmp_path / "handoff"
-    home.mkdir()
+    # ISOLATION: the ``isolated_handoff_home`` fixture sets ``HANDOFF_HOME`` to a tmp dir BEFORE we
+    # ``_config.load()``, so ``cfg.home`` (and the ``queue_dir`` we derive from it) lands under the
+    # throwaway home — never the live ``~/.claude-handoff`` the watchdog scans. (The prior version
+    # called ``_config.load()`` while the ambient ``HANDOFF_HOME`` was still live, then set the env
+    # too late, so ``cfg.queue_dir`` wrote the .uri/.singlepane into the LIVE home → the watchdog
+    # spawned real sessions.)
+    home = isolated_handoff_home
     (home / "config.json").write_text("{}")
     ws = _bare_and_clone(tmp_path)
     monkeypatch.delenv("HANDOFF_WINDOW_FOCUS_PATH", raising=False)
     cfg = _config.load()
-    monkeypatch.setenv("HANDOFF_HOME", str(home))
     queue_dir = cfg.queue_dir(PROJECT)
+    assert home in queue_dir.parents, "queue_dir must resolve under the tmp HANDOFF_HOME, not live"
     queue_dir.mkdir(parents=True, exist_ok=True)
     rc = dump.write_active_dump(
         cfg=cfg, project=PROJECT, task=TASK, workspace=ws, next_brief="b", status="active",
