@@ -15,8 +15,9 @@ auto-close on discharge + janitor backlog sweep).
 | **A** signal writer | `handoff audit-discharge` → writes the strong, git-corroborated `ack/<task>.audit_discharged` (forgeable only by the same-UID worker — see "single-user authorization residual" below) | `src/handoff_fanout/codex_audit.py` (git, editable) |
 | **gate** | the 5-predicate fail-safe safety gate (pure, unit-tested) | `src/handoff_fanout/autoclose_gate.py` (git, editable) |
 | **B** close-by-WID | `coord-close-windows.py --close-wid` (AI-title + §6(a) TOCTOU root-fix) + §6(b) stats fix | `~/.claude-handoff/supervisor-monitor/coord-close-windows.py` (non-git, deploy-audited) |
-| **C** driver/sweep | `autoclose-audited-workers.py` (thin glue: gate → bind WID → invoke the close tool) | `~/.claude-handoff/supervisor-monitor/autoclose-audited-workers.py` (non-git, deploy-audited) |
-| **D** opt-in switch | `worker-autoclose.enabled` (DEFAULT-OFF) + kill-switch | sentinel files under `$HANDOFF_HOME` (see below) |
+| **C** driver/sweep | `autoclose-audited-workers.py` (thin glue: gate → bind WID → invoke the close tool) — modes `--task` / `--sweep` (signal path) + `--reconcile` (git-terminal path) | `~/.claude-handoff/supervisor-monitor/autoclose-audited-workers.py` (non-git, deploy-audited) |
+| **C′** git-terminal reconciler | `gate_task_git_terminal` + `reconcile_open_worker_windows` (signal-free: seed the gate from the OPEN worker window's own merged delivery) | `src/handoff_fanout/autoclose_gate.py` (git, editable) |
+| **D** opt-in switch | `worker-autoclose.enabled` (DEFAULT-OFF, signal+reconcile execute) + `worker-autoclose-reconcile.enabled` (DEFAULT-OFF, reconcile mode) + kill-switch | sentinel files under `$HANDOFF_HOME` (see below) |
 | **E** janitor scheduler | launchd plist DESIGN-ONLY → routed to dx (red-line #4) | this doc §E |
 
 ## The 5-predicate safety gate (a window auto-closes ⟺ ALL hold)
@@ -73,6 +74,58 @@ commit — there is **no un-reviewed/un-merged work to lose**. (Un-reviewed work
 the work is already overwritten.) The residual is purely "a worker can self-authorize *its own*
 close", never "an un-reviewed delivery is destroyed".
 
+## C′ — the git-terminal reconciler (signal-free auto-close that actually self-triggers)
+
+### Why (the signal path is inert in practice)
+
+The signal path (`gate_task` / `--task` / `--sweep`) only ever fires for a task that has an
+`ack/<task>.audit_discharged` signal — and that signal is written **only** by a coordinator
+hand-running `handoff audit-discharge`. Coordinators almost never run it (across the whole fleet
+there has typically been a single discharge signal), so the auto-close feature is **inert**: a worker
+that finished, got reviewed, and was merged keeps its window open forever because nothing ever wrote
+its discharge signal.
+
+### The fix — seed the gate from the OPEN window's own merged delivery
+
+`gate_task_git_terminal` runs the **same** fail-safe gate but derives `merge_sha` from the task's
+**own pinned delivery record** (`reclaim._pinned_sha` = `ack/<task>.old_ready` `commit_hash` >
+`ack/<task>.head.json` `head_sha`) instead of reading a discharge signal. Everything else is reused
+**unchanged**: the idle probe (`_evaluate_idle`) and the network corroboration (`_corroborate_git`).
+The shared local checks (worker role + nonce + base anchor + non-vacuous + pinned binding) are factored
+into `_corroborate_local_shared`, used by **both** paths — so the signal path stays byte-for-byte
+identical (its full test suite passes unchanged).
+
+`reconcile_open_worker_windows(cfg, project, windows, parse_title, …)` is a **pure** pass over the
+open windows (injected `windows` + `parse_title`, zero winlist/close I/O): for each window that parses
+to this project's worker (non-coordinator, non-empty task id) it runs `gate_task_git_terminal` and
+collects only the `close_ok` decisions (each annotated with `.task` for WID binding). The driver
+(`--reconcile`) does the winlist + close I/O; the gate carries all judgement.
+
+### Why this is SAFE — "merged to origin/main" is the strongest possible terminal proof
+
+The only thing the git-terminal path drops versus the signal path is the coordinator's **explicit
+GREEN assertion**. It replaces it with the strictly stronger terminal fact: **the pinned commit is a
+real ancestor of `origin/<int>` (= already merged).** On `main`, a merge requires a GREEN pre-push
+`audit-check` (red-line #3) and a worker **cannot self-merge** — so "merged to origin/main" *implies*
+"a coordinator audited it GREEN and merged it". All 5 fail-safe predicates still apply:
+worker-not-coordinator, pinned-bound + merged + live-HEAD == pinned + clean, idle + settled, and any
+exception ⇒ DON'T close.
+
+🔴 **Abandoned work is correctly REFUSED.** A worker whose pinned commit is **not** an ancestor of the
+integration head (never merged) → `not-merged` refusal. A worktree that drifted off the pinned commit
+→ `worktree-live-head-drift`. Uncommitted changes → `dirty`. So a window only closes when its
+worktree sits at a clean, merged commit — there is **no un-reviewed/un-merged work to lose** (the same
+绝不误关 guarantee as the signal path).
+
+### Known boundary — ancestry model only covers fast-forward / ancestor merges
+
+The proof is `is-ancestor(pinned, origin/<int>)`. A worker whose branch was integrated by a
+**squash** or a **rebase** (so the worker's *exact* pinned commit never appears on `main`) will fail
+`not-merged` and be **left for MANUAL close** — fail-safe, never mis-closed. This matches the
+fleet's `--ff-only` merge convention (worker tips land verbatim on `main`); non-ff integrations are a
+deliberate, honest gap, not a silent drop. (AI-retitled windows with no recoverable identity are also
+left for manual close, exactly as in the signal path.)
+
 ## D — the opt-in switch (DEFAULT-OFF) + kill-switch
 
 `worker-autoclose.enabled` is **SEPARATE** from the v4 coordinator-autoclose switch
@@ -83,6 +136,19 @@ dry-run. Enable via **any one** of:
 export HANDOFF_WORKER_AUTOCLOSE_ENABLED=1                       # process/global
 touch "$HANDOFF_HOME/worker-autoclose.enabled"                 # fleet-wide
 touch "$HANDOFF_HOME/<project>/worker-autoclose.enabled"       # one project
+```
+
+**`worker-autoclose-reconcile.enabled`** (NEW, DEFAULT-OFF) is a **SEPARATE** switch that gates the
+git-terminal `--reconcile` mode (decoupled from `worker-autoclose.enabled`, so the reconciler can be
+rolled out / revoked independently). OFF ⇒ `--reconcile` is a **no-op** (not even dry-run) — an hourly
+`--reconcile` daemon can be deployed **inert** until this is flipped. A real reconcile close needs
+**BOTH** this switch (to run) **and** `worker-autoclose.enabled` (for `--execute` to be honored —
+defense in depth). Enable via **any one** of:
+
+```bash
+export HANDOFF_WORKER_AUTOCLOSE_RECONCILE=1                            # process/global
+touch "$HANDOFF_HOME/worker-autoclose-reconcile.enabled"              # fleet-wide
+touch "$HANDOFF_HOME/<project>/worker-autoclose-reconcile.enabled"    # one project
 ```
 
 **Kill-switch** (emergency disable, no config edit — the driver then does nothing, not even dry-run):
@@ -157,6 +223,18 @@ opt-in switch is ON, and the gate refuses anything not provably audited-to-termi
 
 Scans every `ack/<task>.audit_discharged` in the project, gates each, and closes the cleared ones
 (WID-bound). DRY-RUN unless `--execute` + opt-in ON.
+
+## Git-terminal reconcile (the self-triggering mode — manual or scheduled)
+
+```bash
+~/.claude-handoff/supervisor-monitor/autoclose-audited-workers.py \
+    --project <project> --reconcile [--execute]
+```
+
+Gates EVERY **open** worker window from its own merged delivery (no discharge signal needed). No-op
+unless `worker-autoclose-reconcile.enabled`; DRY-RUN unless additionally `worker-autoclose.enabled` +
+`--execute`. This is the mode the hourly daemon should run so auto-close actually self-triggers (the
+sweep/launchd wiring to `--reconcile` is routed to dx per red-line #4 — see §E).
 
 ## E — janitor launchd scheduler (DESIGN-ONLY → route to dx; do NOT install here)
 

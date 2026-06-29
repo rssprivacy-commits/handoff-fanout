@@ -51,6 +51,7 @@ hold (spec req3 §1):
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -89,6 +90,9 @@ class GateDecision:
     detail: str = ""
     nonce: str | None = None  # the worker's spawn nonce (close-token binding) when close_ok
     evidence: dict = field(default_factory=dict)
+    task: str | None = None  # the worker's task id, annotated by the git-terminal reconciler
+    # (``reconcile_open_worker_windows``) so the driver can WID-bind without re-parsing the
+    # title. The signal-path ``gate_task`` leaves it None (unused there) — zero regression.
 
 
 def _refuse(reason: str, detail: str = "") -> GateDecision:
@@ -150,6 +154,30 @@ def _corroborate_local(cfg: _config.Config, project: str, task: str) -> GateDeci
         return _refuse(
             "head-drift", f"recorded worktree_head {wt_head_rec[:8]} != merge_sha {merge_sha[:8]}"
         )
+    # Hand off to the SHARED local checks (worker role + nonce + base anchor + non-vacuous +
+    # pinned-delivery binding), cross-checking the SIGNAL's own nonce against the sidecar.
+    return _corroborate_local_shared(cfg, project, task, merge_sha, expected_nonce=sig.get("nonce"))
+
+
+def _corroborate_local_shared(
+    cfg: _config.Config,
+    project: str,
+    task: str,
+    merge_sha: str,
+    *,
+    expected_nonce: str | None,
+) -> GateDecision | _LocalOK:
+    """The LOCAL checks SHARED by BOTH the signal path and the git-terminal path: prove the
+    window is a worker (not coordinator), carries a well-formed spawn nonce, advanced
+    non-trivially past the spawn base, and that ``merge_sha`` is bound to THIS task's OWN
+    recorded delivery (``reclaim._pinned_sha``). ``merge_sha`` is supplied by the caller
+    (from the discharge signal, or ``:= pinned`` on the git-terminal path). ``expected_nonce``
+    is the signal's own nonce (signal path) cross-checked against the sidecar nonce — pass
+    ``None`` on the git-terminal path (no signal to cross-check). Returns ``_LocalOK`` (carry
+    values for the git half) or a FAIL-SAFE ``GateDecision`` refusal. Refusal tokens + details
+    are IDENTICAL to the pre-refactor inline checks (signal-path behavior is byte-equivalent).
+    """
+    ack = cfg.ack_dir(project)
 
     # predicate 1: worker, NOT coordinator — authoritative role from the spawn sidecar.
     sidecar = _reclaim._read_json(cfg.queue_dir(project) / f"{task}.singlepane")
@@ -163,8 +191,7 @@ def _corroborate_local(cfg: _config.Config, project: str, task: str) -> GateDeci
     nonce = sidecar.get("spawn_nonce")
     if not isinstance(nonce, str) or not _HEX16_RE.match(nonce):
         return _refuse("nonce-malformed", f"sidecar spawn_nonce={nonce!r}")
-    sig_nonce = sig.get("nonce")
-    if sig_nonce is not None and sig_nonce != nonce:
+    if expected_nonce is not None and expected_nonce != nonce:
         return _refuse("nonce-mismatch", "signal nonce != sidecar spawn_nonce")
 
     # P0-2 base anchor: the spawn-time ack/<task>.worktree base_sha — written BEFORE the
@@ -206,6 +233,31 @@ def _corroborate_local(cfg: _config.Config, project: str, task: str) -> GateDeci
             f"{pinned[:8]} ({pinned_src}) — not this task's own delivery (FORGE D)",
         )
     return _LocalOK(merge_sha=merge_sha, base_sha=base_sha, nonce=nonce, pinned=pinned)
+
+
+def _corroborate_local_git_terminal(
+    cfg: _config.Config, project: str, task: str
+) -> GateDecision | _LocalOK:
+    """The git-terminal LOCAL half: prove this task is closeable from its OWN delivery record
+    ALONE — NO ``audit_discharged`` signal is read. ``merge_sha`` is DERIVED from
+    ``reclaim._pinned_sha`` (this task's recorded closing commit), which is exactly the SHA the
+    signal path binds ``merge_sha`` to — so requiring "pinned is a real ancestor of origin/main"
+    (proved in ``_corroborate_git``) is equivalent to "merged", and "merged" (red-line #3:
+    a merge to main needs a GREEN pre-push audit-check; a worker cannot self-merge) is the
+    git-terminal stand-in for the coordinator's explicit GREEN assertion. Unresolvable pinned
+    ⇒ REFUSE (NEVER fall back to the shared base — the FORGE D root). The shared local checks
+    then run with ``expected_nonce=None`` (no signal nonce to cross-check); ``merge_sha ==
+    pinned`` is tautological on this path but still enforced by the shared helper.
+    """
+    pinned, _src = _reclaim._pinned_sha(cfg, project, task)
+    if not _is_sha(pinned):
+        return _refuse(
+            "pinned-unresolvable",
+            "no recorded closing head SHA for this task (ack/<task>.old_ready commit_hash "
+            "or ack/<task>.head.json head_sha) — can't prove merge_sha is THIS task's own "
+            "delivery; REFUSE rather than fall back to the shared spawn base",
+        )
+    return _corroborate_local_shared(cfg, project, task, pinned, expected_nonce=None)
 
 
 # ─── predicate 2 (git half) + 4: ancestry + live-head drift + dirty ──────────
@@ -433,3 +485,107 @@ def gate_task(
         return _corroborate_git(cfg, project, task, local)
     except Exception as e:  # ultimate fail-safe (predicate 5)
         return _refuse("gate-exception", f"unexpected gate error: {type(e).__name__}: {e}")
+
+
+# ─── the git-terminal gate (signal-free: seed from the OPEN window, not a discharge) ──
+
+
+def gate_task_git_terminal(
+    cfg: _config.Config,
+    project: str,
+    task: str,
+    *,
+    idle_threshold_sec: float = DEFAULT_IDLE_THRESHOLD_SEC,
+    now_epoch: float | None = None,
+    projects_root: Path | None = None,
+) -> GateDecision:
+    """Run the full fail-safe gate WITHOUT a discharge signal — the git-terminal path.
+
+    Identical skeleton + identical safety to ``gate_task`` (cheapest-first + ultimate
+    try/except fail-safe), EXCEPT the local half is ``_corroborate_local_git_terminal``
+    (derive ``merge_sha`` from this task's pinned delivery record instead of reading
+    ``ack/<task>.audit_discharged``). The idle probe (``_evaluate_idle``) and the network
+    git corroboration (``_corroborate_git``) are reused UNCHANGED — so the SAME 5 fail-safe
+    predicates apply: worker-not-coordinator, pinned-bound-and-merged (= a real ancestor of
+    ``origin/<int>``, which on main implies a GREEN pre-push audit-check — red-line #3),
+    not-in-flight, not-dirty, and any exception ⇒ DON'T close. Abandoned work (a pinned
+    commit that is NOT an ancestor of the integration head) is REFUSED ``not-merged``.
+
+    This exists because the discharge signal is only ever written by a coordinator manually
+    running ``handoff audit-discharge`` — which almost never happens, so the signal-driven
+    auto-close is INERT in practice. Seeding the gate from the open worker window's own
+    already-merged delivery makes auto-close actually self-trigger, with NO loss of safety
+    (it merely replaces the coordinator's explicit GREEN assertion with the strictly stronger
+    terminal fact "this commit is already on origin/main").
+    """
+    if now_epoch is None:
+        now_epoch = time.time()
+    if projects_root is None:
+        projects_root = Path.home() / ".claude" / "projects"
+    try:
+        local = _corroborate_local_git_terminal(cfg, project, task)
+        if isinstance(local, GateDecision):  # a local refusal
+            return local
+        idle_refusal = _evaluate_idle(cfg, project, task, idle_threshold_sec, now_epoch, projects_root)
+        if idle_refusal is not None:
+            return idle_refusal
+        return _corroborate_git(cfg, project, task, local)
+    except Exception as e:  # ultimate fail-safe (predicate 5)
+        return _refuse("gate-exception", f"unexpected gate error: {type(e).__name__}: {e}")
+
+
+def reconcile_open_worker_windows(
+    cfg: _config.Config,
+    project: str,
+    windows: list[dict],
+    parse_title,
+    *,
+    idle_threshold_sec: float = DEFAULT_IDLE_THRESHOLD_SEC,
+    now_epoch: float | None = None,
+    projects_root: Path | None = None,
+) -> list[GateDecision]:
+    """PURE decision pass over the OPEN windows (injected ``windows`` + ``parse_title``; ZERO
+    winlist/close I/O of its own — that belongs to the driver). For every window whose title
+    parses to THIS project's worker (non-coordinator, non-empty task id), run
+    ``gate_task_git_terminal``; collect ONLY the ``close_ok`` decisions, each annotated with
+    its ``task`` (so the driver can WID-bind via the existing ``resolve_wid`` without
+    re-parsing). A window whose title has been fully AI-retitled (``parse_title`` yields no
+    structured project/task identity) is SKIPPED — left for MANUAL close, the same fail-safe
+    as today (winlist exposes only title/window_number/desktop, no workspace path). Each task
+    is gated at most once (a duplicate parse can never produce a second close decision).
+    """
+    decisions: list[GateDecision] = []
+    seen: set[str] = set()
+    for w in windows:
+        title = w.get("title", "") if isinstance(w, dict) else ""
+        proj, tid, is_coord, _nonce = parse_title(title)
+        if is_coord:
+            continue  # never gate/close a coordinator window
+        if proj != project or not tid:
+            continue  # other project / AI-titled (no recoverable identity) → skip (manual)
+        if tid in seen:
+            continue
+        seen.add(tid)
+        d = gate_task_git_terminal(
+            cfg, project, tid,
+            idle_threshold_sec=idle_threshold_sec, now_epoch=now_epoch, projects_root=projects_root,
+        )
+        if d.close_ok:
+            d.task = tid  # annotate for the driver's WID binding (resolve_wid needs the task)
+            decisions.append(d)
+    return decisions
+
+
+def reconcile_enabled(cfg: _config.Config, project: str) -> bool:
+    """``worker-autoclose-reconcile.enabled`` — DEFAULT-OFF, and DECOUPLED from the signal-path
+    ``worker-autoclose.enabled`` switch (the git-terminal reconciler is a SEPARATE, independently
+    revocable rollout). Any one of: env ``HANDOFF_WORKER_AUTOCLOSE_RECONCILE=1`` / fleet
+    ``$HANDOFF_HOME/worker-autoclose-reconcile.enabled`` / per-project
+    ``$HANDOFF_HOME/<project>/worker-autoclose-reconcile.enabled``."""
+    if os.environ.get("HANDOFF_WORKER_AUTOCLOSE_RECONCILE") == "1":
+        return True
+    if (cfg.home / "worker-autoclose-reconcile.enabled").exists():
+        return True
+    if (cfg.home / project / "worker-autoclose-reconcile.enabled").exists():
+        return True
+    return False

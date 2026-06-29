@@ -493,3 +493,247 @@ def test_discharged_tasks_lists_signals(world):
 def test_discharged_tasks_empty_when_none(world):
     (world["ack"] / f"{TASK}.audit_discharged").unlink()
     assert gate.discharged_tasks(world["cfg"], PROJECT) == []
+
+
+# ═══ git-terminal path (signal-FREE reconciler) ══════════════════════════════
+# gate_task_git_terminal seeds merge_sha from the task's OWN pinned delivery record
+# (reclaim._pinned_sha) instead of reading ack/<task>.audit_discharged. It reuses the SAME
+# _evaluate_idle + _corroborate_git, so the SAME 5 fail-safe predicates apply. The happy
+# world fixture is already terminal (pinned == worktree HEAD == origin/main C1), so it
+# closes WITHOUT a discharge signal; each test mutates ONE thing to drive a refusal.
+
+
+def _commit_in_worktree(wt: Path, content: str, msg: str) -> str:
+    """Advance the worker worktree by one real commit (matches the existing fixtures'
+    inline pattern) and return the new HEAD sha."""
+    (wt / "f.txt").write_text(content)
+    _git(wt, "add", "f.txt")
+    _git(wt, "config", "user.email", "t@t.test")
+    _git(wt, "config", "user.name", "t")
+    _git(wt, "config", "commit.gpgsign", "false")
+    _git(wt, "commit", "-q", "-m", msg)
+    return _git(wt, "rev-parse", "HEAD")
+
+
+def _gate_gt(world, *, now_epoch=EPOCH + 7200):
+    return gate.gate_task_git_terminal(
+        world["cfg"], PROJECT, TASK,
+        now_epoch=now_epoch, projects_root=world["projects_root"],
+    )
+
+
+# ─── ✅ closeable via git-terminal, with AND without a discharge signal ───────
+
+
+def test_git_terminal_happy_path_closes(world):
+    d = _gate_gt(world)
+    assert d.close_ok is True, f"expected close_ok, got refusal {d.reason}: {d.detail}"
+    assert d.reason == gate.CLOSE_OK
+    assert d.nonce == NONCE
+    assert d.evidence["merge_sha"] == world["c1"]
+    assert d.evidence["pinned_sha"] == world["c1"]
+
+
+def test_git_terminal_closes_without_any_signal(world):
+    # The crux: NO audit_discharged signal exists at all, yet the already-merged terminal
+    # worker still closes — auto-close now self-triggers without a coordinator hand-run.
+    (world["ack"] / f"{TASK}.audit_discharged").unlink()
+    d = _gate_gt(world)
+    assert d.close_ok is True, f"git-terminal must close without a signal, got {d.reason}: {d.detail}"
+    assert d.evidence["merge_sha"] == world["c1"]
+
+
+# ─── pinned (the merge_sha source) fail-safes ────────────────────────────────
+
+
+def test_git_terminal_pinned_unresolvable_refused(world):
+    # No recorded closing head (no old_ready, no head.json) → REFUSE (never fall back to base).
+    (world["ack"] / f"{TASK}.old_ready").unlink()
+    hj = world["ack"] / f"{TASK}.head.json"
+    if hj.exists():
+        hj.unlink()
+    d = _gate_gt(world)
+    assert d.close_ok is False
+    assert d.reason == "pinned-unresolvable", f"got {d.reason}: {d.detail}"
+
+
+def test_git_terminal_pinned_from_head_json_closes(world):
+    # reclaim parity: pinned falls back to head.json head_sha when old_ready is absent.
+    (world["ack"] / f"{TASK}.old_ready").unlink()
+    (world["ack"] / f"{TASK}.head.json").write_text(json.dumps({"head_sha": world["c1"]}))
+    d = _gate_gt(world)
+    assert d.close_ok is True, f"{d.reason}: {d.detail}"
+    assert d.evidence["pinned_sha"] == world["c1"]
+
+
+def test_git_terminal_vacuous_refused(world):
+    # pinned == spawn base (C0): the branch never advanced (vacuous ancestor) → REFUSE.
+    _write_pinned(world["ack"], TASK, world["c0"])
+    d = _gate_gt(world)
+    assert d.close_ok is False
+    assert d.reason == "vacuous-no-advance", f"got {d.reason}: {d.detail}"
+
+
+# ─── abandoned work MUST be refused (ancestry is the safety proof) ────────────
+
+
+def test_git_terminal_abandoned_not_merged_refused(world):
+    # The worker advanced to a REAL commit C2 that was NEVER merged to origin/main (the
+    # "abandoned worker window" case). pinned == C2 → ancestry proves it is NOT merged → REFUSE.
+    c2 = _commit_in_worktree(world["wt"], "abandoned unmerged work\n", "C2 unmerged")
+    _write_pinned(world["ack"], TASK, c2)
+    d = _gate_gt(world)
+    assert d.close_ok is False, "abandoned (unmerged) work must NEVER auto-close"
+    assert d.reason == "not-merged", f"got {d.reason}: {d.detail}"
+
+
+def test_git_terminal_live_head_drift_refused(world):
+    # pinned claims the merged C1 but the live worktree has moved on to an unmerged C2.
+    _commit_in_worktree(world["wt"], "moved on after audit\n", "C2 drift")
+    d = _gate_gt(world)  # pinned (old_ready) still C1
+    assert d.close_ok is False
+    assert d.reason == "worktree-live-head-drift", f"got {d.reason}: {d.detail}"
+
+
+def test_git_terminal_dirty_refused(world):
+    (world["wt"] / "f.txt").write_text("uncommitted edit\n")  # tracked file modified
+    d = _gate_gt(world)
+    assert d.close_ok is False
+    assert d.reason == "dirty", f"got {d.reason}: {d.detail}"
+
+
+def test_git_terminal_dirty_untracked_refused(world):
+    (world["wt"] / "scratch.txt").write_text("untracked junk\n")
+    d = _gate_gt(world)
+    assert d.close_ok is False
+    assert d.reason == "dirty", f"got {d.reason}: {d.detail}"
+
+
+# ─── identity / in-flight fail-safes (shared with the signal path) ────────────
+
+
+@pytest.mark.parametrize("role", ["supervisor_succession", "coordinator", "solo", None])
+def test_git_terminal_non_worker_refused(world, role):
+    sidecar = {"isolation": "worktree", "spawn_nonce": NONCE}
+    if role is not None:
+        sidecar["role"] = role
+    (world["queue"] / f"{TASK}.singlepane").write_text(json.dumps(sidecar))
+    d = _gate_gt(world)
+    assert d.close_ok is False
+    assert d.reason == "not-worker", f"got {d.reason}: {d.detail}"
+
+
+def test_git_terminal_missing_sidecar_refused(world):
+    (world["queue"] / f"{TASK}.singlepane").unlink()
+    d = _gate_gt(world)
+    assert d.close_ok is False
+    assert d.reason == "sidecar-missing"
+
+
+def test_git_terminal_idle_too_small_refused(world):
+    d = _gate_gt(world, now_epoch=EPOCH + 60)  # settled but only 60s idle (< 1800)
+    assert d.close_ok is False
+    assert d.reason == "not-idle-enough"
+
+
+@pytest.mark.parametrize("kind", ["running_tool", "blocked_on_question", "dangling_tool_result"])
+def test_git_terminal_in_flight_refused(world, kind):
+    _write_transcript(world["projects_root"], world["wt"], kind=kind, ts=ISO)
+    d = _gate_gt(world)  # long idle, but the last conversation kind is NOT settled
+    assert d.close_ok is False
+    assert d.reason == f"in-flight:{kind}"
+
+
+# ─── reconcile_open_worker_windows (PURE: injected windows + parse_title) ─────
+
+
+def _fake_parse_title_map(mapping):
+    """Build a parse_title stub: title → (project, task_id, is_coord, nonce)."""
+    def _parse(title):
+        return mapping.get(title, (None, None, False, None))
+    return _parse
+
+
+def test_reconcile_open_worker_windows_filters_and_gates(world):
+    windows = [
+        {"title": "worker-win", "window_number": 100, "desktop": 1},
+        {"title": "coord-win", "window_number": 101, "desktop": 1},
+        {"title": "ai-titled", "window_number": 102, "desktop": 1},
+        {"title": "other-proj-win", "window_number": 103, "desktop": 1},
+    ]
+    parse = _fake_parse_title_map({
+        "worker-win": (PROJECT, TASK, False, NONCE),               # this project's worker → gate
+        "coord-win": (PROJECT, "demo-coord", True, "a" * 16),      # coordinator → skip
+        "ai-titled": (None, None, False, None),                    # unparseable → skip (manual)
+        "other-proj-win": ("other", "wk-9", False, "b" * 16),      # different project → skip
+    })
+    decisions = gate.reconcile_open_worker_windows(
+        world["cfg"], PROJECT, windows, parse,
+        now_epoch=EPOCH + 7200, projects_root=world["projects_root"],
+    )
+    assert len(decisions) == 1, [d.reason for d in decisions]
+    d = decisions[0]
+    assert d.close_ok is True
+    assert d.task == TASK  # annotated for the driver's WID binding
+    assert d.nonce == NONCE
+
+
+def test_reconcile_excludes_refused_windows(world):
+    # The window parses to this project's worker, but the gate REFUSES (dirty) → not collected.
+    (world["wt"] / "f.txt").write_text("uncommitted\n")
+    windows = [{"title": "worker-win", "window_number": 100, "desktop": 1}]
+    parse = _fake_parse_title_map({"worker-win": (PROJECT, TASK, False, NONCE)})
+    decisions = gate.reconcile_open_worker_windows(
+        world["cfg"], PROJECT, windows, parse,
+        now_epoch=EPOCH + 7200, projects_root=world["projects_root"],
+    )
+    assert decisions == []
+
+
+def test_reconcile_gates_each_task_once(world):
+    # Two windows that both parse to the same task → gated once, one decision (no duplicates).
+    windows = [
+        {"title": "w-a", "window_number": 100, "desktop": 1},
+        {"title": "w-b", "window_number": 101, "desktop": 1},
+    ]
+    parse = _fake_parse_title_map({
+        "w-a": (PROJECT, TASK, False, NONCE),
+        "w-b": (PROJECT, TASK, False, NONCE),
+    })
+    decisions = gate.reconcile_open_worker_windows(
+        world["cfg"], PROJECT, windows, parse,
+        now_epoch=EPOCH + 7200, projects_root=world["projects_root"],
+    )
+    assert len(decisions) == 1
+
+
+# ─── reconcile_enabled (DEFAULT-OFF; decoupled from worker-autoclose.enabled) ─
+
+
+def test_reconcile_enabled_default_off(world, monkeypatch):
+    monkeypatch.delenv("HANDOFF_WORKER_AUTOCLOSE_RECONCILE", raising=False)
+    assert gate.reconcile_enabled(world["cfg"], PROJECT) is False
+
+
+def test_reconcile_enabled_env(world, monkeypatch):
+    monkeypatch.setenv("HANDOFF_WORKER_AUTOCLOSE_RECONCILE", "1")
+    assert gate.reconcile_enabled(world["cfg"], PROJECT) is True
+
+
+def test_reconcile_enabled_fleet_sentinel(world, monkeypatch):
+    monkeypatch.delenv("HANDOFF_WORKER_AUTOCLOSE_RECONCILE", raising=False)
+    (world["home"] / "worker-autoclose-reconcile.enabled").write_text("")
+    assert gate.reconcile_enabled(world["cfg"], PROJECT) is True
+
+
+def test_reconcile_enabled_per_project_sentinel(world, monkeypatch):
+    monkeypatch.delenv("HANDOFF_WORKER_AUTOCLOSE_RECONCILE", raising=False)
+    (world["home"] / PROJECT / "worker-autoclose-reconcile.enabled").write_text("")
+    assert gate.reconcile_enabled(world["cfg"], PROJECT) is True
+
+
+def test_reconcile_enabled_separate_from_signal_switch(world, monkeypatch):
+    # the signal-path worker-autoclose.enabled switch must NOT enable the reconciler.
+    monkeypatch.delenv("HANDOFF_WORKER_AUTOCLOSE_RECONCILE", raising=False)
+    (world["home"] / "worker-autoclose.enabled").write_text("")
+    assert gate.reconcile_enabled(world["cfg"], PROJECT) is False
