@@ -154,19 +154,32 @@ def _build_uri(cfg: _config.Config, prompt_text: str) -> str:
 
 
 def _write_uri(
-    queue_dir: Path, task: str, *, workspace: Path, uri: str, spawner_focus: str | None = None
+    queue_dir: Path,
+    task: str,
+    *,
+    workspace: Path,
+    uri: str,
+    is_coordinator: bool,
+    spawner_focus: str | None = None,
 ) -> None:
     """Publish the launchd trigger LAST. ``WORKSPACE`` drives the watchdog's COLD vs SINGLEPANE
     routing (a worktree dir under ``*/worktrees/*`` ⇒ COLD; the real repo ⇒ SINGLEPANE).
+
+    ``is_coordinator`` (place-role-explicit-contract 2026-06-29): the engine KNOWS the role at spawn
+    time, so it stamps an explicit ``ROLE=coord`` (coordinator window) / ``ROLE=worker`` line into the
+    manifest. The launcher reads ``ROLE=`` directly to tile the just-spawned window (coord→right-half,
+    worker→free-quadrant) — mode-agnostic (worktree + singlepane + cold-start, one code path), no
+    UI-sniffing. Always emitted (mandatory third line) so every engine-written .uri carries the role.
 
     ``spawner_focus`` (direct-jump-spawn 2026-06-13 / mp-locate-return 2026-06-14): the validated
     absolute .handoff.code-workspace path of the SPAWNING window (the active coordinator) — from the
     CLI/env OR env-independent self-identification (cwd worktree / singlepane focus marker). Written as
     an additive ``SPAWNER_FOCUS=`` line the watchdog reads → exports → ``code-router.sh`` runs the
     one-step ``focus-jump`` to the spawner's desktop before opening this worker (so the worker is born
-    on the spawner's Space). Omitted when absent → the .uri stays byte-identical to the pre-feature
-    form (向后兼容)."""
-    body = f"WORKSPACE={workspace}\nURI={uri}\n"
+    on the spawner's Space). Omitted when absent → the SPAWNER_FOCUS line is suppressed (向后兼容 for
+    that optional line)."""
+    role_token = "coord" if is_coordinator else "worker"
+    body = f"WORKSPACE={workspace}\nURI={uri}\nROLE={role_token}\n"
     if spawner_focus:
         body += f"SPAWNER_FOCUS={spawner_focus}\n"
     atomic.atomic_replace(queue_dir / f"{task}.uri", body)
@@ -404,7 +417,11 @@ def _produce_singlepane(
             wave_id=wave_id,
         )
         # WORKSPACE=real repo ⇒ SINGLEPANE path; spawner_focus drives the watchdog one-step focus-jump.
-        _write_uri(queue_dir, task, workspace=src, uri=uri, spawner_focus=spawner_focus)
+        # ROLE=coord iff this is a coordinator succession (single source of truth = the spawn role).
+        _write_uri(
+            queue_dir, task, workspace=src, uri=uri,
+            is_coordinator=(role == ROLE_SUCCESSION), spawner_focus=spawner_focus,
+        )
     except Exception as e:
         _err(f"singlepane spawn failed ({e}); rolling back partial intent")
         _rollback(queue_dir, task, ws_file=ws_file)
@@ -519,7 +536,12 @@ def _produce_worktree(
             wave_id=wave_id,
         )
         # WORKSPACE=worktree dir ⇒ COLD path; spawner_focus drives the watchdog one-step focus-jump.
-        _write_uri(queue_dir, task, workspace=wt, uri=uri, spawner_focus=spawner_focus)
+        # ROLE=coord iff this is a coordinator succession (single source of truth = the spawn role) —
+        # mirrors create_worktree(is_coordinator=...) on this path.
+        _write_uri(
+            queue_dir, task, workspace=wt, uri=uri,
+            is_coordinator=(role == ROLE_SUCCESSION), spawner_focus=spawner_focus,
+        )
     except Exception as e:
         _err(f"worktree publish failed ({e}); rolling back partial intent")
         _rollback(queue_dir, task)

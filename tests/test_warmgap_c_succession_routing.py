@@ -322,6 +322,9 @@ def test_succession_route_e2e(tmp_path, monkeypatch, notify_calls, capsys):
     # .uri: WORKSPACE is the REAL repo (singlepane), prompt 同文 encode_short_prompt + 🆔
     uri_text = (queue / f"{TASK}.uri").read_text()
     assert f"WORKSPACE={ws}" in uri_text
+    # place-role-explicit-contract: a supervisor_succession spawn is a coordinator window → ROLE=coord
+    # (the launcher tiles it right-half). The sidecar role stays supervisor_succession (above).
+    assert "ROLE=coord\n" in uri_text
     expected_prompt = (
         f"🆔{TASK} 自动接续 / project=`{PROJECT}` / task=`{TASK}` — "
         f"open `{home}/{PROJECT}/queue/{TASK}.md` "

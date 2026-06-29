@@ -571,9 +571,15 @@ def test_singlepane_succession_publish_holds_project_spawn_lock(tmp_path, monkey
     seen: dict[str, bool] = {}
     real_write_uri = spawn._write_uri
 
-    def probe(queue_dir: Path, task: str, *, workspace: Path, uri: str, spawner_focus=None) -> None:
+    def probe(
+        queue_dir: Path, task: str, *, workspace: Path, uri: str,
+        is_coordinator: bool, spawner_focus=None,
+    ) -> None:
         seen["lock_held"] = (home / PROJECT / ".spawn.lock").is_dir()
-        real_write_uri(queue_dir, task, workspace=workspace, uri=uri, spawner_focus=spawner_focus)
+        real_write_uri(
+            queue_dir, task, workspace=workspace, uri=uri,
+            is_coordinator=is_coordinator, spawner_focus=spawner_focus,
+        )
 
     monkeypatch.setattr(spawn, "_write_uri", probe)
     rc = spawn.main(

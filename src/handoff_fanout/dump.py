@@ -1385,9 +1385,14 @@ def write_active_dump(
     # SPAWNER_FOCUS line when this dump runs in a coordinator terminal (fail-open → "").
     # Step 4: consume the SINGLE pre-resolved decision — main() threaded it in, else the top-of-
     # function self-gate resolved it (so it is never None on this spawning publish path); no re-read.
+    # place-role-explicit-contract (2026-06-29): stamp the explicit ROLE= the launcher tiles by.
+    # ``is_coordinator`` is the cold-start coordinator case (DEFECT#1): the singlepane sidecar above
+    # records role="worker" for it (the watchdog red-top contract), so the ROLE= line — derived
+    # straight from is_coordinator — is the ONLY place that carries the true coord identity to the
+    # launcher's placement (→ ROLE=coord → right-half). A non-coordinator dump → ROLE=worker.
     atomic.atomic_replace(
         uri_path,
-        f"WORKSPACE={workspace}\nURI={uri}\n"
+        f"WORKSPACE={workspace}\nURI={uri}\nROLE={'coord' if is_coordinator else 'worker'}\n"
         f"{_spawner_focus_line(anchor_decision, home=cfg.home, project=project, worker_task=task, isolation='worktree' if worktree_info else 'singlepane')}",
     )
     print(f"[dump] wrote {uri_path}")
@@ -1730,9 +1735,10 @@ def handle_open_batch(
         uri = build_uri(cfg, project, sub_id)
         # Launcher-visible trigger — atomic_replace (see the .md note above). direct-jump-spawn:
         # append the SPAWNER_FOCUS line when dumped from a coordinator terminal (fail-open → "").
+        # place-role-explicit-contract: a fan-out sub-task is always a worker → ROLE=worker.
         atomic.atomic_replace(
             queue_dir / f"{sub_id}.uri",
-            f"WORKSPACE={workspace}\nURI={uri}\n{_focus_line}",
+            f"WORKSPACE={workspace}\nURI={uri}\nROLE=worker\n{_focus_line}",
         )
         print(f"[open-batch]   sub-task {sub_id} (#{idx + 1}/{len(sub_tasks)}) written")
 
@@ -1854,9 +1860,10 @@ def trigger_fan_in_if_ready(
     uri = build_uri(cfg, project, fan_in_task)
     # direct-jump-spawn: append the SPAWNER_FOCUS line when dumped from a coordinator
     # terminal (fail-open → ""; the fan-in tab lands on the spawner's desktop too).
+    # place-role-explicit-contract: the fan-in window is a worker → ROLE=worker.
     atomic.atomic_replace(
         queue_dir / f"{fan_in_task}.uri",
-        f"WORKSPACE={workspace}\nURI={uri}\n"
+        f"WORKSPACE={workspace}\nURI={uri}\nROLE=worker\n"
         f"{_spawner_focus_line(decision, home=cfg.home, project=project, worker_task=fan_in_task, isolation='singlepane')}",
     )
     print(f"[trigger-fan-in] wrote queue/{fan_in_task}.{{md,uri}} + fan-in.env")

@@ -90,8 +90,10 @@ def test_active_dump_writes_spawner_focus_when_env_valid(tmp_path, monkeypatch):
     assert _active_dump(home, ws, monkeypatch) == 0
     text = _uri_text(home / PROJECT / "queue", TASK)
     assert f"SPAWNER_FOCUS={os.path.realpath(str(focus))}\n" in text
-    # additive THIRD line — the first two stay WORKSPACE / URI.
-    assert text.splitlines()[2].startswith("SPAWNER_FOCUS=")
+    # place-role-explicit-contract: the lines are WORKSPACE / URI / ROLE=worker / SPAWNER_FOCUS — the
+    # mandatory ROLE= is the third line, so the additive SPAWNER_FOCUS is now the FOURTH.
+    assert text.splitlines()[2] == "ROLE=worker"  # non-coordinator single-task dump
+    assert text.splitlines()[3].startswith("SPAWNER_FOCUS=")
 
 
 def test_active_dump_no_focus_line_when_env_absent(tmp_path, monkeypatch):
@@ -103,8 +105,10 @@ def test_active_dump_no_focus_line_when_env_absent(tmp_path, monkeypatch):
 
     assert _active_dump(home, ws, monkeypatch) == 0
     text = _uri_text(home / PROJECT / "queue", TASK)
-    assert "SPAWNER_FOCUS" not in text  # byte-identical to the pre-feature .uri
-    assert text == f"WORKSPACE={ws}\nURI={dump.build_uri(_config.load(), PROJECT, TASK)}\n"
+    assert "SPAWNER_FOCUS" not in text  # no focus env → no SPAWNER_FOCUS line
+    # place-role-explicit-contract: the .uri now always carries the mandatory ROLE= line (here a
+    # non-coordinator single-task dump → ROLE=worker); everything else is unchanged.
+    assert text == f"WORKSPACE={ws}\nURI={dump.build_uri(_config.load(), PROJECT, TASK)}\nROLE=worker\n"
 
 
 def test_active_dump_anchor_miss_logged_uri_byte_compat(tmp_path, monkeypatch):
@@ -145,7 +149,52 @@ def test_active_dump_writes_spawner_focus_from_self_id(tmp_path, monkeypatch):
     assert _active_dump(home, ws, monkeypatch) == 0
     text = _uri_text(home / PROJECT / "queue", TASK)
     assert f"SPAWNER_FOCUS={focus}\n" in text
-    assert text.splitlines()[2] == f"SPAWNER_FOCUS={focus}"  # additive third line
+    # place-role-explicit-contract: ROLE=worker is the third line → SPAWNER_FOCUS is the fourth.
+    assert text.splitlines()[2] == "ROLE=worker"
+    assert text.splitlines()[3] == f"SPAWNER_FOCUS={focus}"  # additive fourth line
+
+
+# ─── place-role-explicit-contract: the engine-stamped ROLE= line ─────────────
+
+
+def test_active_dump_cold_start_coordinator_writes_role_coord(tmp_path, monkeypatch):
+    """DEFECT#1 (the cold-start singlepane coordinator): an ``is_coordinator`` dump records
+    role="worker" in its singlepane SIDECAR (the watchdog red-top contract), so the .uri's explicit
+    ROLE= is the ONLY signal carrying the true coordinator identity to the launcher's placement. It
+    MUST be ROLE=coord (→ right-half), not worker."""
+    home = tmp_path / "handoff"
+    home.mkdir()
+    (home / "config.json").write_text("{}")
+    ws = _bare_and_clone(tmp_path)
+    monkeypatch.delenv("HANDOFF_WINDOW_FOCUS_PATH", raising=False)
+    cfg = _config.load()
+    monkeypatch.setenv("HANDOFF_HOME", str(home))
+    queue_dir = cfg.queue_dir(PROJECT)
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    rc = dump.write_active_dump(
+        cfg=cfg, project=PROJECT, task=TASK, workspace=ws, next_brief="b", status="active",
+        tests=None, baseline={"git_head": "deadbeef", "branch": "main", "dirty": False},
+        queue_dir=queue_dir, anchor_decision=None, is_coordinator=True,
+    )
+    assert rc == 0
+    text = _uri_text(queue_dir, TASK)
+    assert "\nROLE=coord\n" in text, "cold-start coordinator .uri must carry ROLE=coord"
+    # the singlepane sidecar still records role="worker" — proving ROLE= is the independent signal.
+    sidecar = json.loads((queue_dir / f"{TASK}.singlepane").read_text())
+    assert sidecar["role"] == "worker"
+    assert sidecar["is_coordinator"] is True
+
+
+def test_active_dump_non_coordinator_writes_role_worker(tmp_path, monkeypatch):
+    """A plain (non-coordinator) single-task dump stamps ROLE=worker."""
+    home = tmp_path / "handoff"
+    home.mkdir()
+    (home / "config.json").write_text("{}")
+    ws = _bare_and_clone(tmp_path)
+    monkeypatch.delenv("HANDOFF_WINDOW_FOCUS_PATH", raising=False)
+    assert _active_dump(home, ws, monkeypatch) == 0
+    text = _uri_text(home / PROJECT / "queue", TASK)
+    assert "\nROLE=worker\n" in text
 
 
 # ─── points 2 & 3: open-batch fan-out + fan-in ───────────────────────────────
@@ -221,7 +270,8 @@ def test_open_batch_no_focus_line_when_env_absent(
 
     queue_dir = isolated_handoff_home / project / "queue"
     uri = dump.build_uri(_config.load(), project, "sub-a")
-    assert _uri_text(queue_dir, "sub-a") == f"WORKSPACE={ws}\nURI={uri}\n"  # byte-identical
+    # place-role-explicit-contract: a fan-out sub-task is a worker → mandatory ROLE=worker line.
+    assert _uri_text(queue_dir, "sub-a") == f"WORKSPACE={ws}\nURI={uri}\nROLE=worker\n"
     assert "SPAWNER_FOCUS" not in _uri_text(queue_dir, "sub-b")
 
 
@@ -279,4 +329,5 @@ def test_fan_in_no_focus_line_when_env_absent(
 
     assert dump.trigger_fan_in_if_ready(project, ws, "test-batch", queue_dir, cfg=cfg) is True
     uri = dump.build_uri(cfg, project, "test-fanin")
-    assert _uri_text(queue_dir, "test-fanin") == f"WORKSPACE={ws}\nURI={uri}\n"  # byte-identical
+    # place-role-explicit-contract: the fan-in window is a worker → mandatory ROLE=worker line.
+    assert _uri_text(queue_dir, "test-fanin") == f"WORKSPACE={ws}\nURI={uri}\nROLE=worker\n"

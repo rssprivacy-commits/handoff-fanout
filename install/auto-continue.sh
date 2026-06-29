@@ -258,11 +258,18 @@ write_ack() {
 # affect the spawn outcome (the `.submitted` ack is already written by the time this runs). The
 # watchdog is the only FLEET-WIDE trigger — every project + every coordinator
 # (new or pre-existing) — because it does NOT depend on a coordinator's onboarding brief (§0.8
-# misses already-running coordinators / fires late). Role: a coordinator succession carries
-# role=supervisor_succession in the singlepane sidecar (→ coord → right-half); a worktree worker /
-# no sidecar / role=worker → worker → free-quadrant (the tool maps role→slot). Always returns 0.
+# misses already-running coordinators / fires late).
+#
+# Role (place-role-explicit-contract / 2026-06-29): the AUTHORITATIVE source is the engine-stamped
+# ROLE= line in the .uri (`$6` = uri_role: "coord"|"worker"). The engine KNOWS the role at spawn
+# time and emits it for EVERY spawn path (worktree coord, singlepane succession coord, singlepane
+# cold-start coordinator, worker) — mode-agnostic, no UI-sniffing (no 🧭中枢 title / red-titleBar
+# inspection). coord → right-half, worker → free-quadrant (the tool maps role→slot). FALLBACK only
+# when ROLE= is absent (a legacy / in-flight .uri written before this change): read the per-project
+# singlepane sidecar `role` (the pre-contract transitional signal), then default to worker. Always
+# returns 0.
 maybe_place_window() {
-    local project="$1" task="$2" proj_dir="$3" queue="$4" wid="${5:-}"
+    local project="$1" task="$2" proj_dir="$3" queue="$4" wid="${5:-}" uri_role="${6:-}"
     # default-ON gate (mirror worker-autoclose `.worker-autoclose-off`): global OR per-project OFF
     # sentinel ⇒ skip silently; otherwise placement runs by default.
     [ -f "$HANDOFF_ROOT/.window-placement-off" ] && return 0
@@ -282,12 +289,21 @@ maybe_place_window() {
     # Reject a non-positive WID (0 / 00) defensively — a real Quartz window_number is always > 0
     # (codex r2 advisory). An out-of-range value would otherwise resolve to no window.
     [ -n "$wid" ] && { [ "$wid" -gt 0 ] 2>/dev/null || wid=""; }
-    # Role from the singlepane sidecar's `role` field (singlepane is per-project, so it alone can't
-    # tell coord from worker). A coordinator succession = supervisor_succession; everything else
-    # (worktree worker / no sidecar / role=worker) defaults to worker.
-    local role="worker" sc="$queue/$task.singlepane" sc_role=""
-    if [ -f "$sc" ]; then
-        sc_role=$("$HANDOFF_PYTHON_CMD" - "$sc" <<'PY' 2>/dev/null
+    # Role resolution (place-role-explicit-contract / 2026-06-29). AUTHORITATIVE = the engine-stamped
+    # ROLE= from the .uri ($uri_role): the engine knows coord-vs-worker at spawn time and emits it on
+    # every path → no UI-sniffing, mode-agnostic. Only "coord" maps to coord; "worker" (and any other
+    # explicit value) → worker. FALLBACK (ROLE= absent — a legacy / in-flight .uri): read the
+    # per-project singlepane sidecar `role` (the transitional pre-contract signal), else default to
+    # worker. A coordinator succession carries role=supervisor_succession in that sidecar.
+    local role="worker"
+    case "$uri_role" in
+        coord) role="coord" ;;
+        worker) role="worker" ;;
+        *)
+            # No explicit ROLE= → transitional singlepane-sidecar fallback (then worker default).
+            local sc="$queue/$task.singlepane" sc_role=""
+            if [ -f "$sc" ]; then
+                sc_role=$("$HANDOFF_PYTHON_CMD" - "$sc" <<'PY' 2>/dev/null
 import json, sys, signal
 # hard self-bound (default-ON contract: never an unbounded subprocess in the pre-return-jump path).
 # A hung read/parse → SIGALRM → handler raises → except → print "" (role defaults to worker). The
@@ -301,8 +317,10 @@ except Exception:
     print("")
 PY
 )
-        case "$sc_role" in supervisor_succession|*coord*|*supervisor*) role="coord" ;; esac
-    fi
+                case "$sc_role" in supervisor_succession|*coord*|*supervisor*) role="coord" ;; esac
+            fi
+            ;;
+    esac
     # Mutually-exclusive selector: --wid when captured, else the title path --task (fallback).
     local _sel_flag _sel_val _sel_kind
     if [ -n "$wid" ]; then _sel_flag="--wid"; _sel_val="$wid"; _sel_kind="wid=$wid"; else _sel_flag="--task"; _sel_val="$task"; _sel_kind="task (title)"; fi
@@ -1827,9 +1845,16 @@ for PROJ_DIR in "$HANDOFF_ROOT"/*/; do
         [ -f "$QUEUE/$TASK.done" ] && continue
         [ -f "$QUEUE/$TASK.BLOCKED.md" ] && continue
 
-        # Parse URI file: 第一行 WORKSPACE= / 第二行 URI= / (可选)第三行 SPAWNER_FOCUS=
+        # Parse URI file: 第一行 WORKSPACE= / 第二行 URI= / 第三行 ROLE= / (可选)SPAWNER_FOCUS=
         WORKSPACE=$(grep -m1 '^WORKSPACE=' "$URI_FILE" 2>/dev/null | cut -d= -f2-)
         URI=$(grep -m1 '^URI=' "$URI_FILE" 2>/dev/null | cut -d= -f2-)
+        # place-role-explicit-contract (2026-06-29): the engine stamps an explicit ROLE=coord|worker
+        # (it KNOWS the role at spawn time). This is the AUTHORITATIVE window-placement role — the
+        # launcher no longer derives it from UI appearance (🧭中枢 title / red titleBar) or guesses
+        # from the per-project singlepane sidecar. Threaded to maybe_place_window below. A legacy /
+        # in-flight .uri written before this change carries no ROLE= line → empty → maybe_place_window
+        # falls back to its transitional sidecar read, ultimately defaulting to worker (safe).
+        URI_ROLE=$(grep -m1 '^ROLE=' "$URI_FILE" 2>/dev/null | cut -d= -f2-)
         # direct-jump-spawn (2026-06-13) / mp-locate-return (2026-06-14): the SPAWNING window's own
         # .handoff.code-workspace abs path — from `handoff spawn --spawner-focus-path` OR engine
         # self-identification (validated). EXPORT it (reset every iteration, empty when absent) so the
@@ -2357,7 +2382,7 @@ EOF
             _place_wid=""
             log "PLACE-WID-DIAG[$TASK]: gate-declined (_PLACE_WIDS_OK=${_PLACE_WIDS_OK:-0} _skip_code_n=${_skip_code_n:-0} COLD=${COLD_WINDOW:-0} SP=${SINGLEPANE_WINDOW:-0}) → title"
         fi
-        maybe_place_window "$PROJECT" "$TASK" "$PROJ_DIR" "$QUEUE" "$_place_wid"
+        maybe_place_window "$PROJECT" "$TASK" "$PROJ_DIR" "$QUEUE" "$_place_wid" "$URI_ROLE"
 
         # SP-SUBMIT baseline (sw-sp-enter-retry): the singlepane confirm signal is a NEW
         # transcript *.jsonl (∉ this set) carrying 🆔<task>. Captured BEFORE the URI dispatch

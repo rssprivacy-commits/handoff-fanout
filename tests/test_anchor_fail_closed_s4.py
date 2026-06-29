@@ -413,7 +413,8 @@ def test_dump_warn_miss_fail_open_byte_compat(tmp_path, monkeypatch):
     ws = _git_ws(tmp_path)
     assert _dump_active(home, ws, monkeypatch) == 0
     uri = (home / PROJECT / "queue" / f"{TASK}.uri").read_text()
-    assert uri == f"WORKSPACE={ws}\nURI={dump.build_uri(_config.load(), PROJECT, TASK)}\n"
+    # place-role-explicit-contract: non-coordinator active dump → mandatory ROLE=worker line.
+    assert uri == f"WORKSPACE={ws}\nURI={dump.build_uri(_config.load(), PROJECT, TASK)}\nROLE=worker\n"
     misses = (home / PROJECT / "spawn-anchor-miss.log").read_text().splitlines()
     assert len(misses) == 1 and json.loads(misses[0])["reason"] == "dump:anchor-unresolved"
 
@@ -623,7 +624,8 @@ def test_write_active_dump_direct_warn_still_writes(tmp_path, monkeypatch):
     )
     assert rc == 0
     uri = (queue_dir / f"{TASK}.uri").read_text()
-    assert uri == f"WORKSPACE={ws}\nURI={dump.build_uri(cfg, PROJECT, TASK)}\n"
+    # place-role-explicit-contract: non-coordinator direct write → mandatory ROLE=worker line.
+    assert uri == f"WORKSPACE={ws}\nURI={dump.build_uri(cfg, PROJECT, TASK)}\nROLE=worker\n"
 
 
 def test_write_active_dump_direct_terminal_done_not_gated(tmp_path, monkeypatch):

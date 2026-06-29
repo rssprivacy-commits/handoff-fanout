@@ -303,9 +303,11 @@ def _dump_degraded_fan_in(
     atomic.atomic_replace(queue_dir / f"{fan_in_task}.md", content)
 
     uri = dump.build_uri(cfg, project, fan_in_task)
+    # place-role-explicit-contract (2026-06-29): a (degraded) fan-in window is a worker → ROLE=worker,
+    # so the launcher tiles it to a free quadrant. Mirrors dump.trigger_fan_in_if_ready's .uri.
     atomic.atomic_replace(
         queue_dir / f"{fan_in_task}.uri",
-        f"WORKSPACE={workspace}\nURI={uri}\n",
+        f"WORKSPACE={workspace}\nURI={uri}\nROLE=worker\n",
     )
     print(f"  [watchdog] degraded fan-in dumped: queue/{fan_in_task}.{{md,uri}}")
     _notify(
